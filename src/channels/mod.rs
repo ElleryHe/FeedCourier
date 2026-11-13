@@ -3,16 +3,15 @@
 //!
 //! Concrete channel implementations (`smtp`, `telegram`, `notion`) plug into this module in Wave 2.
 
+pub mod smtp;
+pub mod telegram;
+
 use std::fmt;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use htmd as _;
-use html2text as _;
-use lettre as _;
-use minijinja as _;
 use serde::{Deserialize, Serialize};
-use telegram_rich as _;
 
 use crate::crypto::compute_credential_group_key;
 use crate::db::models::{Channel, DeliveryTask, Entry, Feed, Route};
