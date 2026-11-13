@@ -12,13 +12,17 @@ use axum::routing::{delete, get, patch, post};
 use http as _;
 use http_body_util as _;
 use tower as _;
-use tower_http as _;
+use tower_http::trace::TraceLayer;
 
 use crate::config::AppConfig;
-use crate::crypto::MasterKey;
+use crate::crypto::{MasterKey, hash_password};
 use crate::db::Database;
+use crate::db::models::{
+    SETTING_ADMIN_PASSWORD_HASH, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST,
+};
 use crate::error::AppResult;
 use crate::ingest::IngestEngine;
+use crate::mcp::{McpState, build_mcp_router_with_state};
 use crate::net::ProtectedHttpClient;
 use crate::scheduler::DeliveryDispatcher;
 
@@ -156,4 +160,40 @@ pub fn build_api_only_router(state: AppState) -> Router {
 /// JSON `404` responses for unknown `/api/*` paths, and `rust-embed` static SPA WebUI serving.
 pub fn build_api_router(state: AppState) -> Router {
     build_api_only_router(state).fallback(spa::serve_spa)
+}
+
+/// Bootstrap optional environment variable presets (`ADMIN_PASSWORD`, `SSRF_ALLOWLIST`,
+/// `OUTBOUND_PROXY`) into SQLite `system_settings` before initializing [`DeliveryDispatcher`].
+pub async fn bootstrap_env_settings(config: &AppConfig, db: &Database) -> AppResult<()> {
+    if let Some(ref admin_pw) = config.admin_password
+        && !admin_pw.is_empty()
+    {
+        let phc = hash_password(admin_pw)?;
+        db.set_setting_typed(SETTING_ADMIN_PASSWORD_HASH, &phc)
+            .await?;
+    }
+    if !config.ssrf_allowlist.is_empty() && db.get_setting(SETTING_SSRF_ALLOWLIST).await?.is_none()
+    {
+        db.set_setting_typed(SETTING_SSRF_ALLOWLIST, &config.ssrf_allowlist)
+            .await?;
+    }
+    if let Some(ref proxy_url) = config.outbound_proxy
+        && db.get_setting(SETTING_OUTBOUND_PROXY_URL).await?.is_none()
+    {
+        db.set_setting_typed(SETTING_OUTBOUND_PROXY_URL, proxy_url)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Build the unified production Axum router combining:
+/// - `/mcp` Streamable HTTP MCP server (`Bearer` token guard via `route_layer`)
+/// - `/api/v1/*` REST API (`fc_session` HttpOnly cookie guard on protected routes)
+/// - JSON `404` responses for unknown `/api/*` and `/mcp/*` paths
+/// - `rust-embed` static React 19 single-page WebUI (`/` and client-side deep links)
+pub fn build_full_router(app_state: AppState, mcp_state: McpState) -> Router {
+    build_api_only_router(app_state)
+        .merge(build_mcp_router_with_state(mcp_state))
+        .fallback(spa::serve_spa)
+        .layer(TraceLayer::new_for_http())
 }
