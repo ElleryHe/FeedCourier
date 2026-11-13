@@ -1,31 +1,159 @@
-//! REST API (`/api/v1/*`), HttpOnly session authentication, and `rust-embed` static WebUI router.
-//!
-//! Implemented in Wave 2 (`feedcourier.md` Section 二.2 & 六.2).
+//! REST API (`/api/v1/*`), HttpOnly session authentication, and `rust-embed` static WebUI router
+//! (`feedcourier.md` Sections 二.2 & 六.2).
+
+pub mod auth;
+pub mod dto;
+pub mod handlers;
+pub mod spa;
 
 use axum::Router;
-use axum::routing::get;
-use bytes as _;
+use axum::middleware;
+use axum::routing::{delete, get, patch, post};
 use http as _;
 use http_body_util as _;
-use mime_guess as _;
-use rust_embed as _;
 use tower as _;
 use tower_http as _;
 
-use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION};
+use crate::config::AppConfig;
+use crate::crypto::MasterKey;
+use crate::db::Database;
+use crate::error::AppResult;
+use crate::ingest::IngestEngine;
+use crate::net::ProtectedHttpClient;
+use crate::scheduler::DeliveryDispatcher;
 
-/// Build a baseline health/metadata router (extended with full `/api/v1` and WebUI routes in Wave 2).
+/// Shared Axum application state (`Clone` via `DeliveryDispatcher`'s internal `Arc`).
+#[derive(Debug, Clone)]
+pub struct AppState {
+    runtime: DeliveryDispatcher,
+}
+
+impl AppState {
+    /// Wrap an initialized [`DeliveryDispatcher`] runtime.
+    pub fn new(runtime: DeliveryDispatcher) -> Self {
+        Self { runtime }
+    }
+
+    /// Construct [`AppState`] loading persisted network settings from SQLite `system_settings`.
+    pub async fn from_parts(
+        config: AppConfig,
+        db: Database,
+        master_key: MasterKey,
+    ) -> AppResult<Self> {
+        let runtime = DeliveryDispatcher::from_db_settings(config, db, master_key).await?;
+        Ok(Self { runtime })
+    }
+
+    pub fn runtime(&self) -> &DeliveryDispatcher {
+        &self.runtime
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        self.runtime.config()
+    }
+
+    pub fn db(&self) -> &Database {
+        self.runtime.db()
+    }
+
+    pub fn master_key(&self) -> &MasterKey {
+        self.runtime.master_key()
+    }
+
+    pub fn http(&self) -> &ProtectedHttpClient {
+        self.runtime.http()
+    }
+
+    pub fn ingest(&self) -> &IngestEngine {
+        self.runtime.ingest()
+    }
+}
+
+/// Build a baseline health/metadata router (preserved for lightweight smoke checks).
 pub fn baseline_router() -> Router {
-    Router::new().route(
-        "/api/v1/health",
-        get(|| async {
-            axum::Json(serde_json::json!({
-                "name": APP_NAME,
-                "version": VERSION,
-                "license": LICENSE_SPDX,
-                "repo_url": REPO_URL,
-                "status": "ok",
-            }))
-        }),
-    )
+    Router::new().route("/api/v1/health", get(handlers::health_check))
+}
+
+/// Build the `/api/v1/*` REST API router without attaching the SPA fallback handler.
+pub fn build_api_only_router(state: AppState) -> Router {
+    let public_routes = Router::new()
+        .route("/api/v1/health", get(handlers::health_check))
+        .route("/api/v1/auth/status", get(auth::auth_status))
+        .route("/api/v1/auth/setup", post(auth::auth_setup))
+        .route("/api/v1/auth/login", post(auth::auth_login))
+        .route("/api/v1/auth/logout", post(auth::auth_logout));
+
+    let protected_routes = Router::new()
+        // Overview & Maintenance
+        .route("/api/v1/overview", get(handlers::get_overview))
+        .route("/api/v1/maintenance/gc", post(handlers::run_maintenance_gc))
+        .route("/api/v1/maintenance/backup", get(handlers::download_backup))
+        // Feeds & OPML
+        .route(
+            "/api/v1/feeds",
+            get(handlers::list_feeds).post(handlers::create_feed),
+        )
+        .route("/api/v1/feeds/preview", post(handlers::preview_feed))
+        .route("/api/v1/feeds/opml/import", post(handlers::import_opml))
+        .route("/api/v1/feeds/opml/export", get(handlers::export_opml))
+        .route(
+            "/api/v1/feeds/{id}",
+            patch(handlers::update_feed).delete(handlers::delete_feed),
+        )
+        .route("/api/v1/feeds/{id}/poll", post(handlers::poll_feed_now))
+        // Trusted Channels & Notion Onboarding
+        .route(
+            "/api/v1/channels",
+            get(handlers::list_channels).post(handlers::create_channel),
+        )
+        .route(
+            "/api/v1/channels/notion/init-db",
+            post(handlers::notion_init_db),
+        )
+        .route(
+            "/api/v1/channels/notion/inspect-schema",
+            post(handlers::notion_inspect_schema),
+        )
+        .route(
+            "/api/v1/channels/{id}",
+            patch(handlers::update_channel).delete(handlers::delete_channel),
+        )
+        .route("/api/v1/channels/{id}/test", post(handlers::test_channel))
+        // Routes
+        .route(
+            "/api/v1/routes",
+            get(handlers::list_routes).post(handlers::create_route),
+        )
+        .route(
+            "/api/v1/routes/{id}",
+            patch(handlers::update_route).delete(handlers::delete_route),
+        )
+        // Outbox & Dead-Letter Tasks
+        .route("/api/v1/tasks", get(handlers::list_tasks))
+        .route("/api/v1/tasks/retry", post(handlers::retry_tasks))
+        // System Settings & MCP Bearer Tokens
+        .route(
+            "/api/v1/settings",
+            get(handlers::get_settings).put(handlers::update_settings),
+        )
+        .route(
+            "/api/v1/mcp-tokens",
+            get(handlers::list_mcp_tokens).post(handlers::create_mcp_token),
+        )
+        .route(
+            "/api/v1/mcp-tokens/{id}",
+            delete(handlers::delete_mcp_token),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ));
+
+    public_routes.merge(protected_routes).with_state(state)
+}
+
+/// Build the full Axum router combining `/api/v1/*` endpoints, `fc_session` authentication,
+/// JSON `404` responses for unknown `/api/*` paths, and `rust-embed` static SPA WebUI serving.
+pub fn build_api_router(state: AppState) -> Router {
+    build_api_only_router(state).fallback(spa::serve_spa)
 }
