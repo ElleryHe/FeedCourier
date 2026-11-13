@@ -1,0 +1,22 @@
+# Rust build artifacts
+target/
+
+# Runtime data, SQLite databases & auto-generated keys
+data/
+*.db
+*.db*
+master.key
+
+# Frontend dependencies & local build output (rebuilt cleanly in Stage 1)
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Git metadata & CI definitions
+.git/
+.github/
+
+# Local environment & OS files
+.env
+.env.*
+.DS_Store
