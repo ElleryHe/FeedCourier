@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+
+# Runtime data & SQLite artifacts
+/data
+*.db
+*.db-shm
+*.db-wal
+master.key
+
+# Frontend dependencies & build output
+/web/node_modules
+/web/dist
+/web/.vite
+
+# OS & editor files
+.DS_Store
+.env
+.env.*
+!.env.example
