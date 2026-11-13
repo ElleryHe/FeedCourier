@@ -17,14 +17,9 @@ jobs:
   web:
     name: WebUI (TypeScript & Vite)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: FeedCourier
     steps:
-      - name: Checkout FeedCourier
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: FeedCourier
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -36,7 +31,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: FeedCourier/web/pnpm-lock.yaml
+          cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Install frontend dependencies
         run: pnpm --dir web install --frozen-lockfile
@@ -51,34 +46,25 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: web-dist
-          path: FeedCourier/web/dist
+          path: web/dist
           if-no-files-found: error
 
   rust:
     name: Rust Gateway (fmt, clippy, test, release)
     runs-on: ubuntu-latest
     needs: web
-    defaults:
-      run:
-        working-directory: FeedCourier
     steps:
-      - name: Checkout FeedCourier
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: FeedCourier
 
-      - name: Checkout sibling telegram-rich
-        uses: actions/checkout@v4
-        with:
-          repository: ElleryHe/telegram-rich
-          ref: v0.0.1
-          path: telegram-rich
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config
 
       - name: Download compiled WebUI dist
         uses: actions/download-artifact@v4
         with:
           name: web-dist
-          path: FeedCourier/web/dist
+          path: web/dist
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,8 +73,6 @@ jobs:
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: FeedCourier -> target
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -106,21 +90,11 @@ jobs:
     name: License & Supply-Chain Audit (cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout FeedCourier
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: FeedCourier
-
-      - name: Checkout sibling telegram-rich
-        uses: actions/checkout@v4
-        with:
-          repository: ElleryHe/telegram-rich
-          ref: v0.0.1
-          path: telegram-rich
 
       - name: Run cargo-deny check
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          manifest-path: FeedCourier/Cargo.toml
           command: check
           command-arguments: licenses bans sources

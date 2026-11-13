@@ -3,12 +3,13 @@
 **English** | [简体中文](./README.zh-CN.md)
 
 [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
+[![Release](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 
 **FeedCourier** is a lightweight, single-binary pure-Rust **RSS / Atom / JSON Feed streaming delivery gateway** (`<20 MB` idle RSS, single SQLite WAL volume at `/data`) designed for individuals and small engineering teams.
 
-Inspired by `rss2email`'s single-entry reliability—without multi-tenant bloat or local content hoarding—FeedCourier routes feed entries in real time to **SMTP Newsletters**, **Telegram Bot API 10.4** (`sendRichMessage` via [`telegram-rich`](https://github.com/ElleryHe/telegram-rich), Compact Card, and Media Mode), and **Notion (`2026-03-11` Data Sources & Markdown v2)**, managed identically through an **embedded React 19 WebUI** and a **native Streamable HTTP MCP server (`/mcp`)**.
+Inspired by `rss2email`'s single-entry reliability—without multi-tenant bloat or local content hoarding—FeedCourier routes feed entries in real time to **SMTP Newsletters**, **Telegram Bot API 10.4** (`sendRichMessage` via [`telegram-rich`](https://crates.io/crates/telegram-rich), Compact Card, and Media Mode), and **Notion (`2026-03-11` Data Sources & Markdown v2)**, managed identically through an **embedded React 19 WebUI** and a **native Streamable HTTP MCP server (`/mcp`)**.
 
 ---
 
@@ -97,7 +98,7 @@ Every outbound request touching user-supplied URLs—feed polling, full-article 
 
 - **SMTP Newsletters**: Renders clean, responsive inline-CSS single-column reader emails via `minijinja` (`multipart/alternative` with `html2text` plain-text fallback), staying well below Gmail's `102 KB` clipping threshold.
 - **Telegram Bot API 10.4 (3 Route-Selectable Modes)**:
-  - **Rich Message (`rich_message`)**: Normalizes HTML via [`telegram-rich`](https://github.com/ElleryHe/telegram-rich) into Bot API 10.4 `sendRichMessage` Rich HTML (supporting `<table compact>`, `<blockquote expandable>`, `<tg-button-row>`, code language tags, and lifted media blocks) and fits within official limits (`32,768` chars / `500` blocks / `16` nesting depth / `50` media / `20` columns) at clean block boundaries. Automatically probes Bot API capabilities and degrades gracefully to Compact Card on older Local Bot API Servers.
+  - **Rich Message (`rich_message`)**: Normalizes HTML via [`telegram-rich`](https://crates.io/crates/telegram-rich) ([source](https://github.com/ElleryHe/telegram-rich)) into Bot API 10.4 `sendRichMessage` Rich HTML (supporting `<table compact>`, `<blockquote expandable>`, `<tg-button-row>`, code language tags, and lifted media blocks) and fits within official limits (`32,768` chars / `500` blocks / `16` nesting depth / `50` media / `20` columns) at clean block boundaries. Automatically probes Bot API capabilities and degrades gracefully to Compact Card on older Local Bot API Servers.
   - **Compact Card (`compact_card`)**: Concise `sendMessage` digest (`4,096`-char safe truncation) with bold title, source label, summary, canonical link, and route-level `link_preview` toggle.
   - **Media Mode (`media_mode`)**: Extracts `<enclosure>`, `media:content`, and inline media with a fixed 3-line caption (*author/feed*, *Unicode-segmented first sentence*, *canonical URL*), hotlink-protected zero-disk multipart fallback, and checkpointed 10-item `sendMediaGroup` batching.
 - **Notion (`Notion-Version: 2026-03-11`)**:
@@ -122,6 +123,8 @@ FeedCourier mounts an `rmcp`-powered Streamable HTTP endpoint at `/mcp` protecte
 
 ### Option 1: Docker Run
 
+Multi-arch (`linux/amd64`, `linux/arm64`) images are published to **GitHub Container Registry (`ghcr.io/elleryhe/feedcourier:<version>`)** and **Docker Hub (`<dockerhub-user>/feedcourier:<version>`)** on every tagged release (`0.1.0`, `0.1`, `0`, `latest`):
+
 ```bash
 docker run -d \
   --name feedcourier \
@@ -129,6 +132,9 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   ghcr.io/elleryhe/feedcourier:latest
+  # Or pin an exact release / pull from Docker Hub:
+  # ghcr.io/elleryhe/feedcourier:0.1.0
+  # <dockerhub-user>/feedcourier:0.1.0
 ```
 
 Open `http://127.0.0.1:8080` to set your administrator password on first launch (or pre-seed `ADMIN_PASSWORD`). FeedCourier automatically generates `/data/master.key` (`0600`) and initializes `/data/feedcourier.db` in SQLite WAL mode.
@@ -138,7 +144,7 @@ Open `http://127.0.0.1:8080` to set your administrator password on first launch 
 ```yaml
 services:
   feedcourier:
-    image: ghcr.io/elleryhe/feedcourier:latest
+    image: ghcr.io/elleryhe/feedcourier:latest # or ghcr.io/elleryhe/feedcourier:0.1.0 / <dockerhub-user>/feedcourier:0.1.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -160,15 +166,15 @@ services:
 docker compose up -d
 ```
 
-### Option 3: Build from Source
+### Option 3: Prebuilt Binaries or Build from Source
 
-Prerequisites: **Rust 1.88+ (2024 Edition)**, **Node.js 24+**, **`pnpm`**, and **`cmake`** (for `aws-lc-rs`).
+Prebuilt single-file release archives (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`) with `SHA256SUMS.txt` are published on [GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases).
+
+To compile from source, install **Rust 1.88+ (2024 Edition)**, **Node.js 24+**, **`pnpm`**, and **`cmake`** (for `aws-lc-rs`):
 
 ```bash
-# 1. Clone FeedCourier and sibling telegram-rich crate side by side
+# 1. Clone FeedCourier
 git clone https://github.com/ElleryHe/FeedCourier.git
-git clone --branch v0.0.1 https://github.com/ElleryHe/telegram-rich.git
-
 cd FeedCourier
 
 # 2. Build embedded React 19 WebUI assets into web/dist
@@ -176,18 +182,31 @@ corepack enable
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web build
 
-# 3. Compile single static-asset release binary
+# 3. Compile single static-asset release binary (pulls telegram-rich from crates.io)
 cargo build --release --locked
 
 # 4. Launch gateway
 DATA_DIR=./data LISTEN_ADDR=127.0.0.1:8080 ./target/release/feedcourier
 ```
 
-You can also build the standalone multi-stage container image directly from the `FeedCourier` directory (the `Dockerfile` fetches `telegram-rich` `v0.0.1` automatically):
+You can also build the standalone multi-stage container image locally:
 
 ```bash
 docker build -t feedcourier:local .
 ```
+
+### Automated Docker & GitHub Releases (`.github/workflows/release.yml`)
+
+Pushing a semantic version tag (`v*.*.*`, e.g. `git tag v0.1.0 && git push origin v0.1.0`) triggers `.github/workflows/release.yml`:
+
+1. **Version-Verified Multi-Platform Binaries**: Verifies `Cargo.toml` matches `${GITHUB_REF_NAME#v}`, compiles locked binaries across Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`), generates `SHA256SUMS.txt`, and publishes a GitHub Release (`prerelease` automatically detected for `-rc` / `-beta` / `-alpha` tags).
+2. **Multi-Arch GHCR + Docker Hub Publishing (`linux/amd64`, `linux/arm64`)**:
+   - **GHCR (`ghcr.io/elleryhe/feedcourier:<version>`)** is pushed automatically using the built-in `GITHUB_TOKEN`.
+   - **Docker Hub (`<dockerhub-user>/feedcourier:<version>`)** is pushed automatically via Docker Hub API Token authentication whenever the following GitHub Actions secrets are configured on the repository (or fork):
+     - `DOCKERHUB_USERNAME` — Your Docker Hub account username.
+     - `DOCKERHUB_TOKEN` — A Docker Hub Personal Access Token (`Read, Write, Delete` scope).
+     - `DOCKERHUB_REPO` *(optional repository variable)* — Overrides the target repository name (defaults to `<DOCKERHUB_USERNAME>/feedcourier`).
+   - Published tags follow semver conventions: `<version>` (e.g. `0.1.0`), `<major>.<minor>` (`0.1`), `<major>` (`0`), `latest` (stable releases only), and `sha-<short>`.
 
 ---
 
@@ -229,9 +248,8 @@ docker build -t feedcourier:local .
 
 ---
 
-## License
+## License & Compliance
 
-- **FeedCourier** is licensed under the **GNU Affero General Public License v3.0 only ([`AGPL-3.0-only`](./LICENSE))**.
-  - In compliance with **AGPLv3 Section 13** (Remote Network Interaction), both the embedded WebUI footer (`/api/v1/auth/status`) and the `/mcp` `ServerInfo` metadata natively publish the build version, `AGPL-3.0-only` license identifier, and source repository URL. If you deploy a modified version accessible over a network, you must make the Corresponding Source of your modified version available to its users under the same license.
-- The standalone Telegram Bot API 10.4 rich-message toolkit **[`telegram-rich`](https://github.com/ElleryHe/telegram-rich)** is independently maintained and dual-licensed under **`MIT OR Apache-2.0`**.
-- Dependency license compliance across the entire crate graph is continuously audited in CI via [`cargo-deny`](./deny.toml).
+[AGPL-3.0](./LICENSE)
+
+Deploying and using FeedCourier must comply with the Telegram Terms of Service ([Telegram Bot Developer Terms](https://telegram.org/tos/bot-developers)), Notion Terms of Service ([Notion Developer Terms](https://developers.notion.com/)), SMTP anti-spam policies, and upstream crawling and content terms. Do not use this software for spam, API abuse, or unauthorized content redistribution.

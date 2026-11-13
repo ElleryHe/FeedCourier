@@ -1,7 +1,7 @@
 # =============================================================================
 # Stage 1: Build embedded React 19 + Vite WebUI (`web/dist`)
 # =============================================================================
-FROM node:24-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
 
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable && corepack prepare pnpm@10 --activate
@@ -22,12 +22,6 @@ FROM rust:1-bookworm AS rust-builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake pkg-config \
     && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# Fetch sibling `telegram-rich` crate so `path = "../telegram-rich"` in
-# `/build/FeedCourier/Cargo.toml` resolves cleanly inside standalone builds.
-RUN git clone --branch v0.0.1 --depth 1 https://github.com/ElleryHe/telegram-rich.git /build/telegram-rich
 
 WORKDIR /build/FeedCourier
 

@@ -3,12 +3,13 @@
 [English](./README.md) | **简体中文**
 
 [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
+[![Release](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 
 **FeedCourier** 是一款面向个人与极客小团队（10 人以内）的纯血 Rust 单二进制 **RSS / Atom / JSON Feed 流式订阅投递网关**（空闲内存 `<20 MB`，仅需挂载单一 `/data` SQLite WAL 数据目录）。
 
-项目传承经典工具 `rss2email` 稳定可靠的单篇投递哲学，砍掉重型多租户与在线阅读器囤积包袱，将订阅流实时桥接至 **SMTP 精品阅读邮件**、**Telegram Bot API 10.4**（基于 [`telegram-rich`](https://github.com/ElleryHe/telegram-rich) 的 `sendRichMessage` 富文档、快讯卡片、媒体模式）与 **Notion（`2026-03-11` 数据源 & Markdown v2）**，并在同一进程内原生内嵌 **React 19 可视化管理面板**与 **Streamable HTTP MCP 服务端（`/mcp`）**。
+项目传承经典工具 `rss2email` 稳定可靠的单篇投递哲学，砍掉重型多租户与在线阅读器囤积包袱，将订阅流实时桥接至 **SMTP 精品阅读邮件**、**Telegram Bot API 10.4**（基于 [`telegram-rich`](https://crates.io/crates/telegram-rich) 的 `sendRichMessage` 富文档、快讯卡片、媒体模式）与 **Notion（`2026-03-11` 数据源 & Markdown v2）**，并在同一进程内原生内嵌 **React 19 可视化管理面板**与 **Streamable HTTP MCP 服务端（`/mcp`）**。
 
 ---
 
@@ -97,7 +98,7 @@ stateDiagram-v2
 
 - **SMTP 邮件通道**：基于 `minijinja` 渲染精调内联 CSS 的单栏响应式阅读信纸，构造标准 `multipart/alternative`（附 `html2text` 纯文本回退），严控体积远离 Gmail `102 KB` 截断红线。
 - **Telegram 通道（对齐 Bot API 10.4，路由级三模切换）**：
-  - **富文档模式（`rich_message`）**：通过自研 [`telegram-rich`](https://github.com/ElleryHe/telegram-rich) 将 HTML 规范化为 Telegram Rich HTML（原生覆盖 `<table compact>`、`<blockquote expandable>`、`<tg-button-row>`、代码块语言保留与独立媒体块提升），并由 `Document::fit` 按官方上限（`32,768` 字符 / `500` 块 / `16` 层嵌套 / `50` 媒体 / `20` 列）在块边界优雅截断。支持通道级 Bot API 能力探测，面对版本滞后的自建 Local Bot API Server 自动降级为快讯模式并告警。
+  - **富文档模式（`rich_message`）**：通过自研 [`telegram-rich`](https://crates.io/crates/telegram-rich)（[源码仓库](https://github.com/ElleryHe/telegram-rich)）将 HTML 规范化为 Telegram Rich HTML（原生覆盖 `<table compact>`、`<blockquote expandable>`、`<tg-button-row>`、代码块语言保留与独立媒体块提升），并由 `Document::fit` 按官方上限（`32,768` 字符 / `500` 块 / `16` 层嵌套 / `50` 媒体 / `20` 列）在块边界优雅截断。支持通道级 Bot API 能力探测，面对版本滞后的自建 Local Bot API Server 自动降级为快讯模式并告警。
   - **快讯模式（`compact_card`）**：调用 `sendMessage`（`4,096` 字符安全截断），组装“加粗标题 + 来源标签 + 精炼摘要 + 原文链接”，支持按路由开关链接预览。
   - **媒体模式（`media_mode`）**：提取 `<enclosure>`、`media:content` 与正文图文音视频，挂载三行精炼文案（*作者/源名* + *Unicode 句子边界首句* + *规范化原文链接*），支持防盗链零落盘流式中转回退与多图断点续投。
 - **Notion 数据源通道（全面对齐 `Notion-Version: 2026-03-11`）**：
@@ -122,6 +123,8 @@ stateDiagram-v2
 
 ### 方式一：Docker 一键启动
 
+每次版本标签发布都会同步构建多架构（`linux/amd64`、`linux/arm64`）容器镜像并推送至 **GitHub Container Registry（`ghcr.io/elleryhe/feedcourier:<version>`）** 与 **Docker Hub（`<dockerhub-user>/feedcourier:<version>`）**（支持 `0.1.0`、`0.1`、`0`、`latest` 等语义化标签）：
+
 ```bash
 docker run -d \
   --name feedcourier \
@@ -129,6 +132,9 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   ghcr.io/elleryhe/feedcourier:latest
+  # 也可锁定精确版本号或从 Docker Hub 拉取：
+  # ghcr.io/elleryhe/feedcourier:0.1.0
+  # <dockerhub-user>/feedcourier:0.1.0
 ```
 
 浏览器访问 `http://127.0.0.1:8080` 完成首次管理员口令初始化（也可通过环境变量 `ADMIN_PASSWORD` 预设）。容器首次启动将在 `/data` 下自动生成 `0600` 权限主密钥 `/data/master.key` 并初始化 SQLite WAL 数据库 `/data/feedcourier.db`。
@@ -138,7 +144,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: ghcr.io/elleryhe/feedcourier:latest
+    image: ghcr.io/elleryhe/feedcourier:latest # 或 ghcr.io/elleryhe/feedcourier:0.1.0 / <dockerhub-user>/feedcourier:0.1.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -160,15 +166,15 @@ services:
 docker compose up -d
 ```
 
-### 方式三：从源码编译构建
+### 方式三：预编译二进制或从源码编译构建
 
-构建依赖：**Rust 1.88+（2024 Edition）**、**Node.js 24+**、**`pnpm`** 以及 **`cmake`**（用于编译 `aws-lc-rs`）。
+各主流平台（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`）的单文件预编译包及 `SHA256SUMS.txt` 校验文件均可在 [GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases) 直接下载。
+
+如需从源码自行编译，请安装 **Rust 1.88+（2024 Edition）**、**Node.js 24+**、**`pnpm`** 以及 **`cmake`**（用于编译 `aws-lc-rs`）：
 
 ```bash
-# 1. 同级克隆主仓库与独立子库 telegram-rich
+# 1. 克隆仓库
 git clone https://github.com/ElleryHe/FeedCourier.git
-git clone --branch v0.0.1 https://github.com/ElleryHe/telegram-rich.git
-
 cd FeedCourier
 
 # 2. 构建前端静态产物至 web/dist
@@ -176,18 +182,31 @@ corepack enable
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web build
 
-# 3. 编译内嵌 WebUI 的单文件 Release 二进制
+# 3. 编译内嵌 WebUI 的单文件 Release 二进制（telegram-rich 直接从 crates.io 拉取）
 cargo build --release --locked
 
 # 4. 启动服务
 DATA_DIR=./data LISTEN_ADDR=127.0.0.1:8080 ./target/release/feedcourier
 ```
 
-也可直接在 `FeedCourier` 目录执行独立 Docker 多阶段构建（`Dockerfile` 会自动拉取 `telegram-rich` `v0.0.1`）：
+也可直接在仓库根目录执行本地多阶段 Docker 镜像构建：
 
 ```bash
 docker build -t feedcourier:local .
 ```
+
+### 自动化版本发布与多架构镜像推送（`.github/workflows/release.yml`）
+
+推送语义化版本 Git 标签（`v*.*.*`，例如 `git tag v0.1.0 && git push origin v0.1.0`）将自动触发 `.github/workflows/release.yml` 流水线：
+
+1. **版本一致性校验与多平台二进制打包**：自动校验 `Cargo.toml` 版本号与 `${GITHUB_REF_NAME#v}` 完全一致，构建 Linux（`x86_64`、`aarch64`）与 macOS（`x86_64`、`aarch64`）四平台锁定二进制压缩包并生成 `SHA256SUMS.txt`，自动创建 GitHub Release（带 `-rc` / `-beta` / `-alpha` 后缀自动标记为预发布）。
+2. **GHCR + Docker Hub 多架构（`linux/amd64`、`linux/arm64`）同步推送**：
+   - **GHCR（`ghcr.io/elleryhe/feedcourier:<version>`）**：使用内置 `GITHUB_TOKEN` 免配置自动推送。
+   - **Docker Hub（`<dockerhub-user>/feedcourier:<version>`）**：当仓库（或 Fork 仓库）在 GitHub Actions Secrets 中配置了以下 Docker Hub API Token 凭据时自动登录并同步推送：
+     - `DOCKERHUB_USERNAME` —— Docker Hub 账号用户名。
+     - `DOCKERHUB_TOKEN` —— Docker Hub Personal Access Token（具备 `Read, Write, Delete` 权限）。
+     - `DOCKERHUB_REPO` *（可选 Repository Variable）* —— 自定义目标镜像名（默认使用 `<DOCKERHUB_USERNAME>/feedcourier`）。
+   - 自动生成的镜像标签涵盖：`<version>`（如 `0.1.0`）、`<major>.<minor>`（`0.1`）、`<major>`（`0`）、`latest`（仅正式版）以及 `sha-<short>`。
 
 ---
 
@@ -231,7 +250,6 @@ docker build -t feedcourier:local .
 
 ## 开源协议与合规声明
 
-- **FeedCourier** 主程序采用 **GNU Affero General Public License v3.0 only（[`AGPL-3.0-only`](./LICENSE)）** 协议开源。
-  - 为严格履行 **AGPLv3 第 13 条**（远程网络交互要求），WebUI 底部常驻页脚（`/api/v1/auth/status`）与 `/mcp` 服务端 `ServerInfo` 元数据均原生内置了构建版本号、`AGPL-3.0-only` 许可证标识与源码仓库链接。若您修改本程序并通过网络向用户提供交互服务，必须以相同许可向服务使用者免费提供修改版对应的完整源代码。
-- 面向 Telegram Bot API 10.4 富消息的独立工具子库 **[`telegram-rich`](https://github.com/ElleryHe/telegram-rich)** 独立维护发布，采用宽松的 **`MIT OR Apache-2.0`** 双许可协议。
-- 全量依赖树的开源许可证兼容性与软件供应链来源由 CI 中的 [`cargo-deny`](./deny.toml) 持续强制校验。
+[AGPL-3.0](./LICENSE)
+
+部署与使用 FeedCourier 须遵守 Telegram 服务条款（[Telegram Bot Developer Terms](https://telegram.org/tos/bot-developers)）、Notion 服务条款（[Notion Developer Terms](https://developers.notion.com/)）、SMTP 反垃圾邮件策略以及上游站点的抓取与内容版权规范；请勿将本软件用于垃圾信息发送、API 滥用或未经授权的内容分发。
