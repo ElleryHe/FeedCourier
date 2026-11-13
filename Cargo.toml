@@ -1,0 +1,112 @@
+[package]
+name = "feedcourier"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/ElleryHe/FeedCourier"
+description = "Lightweight pure-Rust RSS/Atom/JSON Feed delivery gateway with SMTP, Telegram, Notion, and built-in MCP."
+
+[dependencies]
+# Async runtime & web server
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "io", "codec"] }
+axum = { version = "0.8", features = ["macros", "multipart", "http2"] }
+tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.7", features = ["fs", "cors", "trace", "set-header", "catch-panic", "limit"] }
+http = "1.5"
+http-body-util = "0.1"
+bytes = "1.12"
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Embedded database (SQLite WAL)
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+    "chrono",
+    "json",
+] }
+
+# Outbound networking & DNS/SSRF validation
+reqwest = { version = "0.13", default-features = true, features = [
+    "rustls",
+    "socks",
+    "json",
+    "multipart",
+    "stream",
+    "gzip",
+    "brotli",
+    "deflate",
+    "query",
+    "form",
+    "hickory-dns",
+] }
+hickory-resolver = "0.26"
+url = { version = "2.5", features = ["serde"] }
+ipnet = { version = "2.12", features = ["serde"] }
+
+# Feed parsing, Readability & content transformation pipeline
+feed-rs = "3.0"
+quick-xml = { version = "0.42", features = ["serialize"] }
+dom_smoothie = "0.19"
+ammonia = "4.2"
+minijinja = "3.1"
+htmd = "0.5"
+html2text = "0.17"
+unicode-segmentation = "1.13"
+regex = "1.13"
+telegram-rich = { version = "0.0.1", path = "../telegram-rich" }
+
+# Delivery clients (SMTP)
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1-rustls",
+    "aws-lc-rs",
+    "webpki-roots",
+    "rustls-platform-verifier",
+    "builder",
+    "pool",
+    "smtp-transport",
+    "hostname",
+    "serde",
+    "tracing",
+] }
+
+# Security & cryptography
+argon2 = { version = "0.6", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+rand = "0.10"
+
+# Built-in MCP server (Streamable HTTP)
+rmcp = { version = "3.10", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+    "tower",
+    "base64",
+    "uuid",
+] }
+schemars = "1.2"
+
+# Embedded WebUI assets
+rust-embed = { version = "8.14", features = ["interpolate-folder-path", "mime-guess"] }
+mime_guess = "2.0"
+
+# Serialization, time, diagnostics & error handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+wiremock = "0.6"
+tokio-test = "0.4"
