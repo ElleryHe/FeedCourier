@@ -1,0 +1,82 @@
+name: Bug Report
+description: Report feed ingest issues, channel delivery failures, WebUI bugs, or MCP behavior mismatches
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Minimal reproducing feed XML/JSON snippets or sanitized outbox diagnostics help us fix bugs quickly.
+        > **Security note**: Please **do not** report security vulnerabilities in public issues—use [GitHub Private Vulnerability Reporting](https://github.com/ElleryHe/FeedCourier/security/advisories/new) instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version / Tag / Image
+      description: Exact git tag, binary release version, or Docker image tag/digest.
+      placeholder: "v0.1.0 / elleryhe/feedcourier:0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment Method
+      options:
+        - Docker Hub
+        - Prebuilt Binary
+        - Source
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - Ingest / Readability
+        - SMTP Channel
+        - Telegram Channel
+        - Notion Channel
+        - Scheduler / Outbox
+        - WebUI / REST API
+        - MCP Server (/mcp)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Provide clear steps, route/channel settings, or a minimal RSS/Atom/JSON Feed snippet that reproduces the issue.
+      placeholder: |
+        1. Configure a feed with ...
+        2. Route to ...
+        3. Trigger poll / observe task ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized Logs / Error Output
+      description: >
+        Paste relevant `feedcourier` logs (`RUST_LOG=feedcourier=debug`) or dead-letter error details.
+        IMPORTANT: Redact all secrets before submitting — including `MASTER_KEY`, `ADMIN_PASSWORD`,
+        SMTP passwords, Telegram bot tokens, Notion integration secrets, `/mcp` Bearer tokens (`fc_mcp_*`),
+        recipient email addresses, `chat_id`, and `data_source_id`.
+      render: text
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Secret Redaction Check
+      options:
+        - label: I have redacted all tokens, passwords, encryption keys, email addresses, and private channel IDs from this report.
+          required: true
