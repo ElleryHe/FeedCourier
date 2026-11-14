@@ -1,0 +1,29 @@
+name: Feature Request
+description: Propose an enhancement to feed ingest, delivery channels, WebUI, or MCP orchestration
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Use Case
+      description: What workflow friction, feed quirk, or downstream channel capability are you trying to address?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed Design
+      description: Sketch how you would expect this feature, configuration option, API route, or MCP tool to behave.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Alignment with Gateway Scope
+      description: >
+        FeedCourier is intentionally a lightweight, single-binary streaming delivery gateway (ephemeral payloads,
+        single-entry paced delivery, WebUI-locked credentials and recipients) rather than an online RSS reader or
+        full-text archive. Briefly note how this proposal fits within that boundary.
+    validations:
+      required: true

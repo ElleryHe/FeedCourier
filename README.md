@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
 [![Release](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml)
+[![Docker Hub](https://img.shields.io/docker/v/elleryhe/feedcourier?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/elleryhe/feedcourier)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 
@@ -123,7 +124,7 @@ FeedCourier mounts an `rmcp`-powered Streamable HTTP endpoint at `/mcp` protecte
 
 ### Option 1: Docker Run
 
-Multi-arch (`linux/amd64`, `linux/arm64`) images are published to **GitHub Container Registry (`ghcr.io/elleryhe/feedcourier:<version>`)** and **Docker Hub (`<dockerhub-user>/feedcourier:<version>`)** on every tagged release (`0.1.0`, `0.1`, `0`, `latest`):
+Multi-arch (`linux/amd64`, `linux/arm64`) images are published to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)** on every tagged release (`0.1.0`, `0.1`, `latest`):
 
 ```bash
 docker run -d \
@@ -131,10 +132,9 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
-  ghcr.io/elleryhe/feedcourier:latest
-  # Or pin an exact release / pull from Docker Hub:
-  # ghcr.io/elleryhe/feedcourier:0.1.0
-  # <dockerhub-user>/feedcourier:0.1.0
+  elleryhe/feedcourier:latest
+  # Or pin an exact release version:
+  # elleryhe/feedcourier:0.1.0
 ```
 
 Open `http://127.0.0.1:8080` to set your administrator password on first launch (or pre-seed `ADMIN_PASSWORD`). FeedCourier automatically generates `/data/master.key` (`0600`) and initializes `/data/feedcourier.db` in SQLite WAL mode.
@@ -144,7 +144,7 @@ Open `http://127.0.0.1:8080` to set your administrator password on first launch 
 ```yaml
 services:
   feedcourier:
-    image: ghcr.io/elleryhe/feedcourier:latest # or ghcr.io/elleryhe/feedcourier:0.1.0 / <dockerhub-user>/feedcourier:0.1.0
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -170,7 +170,7 @@ docker compose up -d
 
 Prebuilt single-file release archives (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`) with `SHA256SUMS.txt` are published on [GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases).
 
-To compile from source, install **Rust 1.88+ (2024 Edition)**, **Node.js 24+**, **`pnpm`**, and **`cmake`** (for `aws-lc-rs`):
+To compile from source, install **Rust 1.94+ (2024 Edition)**, **Node.js 24+**, **`pnpm`**, and **`cmake`** (for `aws-lc-rs`):
 
 ```bash
 # 1. Clone FeedCourier
@@ -199,14 +199,13 @@ docker build -t feedcourier:local .
 
 Pushing a semantic version tag (`v*.*.*`, e.g. `git tag v0.1.0 && git push origin v0.1.0`) triggers `.github/workflows/release.yml`:
 
-1. **Version-Verified Multi-Platform Binaries**: Verifies `Cargo.toml` matches `${GITHUB_REF_NAME#v}`, compiles locked binaries across Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`), generates `SHA256SUMS.txt`, and publishes a GitHub Release (`prerelease` automatically detected for `-rc` / `-beta` / `-alpha` tags).
-2. **Multi-Arch GHCR + Docker Hub Publishing (`linux/amd64`, `linux/arm64`)**:
-   - **GHCR (`ghcr.io/elleryhe/feedcourier:<version>`)** is pushed automatically using the built-in `GITHUB_TOKEN`.
-   - **Docker Hub (`<dockerhub-user>/feedcourier:<version>`)** is pushed automatically via Docker Hub API Token authentication whenever the following GitHub Actions secrets are configured on the repository (or fork):
+1. **Version-Verified Multi-Platform Binaries & Curated Release Notes**: Verifies `Cargo.toml` matches `${GITHUB_REF_NAME#v}`, compiles locked binaries across Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `aarch64`), generates `SHA256SUMS.txt`, extracts the matching `CHANGELOG.md` section, and publishes a GitHub Release (`prerelease` automatically detected for `-rc` / `-beta` / `-alpha` tags).
+2. **Multi-Arch Docker Hub Publishing (`linux/amd64`, `linux/arm64`)**:
+   - **[`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)** is built, pushed, and synced with repository metadata via Docker Hub API Token authentication using the following GitHub Actions secrets:
      - `DOCKERHUB_USERNAME` — Your Docker Hub account username.
      - `DOCKERHUB_TOKEN` — A Docker Hub Personal Access Token (`Read, Write, Delete` scope).
      - `DOCKERHUB_REPO` *(optional repository variable)* — Overrides the target repository name (defaults to `<DOCKERHUB_USERNAME>/feedcourier`).
-   - Published tags follow semver conventions: `<version>` (e.g. `0.1.0`), `<major>.<minor>` (`0.1`), `<major>` (`0`), `latest` (stable releases only), and `sha-<short>`.
+   - Published tags follow clean semantic versioning: `<version>` (e.g. `0.1.0`), `<major>.<minor>` (`0.1`), `<major>` (from `1.0.0`+), and `latest` (stable releases only).
 
 ---
 

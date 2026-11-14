@@ -4,6 +4,7 @@
 
 [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
 [![Release](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml)
+[![Docker Hub](https://img.shields.io/docker/v/elleryhe/feedcourier?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/elleryhe/feedcourier)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 
@@ -123,7 +124,7 @@ stateDiagram-v2
 
 ### 方式一：Docker 一键启动
 
-每次版本标签发布都会同步构建多架构（`linux/amd64`、`linux/arm64`）容器镜像并推送至 **GitHub Container Registry（`ghcr.io/elleryhe/feedcourier:<version>`）** 与 **Docker Hub（`<dockerhub-user>/feedcourier:<version>`）**（支持 `0.1.0`、`0.1`、`0`、`latest` 等语义化标签）：
+每次版本标签发布都会自动构建多架构（`linux/amd64`、`linux/arm64`）容器镜像并推送至 **[Docker Hub（`elleryhe/feedcourier`）](https://hub.docker.com/r/elleryhe/feedcourier)**（支持 `0.1.0`、`0.1`、`latest` 语义化标签）：
 
 ```bash
 docker run -d \
@@ -131,10 +132,9 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
-  ghcr.io/elleryhe/feedcourier:latest
-  # 也可锁定精确版本号或从 Docker Hub 拉取：
-  # ghcr.io/elleryhe/feedcourier:0.1.0
-  # <dockerhub-user>/feedcourier:0.1.0
+  elleryhe/feedcourier:latest
+  # 也可锁定精确发布版本号：
+  # elleryhe/feedcourier:0.1.0
 ```
 
 浏览器访问 `http://127.0.0.1:8080` 完成首次管理员口令初始化（也可通过环境变量 `ADMIN_PASSWORD` 预设）。容器首次启动将在 `/data` 下自动生成 `0600` 权限主密钥 `/data/master.key` 并初始化 SQLite WAL 数据库 `/data/feedcourier.db`。
@@ -144,7 +144,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: ghcr.io/elleryhe/feedcourier:latest # 或 ghcr.io/elleryhe/feedcourier:0.1.0 / <dockerhub-user>/feedcourier:0.1.0
+    image: elleryhe/feedcourier:latest # 或锁定版本 elleryhe/feedcourier:0.1.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -170,7 +170,7 @@ docker compose up -d
 
 各主流平台（`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-apple-darwin`、`aarch64-apple-darwin`）的单文件预编译包及 `SHA256SUMS.txt` 校验文件均可在 [GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases) 直接下载。
 
-如需从源码自行编译，请安装 **Rust 1.88+（2024 Edition）**、**Node.js 24+**、**`pnpm`** 以及 **`cmake`**（用于编译 `aws-lc-rs`）：
+如需从源码自行编译，请安装 **Rust 1.94+（2024 Edition）**、**Node.js 24+**、**`pnpm`** 以及 **`cmake`**（用于编译 `aws-lc-rs`）：
 
 ```bash
 # 1. 克隆仓库
@@ -199,14 +199,13 @@ docker build -t feedcourier:local .
 
 推送语义化版本 Git 标签（`v*.*.*`，例如 `git tag v0.1.0 && git push origin v0.1.0`）将自动触发 `.github/workflows/release.yml` 流水线：
 
-1. **版本一致性校验与多平台二进制打包**：自动校验 `Cargo.toml` 版本号与 `${GITHUB_REF_NAME#v}` 完全一致，构建 Linux（`x86_64`、`aarch64`）与 macOS（`x86_64`、`aarch64`）四平台锁定二进制压缩包并生成 `SHA256SUMS.txt`，自动创建 GitHub Release（带 `-rc` / `-beta` / `-alpha` 后缀自动标记为预发布）。
-2. **GHCR + Docker Hub 多架构（`linux/amd64`、`linux/arm64`）同步推送**：
-   - **GHCR（`ghcr.io/elleryhe/feedcourier:<version>`）**：使用内置 `GITHUB_TOKEN` 免配置自动推送。
-   - **Docker Hub（`<dockerhub-user>/feedcourier:<version>`）**：当仓库（或 Fork 仓库）在 GitHub Actions Secrets 中配置了以下 Docker Hub API Token 凭据时自动登录并同步推送：
+1. **版本一致性校验、变更日志提取与多平台二进制打包**：自动校验 `Cargo.toml` 版本号与 `${GITHUB_REF_NAME#v}` 完全一致，构建 Linux（`x86_64`、`aarch64`）与 macOS（`x86_64`、`aarch64`）四平台锁定二进制压缩包并生成 `SHA256SUMS.txt`，提取 `CHANGELOG.md` 对应版本说明创建 GitHub Release（带 `-rc` / `-beta` / `-alpha` 后缀自动标记为预发布）。
+2. **Docker Hub 多架构（`linux/amd64`、`linux/arm64`）自动推送与文档同步**：
+   - **[`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)** 通过 GitHub Actions Secrets 中的 Docker Hub API Token 凭据自动构建推送，并同步仓库简介与 `README.md`：
      - `DOCKERHUB_USERNAME` —— Docker Hub 账号用户名。
      - `DOCKERHUB_TOKEN` —— Docker Hub Personal Access Token（具备 `Read, Write, Delete` 权限）。
      - `DOCKERHUB_REPO` *（可选 Repository Variable）* —— 自定义目标镜像名（默认使用 `<DOCKERHUB_USERNAME>/feedcourier`）。
-   - 自动生成的镜像标签涵盖：`<version>`（如 `0.1.0`）、`<major>.<minor>`（`0.1`）、`<major>`（`0`）、`latest`（仅正式版）以及 `sha-<short>`。
+   - 自动生成的纯净语义化镜像标签涵盖：`<version>`（如 `0.1.0`）、`<major>.<minor>`（`0.1`）、`<major>`（自 `1.0.0` 起启用）以及 `latest`（仅正式版）。
 
 ---
 

@@ -2,9 +2,14 @@
 name = "feedcourier"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.94"
 license = "AGPL-3.0-only"
 repository = "https://github.com/ElleryHe/FeedCourier"
+homepage = "https://github.com/ElleryHe/FeedCourier"
+readme = "README.md"
 description = "Lightweight pure-Rust RSS/Atom/JSON Feed delivery gateway with SMTP, Telegram, Notion, and built-in MCP."
+keywords = ["rss", "atom", "telegram", "notion", "mcp"]
+categories = ["web-programming::http-server", "command-line-utilities", "email"]
 
 [dependencies]
 # Async runtime & web server
@@ -110,3 +115,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tempfile = "3.27"
 wiremock = "0.6"
 tokio-test = "0.4"
+
+[lints.cargo]
+redundant_homepage = "allow"

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a Security Vulnerability
+    url: https://github.com/ElleryHe/FeedCourier/security/advisories/new
+    about: Privately disclose security vulnerabilities via GitHub Security Advisories (do not open a public issue)
