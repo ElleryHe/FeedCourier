@@ -62,7 +62,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config
 
       - name: Download compiled WebUI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist

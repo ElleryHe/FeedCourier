@@ -87,7 +87,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config
 
       - name: Download compiled WebUI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist
@@ -164,7 +164,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Download compiled WebUI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist
@@ -335,7 +335,7 @@ jobs:
           fi
 
       - name: Download release binary archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           merge-multiple: true
