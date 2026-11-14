@@ -16,3 +16,10 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    ignore:
+      # Ignore odd-numbered non-LTS Node.js majors (Docker uses Bundler version syntax)
+      - dependency-name: "node"
+        versions:
+          - "~> 25.0"
+          - "~> 27.0"
+          - "~> 29.0"
