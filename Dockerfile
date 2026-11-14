@@ -1,7 +1,7 @@
 # =============================================================================
 # Stage 1: Build embedded React 19 + Vite WebUI (`web/dist`)
 # =============================================================================
-FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:25-alpine AS web-builder
 
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable && corepack prepare pnpm@10 --activate
