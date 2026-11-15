@@ -52,7 +52,7 @@ All four `.tar.gz` archives are hashed into `SHA256SUMS.txt`, paired with the ma
 
 ### 2. Multi-Arch Docker Hub Publishing (`elleryhe/feedcourier`)
 
-In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd64`, `linux/arm64`) image to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)** and synchronizes the repository's `README.md` description:
+In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd64`, `linux/arm64`) image to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
 
 - **Published Image Tags**:
   - `<version>` (e.g., `0.1.2`)
@@ -61,7 +61,7 @@ In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd
   - `latest` (for stable non-prerelease tags)
 - **Required GitHub Actions Secrets / Variables**:
   - `DOCKERHUB_USERNAME` *(Secret)* — Docker Hub account username.
-  - `DOCKERHUB_TOKEN` *(Secret)* — Docker Hub Personal Access Token (`Read, Write, Delete` scope).
+  - `DOCKERHUB_TOKEN` *(Secret)* — Docker Hub Personal Access Token (`Read & Write` scope).
   - `DOCKERHUB_REPO` *(Optional Variable)* — Overrides the target repository name (defaults to `<DOCKERHUB_USERNAME>/feedcourier`).
 
 ---

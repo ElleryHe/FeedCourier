@@ -283,16 +283,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Sync Docker Hub description and README
-        uses: peter-evans/dockerhub-description@v5
-        continue-on-error: true
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ steps.registries.outputs.image }}
-          short-description: RSS/Atom/JSON Feed subscription delivery service for SMTP Email, Telegram, Notion & MCP
-          readme-filepath: ./README.md
-
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest

@@ -45,14 +45,13 @@ flowchart LR
   - `feedcourier-<version>-aarch64-apple-darwin.tar.gz`（`macos-latest`）
   - `feedcourier-<version>-x86_64-apple-darwin.tar.gz`（`macos-latest`）
 
-### 第二步：Docker Hub 多架构镜像推送与文档同步
+### 第二步：Docker Hub 多架构镜像推送
 - 通过 Docker Buildx 与 QEMU 构建 **`linux/amd64` + `linux/arm64`** 多架构镜像并推送至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
 - **镜像标签规则**：
   - `<version>`（如 `0.1.2`）
   - `<major>.<minor>`（如 `0.1`）
   - `<major>`（自 `1.0.0` 正式版起启用）
   - `latest`（仅对不带 `-rc` / `-beta` / `-alpha` 后缀的正式版标签更新）
-- 构建完成后自动将仓库根目录的 `README.md` 与简介同步至 Docker Hub 镜像仓库主页。
 
 ### 第三步：`CHANGELOG.md` 提取与 `SHA256SUMS.txt` 发布
 - 通过 `awk` 从根目录 `CHANGELOG.md` 中截取对应 `## [<version>]` 章节的更新说明；
