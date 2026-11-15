@@ -1,3 +1,7 @@
+---
+description: "Security design of FeedCourier: ChaCha20-Poly1305 credential encryption, Argon2id password hashing, MCP Destination Lock, prompt-injection isolation, and SSRF protection."
+---
+
 # Security & Isolation
 
 This document details FeedCourier's implementation of at-rest credential encryption, WebUI and MCP secret redaction, the MCP Destination Lock, the prompt-injection sanitization pipeline, and connect-time DNS SSRF protection.

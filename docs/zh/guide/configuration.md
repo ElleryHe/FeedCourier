@@ -1,3 +1,7 @@
+---
+description: "配置 FeedCourier 环境变量、HTTP 与 SOCKS5 出站代理、按订阅源与按通道独立代理开关，以及内网自建服务的 SSRF 白名单。"
+---
+
 # 环境配置与代理
 
 FeedCourier 的基础运行参数通过环境变量设置，而网络代理、内网 SSRF 白名单、订阅源策略与通道凭据均支持在 WebUI 中修改并保存到 SQLite 数据库。

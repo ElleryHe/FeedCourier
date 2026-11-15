@@ -1,3 +1,7 @@
+---
+description: "FeedCourier 持续集成、自动化发版与文档站部署说明：GitHub Actions 检查、四平台二进制构建、Docker Hub 多架构镜像与 Cloudflare 静态部署。"
+---
+
 # 持续集成、自动化发版与文档部署
 
 FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.github/workflows/release.yml`）执行代码检查、许可证合规校验、四平台二进制编译与 Docker Hub 多架构镜像构建，并通过 Cloudflare Workers Static Assets 部署中英双语文档站（`feedcourier.ellery.me`）。

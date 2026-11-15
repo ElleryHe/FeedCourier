@@ -1,3 +1,7 @@
+---
+description: "FeedCourier 在线备份与快照恢复 SQLite WAL 数据库及 master.key 主密钥、正文保留期清理、反向代理配置与健康检查说明。"
+---
+
 # 数据备份与维护
 
 FeedCourier 的所有持久化数据均保存在单一 `DATA_DIR`（容器内默认为 `/data`）目录下，便于日常备份、实例迁移与反向代理部署。

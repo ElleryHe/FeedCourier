@@ -1,3 +1,7 @@
+---
+description: "Deliver RSS, Atom, and JSON Feed articles via SMTP Email with STARTTLS or implicit TLS, HTML and plain-text formatting, and List-ID inbox filter headers."
+---
+
 # SMTP Email
 
 The SMTP channel delivers each matched feed entry as an individual email with a clean single-column HTML layout, a plain-text fallback, and standard mailing-list headers for inbox filtering.

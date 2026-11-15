@@ -1,3 +1,7 @@
+---
+description: "FeedCourier REST API 接口参考（/api/v1/*）：涵盖会话认证、概览统计、订阅源与 OPML 导入导出、投递通道、路由规则、任务队列与在线备份。"
+---
+
 # REST API 接口参考（`/api/v1/*`）
 
 FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON REST API 与后端通信（路由与处理器源码位于 `src/api/mod.rs`、`src/api/auth.rs`、`src/api/handlers.rs` 与 `src/api/dto.rs`）。运维脚本或外部程序也可直接通过 `curl` 调用这些接口。

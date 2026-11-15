@@ -1,3 +1,7 @@
+---
+description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, routes, delivery_tasks, sessions, mcp_tokens, and system_settings."
+---
+
 # SQLite Database Schema
 
 FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) and run automatically on startup. All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and foreign keys enforce **`ON DELETE CASCADE`**.

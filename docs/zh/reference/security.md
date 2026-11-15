@@ -1,3 +1,7 @@
+---
+description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加密、Argon2id 密码哈希、投递目的地锁定、提示词注入隔离与连接层防 SSRF。"
+---
+
 # 安全与防注入机制
 
 本文说明 FeedCourier 在凭据加密存储、WebUI 与 MCP 敏感信息脱敏、投递目的地锁定（Destination Lock）、外部订阅源提示词注入隔离（Prompt Injection Isolation）以及连接层防 SSRF 方面的实现机制。

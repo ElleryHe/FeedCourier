@@ -1,3 +1,7 @@
+---
+description: "通过 Docker Run、Docker Compose、Linux/macOS 预编译二进制文件或源码编译快速部署 FeedCourier，并完成首次管理员密码初始化。"
+---
+
 # 快速开始
 
 FeedCourier 将后端服务、SQLite 数据库迁移脚本、Web 管理界面与 `/mcp` 接口打包为单一可执行文件，无需额外部署外部数据库或缓存服务。你可以根据环境选择以下任一方式启动。

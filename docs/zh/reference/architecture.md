@@ -1,3 +1,7 @@
+---
+description: "FeedCourier 系统架构总览：模块划分、四级 SHA-256 指纹去重、SQLite WAL 读写双连接池、正文垃圾回收与发件箱租约调度状态机。"
+---
+
 # 系统架构总览
 
 本文说明 FeedCourier 后端的核心模块划分、数据流向、四级 SHA-256 指纹去重、SQLite WAL 读写双连接池与 `NOT EXISTS` 载荷垃圾回收，以及基于租约（`lease_until`）与共享凭据组（`credential_group_key`）的发件箱调度状态机。

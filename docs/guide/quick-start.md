@@ -1,3 +1,7 @@
+---
+description: "Deploy FeedCourier with Docker Run, Docker Compose, prebuilt Linux and macOS binaries, or from source, and initialize the WebUI administrator password."
+---
+
 # Quick Start
 
 FeedCourier runs as a standalone binary or a multi-architecture Docker image (`linux/amd64`, `linux/arm64`) with the web console and SQLite database migrations bundled inside.

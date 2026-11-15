@@ -1,6 +1,8 @@
-import { defineConfig, type DefaultTheme } from "vitepress";
+import { defineConfig, type DefaultTheme, type HeadConfig } from "vitepress";
 import { withMermaid } from "vitepress-plugin-mermaid";
 
+const SITE_ORIGIN = "https://feedcourier.ellery.me";
+const OG_IMAGE_URL = `${SITE_ORIGIN}/og-image.png`;
 const currentYear = new Date().getFullYear();
 const copyrightHtml = `Copyright © <span data-current-year>${currentYear}</span> FeedCourier`;
 
@@ -108,21 +110,99 @@ export default withMermaid(
     cleanUrls: true,
     lastUpdated: true,
     sitemap: {
-      hostname: "https://feedcourier.ellery.me",
+      hostname: SITE_ORIGIN,
     },
     head: [
       ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
       ["meta", { name: "theme-color", content: "#10b981" }],
+      ["meta", { property: "og:image", content: OG_IMAGE_URL }],
+      ["meta", { property: "og:image:type", content: "image/png" }],
+      ["meta", { property: "og:image:width", content: "1200" }],
+      ["meta", { property: "og:image:height", content: "630" }],
       [
         "meta",
         {
-          property: "og:image",
-          content: "https://feedcourier.ellery.me/logo.png",
+          property: "og:image:alt",
+          content: "FeedCourier — Self-Hosted RSS, Atom & JSON Feed Delivery Service",
         },
       ],
       ["meta", { property: "og:type", content: "website" }],
       ["meta", { property: "og:site_name", content: "FeedCourier" }],
+      ["meta", { name: "twitter:card", content: "summary_large_image" }],
+      ["meta", { name: "twitter:image", content: OG_IMAGE_URL }],
     ],
+    transformHead({ pageData, title, description }) {
+      if (pageData.isNotFound || pageData.relativePath === "404.md") {
+        return [["meta", { name: "robots", content: "noindex" }]];
+      }
+
+      const rel = pageData.relativePath.replace(/\.md$/, "");
+      const isZh = rel === "zh/index" || rel.startsWith("zh/");
+      const subPath = isZh ? rel.replace(/^zh\//, "") : rel;
+      const isHome = subPath === "index";
+
+      const enPath = isHome ? "/" : `/${subPath}`;
+      const zhPath = isHome ? "/zh/" : `/zh/${subPath}`;
+      const canonicalUrl = `${SITE_ORIGIN}${isZh ? zhPath : enPath}`;
+      const enUrl = `${SITE_ORIGIN}${enPath}`;
+      const zhUrl = `${SITE_ORIGIN}${zhPath}`;
+
+      const pageTitle = title || "FeedCourier";
+      const pageDesc =
+        (typeof pageData.frontmatter.description === "string" &&
+          pageData.frontmatter.description) ||
+        description;
+
+      const tags: HeadConfig[] = [
+        ["link", { rel: "canonical", href: canonicalUrl }],
+        ["link", { rel: "alternate", hreflang: "en-US", href: enUrl }],
+        ["link", { rel: "alternate", hreflang: "zh-CN", href: zhUrl }],
+        ["link", { rel: "alternate", hreflang: "x-default", href: enUrl }],
+        ["meta", { property: "og:title", content: pageTitle }],
+        ["meta", { property: "og:description", content: pageDesc }],
+        ["meta", { property: "og:url", content: canonicalUrl }],
+        ["meta", { property: "og:locale", content: isZh ? "zh_CN" : "en_US" }],
+        [
+          "meta",
+          {
+            property: "og:locale:alternate",
+            content: isZh ? "en_US" : "zh_CN",
+          },
+        ],
+        ["meta", { name: "twitter:title", content: pageTitle }],
+        ["meta", { name: "twitter:description", content: pageDesc }],
+      ];
+
+      if (isHome) {
+        const jsonLd = {
+          "@context": "https://schema.org",
+          "@type": "SoftwareApplication",
+          name: "FeedCourier",
+          applicationCategory: "DeveloperApplication",
+          operatingSystem: "Linux, macOS, Docker",
+          license: "https://www.gnu.org/licenses/agpl-3.0.html",
+          url: canonicalUrl,
+          inLanguage: isZh ? "zh-CN" : "en-US",
+          codeRepository: "https://github.com/ElleryHe/FeedCourier",
+          downloadUrl: "https://github.com/ElleryHe/FeedCourier/releases",
+          softwareRequirements:
+            "Docker or standalone 64-bit Linux/macOS binary",
+          offers: {
+            "@type": "Offer",
+            price: "0",
+            priceCurrency: "USD",
+          },
+          description: pageDesc,
+        };
+        tags.push([
+          "script",
+          { type: "application/ld+json" },
+          JSON.stringify(jsonLd),
+        ]);
+      }
+
+      return tags;
+    },
     themeConfig: {
       logo: {
         light: "/logo-light.svg",

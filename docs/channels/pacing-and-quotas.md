@@ -1,3 +1,7 @@
+---
+description: "Configure send intervals, random jitter, hourly and daily delivery quotas, shared credential rate limits, and keyword or regex route filters."
+---
+
 # Send Rate, Quotas & Filters
 
 When a feed publishes multiple articles at once—or when several feeds update at the same time—sending all of them immediately can trigger downstream rate limits (such as SMTP temporary deferrals or HTTP `429 Too Many Requests` on Telegram and Notion).

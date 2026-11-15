@@ -1,3 +1,7 @@
+---
+description: "FeedCourier 通道协议与投递实现细节：SMTP、Telegram Bot API 与 Notion API 报文转换、长文分片、流式媒体回退与跨崩溃断点对账。"
+---
+
 # 通道协议与投递实现
 
 本文记录 FeedCourier 三类授信投递通道（**SMTP**、**Telegram Bot API 10.4**、**Notion API `2026-03-11`**）的底层协议规范、报文转换规则、流式媒体处理以及跨崩溃断点（`DeliveryCheckpoint`）对账流程。

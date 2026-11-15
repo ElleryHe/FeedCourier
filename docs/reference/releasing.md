@@ -1,3 +1,7 @@
+---
+description: "CI/CD and release pipeline reference for FeedCourier covering GitHub Actions checks, multi-platform binary builds, Docker Hub multi-arch images, and VitePress deployment."
+---
+
 # Release & CI/CD Pipeline
 
 FeedCourier uses two GitHub Actions workflows—**CI** (`.github/workflows/ci.yml`) and **Release** (`.github/workflows/release.yml`)—to run automated checks, verify internal documentation links, compile multi-platform binaries, and publish multi-architecture Docker Hub images.

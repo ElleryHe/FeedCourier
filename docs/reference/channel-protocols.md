@@ -1,3 +1,7 @@
+---
+description: "Technical specification of FeedCourier's SMTP, Telegram Bot API, and Notion API delivery adapters, payload chunking, streaming media fallback, and crash checkpoints."
+---
+
 # Channel Protocols & Delivery
 
 This document specifies the wire protocols, payload transformations, streaming media handling, and `DeliveryCheckpoint` crash-recovery logic for FeedCourier's three delivery adapters: **SMTP**, **Telegram Bot API 10.4**, and **Notion API `2026-03-11`**.
