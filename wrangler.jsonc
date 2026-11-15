@@ -15,5 +15,6 @@
       "pattern": "feedcourier.ellery.me",
       "custom_domain": true
     }
-  ]
+  ],
+  "previews": {}
 }

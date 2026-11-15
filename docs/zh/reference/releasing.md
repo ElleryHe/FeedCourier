@@ -94,5 +94,5 @@ git push origin v0.1.1
 - **构建根目录（Root directory）**：`/`（或 `docs`）
 - **构建命令（Build command）**：`pnpm --dir docs install --frozen-lockfile && pnpm --dir docs build`
 - **静态产物目录（Assets directory）**：`./docs/.vitepress/dist`（`docs/` 内为 `./.vitepress/dist`）
-- **部署命令（Deploy command）**：`npx wrangler deploy`
-- **自定义域名路由**：`https://feedcourier.ellery.me`（推送至 `develop` 分支时自动生成 Cloudflare Preview URL 供预览验收，合入 `main` 分支后自动发布至生产域名）。
+- **部署命令（Deploy command）**：`npx wrangler deploy`（非生产分支 / PR 预览命令为 `npx wrangler preview`，需配置 `"previews": {}`）
+- **自定义域名路由**：`https://feedcourier.ellery.me`（推送至 `develop` 分支时通过 `"previews": {}` 自动生成 Cloudflare Preview URL 供预览验收，合入 `main` 分支后自动发布至生产域名）。

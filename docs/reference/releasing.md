@@ -75,6 +75,6 @@ The bilingual VitePress documentation site in `docs/` deploys to **Cloudflare Wo
 | **Worker Name** | `feedcourier` |
 | **Root Directory** | `/` (or `docs`) |
 | **Build Command** | `pnpm --dir docs install --frozen-lockfile && pnpm --dir docs build` |
-| **Deploy Command** | `npx wrangler deploy` |
+| **Deploy Command** | `npx wrangler deploy` (Non-production / PR preview: `npx wrangler preview` via `"previews": {}`) |
 | **Output Directory** | `./docs/.vitepress/dist` (`./.vitepress/dist` inside `docs/`) |
-| **Custom Domain** | `https://feedcourier.ellery.me` (`Production branch: main`, preview URLs generated automatically on `develop`) |
+| **Custom Domain** | `https://feedcourier.ellery.me` (`Production branch: main`, preview URLs generated automatically on `develop` via `"previews": {}`) |
