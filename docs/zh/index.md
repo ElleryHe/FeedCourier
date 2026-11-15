@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "FeedCourier"
-  text: "轻量级纯血 Rust 订阅流投递网关"
-  tagline: "空闲内存 <20 MB · 单文件 SQLite WAL · 实时桥接 SMTP 邮件、Telegram Bot API 10.4 与 Notion 2026-03-11 · 原生内嵌 React 19 控制台与 /mcp 服务端"
+  text: "RSS / Atom / JSON Feed 订阅投递服务"
+  tagline: "基于 Rust、SQLite 与 React 构建，定时抓取并过滤订阅源文章，投递至 SMTP 邮件、Telegram 与 Notion，内置 Web 管理控制台与 /mcp 服务端。"
   image:
     light: /logo-light.svg
     dark: /logo-dark.svg
@@ -14,66 +14,66 @@ hero:
       text: 快速开始
       link: /zh/guide/quick-start
     - theme: alt
-      text: 设计理念与架构
+      text: 使用手册
       link: /zh/guide/introduction
     - theme: alt
-      text: GitHub 仓库
-      link: https://github.com/ElleryHe/FeedCourier
+      text: 架构手册
+      link: /zh/reference/architecture
 
 features:
-  - title: 阅后即焚投递网关
-    details: 传承 rss2email 单篇投递哲学，不做臃肿在线阅读器。SQLite WAL 永久保留 64 位 SHA-256 指纹防重，正文与媒体元数据在保留窗口（默认 24h）后由零引用计数 NOT EXISTS GC 自动回收。
+  - title: 文章去重与定期清理
+    details: 在 SQLite 中长期保留文章 SHA-256 指纹以避免重复投递；已完成投递的正文与媒体元数据在保留期（默认 24 小时）过后自动清理。
     link: /zh/guide/introduction
-    linkText: 了解四大设计边界
-  - title: 防风控匀速步进发件箱
-    details: 全通道统一按 1 Task = 1 Entry × 1 Route 实时入队，通过最小发信间隔、随机抖动与小时/日配额护栏削峰填谷；共用同一发信账号、Bot Token 或 Notion Secret 的通道自动共享限流锁。
+    linkText: 查看项目简介
+  - title: 发送频率控制与配额管理
+    details: 按 1 Task = 1 Entry × 1 Route 独立入队，支持配置最小发信间隔、随机抖动以及每小时/每日配额；共用同一发信账号、Bot Token 或 Notion 密钥的通道共享限流状态。
     link: /zh/channels/pacing-and-quotas
-    linkText: 查看步进流控与配额
-  - title: SMTP 精品单栏阅读信纸
-    details: 基于 minijinja 渲染精调内联 CSS 单栏响应式信纸（严控 <95 KiB 远离 Gmail 102 KB 截断线），保留 Force-From 保障 SPF/DKIM/DMARC 送达率，内置确定性 Message-ID 与按源 List-Id 归类。
+    linkText: 查看频率、配额与过滤
+  - title: SMTP 邮件投递
+    details: 使用响应式内联 CSS 邮件模板渲染正文，支持 Force-From 发件人对齐以匹配 SPF/DKIM/DMARC 校验，并提供确定性 Message-ID 与按订阅源分类的 List-Id。
     link: /zh/channels/smtp
-    linkText: 配置 SMTP 邮件通道
-  - title: Telegram Bot API 10.4 三模投递
-    details: 路由级自由切换富文档模式（基于自研 telegram-rich 的 sendRichMessage）、快讯卡片模式与三行精炼媒体模式，支持防盗链内存零落盘流式中转、多图断点续投及旧版自建服务端自动降级。
+    linkText: 配置 SMTP 邮件
+  - title: Telegram 多模式投递
+    details: 支持按路由选择富文本消息、摘要卡片或媒体消息模式，支持防盗链图片内存转发、多图分组续传以及自建 Local Bot API 兼容降级。
     link: /zh/channels/telegram
     linkText: 配置 Telegram 通道
-  - title: Notion 2026-03-11 & Markdown v2
-    details: 全面对齐 Notion-Version 2026-03-11 数据源架构，支持父页面一键初始化 7 列标准表或绑定补齐已有 data_source_id，内置代码块动态反引号扩充、allow_async 异步长文写入与 FC-ID 有效一次防重对账。
+  - title: Notion 数据库同步
+    details: 支持在父页面下自动初始化标准属性列或绑定已有数据源，内置 HTML 转 Notion Markdown、长文异步创建及重复页面校验。
     link: /zh/channels/notion
-    linkText: 配置 Notion 数据源
-  - title: 原生 /mcp 服务端与纵深防御
-    details: 内嵌基于 rmcp 的 Streamable HTTP /mcp 端点与 readonly / admin 双级令牌；通道密钥与收件终点硬锁死在 WebUI 中，外部正文包裹 <untrusted_feed_content> 防提示词注入，出站请求全链路连接层防 SSRF。
+    linkText: 配置 Notion 通道
+  - title: 内置 Web 控制台与 /mcp 接口
+    details: 单二进制内嵌 React 管理界面与 Streamable HTTP /mcp 端点，支持 readonly 与 admin 两级令牌；通道密钥加密存储，出站请求在连接层统一拦截内网 SSRF 地址。
     link: /zh/mcp/setup
-    linkText: 接入 AI 客户端
+    linkText: 配置 MCP 客户端
 ---
 
-## 整体数据流向速览
+## 整体数据流向
 
 ```mermaid
 flowchart LR
-    subgraph Ingest["受保护抓取与清洗管线"]
+    subgraph Ingest["抓取与解析管线"]
         F["RSS / Atom / JSON Feed"] --> HC["连接层防 SSRF 客户端"]
-        HC --> R["按需 Readability 全文提取 (dom_smoothie)"]
-        R --> D["四级防漂移 SHA-256 去重 & Ammonia 清洗"]
+        HC --> R["按需 Readability 全文提取"]
+        R --> D["SHA-256 去重与 HTML 清洗"]
     end
 
-    subgraph Storage["SQLite WAL 单卷存储 (/data)"]
-        D --> E[("entries (永久指纹 + 阅后即焚正文)")]
-        E --> T[("delivery_tasks (租约 + Checkpoint 发件箱)")]
-        GC["零引用计数 NOT EXISTS GC"] -.-> E
+    subgraph Storage["SQLite 单卷存储 (/data)"]
+        D --> E[("文章记录与去重指纹")]
+        E --> T[("投递任务队列")]
+        GC["过期正文定期清理"] -.-> E
     end
 
-    subgraph Targets["匀速步进投递通道"]
-        T --> SMTP["SMTP 邮件 (Force-From / 响应式内联信纸)"]
-        T --> TG["Telegram Bot API 10.4 (富文档 / 快讯 / 媒体)"]
-        T --> NT["Notion 2026-03-11 (数据源 + Markdown v2)"]
+    subgraph Targets["投递通道"]
+        T --> SMTP["SMTP 邮件"]
+        T --> TG["Telegram"]
+        T --> NT["Notion"]
     end
 
-    UI["内嵌 React 19 WebUI"] <--> Storage
-    MCP["Streamable HTTP /mcp (readonly | admin)"] <--> Storage
+    UI["内置 Web 控制台"] <--> Storage
+    MCP["Streamable HTTP /mcp"] <--> Storage
 ```
 
-## 30 秒 Docker 一键部署
+## Docker 快速部署
 
 ```bash
 docker run -d \
@@ -84,4 +84,4 @@ docker run -d \
   elleryhe/feedcourier:latest
 ```
 
-启动后浏览器访问 `http://127.0.0.1:8080` 即可引导设置管理员口令，进入内嵌 React 19 控制台配置授信通道、导入 OPML 订阅源或签发 `/mcp` 令牌。更多部署方式请查阅[快速开始](/zh/guide/quick-start)。
+启动后在浏览器访问 `http://127.0.0.1:8080` 设置管理员密码，即可在 Web 控制台中配置推送通道、导入 OPML 订阅源或签发 `/mcp` 令牌。更多部署方式请参阅[快速开始](/zh/guide/quick-start)。

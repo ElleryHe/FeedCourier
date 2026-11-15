@@ -1,60 +1,106 @@
-# Core Architecture Deep Dive
+# System Architecture
 
-This reference documents FeedCourier's internal subsystems: the **4-tier anti-drift SHA-256 deduplication pipeline**, **zero-refcount `NOT EXISTS` payload garbage collection**, **SQLite WAL read/write pool separation**, **lease-based outbox recovery**, and **connect-time DNS SSRF protection**.
+This document describes FeedCourier's internal module layout, data flow, four-tier SHA-256 fingerprint deduplication, SQLite WAL read/write connection pools, `NOT EXISTS` payload garbage collection, and the lease-based outbox state machine (`lease_until` + `credential_group_key`).
+
+For downstream channel protocol specifications and security isolation details, see:
+- [Channel Protocols & Delivery](/reference/channel-protocols)
+- [Security & Isolation](/reference/security)
 
 ---
 
-## High-Level Data Flow
+## 1. Module Layout & Data Flow
+
+FeedCourier runs inside a single Rust process composed of five primary subsystems:
+- **`ProtectedHttpClient` (`src/net/`)**: Performs pre-connect DNS IP validation against SSRF, hop-by-hop redirect validation (up to 5 hops), streaming response byte caps, and optional outbound proxy routing.
+- **`IngestEngine` (`src/ingest/`)**: Executes feed polling (`ETag` / `Last-Modified` conditional requests), optional `dom_smoothie` Readability full-article extraction, `ammonia` HTML sanitization, four-tier SHA-256 fingerprint calculation, and route content filtering.
+- **`Database` (`src/db/`)**: Manages a serialized SQLite WAL writer pool (`write_pool`) and a concurrent read-only pool (`read_pool`) over `feeds`, `entries`, `channels`, `routes`, and `delivery_tasks`.
+- **`DeliveryDispatcher` (`src/scheduler/`)**: Drives the background feed polling loop, the lease-based outbox worker (with shared-credential pacing, rolling quotas, and `checkpoint_json` crash recovery), and the periodic maintenance loop (`NOT EXISTS` payload GC and `PRAGMA optimize`).
+- **Axum HTTP Server (`src/api/`, `src/mcp/`)**: Serves the embedded React 19 WebUI, the JSON REST API (`/api/v1/*`), and the Streamable HTTP MCP endpoint (`/mcp`) on a single listen address.
 
 ```mermaid
 flowchart LR
-    subgraph Ingest["Guarded Ingest Pipeline"]
-        F["RSS / Atom / JSON Feed"] --> HC["SSRF-Guarded HTTP Client"]
-        HC --> R["Optional Readability (dom_smoothie)"]
-        R --> D["4-Tier SHA-256 Dedup & Ammonia Sanitizer"]
+    subgraph Ingest["Ingestion (IngestEngine)"]
+        F["RSS / Atom / JSON Feed"] --> HC["ProtectedHttpClient<br>(DNS SSRF Guard / Byte Caps)"]
+        HC --> R["Readability Extraction<br>(dom_smoothie Semaphore)"]
+        R --> D["4-Tier SHA-256 Dedup &<br>ammonia HTML Sanitizer"]
     end
 
-    subgraph Storage["SQLite WAL (/data)"]
-        D --> E[("entries (Permanent Hash + Ephemeral Body)")]
-        E --> T[("delivery_tasks (Lease + Checkpoint Outbox)")]
-        GC["Zero-Refcount NOT EXISTS GC"] -.-> E
+    subgraph Storage["SQLite WAL Storage (Database)"]
+        D --> WPool["write_pool (max_connections = 1)"]
+        WPool --> E[("entries<br>(Permanent Hash + Transient Body)")]
+        WPool --> T[("delivery_tasks<br>(Lease + checkpoint_json)")]
+        GC["Maintenance Loop<br>(NOT EXISTS Payload GC)"] -.-> WPool
+        RPool["read_pool (query_only = ON)"] --- E
+        RPool --- T
     end
 
-    subgraph Targets["Paced Delivery Channels"]
-        T --> SMTP["SMTP Newsletter (Force-From / Inline CSS)"]
-        T --> TG["Telegram Bot API 10.4 (Rich / Card / Media)"]
-        T --> NT["Notion 2026-03-11 (Data Source + Markdown v2)"]
+    subgraph Outbox["Outbox Dispatch (DeliveryDispatcher)"]
+        T --> Disp["Lease Claim & Rate Limiting<br>(lease_until / credential_group_key)"]
+        Disp --> SMTP["SmtpSender (lettre)"]
+        Disp --> TG["TelegramSender (Bot API 10.4)"]
+        Disp --> NT["NotionSender (2026-03-11)"]
     end
 
-    UI["Embedded React 19 WebUI"] <--> Storage
-    MCP["Streamable HTTP /mcp (readonly | admin)"] <--> Storage
+    UI["Axum REST API (/api/v1/*)<br>& React 19 WebUI"] <--> RPool
+    UI --> WPool
+    MCP["Streamable HTTP (/mcp)<br>(readonly | admin)"] <--> RPool
+    MCP --> WPool
 ```
 
 ---
 
-## 1. Four-Tier Anti-Drift SHA-256 Deduplication
+## 2. Four-Tier SHA-256 Fingerprint Deduplication
 
-Many real-world RSS and Atom feeds exhibit subtle defects: rotating marketing query parameters (`?utm_source=...`), changing `http://` to `https://`, or omitting `<guid>` and `<pubDate>` entirely (causing naive parsers to inject `now()` on every poll and re-deliver every article on every tick).
+Implemented in `src/ingest/fingerprint.rs` (`compute_entry_fingerprint`).
 
-FeedCourier computes a deterministic 64-character hex SHA-256 fingerprint (`src/ingest/fingerprint.rs`) per feed using a strict **4-tier fallback chain**:
+Because upstream RSS, Atom, and JSON Feeds frequently omit stable item IDs, append rotating marketing parameters (`?utm_source=...`), or omit `<pubDate>`, FeedCourier computes a deterministic 64-character hex SHA-256 fingerprint per feed using a four-tier fallback hierarchy enforced by `UNIQUE (feed_id, fingerprint_sha256)`:
 
-| Priority | Tier Name | Input Normalized Before Hashing | Why It Prevents Drift |
-| :--- | :--- | :--- | :--- |
-| **Tier 1** | `NativeId` | Atom `<id>`, RSS `<guid>`, or JSON Feed `id` (trimmed). | Highest fidelity when the publisher provides stable item IDs. |
-| **Tier 2** | `CanonicalUrl` | Entry permalink normalized via `normalize_canonical_url`: scheme unified (`http` → `https`), host lowercased, default ports `:80`/`:443` stripped, fragment `#...` removed, query parameters sorted, and tracking keys (`utm_*`, `fbclid`, `gclid`, `mc_cid`, `mc_eid`, `spm`, `from`, `ref`, `_hsenc`, `_hsmi`, `mkt_tok`, `igshid`) stripped. | Immune to marketing campaign query mutations and HTTP→HTTPS migrations. |
-| **Tier 3** | `TitleAndPublished` | `normalized_title + original_published_unix_timestamp` — **only used when the feed XML/JSON explicitly contains a publication timestamp**. | Avoids synthetic "current time" injection on feeds that omit `<pubDate>`. |
-| **Tier 4** | `TitleAndContentPrefix` | `normalized_title + first 512 bytes` of sanitized plain-text body. | Stable content-addressed fallback for bare feeds lacking IDs, links, and dates. |
+```mermaid
+flowchart TD
+    Entry["Parsed Feed Entry (feed-rs)"] --> T1{"Tier 1: Non-empty guid / id?"}
+    T1 -->|"Yes"| H1["SHA-256('id:' + trim(guid))"]
+    T1 -->|"No"| T2{"Tier 2: Valid entry link?"}
+    T2 -->|"Yes"| Norm["normalize_canonical_url:<br>Resolve relative URL · Lowercase scheme/host<br>Strip default ports, fragment & tracking query keys"]
+    Norm --> H2["SHA-256('url:' + canonical_url)"]
+    T2 -->|"No"| T3{"Tier 3: Explicit published_at in feed?"}
+    T3 -->|"Yes (Never inject Utc::now())"| H3["SHA-256('title_ts:' + title + ':' + published_at_unix)"]
+    T3 -->|"No"| H4["Tier 4: SHA-256('title_body:' + title + ':' + summary_prefix[..512 bytes])"]
+```
+
+| Priority | Tier | Hash Input Format | Rationale |
+| :---: | :--- | :--- | :--- |
+| **Tier 1** | `guid` (`NativeId`) | `id:<trimmed_guid_or_id>` | Uses the upstream Atom `<id>`, RSS `<guid>`, or JSON Feed `id` when present. |
+| **Tier 2** | `canonical_url` | `url:<normalized_canonical_url>` | Normalizes the entry link via `normalize_canonical_url` so campaign query mutations do not alter the digest. |
+| **Tier 3** | `title + published_at` | `title_ts:<normalized_title>:<published_at_unix>` | Used only when the feed explicitly provides a publication timestamp; never substitutes `Utc::now()`, preventing hash drift on every poll. |
+| **Tier 4** | `title + summary` | `title_body:<normalized_title>:<plain_summary_512b>` | Fallback for minimal feeds without IDs, links, or dates, hashing the normalized title and the first 512 bytes of plain-text summary. |
+
+### URL Normalization (`normalize_canonical_url`)
+
+Before computing a Tier 2 fingerprint or storing `entries.canonical_url`, links are normalized as follows:
+1. Relative URLs are resolved against the fallback chain `canonical_url -> entry xml:base -> feed site_url -> feed_url`;
+2. Scheme and host are lowercased, and default ports (`:80`, `:443`) and URL fragments (`#...`) are stripped;
+3. Marketing and tracking query parameters are removed: all `utm_*` keys plus `fbclid`, `gclid`, `dclid`, `msclkid`, `twclid`, `igshid`, `mc_cid`, `mc_eid`, `spm`, `from`, `_hsenc`, `_hsmi`, `mkt_tok`, `vero_id`, `oly_enc_id`, `oly_anon_id`, `rb_clickid`, `s_kwcid`, and `yclid`;
+4. Remaining query parameters are sorted lexicographically.
 
 ### Silent Initialization (`silent_init`)
-When a new feed is added (`silent_init = true` by default) or imported via OPML 2.0, all existing historical entries in the feed are inserted into `entries` with their SHA-256 fingerprints, while **zero** `delivery_tasks` are enqueued (unless `push_latest_one = true` is explicitly requested to verify channel connectivity with the single newest item).
+When a feed is created (`silent_init = true` by default) or imported via OPML 2.0, the initial poll records the SHA-256 fingerprints of all existing entries in `entries` and flips `silent_init` to `0` without enqueuing historical `delivery_tasks` (unless `push_latest_one = true` is set, which enqueues only the single newest item to verify channel connectivity).
 
 ---
 
-## 2. Zero-Refcount `NOT EXISTS` Payload Garbage Collection
+## 3. SQLite WAL Dual-Pool Concurrency & `NOT EXISTS` Payload GC
 
-Maintaining manual reference counts across routes and tasks is error-prone when users delete routes, disable channels, or filter out entries.
+### 1. Read/Write Connection Pool Separation (`src/db/mod.rs`)
 
-Instead, FeedCourier uses a declarative **`NOT EXISTS` relational predicate** (`src/db/mod.rs`) executed hourly (and on manual trigger):
+To prevent `SQLITE_BUSY` lock contention between background ingestion/outbox writes and concurrent WebUI or MCP reads, `Database::connect` opens two separate `sqlx::SqlitePool` instances against `<DATA_DIR>/feedcourier.db`:
+
+| Pool | Max Connections | Connection PRAGMAs | Responsibilities |
+| :--- | :--- | :--- | :--- |
+| **`write_pool`** | `max_connections = 1` | `journal_mode = WAL`<br>`synchronous = NORMAL`<br>`busy_timeout = 5000`<br>`foreign_keys = ON` | Serializes all `INSERT` / `UPDATE` / `DELETE` transactions: entry ingestion, atomic task claiming, `checkpoint_json` updates, configuration writes, and `VACUUM INTO` backups. |
+| **`read_pool`** | Default `8`<br>(`DB_READ_MAX_CONNECTIONS`) | Same as above, plus:<br>`PRAGMA query_only = ON` | Serves concurrent WebUI queries, task list pagination, route lookups, and read-only MCP diagnostics without blocking the writer. |
+
+### 2. `NOT EXISTS` Payload Garbage Collection (`purge_expired_entry_payloads`)
+
+`entries.fingerprint_sha256` rows are retained permanently to prevent duplicate deliveries, whereas large HTML bodies and media arrays are reclaimed once delivery completes. Rather than maintaining manual reference counters that can drift when routes are deleted or channels are disabled, the hourly maintenance task (also triggerable via `POST /api/v1/maintenance/gc`) executes a declarative `NOT EXISTS` update:
 
 ```sql
 UPDATE entries
@@ -73,65 +119,61 @@ WHERE payload_purged_at IS NULL
   );
 ```
 
-This single query guarantees:
-1. Entries with **active or retrying tasks** retain their HTML and media metadata even if `RETENTION_HOURS` has elapsed.
-2. Entries that were **filtered out**, **silently initialized**, or whose **routes/channels were deleted** are automatically reclaimed once `discovered_at <= now - RETENTION_HOURS`.
-3. The compact `(feed_id, fingerprint_sha256)` row stays forever (`< 100 bytes` per row), preventing historical entries from ever re-triggering.
+- **Retention Window (`RETENTION_HOURS`)**: Parameter `?2` equals `now - RETENTION_HOURS * 3600` (default `24` hours). During this window, entry payloads remain intact even for `delivered` or `dead_letter` tasks so operators can retry failed deliveries via the WebUI or MCP `retry_dead_tasks`;
+- **Automatic Reclamation**: Once `discovered_at <= now - RETENTION_HOURS` and no task for that entry remains in an active state (`queued`, `delivering`, `retrying`, `deferred`), `content_html`, `summary_text`, `first_sentence`, and `media_json` are set to `NULL` and `payload_purged_at` is recorded;
+- **Partial Index**: `idx_entries_gc_candidates ON entries (discovered_at) WHERE payload_purged_at IS NULL` restricts GC scans to unpurged rows.
 
 ---
 
-## 3. SQLite WAL Read/Write Connection Pool Separation
+## 4. Outbox Task State Machine, `lease_until` Recovery & Shared-Credential Rate Limiting
 
-To eliminate `SQLITE_BUSY` contention between background feed polling, outbox checkpoint writes, and concurrent WebUI / MCP queries, `Database` (`src/db/mod.rs`) maintains **two separate `sqlx::SqlitePool` instances** against `<DATA_DIR>/feedcourier.db`:
+Implemented in `src/scheduler/mod.rs` (`DeliveryDispatcher`) and `src/db/mod.rs` (`claim_next_delivery_task`).
 
-| Pool | Max Connections | SQLite Pragmas | Workload |
-| :--- | :--- | :--- | :--- |
-| **`write_pool`** | `1` (Serialized) | `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`, `foreign_keys = ON` | Atomic task claiming (`UPDATE ... RETURNING`), entry ingestion, checkpoint flushes, and config mutations. |
-| **`read_pool`** | `8` (`DB_READ_MAX_CONNECTIONS`) | `query_only = ON`, `busy_timeout = 5000`, `foreign_keys = ON` | Concurrent WebUI dashboard reads, MCP `list_feeds_status` / `inspect_failed_deliveries`, and route lookups. |
+### 1. Outbox State Machine
 
----
+Each row in `delivery_tasks` (`1 Task = 1 Entry × 1 Route`) transitions through the following states (with the corresponding SQL `delivery_tasks.status` column values shown in parentheses):
 
-## 4. Lease-Based Outbox & `checkpoint_json` State Machine
+- **Pending (`pending` / SQL `'queued'`)**: Enqueued after matching a route filter and waiting to be claimed.
+- **Leased (`leased` / SQL `'delivering'`)**: Atomically claimed by the worker with a lease expiration timestamp `lease_until = now + 120s` (`DEFAULT_TASK_LEASE_SECS`).
+- **Deferred (`deferred`)**: Rescheduled to a future `next_attempt_at` **without incrementing** the failure attempt counter because the channel is inside a pacing interval, has reached its rolling `hourly_quota` / `daily_quota`, or is polling an asynchronous Notion page import (`202 Accepted`).
+- **Failed / Retrying (`failed` / SQL `'retrying'`)**: Encountered a transient network error, upstream `5xx`, or `429 Too Many Requests` (`Retry-After`) with `attempt_count < 6` (`DEFAULT_MAX_DELIVERY_ATTEMPTS`).
+- **Delivered (`delivered`)**: Confirmed by the downstream channel; `completed_at` is recorded.
+- **Dead Letter (`dead_letter`)**: Exhausted all `6` delivery attempts or failed with a permanent `4xx` authentication/validation error; remains idle until manually requeued via the WebUI or MCP `retry_dead_tasks`.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued
-    queued --> delivering: "Atomic claim (set lease_until = now + 120s)"
-    deferred --> delivering: "Quota window opens"
-    retrying --> delivering: "next_attempt_at reached"
-    delivering --> delivering: "Expired lease takeover (reconcile checkpoint_json)"
+    [*] --> queued: "Route matched (pending)"
+    queued --> delivering: "Atomic claim (leased, lease_until = now + 120s)"
+    deferred --> delivering: "Quota window or pacing delay elapsed (next_attempt_at <= now)"
+    retrying --> delivering: "Backoff elapsed (next_attempt_at <= now)"
+    delivering --> delivering: "Process crash / expired lease takeover (lease_until <= now, reconcile checkpoint_json)"
     delivering --> delivered: "Downstream confirmed"
-    delivering --> retrying: "Transient error / 429 Retry-After cooldown"
-    delivering --> deferred: "Hourly / daily quota reached"
+    delivering --> retrying: "Transient error / 429 (attempt_count < 6)"
+    delivering --> deferred: "Quota reached / pacing cooldown / Notion async poll (rollback attempt_count)"
     delivering --> dead_letter: "Max attempts (6) or permanent 4xx error"
-    dead_letter --> queued: "Manual WebUI / MCP retry"
+    dead_letter --> queued: "Manual WebUI / MCP retry_dead_tasks"
     delivered --> [*]
 ```
 
-### Atomic Claiming & Expired-Lease Takeover
-Outbox workers never rely on fragile startup-only crash recovery scans. On every dispatch tick, a worker claims due tasks **or** tasks whose `lease_until` (`DEFAULT_TASK_LEASE_SECS = 120s`) has expired:
+### 2. `lease_until` Expired-Lease Recovery
 
-- **`queued` / `retrying` / `deferred`** where `next_attempt_at <= now`
-- **`delivering`** where `lease_until <= now` (process killed, container restarted, or network hung)
+On every dispatch cycle, `claim_next_delivery_task` executes a single `UPDATE ... RETURNING *` statement on `write_pool` that selects either:
+1. `status IN ('queued', 'retrying', 'deferred') AND next_attempt_at <= now`, or
+2. `status = 'delivering' AND lease_until <= now`.
 
-### Per-Channel Delivery Semantics
+If the process terminates mid-delivery (`SIGKILL`, container restart, or power loss), the task's `120`-second lease expires and the next worker tick claims it automatically. Before issuing a new network request, the channel adapter inspects `checkpoint_json` (`DeliveryCheckpoint`) to reconcile or resume partial progress (see [Channel Protocols & Delivery](/reference/channel-protocols)).
 
-| Channel | Semantics | `checkpoint_json` Structure |
-| :--- | :--- | :--- |
-| **Notion (`2026-03-11`)** | **Effective-once** | `{"kind":"notion","create_initiated":true,"async_task_id":"...","page_id":"..."}` — Queries `FC-ID` before recreating if `create_initiated` is set. |
-| **SMTP** | **At-least-once** *(client-deduplicable)* | `{"kind":"smtp","message_id":"<fc-entry-...>"}` — Reuses identical RFC 5322 `Message-ID` across retries. |
-| **Telegram (`10.4`)** | **At-least-once** *(bounded to 1 batch)* | `{"kind":"telegram","next_batch_offset":10,"sent_message_ids":[...],"degraded_to_compact":false}` — Resumes `sendMediaGroup` from the first unsent 10-item batch. |
+### 3. Shared-Credential Rate Limiting (`credential_group_key`) & Quotas
+
+Multiple logical channels may share the same underlying sender credential (for example, one Telegram `bot_token` posting to multiple chats/topics, or one Notion `integration_secret` writing to multiple data sources). When a channel is saved, FeedCourier computes a SHA-256 `credential_group_key` from the channel kind and primary credential:
+
+- **Pacing & Jitter**: `DeliveryDispatcher` tracks the next allowed send timestamp per `credential_group_key`. After each delivery, all channels sharing that key wait `min_interval_secs + uniform_random(0..=jitter_max_secs)` seconds;
+- **Group-Wide `429` Cooldown (`cooldown_until`)**: When an upstream API returns `429 Too Many Requests` (with a Telegram `retry_after` parameter or HTTP `Retry-After` header), `cooldown_until` is applied across all channels sharing the same `credential_group_key`;
+- **Rolling Quotas (`hourly_quota` / `daily_quota`)**: Before sending, the worker counts `status = 'delivered'` tasks for the channel over the trailing `3,600` and `86,400` seconds. When a quota is reached, the task is moved to `deferred` until the oldest delivered task exits the rolling window.
 
 ---
 
-## 5. Guarded Outbound Networking, Exponential Backoff & Readability
+## 5. Polling Concurrency Isolation & Circuit Breaker
 
-1. **Connect-Time DNS SSRF Guard (`src/net/ssrf.rs`)**: `SsrfDnsResolver` hooks directly into `reqwest`'s DNS resolution phase, validating every resolved IPv4/IPv6 socket address against private, loopback, link-local, and cloud metadata (`169.254.169.254`) ranges **before** TCP `connect()` is called—defeating DNS rebinding attacks.
-2. **Hop-by-Hop Redirect Re-Validation**: `reqwest`'s automatic redirect policy is disabled (`Policy::none()`). `ProtectedHttpClient` manually inspects up to `5` redirect hops (`DEFAULT_MAX_REDIRECT_HOPS = 5`), resolving relative `Location` headers and re-validating every hop's scheme (`http`/`https`) and IP address.
-3. **Streaming Byte Caps**: Responses are read chunk-by-chunk and aborted immediately if they exceed `10 MiB` (feeds), `5 MiB` (Readability web pages), `10 MiB` (Telegram fallback photos), or `50 MiB` (Telegram fallback video/audio/documents).
-4. **Conditional HTTP Polling & Circuit Breaker**:
-   - Persists `etag` (`If-None-Match`) and `last_modified` (`If-Modified-Since`) per feed; `304 Not Modified` responses finish in `< 1 ms` without parsing XML/JSON.
-   - On transient HTTP or network errors, schedules the next poll using exponential backoff with jitter:
-     $$t_{\text{delay}} = \min\left(21600,\; t_0 \cdot 2^{\min(n, 8)} + \text{jitter}\right)$$
-   - After **`15` consecutive failures** (`DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 15`), the feed transitions to `health_status = 'circuit_open'` and pauses automatic polling until reset via WebUI or MCP `reset_and_poll_feed`.
-5. **Isolated Readability Semaphore**: Feeds with `fetch_full_content = true` extract full article HTML via pure-Rust `dom_smoothie` behind a dedicated semaphore (`DEFAULT_READABILITY_CONCURRENCY = 2`, `15s` timeout), ensuring slow origin websites never starve regular feed polling.
+- **Semaphore Isolation**: Feed XML/JSON polling runs under a dedicated semaphore (`DEFAULT_FEED_POLL_CONCURRENCY = 4`, capped at `DEFAULT_MAX_FEED_BYTES = 10 MiB` per response). Feeds with `fetch_full_content = true` run `dom_smoothie` Readability extraction on a separate semaphore (`DEFAULT_READABILITY_CONCURRENCY = 2`, `DEFAULT_MAX_ARTICLE_BYTES = 5 MiB`, offloaded via `spawn_blocking`) so slow article origins do not block routine feed polling.
+- **Exponential Backoff & Circuit Breaker**: Poll failures increment `consecutive_failures`, set `health_status = 'backoff'`, and schedule the next poll using $t_{\text{delay}} = \min(21600,\; t_0 \cdot 2^{\min(n, 8)} + \text{jitter})$. Reaching `DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 15` consecutive failures transitions the feed to `'circuit_open'` and halts automatic polling until reset via the WebUI or MCP `reset_and_poll_feed`.

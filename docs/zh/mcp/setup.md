@@ -1,33 +1,33 @@
-# MCP 客户端接入配置
+# 客户端接入与安全说明
 
-FeedCourier 在同一个 HTTP 监听端口（默认 `0.0.0.0:8080`）上原生挂载了符合最新 Model Context Protocol 规范的 **Streamable HTTP 服务端（`/mcp`）**（基于官方 Rust SDK `rmcp` 构建）。
+FeedCourier 在同一个 HTTP 监听端口（默认 `0.0.0.0:8080`）上提供了符合 Model Context Protocol 规范的 **Streamable HTTP 接口（`/mcp`）**。
 
-无需额外部署 Node.js/Python 包装脚本或独立容器，你只需在 WebUI 中签发一枚 Bearer Token，即可在 **Claude Desktop**、**Cursor**、**Windsurf**、**Antigravity** 或任何兼容 Streamable HTTP 的 AI 客户端中，用自然语言接管日常订阅巡检、死信排障、全文提取试抓与路由编排。
+你无需额外部署中转脚本或独立服务，只需在 WebUI 中生成一个 Bearer 令牌，即可在 **Claude Desktop**、**Cursor**、**Windsurf**、**Antigravity** 等支持 MCP 的客户端中，通过自然语言查看订阅状态、排查失败任务、预览抓取结果或管理订阅源与路由规则。
 
 ---
 
-## 1. 在 WebUI 中签发与管理 MCP 令牌
+## 1. 在 WebUI 中生成 MCP 令牌
 
 1. 登录 FeedCourier WebUI，进入 **Settings → Native MCP Server (`/mcp`)**。
 2. 点击 **Issue Token**，填写令牌备注名称（如 `cursor-macbook` 或 `claude-readonly`），并选择权限范围（Scope）：
 
-| 权限级别（Scope） | 允许调用的工具集 | 适用场景建议 |
+| 权限范围（Scope） | 可调用的工具 | 适用场景 |
 | :--- | :--- | :--- |
-| **`readonly`（只读巡检）** | `list_feeds_status`<br>`inspect_failed_deliveries`<br>`preview_feed_latest` | 日常只读状态查询、失败任务诊断、新源 URL 试抓与过滤规则预览。无法修改任何数据库状态。 |
-| **`admin`（全权限编排）** | 全部 `readonly` 工具 **+** <br>`manage_feed`<br>`configure_route`<br>`reset_and_poll_feed`<br>`retry_dead_tasks` | 用自然语言新增/暂停/删除订阅源、维护标签、编排路由规则、解除熔断立即拉取以及批量重投死信任务。 |
+| **`readonly`（只读权限）** | `list_feeds_status`<br>`inspect_failed_deliveries`<br>`preview_feed_latest` | 仅用于查看订阅源状态、查看投递失败诊断日志以及试抓预览新订阅源，无法修改任何配置或数据。 |
+| **`admin`（管理权限）** | 全部 `readonly` 工具 **+** <br>`manage_feed`<br>`configure_route`<br>`reset_and_poll_feed`<br>`retry_dead_tasks` | 除查看与预览外，还可通过自然语言添加/修改/暂停/删除订阅源、配置路由过滤规则、立即触发拉取以及重投失败任务。 |
 
-3. 点击生成后，界面会展示以 `fc_mcp_` 开头的 **55 位明文令牌**及自动填充好当前访问地址的 JSON 配置片段。
+3. 点击生成后，界面会显示以 `fc_mcp_` 开头的明文令牌，以及自动填好当前服务地址的客户端配置 JSON。
 
 > [!IMPORTANT]
-> **明文令牌仅在创建瞬间展示一次**：后端数据库（`mcp_tokens` 表）仅存储令牌的 **SHA-256 哈希值（`token_hash`）** 与前 15 位前缀（`token_prefix`，如 `fc_mcp_a1b2c3d4`），绝不保存明文。若令牌遗失或怀疑泄露，请直接在 WebUI 列表中点击 **Revoke（吊销）** 并重新签发。每次 AI 客户端发起请求时，WebUI 列表中的 `last_used_at` 时间戳会自动更新。
+> **明文令牌仅在创建时显示一次**：数据库中仅保存令牌的 SHA-256 哈希值与前 15 位前缀（如 `fc_mcp_a1b2c3d4`），不保存明文。如果令牌遗失或不再使用，可在 WebUI 列表中点击 **Revoke（吊销）** 并重新生成。
 
 ---
 
-## 2. 主流 AI 客户端配置示例
+## 2. 客户端连接配置
 
 ### Cursor / Windsurf / Antigravity（原生 Streamable HTTP）
 
-在客户端的 `mcp.json`（或 `~/.cursor/mcp.json`、`~/.gemini/antigravity/mcp_config.json`）中添加：
+在客户端的 MCP 配置文件（如 `~/.cursor/mcp.json` 或 `~/.gemini/antigravity/mcp_config.json`）中添加：
 
 ```json
 {
@@ -43,11 +43,11 @@ FeedCourier 在同一个 HTTP 监听端口（默认 `0.0.0.0:8080`）上原生�
 }
 ```
 
-> 若你的 FeedCourier 部署在远程服务器并配置了 HTTPS 反向代理（如 `https://feedcourier.example.com`），请将 `url` 替换为 `"https://feedcourier.example.com/mcp"`。
+> 如果你的 FeedCourier 部署在远程服务器并配置了 HTTPS 反向代理，请将 `url` 替换为对应的公网或内网地址（例如 `"https://feedcourier.example.com/mcp"`）。
 
-### Claude Desktop（通过 `mcp-remote` 桥接或原生远端连接）
+### Claude Desktop（通过 `mcp-remote` 桥接）
 
-如果所使用的本地桌面客户端版本仅支持 `stdio` 命令方式配置自定义 Header，可使用社区标准的 `mcp-remote` 零配置桥接至 Streamable HTTP 端点：
+如果所使用的桌面客户端版本仅支持通过本地命令行（`stdio`）方式设置自定义请求头，可以使用 `mcp-remote` 桥接至 `/mcp` 端点：
 
 ```json
 {
@@ -66,16 +66,9 @@ FeedCourier 在同一个 HTTP 监听端口（默认 `0.0.0.0:8080`）上原生�
 }
 ```
 
----
+### 使用 `curl` 验证连通性
 
-## 3. 连通性验证与 AGPLv3 元数据声明
-
-连接建立时，客户端会向 `/mcp` 发送 JSON-RPC `initialize` 握手请求。FeedCourier 的 `McpServer::get_info` 会返回：
-
-- **`serverInfo`**：`name: "feedcourier"`、`title: "FeedCourier"`、`version: "0.1.0"`、`websiteUrl: "https://github.com/ElleryHe/FeedCourier"`（满足 `AGPL-3.0-only` 第 13 条对网络远程交互服务源码获取途径的原生披露要求）；
-- **`instructions`**：向 AI 模型注入强制性的防提示词注入指令与授信终点隔离准则（详见 [MCP 纵深安全边界](/zh/mcp/security)）。
-
-你也可以在终端使用 `curl` 快速验证 `/mcp` 端点的鉴权与连通性：
+你也可以在终端使用 `curl` 发送 `initialize` 请求，测试令牌与 `/mcp` 端点是否正常工作：
 
 ```bash
 curl -i -X POST http://127.0.0.1:8080/mcp \
@@ -94,16 +87,20 @@ curl -i -X POST http://127.0.0.1:8080/mcp \
   }'
 ```
 
-- 当 Token 有效时，服务端返回 `200 OK` 及包含 `serverInfo` 与 `instructions` 的初始化响应；
-- 当缺少 `Authorization` 头或 Token 已吊销时，中间件直接返回 `401 Unauthorized` JSON 错误。
-
 ---
 
-## 4. 常用自然语言运维提示词（Prompts）
+## 3. 安全说明
 
-完成接入后，你可以直接对 AI 助手说：
+由于订阅源内容来自外部网站，将 AI 助手接入订阅服务时需要防范恶意文章内容诱导 AI 执行未授权操作。FeedCourier 在 MCP 接口层采取了以下三项隔离措施：
 
-- **日常巡检**：“*帮我查看一下 FeedCourier 当前的运行状态，有没有处于退避（backoff）或熔断（circuit_open）状态的订阅源？*”
-- **试抓与全文对比**：“*帮我用 `preview_feed_latest` 试抓一下 `https://blog.rust-lang.org/feed.xml`，对比开启 `fetch_full_content` 前后的效果。*”
-- **订阅与路由编排**：“*把上面那个 Rust 官方博客加到订阅源里，打上 `rust` 和 `programming` 标签，开启全文提取并立即试推最新 1 篇；然后检查是否已有匹配 `rust` 标签发往 Telegram 的路由。*”
-- **故障自愈**：“*检查一下有没有死信（dead_letter）投递任务，告诉我失败原因，并把它们全部重新入队投递。*”
+1. **权限分级（`readonly` 与 `admin`）**：
+   - `readonly` 令牌仅可调用状态查询、失败任务诊断和试抓预览三个只读工具，任何写操作调用均会被服务端直接拒绝。
+   - `admin` 令牌可额外执行订阅源增删改、路由规则配置、重置拉取与重投失败任务。日常如果只需要让 AI 帮忙检查运行情况，建议优先使用 `readonly` 令牌。
+2. **通道与收件地址隔离**：
+   - 推送通道的密钥（SMTP 密码、Telegram `bot_token`、Notion `integration_secret`）和收件地址（邮箱地址、`chat_id`、Notion 数据库 ID）**只能在 WebUI 中由管理员创建和修改**。
+   - MCP 接口不提供任何创建或修改推送通道的工具，也不会向 AI 客户端返回任何密钥或收件地址（AI 只能看到通道的数字 `id`、名称和类型，并通过数字 `channel_id` 将路由绑定到已有通道），从而避免数据被导向未知的外部收件地址。
+3. **防提示词注入与内网隔离**：
+   - 外部订阅源的标题、作者、摘要和上游报错信息在通过 MCP 返回给 AI 前，都会移除控制字符、限制长度并包裹在 `<untrusted_feed_content>` 标签内，同时不包含原始 HTML，防止网页或文章中的恶意文本诱导 AI 执行非预期操作。
+   - 所有通过 MCP 发起的订阅源试抓和添加请求均经过连接层内网地址拦截保护，默认阻止访问本机环回地址、局域网私有网段与云实例元数据地址。
+
+> 关于加密存储、`<untrusted_feed_content>` 净化流程以及连接层防 SSRF 的具体实现细节，请参阅架构手册中的 [安全与防注入机制](/zh/reference/security)。

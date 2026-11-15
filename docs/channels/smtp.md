@@ -1,68 +1,71 @@
-# SMTP Newsletters Channel
+# SMTP Email
 
-FeedCourier's SMTP adapter (`src/channels/smtp.rs`) carries forward `rss2email`'s single-article email philosophy while solving modern email deliverability, SPF/DKIM/DMARC alignment, and Gmail's `102 KB` clipping limit.
-
----
-
-## Key Capabilities
-
-1. **Responsive Inline-CSS Single-Column Reader Template**: Rendered via `minijinja` with zero external stylesheet dependencies, paired with a 78-column plain-text fallback (`html2text`) inside a standard `multipart/alternative` MIME envelope.
-2. **Strict `95 KiB` HTML Budget (Anti-Clipping)**: Automatically truncates oversized HTML bodies at clean tag/character boundaries below `MAX_EMAIL_HTML_BYTES = 95 KiB`, appending a *"Continue reading original article →"* callout so Gmail and Fastmail never clip the footer or break layout styling.
-3. **`Force-From` Deliverability Discipline**: Always sends from your authenticated SPF/DKIM/DMARC-aligned `from_address` while dynamically formatting the display name as `"<Feed Title> via FeedCourier"`.
-4. **Deterministic `Message-ID` & `List-Id` Headers**: Generates a reproducible RFC 5322 `Message-ID` from the entry's SHA-256 fingerprint and a per-feed `List-Id` header so email clients can deduplicate retries and auto-filter newsletters into folders.
-5. **Pooled Async Transports**: Reuses persistent `lettre` `AsyncSmtpTransport` connections across deliveries.
+The SMTP channel delivers each matched feed entry as an individual email with a clean single-column HTML layout, a plain-text fallback, and standard mailing-list headers for inbox filtering.
 
 ---
 
-## Configuration Fields
+## Preparing SMTP Credentials
 
-SMTP channels are configured in the WebUI under **Channels → New Channel → SMTP** (`SmtpChannelConfig`):
+Most email providers require an **App Password** (rather than your main account password) when sending mail over SMTP:
 
-| Field | Type | Required | Description |
-| :--- | :--- | :--- | :--- |
-| `host` | `string` | Yes | SMTP server hostname (e.g., `smtp.fastmail.com`, `smtp.gmail.com`, `email-smtp.us-east-1.amazonaws.com`). |
-| `port` | `u16` | Yes | SMTP port (`587` for STARTTLS, `465` for implicit TLS/SMTPS, `25`/`1025` for local relay). |
-| `security` | `string` | Yes | Transport encryption mode: `"start_tls"` (default), `"tls"`, or `"plain"`. |
-| `username` | `string?` | Optional | SMTP authentication username (encrypted at rest). |
-| `password` | `string?` | Optional | SMTP authentication password or App Password (encrypted at rest via ChaCha20-Poly1305). |
-| `from_address` | `string` | Yes | Fixed sender email address (`Force-From`) authorized by your SMTP provider's SPF/DKIM records. |
-| `to_addresses` | `string[]` | Yes | One or more recipient email addresses locked inside this trusted channel. |
-| `reply_to` | `string?` | Optional | Optional `Reply-To` address. |
+| Provider | SMTP Host (`host`) | Port (`port`) | Security (`security`) | Notes |
+| :--- | :--- | :---: | :---: | :--- |
+| **Gmail / Google Workspace** | `smtp.gmail.com` | `587` or `465` | `start_tls` or `tls` | Enable 2-Step Verification in your Google Account and generate a 16-character **App Password**. |
+| **Fastmail** | `smtp.fastmail.com` | `465` | `tls` | Create an App Password with SMTP access under **Settings → Privacy & Security**. |
+| **Apple iCloud Mail** | `smtp.mail.me.com` | `587` | `start_tls` | Generate an app-specific password at `account.apple.com`; set `from_address` to your iCloud email or alias. |
+| **Corporate / Self-Hosted Mail** | Your server hostname | `465` or `587` | `tls` or `start_tls` | Use a dedicated client password; `from_address` must match an authorized sender address. |
 
 ---
 
-## How `Force-From` Protects Your Sender Reputation
+## WebUI Configuration Fields
 
-Traditional tools that spoof the feed author's domain in the `From:` header fail modern DMARC policies and get rejected by Gmail, iCloud, and Proton Mail.
+In the WebUI, go to **Channels → New Channel → SMTP** and fill in the following fields:
 
-FeedCourier enforces `Force-From` on every outgoing message:
+| Field | Required | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `host` | Yes | — | SMTP server hostname (for example, `smtp.gmail.com` or `smtp.fastmail.com`). |
+| `port` | Yes | `587` | SMTP server port (`587` for STARTTLS, `465` for implicit TLS/SMTPS, `25`/`1025` for local relays). |
+| `security` | Yes | `start_tls` | Encryption mode:<br>• `start_tls`: Upgrade connection via STARTTLS (standard for port `587`)<br>• `tls`: Implicit TLS / SMTPS (standard for port `465`)<br>• `plain`: Unencrypted SMTP (only for local or internal relays) |
+| `username` | No | — | SMTP login username (usually your full email address). |
+| `password` | No | — | SMTP password or App Password (encrypted at rest; leave blank when editing to keep the existing password). |
+| `from_address` | Yes | — | Sender email address (`Force-From`). Must be authorized by your SMTP account. |
+| `to_addresses` | Yes | — | One or more recipient email addresses. |
+| `reply_to` | No | — | Optional `Reply-To` email address. |
+
+After saving, click **Test** on the channel card to send a test email and verify connectivity.
+
+---
+
+## Sender Alignment (`Force-From`) & Subject Format
+
+Modern email providers enforce **SPF, DKIM, and DMARC** policies. If an automated service tries to spoof the original blog author's domain in the `From:` address, the email will be rejected or routed to spam.
+
+FeedCourier always uses **sender alignment (`Force-From`)**:
+- **Fixed Sender Address**: The email address in the `From:` header is always your configured `from_address` (e.g., `courier@yourdomain.com`), ensuring it matches your authenticated SMTP account.
+- **Feed Name as Display Name & Subject Prefix**: The sender display name is set to the feed title (e.g., `"Rust Blog via FeedCourier"`), and the email subject is prefixed with `[<Feed Title>]`:
 
 ```http
-From: "Rust Blog" <courier@yourdomain.com>
+From: "Rust Blog via FeedCourier" <courier@yourdomain.com>
 To: reader@example.com
 Subject: [Rust Blog] Announcing Rust 1.94.0
-Message-ID: <fc-entry-8f3c9a2e1b4d7051c8a9e2b3@yourdomain.com>
-List-Id: "Rust Blog" <feed-12.yourdomain.com>
+List-Id: "Rust Blog" <feed-12.feedcourier.yourdomain.com>
 Auto-Submitted: auto-generated
-X-Mailer: FeedCourier
-Content-Type: multipart/alternative; boundary="..."
 ```
-
-- **`From:`** uses your verified `from_address` (`courier@yourdomain.com`) with the sanitized feed title as the display name (`"Rust Blog"`).
-- **`Message-ID:`** is derived deterministically from `(feed_id, fingerprint_sha256, route_id, domain)` and persisted in `delivery_tasks.checkpoint_json` (`{"kind": "smtp", "message_id": "<...>"}`) before transmission. If a network drop causes an at-least-once retry, the retried email carries the **exact same `Message-ID`**, allowing standards-compliant mail servers and clients to deduplicate it automatically.
-- **`List-Id:`** uses `<feed-{id}.{domain}>`, making it trivial to create inbox rules or Sieve filters per feed.
-- **`Auto-Submitted: auto-generated`** prevents vacation auto-responders from replying to automated feed deliveries.
 
 ---
 
-## Error Handling & Rate-Limit Cooldowns
+## What Delivered Emails Look Like
 
-| SMTP Response Code | Classification | Outbox Behavior |
-| :--- | :--- | :--- |
-| `250 OK` | `Delivered` | Task marked `delivered`, `checkpoint_json` records `message_id`. |
-| `421`, `450`, `451`, `452` (4xx Transient) | `Retry` + Group Cooldown | Task transitions to `retrying` with exponential backoff; all channels sharing the SMTP `credential_group_key` enter cooldown. |
-| `535`, `550`, `553`, `554` (5xx Permanent) | `PermanentFailure` | Task moves immediately to `dead_letter` with the full SMTP diagnostic string recorded in `diagnostic_log`. |
+- **Single-Column HTML + Plain Text**: Each email includes a clean, mobile-friendly single-column HTML view alongside a 78-column plain-text version (`multipart/alternative`), with the feed title, article title, author, publication date, and a link to the original article.
+- **Protection Against Email Clipping**: Very long articles are automatically shortened before exceeding email client size limits (such as Gmail's 102 KB clipping threshold), with a **"Continue reading original article →"** link at the bottom.
+- **Easy Inbox Filtering (`List-Id`)**: Every email includes a standard `List-Id` header per feed, so you can create inbox rules or filters in Gmail, Fastmail, Apple Mail, or Thunderbird to sort specific feeds into folders automatically.
 
-::: tip Recommended Pacing for Consumer Mailboxes
-When sending through personal Gmail, Fastmail, or iCloud SMTP accounts, keep `min_interval_secs` at `15`–`30` seconds and set `hourly_quota` to `60`–`100` to stay comfortably within provider anti-abuse thresholds.
+::: tip Recommended Send Rate for Personal Mailboxes
+When sending through personal Gmail, Fastmail, or iCloud accounts, keeping `min_interval_secs` between `15` and `30` seconds and setting `hourly_quota` to `60`–`100` helps stay well within provider sending limits.
 :::
+
+---
+
+## Technical Details
+
+For details on MIME assembly, HTML byte budgets, deterministic `Message-ID` deduplication, and SMTP error classification, see [Channel Protocols & Delivery](/reference/channel-protocols).

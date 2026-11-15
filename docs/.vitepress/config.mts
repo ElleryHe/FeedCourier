@@ -1,11 +1,107 @@
-import { defineConfig } from "vitepress";
+import { defineConfig, type DefaultTheme } from "vitepress";
 import { withMermaid } from "vitepress-plugin-mermaid";
+
+const enUserGuideSidebar: DefaultTheme.SidebarItem[] = [
+  {
+    text: "Getting Started",
+    items: [
+      { text: "Project Overview", link: "/guide/introduction" },
+      { text: "Quick Start", link: "/guide/quick-start" },
+      { text: "Configuration & Proxy", link: "/guide/configuration" },
+      { text: "Backup & Maintenance", link: "/guide/operations" },
+    ],
+  },
+  {
+    text: "Delivery Channels",
+    items: [
+      {
+        text: "Send Rate, Quotas & Filters",
+        link: "/channels/pacing-and-quotas",
+      },
+      { text: "SMTP Email", link: "/channels/smtp" },
+      { text: "Telegram", link: "/channels/telegram" },
+      { text: "Notion", link: "/channels/notion" },
+    ],
+  },
+  {
+    text: "MCP Integration",
+    items: [
+      { text: "Client Setup & Security", link: "/mcp/setup" },
+      { text: "Tools Overview", link: "/mcp/tools" },
+    ],
+  },
+];
+
+const enArchitectureSidebar: DefaultTheme.SidebarItem[] = [
+  {
+    text: "Architecture & Development",
+    items: [
+      { text: "System Architecture", link: "/reference/architecture" },
+      {
+        text: "Channel Protocols & Delivery",
+        link: "/reference/channel-protocols",
+      },
+      { text: "Security & Isolation", link: "/reference/security" },
+      { text: "Database Schema", link: "/reference/database-schema" },
+      { text: "REST API", link: "/reference/rest-api" },
+      { text: "Build & Release Pipeline", link: "/reference/releasing" },
+    ],
+  },
+];
+
+const zhUserGuideSidebar: DefaultTheme.SidebarItem[] = [
+  {
+    text: "入门与部署",
+    items: [
+      { text: "项目简介", link: "/zh/guide/introduction" },
+      { text: "快速开始", link: "/zh/guide/quick-start" },
+      { text: "环境配置与代理", link: "/zh/guide/configuration" },
+      { text: "数据备份与维护", link: "/zh/guide/operations" },
+    ],
+  },
+  {
+    text: "推送通道设置",
+    items: [
+      {
+        text: "发送频率、配额与过滤",
+        link: "/zh/channels/pacing-and-quotas",
+      },
+      { text: "SMTP 邮件", link: "/zh/channels/smtp" },
+      { text: "Telegram", link: "/zh/channels/telegram" },
+      { text: "Notion", link: "/zh/channels/notion" },
+    ],
+  },
+  {
+    text: "MCP 接入",
+    items: [
+      { text: "客户端接入与安全说明", link: "/zh/mcp/setup" },
+      { text: "工具说明", link: "/zh/mcp/tools" },
+    ],
+  },
+];
+
+const zhArchitectureSidebar: DefaultTheme.SidebarItem[] = [
+  {
+    text: "架构与开发手册",
+    items: [
+      { text: "系统架构总览", link: "/zh/reference/architecture" },
+      {
+        text: "通道协议与投递实现",
+        link: "/zh/reference/channel-protocols",
+      },
+      { text: "安全与防注入机制", link: "/zh/reference/security" },
+      { text: "数据库表结构", link: "/zh/reference/database-schema" },
+      { text: "REST API 接口", link: "/zh/reference/rest-api" },
+      { text: "构建与发布流程", link: "/zh/reference/releasing" },
+    ],
+  },
+];
 
 export default withMermaid(
   defineConfig({
     title: "FeedCourier",
     description:
-      "Lightweight pure-Rust RSS / Atom / JSON Feed streaming delivery gateway for SMTP, Telegram Bot API 10.4, Notion 2026-03-11, and MCP.",
+      "RSS, Atom, and JSON Feed subscription delivery service built with Rust, SQLite, and React. Delivers articles to SMTP Email, Telegram, and Notion, with an embedded web console and MCP server.",
     cleanUrls: true,
     lastUpdated: true,
     sitemap: {
@@ -63,71 +159,26 @@ export default withMermaid(
         label: "English",
         lang: "en-US",
         description:
-          "Lightweight pure-Rust RSS / Atom / JSON Feed streaming delivery gateway for SMTP, Telegram Bot API 10.4, Notion 2026-03-11, and MCP.",
+          "RSS, Atom, and JSON Feed subscription delivery service built with Rust, SQLite, and React. Delivers articles to SMTP Email, Telegram, and Notion, with an embedded web console and MCP server.",
         themeConfig: {
           nav: [
-            { text: "Guide", link: "/guide/introduction", activeMatch: "/guide/" },
             {
-              text: "Channels",
-              link: "/channels/pacing-and-quotas",
-              activeMatch: "/channels/",
+              text: "User Guide",
+              link: "/guide/introduction",
+              activeMatch: "^/(guide|channels|mcp)/",
             },
-            { text: "MCP", link: "/mcp/setup", activeMatch: "/mcp/" },
             {
-              text: "Reference",
+              text: "Architecture",
               link: "/reference/architecture",
-              activeMatch: "/reference/",
+              activeMatch: "^/reference/",
             },
           ],
-          sidebar: [
-            {
-              text: "Getting Started & Operations",
-              items: [
-                { text: "Introduction", link: "/guide/introduction" },
-                { text: "Quick Start", link: "/guide/quick-start" },
-                { text: "Configuration & Proxy", link: "/guide/configuration" },
-                { text: "Operations & Backups", link: "/guide/operations" },
-              ],
-            },
-            {
-              text: "Delivery Channels",
-              items: [
-                {
-                  text: "Pacing, Quotas & Filters",
-                  link: "/channels/pacing-and-quotas",
-                },
-                { text: "SMTP Newsletters", link: "/channels/smtp" },
-                { text: "Telegram (Bot API 10.4)", link: "/channels/telegram" },
-                {
-                  text: "Notion (2026-03-11 & v2)",
-                  link: "/channels/notion",
-                },
-              ],
-            },
-            {
-              text: "Native MCP Server",
-              items: [
-                { text: "Client Setup", link: "/mcp/setup" },
-                { text: "Tools Reference", link: "/mcp/tools" },
-                { text: "Security Boundaries", link: "/mcp/security" },
-              ],
-            },
-            {
-              text: "Architecture & Reference",
-              items: [
-                { text: "Core Architecture", link: "/reference/architecture" },
-                {
-                  text: "SQLite Database Schema",
-                  link: "/reference/database-schema",
-                },
-                { text: "REST API (/api/v1/*)", link: "/reference/rest-api" },
-                {
-                  text: "Release & CI/CD Pipeline",
-                  link: "/reference/releasing",
-                },
-              ],
-            },
-          ],
+          sidebar: {
+            "/guide/": enUserGuideSidebar,
+            "/channels/": enUserGuideSidebar,
+            "/mcp/": enUserGuideSidebar,
+            "/reference/": enArchitectureSidebar,
+          },
           editLink: {
             pattern: "https://github.com/ElleryHe/FeedCourier/edit/main/docs/:path",
             text: "Edit this page on GitHub",
@@ -143,74 +194,26 @@ export default withMermaid(
         lang: "zh-CN",
         link: "/zh/",
         description:
-          "轻量级纯 Rust RSS / Atom / JSON Feed 流式订阅投递网关，原生支持 SMTP、Telegram Bot API 10.4、Notion 2026-03-11 与 MCP。",
+          "基于 Rust、SQLite 与 React 构建的 RSS / Atom / JSON Feed 订阅投递服务，支持投递至 SMTP 邮件、Telegram 与 Notion，内置 Web 控制台与 MCP 服务端。",
         themeConfig: {
           nav: [
-            { text: "指南", link: "/zh/guide/introduction", activeMatch: "/zh/guide/" },
             {
-              text: "推送通道",
-              link: "/zh/channels/pacing-and-quotas",
-              activeMatch: "/zh/channels/",
+              text: "使用手册",
+              link: "/zh/guide/introduction",
+              activeMatch: "^/zh/(guide|channels|mcp)/",
             },
-            { text: "MCP 接入", link: "/zh/mcp/setup", activeMatch: "/zh/mcp/" },
             {
-              text: "参考手册",
+              text: "架构手册",
               link: "/zh/reference/architecture",
-              activeMatch: "/zh/reference/",
+              activeMatch: "^/zh/reference/",
             },
           ],
-          sidebar: [
-            {
-              text: "快速开始与运维",
-              items: [
-                { text: "项目定位与设计哲学", link: "/zh/guide/introduction" },
-                { text: "快速开始", link: "/zh/guide/quick-start" },
-                { text: "环境变量与代理分流", link: "/zh/guide/configuration" },
-                { text: "持久化运维与热备份", link: "/zh/guide/operations" },
-              ],
-            },
-            {
-              text: "三大推送通道配置",
-              items: [
-                {
-                  text: "步进流控、配额与过滤",
-                  link: "/zh/channels/pacing-and-quotas",
-                },
-                { text: "SMTP 邮件信纸通道", link: "/zh/channels/smtp" },
-                {
-                  text: "Telegram 通道 (Bot API 10.4)",
-                  link: "/zh/channels/telegram",
-                },
-                {
-                  text: "Notion 通道 (2026-03-11)",
-                  link: "/zh/channels/notion",
-                },
-              ],
-            },
-            {
-              text: "原生 MCP 智能接入",
-              items: [
-                { text: "客户端接入配置", link: "/zh/mcp/setup" },
-                { text: "7 大工具详解", link: "/zh/mcp/tools" },
-                { text: "纵深安全护栏", link: "/zh/mcp/security" },
-              ],
-            },
-            {
-              text: "架构原理与参考手册",
-              items: [
-                { text: "核心架构深潜", link: "/zh/reference/architecture" },
-                {
-                  text: "SQLite 表结构参考",
-                  link: "/zh/reference/database-schema",
-                },
-                { text: "REST API 接口速查", link: "/zh/reference/rest-api" },
-                {
-                  text: "自动化发布流水线",
-                  link: "/zh/reference/releasing",
-                },
-              ],
-            },
-          ],
+          sidebar: {
+            "/zh/guide/": zhUserGuideSidebar,
+            "/zh/channels/": zhUserGuideSidebar,
+            "/zh/mcp/": zhUserGuideSidebar,
+            "/zh/reference/": zhArchitectureSidebar,
+          },
           editLink: {
             pattern: "https://github.com/ElleryHe/FeedCourier/edit/main/docs/:path",
             text: "在 GitHub 上编辑此页",

@@ -1,6 +1,6 @@
 # Release & CI/CD Pipeline
 
-FeedCourier uses two GitHub Actions workflows—**CI** (`.github/workflows/ci.yml`) and **Release** (`.github/workflows/release.yml`)—to enforce code quality, dead-link-free documentation, multi-platform binary compilation, and multi-architecture Docker Hub publishing.
+FeedCourier uses two GitHub Actions workflows—**CI** (`.github/workflows/ci.yml`) and **Release** (`.github/workflows/release.yml`)—to run automated checks, verify internal documentation links, compile multi-platform binaries, and publish multi-architecture Docker Hub images.
 
 ---
 
@@ -10,11 +10,11 @@ Every push to `main` or `develop` and every pull request runs:
 
 1. **Frontend Verification (`web/`)**:
    - `pnpm --dir web install --frozen-lockfile`
-   - `pnpm --dir web exec tsc --noEmit` (strict TypeScript typecheck)
+   - `pnpm --dir web exec tsc --noEmit` (TypeScript typecheck)
    - `pnpm --dir web build` (produces `web/dist` for `rust-embed`)
-2. **Documentation Build & Dead-Link Verification (`docs/`)**:
+2. **Documentation Build & Link Verification (`docs/`)**:
    - `pnpm --dir docs install --frozen-lockfile`
-   - `pnpm --dir docs build` (VitePress static build verifying zero broken internal links across `/` and `/zh/`)
+   - `pnpm --dir docs build` (VitePress static build checking internal links across `/` and `/zh/`)
 3. **Rust Formatting, Linting & Test Suite**:
    - `cargo fmt --all -- --check`
    - `cargo clippy --all-targets --locked -- -D warnings`
@@ -26,7 +26,7 @@ Every push to `main` or `develop` and every pull request runs:
 
 ## Automated Release Workflow (`.github/workflows/release.yml`)
 
-Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.0 && git push origin v0.1.0`) triggers the automated release pipeline:
+Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.2 && git push origin v0.1.2`) triggers the automated release pipeline:
 
 ```mermaid
 flowchart LR
@@ -43,8 +43,8 @@ flowchart LR
 
 Before compiling, the workflow verifies that `version` in `Cargo.toml` matches `${GITHUB_REF_NAME#v}` exactly. It then builds locked, stripped release archives containing `feedcourier`, `LICENSE`, `README.md`, and `README.zh-CN.md` for:
 
-- `x86_64-unknown-linux-gnu` (built natively on `ubuntu-24.04`)
-- `aarch64-unknown-linux-gnu` (built natively on `ubuntu-24.04-arm`)
+- `x86_64-unknown-linux-gnu` (built on `ubuntu-24.04`)
+- `aarch64-unknown-linux-gnu` (built on `ubuntu-24.04-arm`)
 - `aarch64-apple-darwin` (`MACOSX_DEPLOYMENT_TARGET=11.0`)
 - `x86_64-apple-darwin` (`MACOSX_DEPLOYMENT_TARGET=11.0`)
 
@@ -55,7 +55,7 @@ All four `.tar.gz` archives are hashed into `SHA256SUMS.txt`, paired with the ma
 In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd64`, `linux/arm64`) image to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)** and synchronizes the repository's `README.md` description:
 
 - **Published Image Tags**:
-  - `<version>` (e.g., `0.1.0`)
+  - `<version>` (e.g., `0.1.2`)
   - `<major>.<minor>` (e.g., `0.1`)
   - `<major>` (enabled from `1.0.0`+)
   - `latest` (for stable non-prerelease tags)
