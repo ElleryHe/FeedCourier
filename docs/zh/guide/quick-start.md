@@ -16,7 +16,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
   # 生产环境也可锁定精确语义化版本号：
-  # elleryhe/feedcourier:0.1.0
+  # elleryhe/feedcourier:0.1.1
 ```
 
 容器启动后会自动在挂载的 `/data` 目录中初始化：
@@ -32,7 +32,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # 或锁定版本 elleryhe/feedcourier:0.1.0
+    image: elleryhe/feedcourier:latest # 或锁定版本 elleryhe/feedcourier:0.1.1
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -65,17 +65,17 @@ docker compose logs -f feedcourier
 
 每次版本发布均在 [GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases) 提供四大主流平台的单文件预编译包与 `SHA256SUMS.txt` 校验文件：
 
-| 操作系统与架构 | 目标三元组（Target Triple） | 压缩包文件名（以 `0.1.0` 为例） |
+| 操作系统与架构 | 目标三元组（Target Triple） | 压缩包文件名（以 `0.1.1` 为例） |
 | :--- | :--- | :--- |
-| **Linux x86_64** | `x86_64-unknown-linux-gnu` | `feedcourier-0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| **Linux ARM64** | `aarch64-unknown-linux-gnu` | `feedcourier-0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
-| **macOS Apple Silicon** | `aarch64-apple-darwin` | `feedcourier-0.1.0-aarch64-apple-darwin.tar.gz` |
-| **macOS Intel** | `x86_64-apple-darwin` | `feedcourier-0.1.0-x86_64-apple-darwin.tar.gz` |
+| **Linux x86_64** | `x86_64-unknown-linux-gnu` | `feedcourier-0.1.1-x86_64-unknown-linux-gnu.tar.gz` |
+| **Linux ARM64** | `aarch64-unknown-linux-gnu` | `feedcourier-0.1.1-aarch64-unknown-linux-gnu.tar.gz` |
+| **macOS Apple Silicon** | `aarch64-apple-darwin` | `feedcourier-0.1.1-aarch64-apple-darwin.tar.gz` |
+| **macOS Intel** | `x86_64-apple-darwin` | `feedcourier-0.1.1-x86_64-apple-darwin.tar.gz` |
 
 下载、校验 SHA-256 签名并启动（以 Linux `x86_64` 为例）：
 
 ```bash
-VERSION="0.1.0"
+VERSION="0.1.1"
 TARGET="x86_64-unknown-linux-gnu"
 ARCHIVE="feedcourier-${VERSION}-${TARGET}.tar.gz"
 
@@ -147,7 +147,7 @@ curl -s http://127.0.0.1:8080/api/v1/health
 ```json
 {
   "name": "FeedCourier",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "AGPL-3.0-only",
   "repo_url": "https://github.com/ElleryHe/FeedCourier",
   "status": "ok"

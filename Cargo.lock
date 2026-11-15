@@ -935,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "feedcourier"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ammonia",
  "anyhow",
