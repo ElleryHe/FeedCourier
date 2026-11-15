@@ -12,6 +12,9 @@ web/node_modules/
 web/dist/
 web/.vite/
 
+# Documentation site sources & build artifacts
+docs/
+
 # Git metadata & CI definitions
 .git/
 .github/

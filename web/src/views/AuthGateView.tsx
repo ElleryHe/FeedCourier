@@ -1,9 +1,12 @@
 import { useMutation } from "@tanstack/react-query";
-import { KeyRound, Lock, Rss, ShieldCheck } from "lucide-react";
+import { KeyRound, Lock, ShieldCheck } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { api } from "@/api/client";
 import { ComplianceFooter } from "@/components/layout/ComplianceFooter";
-import { useThemeMode } from "@/components/layout/AppShell";
+import {
+  FeedCourierMark,
+  useThemeMode,
+} from "@/components/layout/AppShell";
 import {
   Button,
   Card,
@@ -88,9 +91,7 @@ export function AuthGateView({
       <div className="flex flex-1 items-center justify-center px-4 py-12">
         <div className="w-full max-w-md space-y-6">
           <div className="flex flex-col items-center text-center">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-zinc-900 text-emerald-400 shadow-sm dark:bg-zinc-800">
-              <Rss className="h-5 w-5" />
-            </div>
+            <FeedCourierMark className="h-12 w-12" />
             <h1 className="mt-3 text-xl font-bold tracking-tight">
               FeedCourier Console
             </h1>

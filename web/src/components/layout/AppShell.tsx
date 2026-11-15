@@ -70,6 +70,53 @@ export function useThemeMode() {
   return { dark, toggleTheme: () => setDark((prev) => !prev) };
 }
 
+export function FeedCourierMark({
+  className = "h-7 w-7",
+}: {
+  className?: string;
+}) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 32 32"
+      fill="none"
+      aria-hidden="true"
+      className={className}
+    >
+      <circle
+        cx="6.5"
+        cy="25.5"
+        r="2.5"
+        className="fill-emerald-500 dark:fill-emerald-400"
+      />
+      <path
+        d="M4.5 18.5A9 9 0 0 1 13.5 27.5"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        className="stroke-zinc-900 dark:stroke-zinc-50"
+      />
+      <path
+        d="M4.5 12.5A15 15 0 0 1 19.5 27.5"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        className="stroke-zinc-700 dark:stroke-zinc-400"
+      />
+      <path
+        d="M11 10L28.5 3.5L18.5 13.5Z"
+        strokeWidth="0.75"
+        strokeLinejoin="round"
+        className="fill-emerald-500 stroke-emerald-500 dark:fill-emerald-400 dark:stroke-emerald-400"
+      />
+      <path
+        d="M18.5 13.5L28.5 3.5L22 21Z"
+        strokeWidth="0.75"
+        strokeLinejoin="round"
+        className="fill-emerald-600 stroke-emerald-600 dark:fill-emerald-500 dark:stroke-emerald-500"
+      />
+    </svg>
+  );
+}
+
 export function AppShell({
   activeSection,
   onNavigate,
@@ -139,9 +186,7 @@ export function AppShell({
         {/* Brand Header */}
         <div className="flex items-center justify-between border-b border-zinc-200/80 px-4 py-4 dark:border-zinc-800/80">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-zinc-900 text-emerald-400 shadow-xs dark:bg-zinc-800">
-              <Rss className="h-4 w-4" />
-            </div>
+            <FeedCourierMark className="h-8 w-8 shrink-0" />
             <div>
               <div className="flex items-center gap-1.5">
                 <span className="text-sm font-bold tracking-tight text-zinc-900 dark:text-zinc-100">
@@ -291,6 +336,7 @@ export function AppShell({
             >
               <Menu className="h-4 w-4" />
             </button>
+            <FeedCourierMark className="h-5 w-5 shrink-0" />
             <span className="text-sm font-bold tracking-tight">
               FeedCourier
             </span>

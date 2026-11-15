@@ -6,6 +6,7 @@ rust-version = "1.94"
 license = "AGPL-3.0-only"
 repository = "https://github.com/ElleryHe/FeedCourier"
 homepage = "https://github.com/ElleryHe/FeedCourier"
+documentation = "https://feedcourier.ellery.me"
 readme = "README.md"
 description = "Lightweight pure-Rust RSS/Atom/JSON Feed delivery gateway with SMTP, Telegram, Notion, and built-in MCP."
 keywords = ["rss", "atom", "telegram", "notion", "mcp"]
