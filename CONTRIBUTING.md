@@ -69,7 +69,7 @@ then run `pnpm --dir web build` once finished.
 
 ## License
 
-`FeedCourier` is licensed under the GNU Affero General Public License v3.0 only
-(`AGPL-3.0-only`). By submitting a contribution to this repository, you agree
-that your contribution is licensed under `AGPL-3.0-only` as set forth in
+`FeedCourier` is licensed under the GNU Affero General Public License v3.0
+(`AGPL-3.0`). By submitting a contribution to this repository, you agree
+that your contribution is licensed under `AGPL-3.0` as set forth in
 [`LICENSE`](./LICENSE).

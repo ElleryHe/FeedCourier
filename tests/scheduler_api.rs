@@ -171,7 +171,7 @@ async fn auth_lifecycle_and_session_guard() {
     assert_eq!(status, StatusCode::OK);
     let health = parse_json(&body);
     assert_eq!(health["status"], "ok");
-    assert_eq!(health["license"], "AGPL-3.0-only");
+    assert_eq!(health["license"], "AGPL-3.0");
 
     // 2. Fresh instance reports `setup_required: true, authenticated: false`.
     let (status, _, body) = h.send(Method::GET, "/api/v1/auth/status", None, None).await;

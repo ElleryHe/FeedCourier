@@ -7,7 +7,7 @@
 //! 1. Embedded React 19 WebUI SPA (`GET /` and client deep links `/feeds`, `/channels`, `/routes`,
 //!    `/tasks`, `/settings`) + hashed `/assets/*` bundle serving + JSON `404` on unknown `/api/*`
 //!    and `/mcp/*` paths.
-//! 2. `GET /api/v1/auth/status` (`setup_required: true`, `AGPL-3.0-only`, `REPO_URL`) and
+//! 2. `GET /api/v1/auth/status` (`setup_required: true`, `AGPL-3.0`, `REPO_URL`) and
 //!    `POST /api/v1/auth/setup` issuing an `HttpOnly` `fc_session` cookie.
 //! 3. Strict cross-surface auth isolation (`fc_session` cannot access `/mcp`; MCP `Bearer` token
 //!    cannot access `/api/v1/*`).

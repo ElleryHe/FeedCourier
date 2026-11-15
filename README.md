@@ -9,12 +9,10 @@
 
   An **RSS / Atom / JSON Feed subscription delivery service** built with Rust, SQLite, and React. It polls feeds, extracts full text when needed, filters articles by route rules, and delivers them to Email via SMTP, Telegram, and Notion, with an embedded web console and an `/mcp` endpoint for AI clients.
 
-  [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
-  [![Release](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml)
+  [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
+  [![Release](https://img.shields.io/github/v/release/ElleryHe/FeedCourier?label=Release)](https://github.com/ElleryHe/FeedCourier/releases/latest)
   [![Docker Hub](https://img.shields.io/docker/v/elleryhe/feedcourier?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/elleryhe/feedcourier)
-  [![Docs](https://img.shields.io/badge/Docs-feedcourier.ellery.me-10B981)](https://feedcourier.ellery.me)
-  [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
-  [![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
+  [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 
   **English** | [简体中文](./README.zh-CN.md) | [Documentation](https://feedcourier.ellery.me)
 </div>

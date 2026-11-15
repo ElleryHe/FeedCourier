@@ -34,7 +34,7 @@ const DEFAULT_POLL_INTERVAL_SECS: i64 = 1800;
 const DEFAULT_FAILED_DELIVERIES_LIMIT: u32 = 20;
 const MAX_FAILED_DELIVERIES_LIMIT: u32 = 100;
 
-/// Build the AGPL-3.0-only Section 13 license/source disclosure and prompt-injection security
+/// Build the AGPL-3.0 Section 13 license/source disclosure and prompt-injection security
 /// instructions returned in MCP `initialize` (`ServerConfig::instructions`).
 pub fn build_mcp_instructions() -> String {
     format!(

@@ -1,6 +1,9 @@
 import { defineConfig, type DefaultTheme } from "vitepress";
 import { withMermaid } from "vitepress-plugin-mermaid";
 
+const currentYear = new Date().getFullYear();
+const copyrightHtml = `Copyright © <span data-current-year>${currentYear}</span> FeedCourier`;
+
 const enUserGuideSidebar: DefaultTheme.SidebarItem[] = [
   {
     text: "Getting Started",
@@ -192,8 +195,8 @@ export default withMermaid(
             text: "Edit this page on GitHub",
           },
           footer: {
-            message: "Released under the AGPL-3.0-only License.",
-            copyright: "Copyright © 2026 ElleryHe",
+            message: "Released under the AGPL-3.0 License.",
+            copyright: copyrightHtml,
           },
         },
       },
@@ -235,8 +238,8 @@ export default withMermaid(
             text: "在 GitHub 上编辑此页",
           },
           footer: {
-            message: "基于 AGPL-3.0-only 开源协议发布。",
-            copyright: "Copyright © 2026 ElleryHe",
+            message: "基于 AGPL-3.0 开源协议发布。",
+            copyright: copyrightHtml,
           },
           docFooter: {
             prev: "上一页",

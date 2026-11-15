@@ -39,7 +39,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   {
     "name": "FeedCourier",
     "version": "0.1.2",
-    "license": "AGPL-3.0-only",
+    "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"
   }
@@ -54,7 +54,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
     "authenticated": true,
     "version": "0.1.2",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
-    "license": "AGPL-3.0-only"
+    "license": "AGPL-3.0"
   }
   ```
 

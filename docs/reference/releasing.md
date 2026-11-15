@@ -20,7 +20,7 @@ Every push to `main` or `develop` and every pull request runs:
    - `cargo clippy --all-targets --locked -- -D warnings`
    - `cargo test --all-targets --locked` (unit and integration tests covering 4-tier deduplication, `NOT EXISTS` GC, SSRF connect-time guards, SMTP `Force-From`, Telegram 10.4 modes, Notion `2026-03-11` Markdown v2, REST API, and MCP tools)
 4. **License & Dependency Supply-Chain Audit**:
-   - `cargo deny check` (`deny.toml` verifying `AGPL-3.0-only` compatibility and advisory checks)
+   - `cargo deny check` (`deny.toml` verifying `AGPL-3.0` compatibility and advisory checks)
 
 ---
 

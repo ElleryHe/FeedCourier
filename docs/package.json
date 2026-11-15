@@ -2,7 +2,7 @@
   "name": "feedcourier-docs",
   "private": true,
   "version": "0.1.1",
-  "license": "AGPL-3.0-only",
+  "license": "AGPL-3.0",
   "type": "module",
   "scripts": {
     "dev": "vitepress dev",

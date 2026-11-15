@@ -18,7 +18,7 @@ FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.g
    - 执行 `cargo test --all-targets` 单元与集成测试（覆盖四级去重、SSRF 拦截、DNS Rebinding、租约恢复、三大通道协议与 MCP 提示词注入防护）；
    - 执行 `cargo build --release --locked` 验证 Release 构建。
 3. **开源许可证与供应链审计（`license-audit`）**：
-   - 运行 `cargo-deny check licenses bans sources`，验证所有第三方 Crate 依赖与主程序 `AGPL-3.0-only` 及子库 `telegram-rich`（`MIT OR Apache-2.0`）许可证兼容。
+   - 运行 `cargo-deny check licenses bans sources`，验证所有第三方 Crate 依赖与主程序 `AGPL-3.0` 及子库 `telegram-rich`（`MIT OR Apache-2.0`）许可证兼容。
 4. **VitePress 双语文档站构建与死链检测（`docs`）**：
    - 运行 `pnpm --dir docs build`，通过 VitePress 构建期死链检测排查中英文内部断链或语法错误。
 

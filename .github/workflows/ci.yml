@@ -124,3 +124,13 @@ jobs:
 
       - name: Build VitePress documentation site
         run: pnpm --dir docs build
+
+  docker-web-stage:
+    name: Dockerfile Web Stage (node:26-alpine)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify Dockerfile web-builder stage
+        run: docker build --target web-builder -t feedcourier-web-builder:ci .

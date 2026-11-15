@@ -290,7 +290,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ steps.registries.outputs.image }}
-          short-description: Lightweight pure-Rust RSS/Atom/JSON Feed delivery gateway with SMTP, Telegram, Notion & MCP
+          short-description: RSS/Atom/JSON Feed subscription delivery service for SMTP Email, Telegram, Notion & MCP
           readme-filepath: ./README.md
 
   release:

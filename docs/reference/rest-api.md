@@ -27,7 +27,7 @@ Liveness probe and AGPLv3 compliance metadata endpoint.
   {
     "name": "FeedCourier",
     "version": "0.1.2",
-    "license": "AGPL-3.0-only",
+    "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"
   }

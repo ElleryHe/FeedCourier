@@ -1,4 +1,4 @@
-# cargo-deny v2 configuration for FeedCourier (`AGPL-3.0-only`)
+# cargo-deny v2 configuration for FeedCourier (`AGPL-3.0`)
 # Enforced in CI via `EmbarkStudios/cargo-deny-action@v2`.
 
 [graph]
