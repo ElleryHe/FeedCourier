@@ -1,35 +1,35 @@
-# Native MCP Client Setup
+# Client Setup & Security
 
-FeedCourier embeds a native **Model Context Protocol (MCP)** server powered by the official Rust SDK (`rmcp`) directly on its Axum HTTP listener at **`/mcp`** using the **Streamable HTTP** transport.
+FeedCourier provides a built-in **Model Context Protocol (MCP)** server at **`/mcp`** over the **Streamable HTTP** transport on the same port as the WebUI (default `0.0.0.0:8080`).
 
-No sidecar bridges, Node.js wrappers, or stdio tunnels are required—any MCP client that supports Streamable HTTP can connect directly with a static Bearer token.
+Any MCP client that supports Streamable HTTP (or `mcp-remote`) can connect directly using a Bearer token issued in the WebUI to check feed status, inspect failed deliveries, preview full-text extraction and filters, or manage feeds and routes.
 
 ---
 
-## Step 1: Issue a Scoped Bearer Token in WebUI
+## 1. Issue a Bearer Token in the WebUI
 
-1. Sign in to your FeedCourier WebUI (`http://127.0.0.1:8080`).
-2. Navigate to **Settings → Native MCP Server (`/mcp`)**.
-3. Enter a descriptive token name (e.g., `Claude Desktop` or `Cursor On-Call`) and select one of the two permission scopes:
+1. Sign in to the FeedCourier WebUI (`http://127.0.0.1:8080`).
+2. Open **Settings → Native MCP Server (`/mcp`)**.
+3. Enter a name for the token (for example, `Claude Desktop` or `Cursor`) and choose a permission scope:
 
-| Scope | Permitted Tools | Recommended Use Case |
+| Scope | Allowed Tools | Typical Use |
 | :--- | :--- | :--- |
-| **`readonly`** | `list_feeds_status`, `inspect_failed_deliveries`, `preview_feed_latest` | Daily health checks, dead-letter diagnostics, and dry-run feed/Readability/filter previews without modifying state. |
-| **`admin`** | All `readonly` tools **plus** `manage_feed`, `configure_route`, `reset_and_poll_feed`, `retry_dead_tasks` | Full natural-language feed subscription management, filter tuning, route binding, circuit-breaker recovery, and dead-letter requeueing. |
+| **`readonly`** | `list_feeds_status`, `inspect_failed_deliveries`, `preview_feed_latest` | Status checks, delivery failure diagnostics, and dry-run feed/filter previews without modifying any data. |
+| **`admin`** | All `readonly` tools **plus** `manage_feed`, `configure_route`, `reset_and_poll_feed`, `retry_dead_tasks` | Adding, updating, pausing, or deleting feeds, configuring route rules, resetting feeds, and retrying failed tasks. |
 
-4. Click **Issue Token** and copy the one-time `fc_mcp_...` secret (or the pre-formatted client JSON snippet).
+4. Click **Issue Token** and copy the generated `fc_mcp_...` token (or the ready-to-paste client JSON configuration).
 
-::: info SHA-256 Token Storage
-FeedCourier never stores raw MCP tokens in SQLite. Only the **SHA-256 hex digest** (`mcp_tokens.token_hash`) and a short display prefix (`token_prefix`) are persisted. If you lose a token, revoke it in the WebUI and issue a new one.
+::: info Token Storage
+The plaintext token is shown only once when created. FeedCourier stores only a SHA-256 hash and a short prefix in the database. If you lose a token, revoke it in the WebUI and create a new one.
 :::
 
 ---
 
-## Step 2: Configure Your MCP Client
+## 2. Configure Your MCP Client
 
-### Claude Desktop / Cursor / Windsurf (Streamable HTTP)
+### Cursor / Windsurf / Streamable HTTP Clients
 
-Add the following entry to your client's `mcpServers` configuration file:
+Add the following entry to your client's `mcpServers` configuration file (such as `~/.cursor/mcp.json`):
 
 ```json
 {
@@ -45,9 +45,26 @@ Add the following entry to your client's `mcpServers` configuration file:
 }
 ```
 
-::: tip Remote HTTPS Deployments
-If your FeedCourier instance is hosted behind a reverse proxy (see [Reverse Proxy & HTTPS Deployment](/guide/operations#reverse-proxy-https-deployment)), replace `http://127.0.0.1:8080/mcp` with `https://feedcourier.example.com/mcp` and ensure response buffering is disabled (`flush_interval -1` in Caddy or `proxy_buffering off;` in Nginx).
-:::
+### Claude Desktop (via `mcp-remote` if Custom Headers Require `stdio`)
+
+If your desktop client version requires a local `stdio` command to attach custom `Authorization` headers, you can bridge to `/mcp` with `mcp-remote`:
+
+```json
+{
+  "mcpServers": {
+    "feedcourier": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://127.0.0.1:8080/mcp",
+        "--header",
+        "Authorization: Bearer fc_mcp_your_token_here"
+      ]
+    }
+  }
+}
+```
 
 ### Claude Code CLI
 
@@ -56,19 +73,35 @@ claude mcp add --transport http feedcourier http://127.0.0.1:8080/mcp \
   --header "Authorization: Bearer fc_mcp_your_token_here"
 ```
 
+::: tip Remote HTTPS Deployments
+If your FeedCourier instance is hosted behind a reverse proxy (see [Reverse Proxy & HTTPS Deployment](/guide/operations#reverse-proxy-https-deployment)), replace `http://127.0.0.1:8080/mcp` with `https://feedcourier.example.com/mcp` and make sure response buffering is disabled (`flush_interval -1` in Caddy or `proxy_buffering off;` in Nginx).
+:::
+
 ---
 
-## Example Natural-Language Workflows
+## 3. Security Overview
 
-Once connected, you can ask your AI assistant to operate FeedCourier directly:
+Connecting an AI assistant to an application that processes external web feeds requires clear permission boundaries:
 
-- **Health & Dead-Letter Triage (`readonly`)**:
+- **Permission Scopes (`readonly` vs. `admin`)**: A `readonly` token can only inspect feed health, view failed delivery logs, and run non-persistent feed previews. Only `admin` tokens can modify feeds, routes, or queued tasks.
+- **Channel & Recipient Isolation (WebUI Only)**: Channel credentials (SMTP passwords, Telegram Bot Tokens, Notion Integration Secrets) and delivery destinations (recipient email addresses, Telegram `chat_id`, Notion databases) can **only** be created or modified by an administrator signed in to the WebUI. The MCP server does not provide any tool to create or edit channels, and channel listings in MCP only return numeric channel IDs and display names—never credentials or destination addresses.
+- **Prompt Injection & Private Network Protection**: External feed titles, summaries, and upstream error messages returned to MCP clients are truncated and wrapped as untrusted content so malicious text inside an article cannot trick an AI assistant into executing unintended actions. In addition, live feed previews (`preview_feed_latest`) and feed additions (`manage_feed`) automatically block requests to private and loopback network addresses unless explicitly permitted in [`SSRF_ALLOWLIST`](/guide/configuration#allowing-trusted-internal-services-ssrf-allowlist).
+
+For technical details on credential encryption, content sanitization, and connection-layer SSRF checks, see [Security & Isolation](/reference/security).
+
+---
+
+## 4. Example Prompts
+
+Once connected, you can ask your AI assistant to help with everyday tasks:
+
+- **Status & Failure Diagnostics (`readonly`)**:
   > *"Check my FeedCourier status. Are any feeds in `backoff` or `circuit_open`? Inspect any dead-letter delivery tasks and explain why they failed."*
-- **Dry-Run Readability & Filter Tuning (`readonly`)**:
+- **Previewing Full-Text Extraction & Filters (`readonly`)**:
   > *"Preview `https://blog.rust-lang.org/feed.xml` with `fetch_full_content: true` and test an `include_keywords` filter for `['release', 'security']`. Show me which recent posts match."*
-- **End-to-End Subscription & Routing (`admin`)**:
-  > *"Subscribe to `https://lwn.net/headlines/rss` with tags `['linux', 'kernel']` and `fetch_full_content: true`, then route the `linux` tag to my Notion channel in Rich/Markdown mode."*
-- **Circuit-Breaker Recovery (`admin`)**:
-  > *"Reset and immediately poll feed #4, then retry all dead-letter tasks."*
+- **Subscribing & Routing (`admin`)**:
+  > *"Subscribe to `https://lwn.net/headlines/rss` with tags `['linux', 'kernel']` and `fetch_full_content: true`, then route the `linux` tag to my Notion channel."*
+- **Recovering Paused Feeds & Failed Tasks (`admin`)**:
+  > *"Reset and poll feed #4 immediately, then retry all dead-letter delivery tasks."*
 
-See [MCP Tools Reference](/mcp/tools) for the complete JSON schemas of all 7 tools, and [MCP Security Boundaries](/mcp/security) for how FeedCourier prevents prompt injection and data exfiltration.
+See [Tools Overview](/mcp/tools) for the parameters and examples of all 7 MCP tools.

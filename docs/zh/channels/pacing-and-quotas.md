@@ -1,100 +1,99 @@
-# 流控、配额与过滤规则
+# 发送频率、配额与过滤
 
-在订阅源高频更新或首次批量拉取时，如果网关将数十篇新文章在 1 秒内并发轰炸至下游 SMTP 服务器、Telegram Bot API 或 Notion API，极易触发下游平台的反垃圾风控（如 SMTP `421`/`451` 临时封禁、Telegram `429 Too Many Requests (retry_after)` 或 Notion `429 Rate Limited`）。
+当订阅源集中更新时，如果在短时间内向 SMTP 服务器、Telegram 或 Notion 连续发送大量请求，容易触发下游平台的频率限制（如 SMTP `421`/`451` 临时限制、Telegram `429 Too Many Requests` 或 Notion `429 Rate Limited`）。
 
-FeedCourier 通过**单篇实时入队模型**、**同底层凭据共享限流锁**、**步进抖动（Pacing + Jitter）**、**小时/每日配额护栏**以及**路由级内容过滤引擎**，在保障实时性的同时彻底消除突发流量尖峰。
+FeedCourier 在推送通道（Channel）和路由规则（Route）两个层面提供了发送间隔控制、配额顺延与内容过滤功能，帮助你在 WebUI 中按需控制投递节奏与推送范围。
 
 ---
 
-## 1. `1 Task = 1 Entry × 1 Route` 实时入队模型
+## 1. 单篇实时入队与独立分发
 
-FeedCourier 不采用“定时汇总多篇文章拼成一封长周报”的批处理模式，而是全通道统一遵循 **`1 Task = 1 Entry × 1 Route`** 的流式原子模型：
+FeedCourier 按单篇文章逐条分发：每当订阅源拉取到一篇新文章，系统会检查所有启用中的路由规则（Routes）。如果文章所属的订阅源和内容满足某条路由的条件，就会为该路由生成一条独立的投递任务。
 
 ```mermaid
 flowchart LR
-    Entry["新文章 (entries)"] --> Eval{"匹配启用中的 Route?"}
-    Eval -->|"源/标签匹配 + 过滤规则通过"| T1["Task #1 (Route A -> SMTP)"]
-    Eval -->|"源/标签匹配 + 过滤规则通过"| T2["Task #2 (Route B -> Telegram)"]
-    Eval -->|"源/标签匹配 + 过滤规则通过"| T3["Task #3 (Route C -> Notion)"]
-    Eval -->|"未命中或被过滤拦截"| Purge["保留指纹 · 正文等待 GC"]
+    Entry["新文章"] --> Eval{"匹配启用中的路由?"}
+    Eval -->|"源/标签匹配 + 过滤规则通过"| T1["任务 1 -> SMTP 通道"]
+    Eval -->|"源/标签匹配 + 过滤规则通过"| T2["任务 2 -> Telegram 通道"]
+    Eval -->|"源/标签匹配 + 过滤规则通过"| T3["任务 3 -> Notion 通道"]
+    Eval -->|"未命中或被过滤"| Skip["仅保留去重指纹"]
 ```
 
-- 每当订阅源拉取到一篇全新指纹（`fingerprint_sha256`）的文章，引擎会立即遍历所有启用中的路由（`routes.enabled = 1`）；
-- 对每条命中的路由，向 `delivery_tasks` 表插入一条独立的投递任务（受 `UNIQUE (route_id, entry_id)` 唯一约束保护，绝不重复入队）；
-- 即使同一篇文章同时分发往 SMTP、Telegram 和 Notion 三个通道，各通道的排队进度、重试次数、配额顺延与断点状态（`checkpoint_json`）完全解耦、互不阻塞。
+即使同一篇文章同时发往 SMTP、Telegram 和 Notion 三个通道，各通道的排队进度、发送间隔与失败重试也彼此独立、互不阻塞。
 
 ---
 
-## 2. 同底层发信凭据跨通道共享限流锁
+## 2. 最小发送间隔与随机延迟
 
-在实际使用中，用户常常会基于**同一个底层发信凭据**创建多个逻辑通道，例如：
-- 使用同一个 Telegram Bot Token，分别创建推送至“技术资讯群话题 A”和“运维告警频道 B”的两个 Telegram 通道；
-- 使用同一个 Notion Internal Integration Secret，分别写入“每日阅读库”和“团队精选库”两个 Notion 数据源；
-- 使用同一个 SMTP 发件邮箱账号，分别投递给不同的收件人列表。
+在 WebUI **Channels** 页面创建或编辑推送通道时，可以配置两个发送频率参数：
 
-为了防止这些共享同一底层账号的通道各自独立计时而叠加突破平台限流，FeedCourier 在创建或更新通道时会自动计算脱敏的 **`credential_group_key`**（HMAC/SHA-256 派生标识，源码见 `ChannelConfig::credential_group_key`）：
+| 参数名称 | 字段名 | 默认值 | 说明 |
+| :--- | :--- | :---: | :--- |
+| **最小发送间隔（秒）** | `min_interval_secs` | `15` | 同一通道（或共享同一账号的通道组）连续两次发送之间的最小等待秒数。 |
+| **随机延迟上限（秒）** | `jitter_max_secs` | `10` | 在最小发送间隔基础上，额外叠加 `0` 到 `jitter_max_secs` 秒之间的随机等待时间。 |
 
-| 通道类型 | 共享限流分组键（`credential_group_key`）计算依据 | 共享效果 |
-| :--- | :--- | :--- |
-| **`smtp`** | ` lowercase(username \|\| from_address) @ lowercase(host) : port ` | 同一 SMTP 服务器上的同一认证账号自动共享发信步进间隔与 `421`/`45x` 全局冷却锁。 |
-| **`telegram`** | ` lowercase(api_base_url) : bot_token ` | 同一 Bot Token（在相同 Bot API 端点下）无论拆分出多少个 `chat_id` 或话题通道，自动共享步进间隔与 `retry_after` 冷却。 |
-| **`notion`** | ` integration_secret ` | 同一 Notion Integration Secret 关联的所有数据源通道自动共享步进间隔与 `429 Retry-After` 冷却。 |
-
-当组内任意一个通道收到下游返回的 `429` / `retry_after` 或 SMTP 临时流控响应时，调度器会将**同一 `credential_group_key` 下的所有通道**同步置入 `cooldown_until` 冷却窗口，避免其它同凭据通道继续撞墙。
+例如保持默认的 `15` 秒最小间隔与 `10` 秒随机延迟时，若一次拉取到 10 篇新文章，系统会以每篇间隔 **15 至 25 秒**的速度依次发送。仍在等待冷却间隔的任务会处于 `deferred`（顺延等待）状态，不会计入失败重试次数。
 
 ---
 
-## 3. 最小发信间隔与随机抖动（Pacing + Jitter）
+## 3. 小时配额与每日配额
 
-每个通道均可配置两个步进控制参数（在数据库与 REST API 中对应 `min_interval_secs` / `jitter_max_secs`，即通道级最小间隔 `min_interval_sec` 与随机抖动 `jitter_sec`）：
+除了控制两次发送之间的间隔外，你还可以为通道设置可选的发送总量上限：
 
-- **`min_interval_secs`（最小发信间隔秒数，默认 `15` 秒）**：同一 `credential_group_key` 连续两次投递之间的硬性最小冷却间隔；
-- **`jitter_max_secs`（随机抖动上限秒数，默认 `10` 秒）**：在最小间隔之上额外叠加 $0 \sim \text{jitter\_max\_secs}$ 秒的均匀分布随机延迟。
+- **每小时配额（`hourly_quota`）**：限制该通道在过去滚动 1 小时（3,600 秒）内最多发送成功的文章篇数（留空表示不限制）。
+- **每日配额（`daily_quota`）**：限制该通道在过去滚动 24 小时（86,400 秒）内最多发送成功的文章篇数（留空表示不限制）。
 
-每次投递完成后，该凭据组的下一次允许发信时间计算公式为：
-
-$$t_{\text{next\_allowed}} = t_{\text{completed}} + \text{min\_interval\_secs} + \text{Uniform}(0, \text{jitter\_max\_secs})$$
-
-例如默认配置（`15s + 0~10s`）下，突发涌入的 20 篇文章会以每篇间隔 **15 至 25 秒**的拟人化离散节奏平滑发出。若任务被领取时仍处于步进冷却期内，该任务会被无损置为 `deferred`（延迟至 $t_{\text{next\_allowed}}$），**不增加 `attempt_count` 重试计数**。
-
----
-
-## 4. 小时与每日配额护栏（`hourly_quota` & `daily_quota`）
-
-除了单次间隔控速外，你还可以为任意通道配置可选的总量水位护栏：
-
-- **`hourly_quota`（每小时最大投递篇数，可选）**：统计该通道在过去滚动 `3,600` 秒内成功送达（`status = 'delivered'`）的任务数；
-- **`daily_quota`（每日最大投递篇数，可选）**：统计该通道在过去滚动 `86,400` 秒内成功送达的任务数。
-
-### 超限顺延语义（`deferred` 而非丢弃）
+### 超出配额后的顺延机制
 
 > [!IMPORTANT]
-> 当某个通道触达 `hourly_quota` 或 `daily_quota` 上限时，新到达的投递任务**绝不会被丢弃或打入死信队列**，而是自动转入 **`deferred`（配额顺延）**状态：
-> - 小时配额触顶：顺延 `300` 秒（5 分钟）后重新检查滚动窗口水位；
-> - 每日配额触顶：顺延 `900` 秒（15 分钟）后重新检查滚动窗口水位；
-> - **零重试损耗**：转入 `deferred` 状态时会回退本次领取增加的 `attempt_count`，不会消耗任务宝贵的 6 次故障重试预算；同时只要存在未完成的 `deferred` 任务，后台 `NOT EXISTS` GC 便会自动保留该文章的正文载荷直至投递完成。
+> 当通道达到 `hourly_quota` 或 `daily_quota` 上限时，后续新文章的投递任务**不会被丢弃，也不会标记为失败**，而是自动进入 **`deferred`（顺延）**状态：
+> - 小时配额触顶时，任务每次顺延 5 分钟后重新检查窗口余量；
+> - 每日配额触顶时，任务每次顺延 15 分钟后重新检查窗口余量；
+> - 顺延等待期间不会消耗故障重试次数，且文章正文会一直保留至投递完成。
 
 ---
 
-## 5. 路由级订阅源选择与内容过滤规则
+## 4. 同账号 / 同令牌通道自动共享限流
 
-在 `routes`（路由规则）中，你可以精细控制哪些订阅源的哪些文章允许进入目标通道。
+在实际使用中，你可能会使用同一个发信账号创建多个推送通道，例如：
+- 用同一个 Telegram `bot_token` 分别创建发往“技术群话题 A”和“个人频道 B”的两个通道；
+- 用同一个 Notion `integration_secret` 分别写入两个不同的 Notion 数据库；
+- 用同一个 SMTP 邮箱账号分别发往不同的收件人。
 
-### 第一步：订阅源匹配（Feed Selector）
+FeedCourier 会自动识别使用相同底层账号或令牌的通道，并将它们的发送间隔与限流冷却状态合并计算：
+- 同一 SMTP 服务器上的同一发件账号共享发送间隔与临时限流冷却；
+- 同一 Telegram `bot_token`（在相同 API 地址下）关联的所有通道共享发送间隔与 `retry_after` 冷却；
+- 同一 Notion `integration_secret` 关联的所有通道共享发送间隔与 `429` 冷却。
 
-每条路由可通过 `feed_ids`（指定订阅源 ID 数组）与 `match_tags`（指定标签数组，大小写不敏感）组合筛选输入源：
-- 若 `feed_ids` 与 `match_tags` **均为空数组 `[]`**：该路由默认匹配**全部订阅源**（适合全局汇总归档通道）；
-- 若配置了 `feed_ids` 或 `match_tags`：只要订阅源的 `id` 在 `feed_ids` 中，**或者**订阅源携带的任意标签命中 `match_tags`（逻辑或 `OR`），即视为源匹配成功。
+当其中一个通道收到下游平台的限流提示时，共享同一凭据的其余通道也会同步等待冷却结束，避免多个通道同时发送触发更严格的封禁。
 
-### 第二步：标题与正文内容过滤（Content Filter Rules）
+---
 
-源码定于 `src/ingest/filter.rs`（`CompiledContentFilter::evaluate`）。系统将文章的**标题（`title`）**与**纯文本正文（`plain_text` / `summary_text`）**合并为检索语料，按以下四步顺序严格判定：
+## 5. 路由级订阅源选择与内容过滤
 
-1. **排除关键词（`exclude_keywords`）**：大小写不敏感子串匹配。只要语料命中列表中**任意一个**排除词，立即拒绝（返回 `excluded by keyword '...'`）。
-2. **排除正则表达式（`exclude_regex`）**：只要语料匹配该正则表达式，立即拒绝（返回 `excluded by regex '...'`）。
-3. **包含关键词（`include_keywords`）**：当列表非空时，语料必须至少命中其中**一个**关键词（逻辑或 `OR`），否则拒绝（返回 `did not match any include_keywords`）。
-4. **包含正则表达式（`include_regex`）**：当配置非空时，语料必须匹配该正则表达式，否则拒绝（返回 `did not match include_regex '...'`）。
+在 WebUI **Routes** 页面（或通过 MCP 的 [`configure_route`](/zh/mcp/tools#5-configure-route) 工具）创建路由时，可以分两步筛选要推送的文章：
+
+### 第一步：选择订阅源或标签
+
+每条路由可通过 **指定订阅源（`feed_ids`）** 与 **匹配标签（`match_tags`，不区分大小写）** 筛选文章来源：
+- 若 `feed_ids` 与 `match_tags` **均留空**：该路由默认匹配**全部订阅源**；
+- 若填写了 `feed_ids` 或 `match_tags`：只要文章所属订阅源在 `feed_ids` 列表中，**或者**订阅源带有 `match_tags` 中的任一标签，即视为匹配该路由。
+
+### 第二步：关键词与正则表达式过滤
+
+系统会将文章的**标题**与**正文纯文本（或摘要）**合并检查，并按以下顺序依次判断：
+
+1. **排除关键词（`exclude_keywords`）**：不区分大小写。只要标题或正文中包含列表里的**任意一个**词，该文章就会被跳过。
+2. **排除正则表达式（`exclude_regex`）**：只要标题或正文匹配该正则表达式，该文章就会被跳过。
+3. **包含关键词（`include_keywords`）**：当列表非空时，标题或正文必须至少包含其中的**一个**词，否则跳过。
+4. **包含正则表达式（`include_regex`）**：当填写了正则表达式时，标题或正文必须匹配该表达式，否则跳过。
 
 > [!TIP]
-> **防 ReDoS 正则安全边界**：所有用户或 MCP 配置的正则表达式均由 Rust `regex` 引擎编译，并强制施加字符长度上限（`MAX_REGEX_PATTERN_LEN = 512`）与编译后 DFA/NFA 体积限制（`size_limit(256 KiB)`、`dfa_size_limit(256 KiB)`），从算法层面免疫灾难性回溯（ReDoS）。
-> 你可以在 WebUI 创建路由前，或通过 MCP 调用 [`preview_feed_latest`](/zh/mcp/tools) 工具传入过滤参数，实时预览最近 10 篇文章的命中结果（`matched_filter`）与未命中原因（`filter_reason`）。
+> 在正式保存路由规则前，你可以在 WebUI 中使用订阅源预览功能，或通过 MCP 调用 [`preview_feed_latest`](/zh/mcp/tools#3-preview-feed-latest) 传入过滤条件，直接查看最近 10 篇文章中哪些会命中、哪些会被哪条规则排除。
+
+---
+
+## 延伸阅读
+
+- 关于发件箱状态机、租约恢复与共享限流键的内部实现，请参阅架构手册中的 [系统架构总览](/zh/reference/architecture)。
+- 关于各通道重试策略与协议交互细节，请参阅架构手册中的 [通道协议与投递实现](/zh/reference/channel-protocols)。

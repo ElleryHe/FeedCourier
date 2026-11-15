@@ -1,12 +1,12 @@
 # Quick Start
 
-FeedCourier ships as a self-contained single binary and a multi-architecture Docker image (`linux/amd64`, `linux/arm64`) with the React 19 WebUI and SQLite migrations embedded inside.
+FeedCourier runs as a standalone binary or a multi-architecture Docker image (`linux/amd64`, `linux/arm64`) with the web console and SQLite database migrations bundled inside.
 
 ---
 
-## Option 1: Docker Run (Fastest)
+## Option 1: Docker Run
 
-Multi-arch images are published to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)** on every tagged release:
+Multi-architecture images are published to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
 
 ```bash
 docker run -d \
@@ -15,26 +15,26 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
-  # Or pin an exact semantic version:
-  # elleryhe/feedcourier:0.1.1
+  # Or pin a specific release version:
+  # elleryhe/feedcourier:0.1.2
 ```
 
 Once the container starts:
 
 1. Open **`http://127.0.0.1:8080`** in your browser.
-2. On first launch, the WebUI prompts you to set your administrator password (unless you pre-seeded `ADMIN_PASSWORD`).
-3. FeedCourier automatically generates `/data/master.key` (`0600` permissions) and initializes `/data/feedcourier.db` in SQLite `WAL` mode.
+2. On first launch, the WebUI prompts you to set an administrator password (unless you configured `ADMIN_PASSWORD` in the environment).
+3. FeedCourier generates `/data/master.key` (`0600` file permissions) and initializes `/data/feedcourier.db` in SQLite `WAL` mode.
 
 ---
 
-## Option 2: Docker Compose (Recommended for Production)
+## Option 2: Docker Compose
 
 Create a `docker-compose.yml` file:
 
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.1
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.2
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -58,7 +58,7 @@ Start the service in the background:
 docker compose up -d
 ```
 
-Verify the gateway health check:
+Verify the health endpoint:
 
 ```bash
 curl -s http://127.0.0.1:8080/api/v1/health
@@ -68,8 +68,8 @@ curl -s http://127.0.0.1:8080/api/v1/health
 {
   "status": "ok",
   "app": "FeedCourier",
-  "version": "0.1.1",
-  "license": "AGPL-3.0-only",
+  "version": "0.1.2",
+  "license": "AGPL-3.0",
   "repo_url": "https://github.com/ElleryHe/FeedCourier"
 }
 ```
@@ -78,7 +78,7 @@ curl -s http://127.0.0.1:8080/api/v1/health
 
 ## Option 3: Prebuilt Binaries
 
-Standalone release archives with `SHA256SUMS.txt` are published on **[GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases)** for four targets:
+Release archives and `SHA256SUMS.txt` are published on **[GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases)** for four targets:
 
 | Platform | Target Triple | Archive Name |
 | :--- | :--- | :--- |
@@ -91,7 +91,7 @@ Download, verify, and run:
 
 ```bash
 # Example for Linux x86_64 (replace VERSION as appropriate)
-VERSION="0.1.1"
+VERSION="0.1.2"
 TARGET="x86_64-unknown-linux-gnu"
 
 curl -LO "https://github.com/ElleryHe/FeedCourier/releases/download/v${VERSION}/feedcourier-${VERSION}-${TARGET}.tar.gz"
@@ -114,7 +114,7 @@ DATA_DIR=./data LISTEN_ADDR=127.0.0.1:8080 ./feedcourier
 
 - **Rust 1.94+** (`2024` Edition)
 - **Node.js 24+** and **`pnpm` 10+** (via `corepack enable`)
-- **`cmake`** and a C compiler (required by `aws-lc-rs` for `rustls` TLS cryptography)
+- **`cmake`** and a C compiler (used by `aws-lc-rs` for `rustls` TLS)
 
 ### Build Steps
 
@@ -123,21 +123,20 @@ DATA_DIR=./data LISTEN_ADDR=127.0.0.1:8080 ./feedcourier
 git clone https://github.com/ElleryHe/FeedCourier.git
 cd FeedCourier
 
-# 2. Build the embedded React 19 WebUI assets into web/dist
+# 2. Build the WebUI assets into web/dist
 corepack enable
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web build
 
-# 3. Compile the single static-asset release binary
-#    (rust-embed bundles web/dist directly into the executable)
+# 3. Compile the release binary (bundles web/dist into the executable)
 cargo build --release --locked
 
-# 4. Run the gateway
+# 4. Run the service
 DATA_DIR=./data LISTEN_ADDR=127.0.0.1:8080 ./target/release/feedcourier
 ```
 
 ::: info Building a Local Container Image
-You can also build the multi-stage container image locally using the repository `Dockerfile`:
+You can also build a container image locally using the repository `Dockerfile`:
 ```bash
 docker build -t feedcourier:local .
 ```
@@ -145,11 +144,11 @@ docker build -t feedcourier:local .
 
 ---
 
-## First-Time Onboarding Checklist
+## First-Time Setup Steps
 
-After signing into the WebUI at `http://127.0.0.1:8080`:
+After signing in to the WebUI at `http://127.0.0.1:8080`:
 
-1. **Create a Trusted Delivery Channel** — Go to **Channels** and configure [SMTP](/channels/smtp), [Telegram](/channels/telegram), or [Notion](/channels/notion). Click **Test** to send an immediate verification message or page.
-2. **Add Feeds or Import OPML** — Go to **Feeds** to add an RSS/Atom/JSON Feed URL (with **Silent Init** enabled by default so historical articles don't flood your channel), or import an OPML 2.0 file.
-3. **Bind a Route** — Go to **Routes** and link specific feeds or tags (e.g., `rust`, `security`) to your target channel, optionally configuring keyword/regex filters and Telegram presentation modes.
-4. **(Optional) Connect an AI Assistant** — Go to **Settings → Native MCP Server (`/mcp`)** to issue a `readonly` or `admin` Bearer token for Claude Desktop, Cursor, or Windsurf. See [MCP Client Setup](/mcp/setup).
+1. **Create a Delivery Channel** — Go to **Channels** and configure [SMTP Email](/channels/smtp), [Telegram](/channels/telegram), or [Notion](/channels/notion). Click **Test** to send a verification message or page.
+2. **Add Feeds or Import OPML** — Go to **Feeds** to add an RSS, Atom, or JSON Feed URL (with **Silent Init** enabled by default so existing historical articles are not sent all at once), or import an OPML 2.0 file.
+3. **Create a Route** — Go to **Routes** and link specific feeds or tags (such as `rust` or `security`) to your target channel, optionally adding keyword or regex filters.
+4. **(Optional) Connect an MCP Client** — Go to **Settings → Native MCP Server (`/mcp`)** to generate a `readonly` or `admin` Bearer token for Claude Desktop, Cursor, or Windsurf. See [Client Setup & Security](/mcp/setup).

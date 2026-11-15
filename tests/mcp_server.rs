@@ -1,6 +1,6 @@
 //! End-to-end Streamable HTTP integration tests for the built-in `/mcp` server (`rmcp` 3.10):
 //! - Mandatory Bearer token authentication (`401 Unauthorized` + `WWW-Authenticate`)
-//! - AGPL-3.0-only Section 13 `ServerConfig` (`ServerInfo`) & prompt-injection instructions
+//! - AGPL-3.0 Section 13 `ServerConfig` (`ServerInfo`) & prompt-injection instructions
 //! - `readonly` token capabilities (`list_feeds_status`, `inspect_failed_deliveries`,
 //!   `preview_feed_latest`), `<untrusted_feed_content>` XML boundary escaping, SSRF blocking,
 //!   channel secret redaction, and strict `admin` scope denial with zero SQLite mutation
@@ -540,7 +540,7 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
     let mut ro_client = McpHttpClient::new(&harness.mcp_url, &harness.readonly_token);
     let init_result = ro_client.initialize().await;
 
-    // Verify AGPL-3.0-only Section 13 compliance & prompt-injection instructions in ServerInfo.
+    // Verify AGPL-3.0 Section 13 compliance & prompt-injection instructions in ServerInfo.
     assert_eq!(init_result["serverInfo"]["name"], "feedcourier");
     assert_eq!(
         init_result["serverInfo"]["websiteUrl"],
@@ -550,8 +550,8 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
         .as_str()
         .expect("ServerInfo instructions must be present");
     assert!(
-        instructions.contains("AGPL-3.0-only"),
-        "instructions must disclose AGPL-3.0-only: {instructions}"
+        instructions.contains("AGPL-3.0"),
+        "instructions must disclose AGPL-3.0: {instructions}"
     );
     assert!(
         instructions.contains("https://github.com/ElleryHe/FeedCourier"),

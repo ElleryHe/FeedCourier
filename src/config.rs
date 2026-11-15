@@ -11,11 +11,11 @@ pub const APP_NAME: &str = "FeedCourier";
 /// Build version sourced from `Cargo.toml` (`CARGO_PKG_VERSION`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Upstream source repository URL (required by AGPL-3.0-only Section 13 in WebUI & MCP ServerInfo).
+/// Upstream source repository URL (required by AGPL-3.0 Section 13 in WebUI & MCP ServerInfo).
 pub const REPO_URL: &str = "https://github.com/ElleryHe/FeedCourier";
 
-/// SPDX license identifier for FeedCourier.
-pub const LICENSE_SPDX: &str = "AGPL-3.0-only";
+/// License identifier for FeedCourier.
+pub const LICENSE_SPDX: &str = "AGPL-3.0";
 
 /// Default persistent data directory.
 pub const DEFAULT_DATA_DIR: &str = "./data";

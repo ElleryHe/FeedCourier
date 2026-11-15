@@ -7,36 +7,34 @@
 
   # FeedCourier
 
-  面向个人与极客小团队的纯血 Rust 单二进制 **RSS / Atom / JSON Feed 流式订阅投递网关**（空闲内存 `<20 MB`，仅需单一 `/data` SQLite WAL 数据卷），实时桥接 SMTP 邮件、Telegram Bot API 10.4 与 Notion `2026-03-11`，原生内嵌 React 19 管理面板与 Streamable HTTP `/mcp` 服务端。
+  基于 Rust、SQLite 与 React 构建的 **RSS / Atom / JSON Feed 订阅投递服务**。定时抓取订阅源，按需提取全文并去重过滤，将文章投递至 SMTP 邮件、Telegram 与 Notion，内置 Web 管理控制台与 `/mcp` 服务端。
 
-  [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
-  [![Release](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml/badge.svg)](https://github.com/ElleryHe/FeedCourier/actions/workflows/release.yml)
+  [![CI](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ElleryHe/FeedCourier/actions/workflows/ci.yml)
+  [![Release](https://img.shields.io/github/v/release/ElleryHe/FeedCourier?label=Release)](https://github.com/ElleryHe/FeedCourier/releases/latest)
   [![Docker Hub](https://img.shields.io/docker/v/elleryhe/feedcourier?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/elleryhe/feedcourier)
-  [![Docs](https://img.shields.io/badge/Docs-feedcourier.ellery.me-10B981)](https://feedcourier.ellery.me/zh/)
-  [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](./LICENSE)
-  [![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
+  [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 
   [English](./README.md) | **简体中文** | [官方文档](https://feedcourier.ellery.me/zh/)
 </div>
 
 ---
 
-## 核心特性
+## 功能特点
 
-- **做投递网关，不做阅读器（正文阅后即焚）** —— 四级防漂移 SHA-256 指纹在 SQLite 中永久留存防重，清洗后的 HTML 正文与媒体元数据在 `RETENTION_HOURS=24` 闭环后由零引用计数 `NOT EXISTS` GC 自动回收；防盗链媒体全程内存流式中转、绝不落盘。
-- **三大精选推送通道** —— 实时投递至 **SMTP 精品阅读邮件**（`Force-From` 保障 SPF/DKIM/DMARC、响应式内联 CSS 信纸）、**Telegram Bot API 10.4**（基于 [`telegram-rich`](https://crates.io/crates/telegram-rich) 的 `sendRichMessage` 富文档、快讯模式、媒体模式及自建 Local Bot API 自动降级）与 **Notion（`2026-03-11`）**（自动初始化 7 列标准数据源、Markdown v2 动态反引号扩充、`allow_async: true` 异步长文写入）。
-- **租约制发件箱、防风控匀速控速与 `checkpoint_json` 崩溃恢复** —— 按 `1 Task = 1 Entry × 1 Route` 独立入队，支持同凭据共享的**最小间隔 + 随机抖动**与**小时/日配额护栏**；基于 `lease_until` 租约与 `checkpoint_json` 断点对账实现 Notion `FC-ID` 有效一次（Effective-once）投递与 Telegram 10 项媒体组分批续发。
-- **连接层 DNS 防 SSRF 与按源/按通道分流代理** —— 出站请求在 TCP 建连前校验解析 IP 并逐跳重验 `30x` 重定向，支持 `SSRF_ALLOWLIST` 精细放行内网服务、流式体积硬上限与按需 `dom_smoothie` Readability 全文提取，以及按源/按通道独立启用 HTTP / SOCKS5 代理。
-- **原生内嵌 Streamable HTTP `/mcp` 与 React 19 WebUI** —— 共享同一业务内核，支持签发 `readonly` / `admin` SHA-256 Bearer 令牌；通道密钥以 ChaCha20-Poly1305 加密黑盒存储、收件终点独占锁死在 WebUI，并对外部订阅内容实施 `<untrusted_feed_content>` 防提示词注入隔离。
+- **文章去重与定期清理** —— 在 SQLite 中长期保留文章 SHA-256 指纹以避免重复投递；已投递的 HTML 正文与媒体元数据在保留期（默认 24 小时）过后自动清理，防盗链媒体通过内存流式转发。
+- **多通道投递（SMTP 邮件 / Telegram / Notion）** —— 支持将匹配文章投递至 **SMTP 邮件**（响应式内联 CSS 模板、`Force-From` 发件人对齐）、**Telegram**（富文本消息、摘要卡片与媒体消息模式，兼容自建 Local Bot API）以及 **Notion**（自动初始化数据库属性列、Markdown 转换与长文异步写入）。
+- **发送速率控制与断点恢复** —— 每篇文章与路由独立入队（`1 Task = 1 Entry × 1 Route`），支持按通道凭据共享最小发送间隔、随机抖动以及每小时/每日发送配额；进程重启或中断后支持任务租约回收与进度恢复。
+- **连接层防 SSRF 与按源/按通道代理** —— 出站 HTTP 请求在建立连接前校验解析后的 IP 地址，并逐跳检查 `30x` 重定向；支持配置内网白名单、响应体积上限、按需 Readability 全文提取，以及按订阅源或通道独立开启 HTTP / SOCKS5 代理。
+- **内置 Web 控制台与 `/mcp` 接口** —— 单一可执行文件内置 React 管理界面与 Streamable HTTP `/mcp` 端点，支持签发只读（`readonly`）与管理（`admin`）令牌；通道凭据加密存储，收件目标仅限在 Web 控制台中创建与修改。
 
 ```mermaid
 flowchart LR
-    Feed["RSS / Atom / JSON Feed"] --> Guard["防 SSRF 客户端 + Readability + 四级 SHA-256 去重"]
-    Guard --> DB[("SQLite WAL (/data)\n永久指纹 + 租约发件箱")]
-    DB --> SMTP["SMTP 阅读邮件"]
-    DB --> TG["Telegram Bot API 10.4"]
-    DB --> NT["Notion 2026-03-11"]
-    UI["内嵌 React 19 WebUI"] <--> DB
+    Feed["RSS / Atom / JSON Feed"] --> Guard["防 SSRF 抓取 + 全文提取 + SHA-256 去重"]
+    Guard --> DB[("SQLite (/data)\n去重指纹 + 投递队列")]
+    DB --> SMTP["SMTP 邮件"]
+    DB --> TG["Telegram"]
+    DB --> NT["Notion"]
+    UI["内置 Web 控制台"] <--> DB
     MCP["Streamable HTTP /mcp"] <--> DB
 ```
 
@@ -53,7 +51,7 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
-  # 或锁定精确版本：elleryhe/feedcourier:0.1.1
+  # 或锁定精确版本：elleryhe/feedcourier:0.1.2
 ```
 
 ### Docker Compose
@@ -61,7 +59,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.1
+    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.2
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -74,7 +72,7 @@ services:
       RETENTION_HOURS: "24"
 ```
 
-启动后访问 `http://127.0.0.1:8080` 初始化管理员密码。如需使用**四平台预编译二进制包或从源码构建**，请参阅 [快速开始指南](https://feedcourier.ellery.me/zh/guide/quick-start)。
+启动后访问 `http://127.0.0.1:8080` 初始化管理员密码。如需使用**预编译二进制包或从源码构建**，请参阅 [快速开始指南](https://feedcourier.ellery.me/zh/guide/quick-start)。
 
 ---
 
@@ -82,12 +80,12 @@ services:
 
 完整中英双语文档托管于 **[feedcourier.ellery.me/zh/](https://feedcourier.ellery.me/zh/)**：
 
-| 章节板块 | 核心文档直链 |
-| :--- | :--- |
-| **1. 快速开始与运维** | [项目介绍与设计边界](https://feedcourier.ellery.me/zh/guide/introduction) · [快速开始（Docker / 二进制 / 源码）](https://feedcourier.ellery.me/zh/guide/quick-start) · [环境变量与代理 / SSRF 配置](https://feedcourier.ellery.me/zh/guide/configuration) · [数据卷运维与在线热备](https://feedcourier.ellery.me/zh/guide/operations) |
-| **2. 三大推送通道** | [匀速步进与配额护栏](https://feedcourier.ellery.me/zh/channels/pacing-and-quotas) · [Telegram Bot API 10.4](https://feedcourier.ellery.me/zh/channels/telegram) · [Notion（`2026-03-11`）](https://feedcourier.ellery.me/zh/channels/notion) · [SMTP 阅读邮件](https://feedcourier.ellery.me/zh/channels/smtp) |
-| **3. MCP 智能接入** | [客户端接入与令牌管理](https://feedcourier.ellery.me/zh/mcp/setup) · [7 个 MCP 工具手册](https://feedcourier.ellery.me/zh/mcp/tools) · [纵深安全与信任边界](https://feedcourier.ellery.me/zh/mcp/security) |
-| **4. 架构与参考手册** | [核心系统架构](https://feedcourier.ellery.me/zh/reference/architecture) · [SQLite 数据库表结构](https://feedcourier.ellery.me/zh/reference/database-schema) · [REST API（`/api/v1/*`）](https://feedcourier.ellery.me/zh/reference/rest-api) · [自动化发布流水线](https://feedcourier.ellery.me/zh/reference/releasing) |
+| 手册分类 | 章节板块 | 文档直链 |
+| :--- | :--- | :--- |
+| **使用手册** | **入门与部署** | [项目简介](https://feedcourier.ellery.me/zh/guide/introduction) · [快速开始](https://feedcourier.ellery.me/zh/guide/quick-start) · [环境配置与代理](https://feedcourier.ellery.me/zh/guide/configuration) · [数据备份与维护](https://feedcourier.ellery.me/zh/guide/operations) |
+| **使用手册** | **推送通道设置** | [发送频率、配额与过滤](https://feedcourier.ellery.me/zh/channels/pacing-and-quotas) · [SMTP 邮件](https://feedcourier.ellery.me/zh/channels/smtp) · [Telegram](https://feedcourier.ellery.me/zh/channels/telegram) · [Notion](https://feedcourier.ellery.me/zh/channels/notion) |
+| **使用手册** | **MCP 接入** | [客户端接入与安全说明](https://feedcourier.ellery.me/zh/mcp/setup) · [工具说明](https://feedcourier.ellery.me/zh/mcp/tools) |
+| **架构手册** | **架构与开发手册** | [系统架构总览](https://feedcourier.ellery.me/zh/reference/architecture) · [通道协议与投递实现](https://feedcourier.ellery.me/zh/reference/channel-protocols) · [安全与防注入机制](https://feedcourier.ellery.me/zh/reference/security) · [数据库表结构](https://feedcourier.ellery.me/zh/reference/database-schema) · [REST API 接口](https://feedcourier.ellery.me/zh/reference/rest-api) · [构建与发布流程](https://feedcourier.ellery.me/zh/reference/releasing) |
 
 ---
 

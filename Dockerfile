@@ -1,10 +1,9 @@
 # =============================================================================
 # Stage 1: Build embedded React 19 + Vite WebUI (`web/dist`)
 # =============================================================================
-FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:26-alpine AS web-builder
 
-ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-RUN corepack enable && corepack prepare pnpm@10 --activate
+RUN npm install -g pnpm@10
 
 WORKDIR /build/FeedCourier/web
 
@@ -15,7 +14,7 @@ COPY web/ ./
 RUN pnpm build
 
 # =============================================================================
-# Stage 2: Build single-binary pure-Rust gateway (embedding `web/dist`)
+# Stage 2: Build single-binary Rust service (embedding `web/dist`)
 # =============================================================================
 FROM rust:1-bookworm AS rust-builder
 

@@ -31,8 +31,8 @@ export interface ActionAckResponse {
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_REPO_URL = "https://github.com/ElleryHe/FeedCourier";
-export const DEFAULT_LICENSE = "AGPL-3.0-only";
-export const DEFAULT_VERSION = "0.1.0";
+export const DEFAULT_LICENSE = "AGPL-3.0";
+export const DEFAULT_VERSION = "0.1.2";
 
 /** `GET /api/v1/auth/status` */
 export interface AuthStatusResponse {
@@ -44,7 +44,7 @@ export interface AuthStatusResponse {
   version: string;
   /** Source repository URL (AGPLv3 Section 13 compliance). */
   repo_url: string;
-  /** SPDX license identifier (`"AGPL-3.0-only"`). */
+  /** License identifier (`"AGPL-3.0"`). */
   license: string;
 }
 
