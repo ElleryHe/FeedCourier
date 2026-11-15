@@ -47,6 +47,8 @@ import {
   TagInput,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { useI18n } from "@/i18n";
+import type { Messages } from "@/i18n/en";
 import {
   errorMessage,
   formatDateTime,
@@ -59,86 +61,72 @@ const NOTION_STANDARD_COLUMNS: Array<{
   standardName: string;
   expectedType: string;
   required: boolean;
-  purpose: string;
 }> = [
   {
     key: "title",
     standardName: "Title",
     expectedType: "title",
     required: true,
-    purpose: "Article title",
   },
   {
     key: "fc_id",
     standardName: "FC-ID",
     expectedType: "rich_text",
     required: true,
-    purpose: "SHA-256 fingerprint for idempotency reconciliation",
   },
   {
     key: "link",
     standardName: "Link",
     expectedType: "url",
     required: false,
-    purpose: "Canonical article URL",
   },
   {
     key: "source",
     standardName: "Source",
     expectedType: "select",
     required: false,
-    purpose: "Feed source title",
   },
   {
     key: "published",
     standardName: "Published",
     expectedType: "date",
     required: false,
-    purpose: "Original publication timestamp",
   },
   {
     key: "state",
     standardName: "State",
     expectedType: "select",
     required: false,
-    purpose: "UnRead / Read reading state",
   },
   {
     key: "tag",
     standardName: "Tag",
     expectedType: "multi_select",
     required: false,
-    purpose: "Synced subscription tags",
   },
 ];
 
-function kindMeta(kind: ChannelKind) {
+function kindDefaults(kind: ChannelKind) {
   switch (kind) {
     case "smtp":
-      return {
-        label: "SMTP Email",
-        icon: Mail,
-        defaultInterval: 15,
-        defaultJitter: 10,
-      };
+      return { icon: Mail, defaultInterval: 15, defaultJitter: 10 };
     case "telegram":
-      return {
-        label: "Telegram Bot",
-        icon: MessageSquare,
-        defaultInterval: 3,
-        defaultJitter: 2,
-      };
+      return { icon: MessageSquare, defaultInterval: 3, defaultJitter: 2 };
     case "notion":
-      return {
-        label: "Notion Data Source",
-        icon: Database,
-        defaultInterval: 2,
-        defaultJitter: 2,
-      };
+      return { icon: Database, defaultInterval: 2, defaultJitter: 2 };
   }
 }
 
+function kindMeta(kind: ChannelKind, m: Messages) {
+  const base = kindDefaults(kind);
+  return {
+    ...base,
+    label: m.channels.kindLabels[kind],
+  };
+}
+
 export function ChannelsView() {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -161,14 +149,14 @@ export function ChannelsView() {
     },
     onSuccess: (res) => {
       if (res.ok) {
-        toast.success("Connectivity test succeeded", res.message);
+        toast.success(m.channels.toastTestOk, res.message);
       } else {
-        toast.error("Connectivity test reported an issue", res.message);
+        toast.error(m.channels.toastTestIssue, res.message);
       }
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
     },
     onError: (err) => {
-      toast.error("Connectivity test failed", errorMessage(err));
+      toast.error(m.channels.toastTestFailed, errorMessage(err));
     },
     onSettled: () => setTestingId(null),
   });
@@ -180,20 +168,20 @@ export function ChannelsView() {
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
     },
     onError: (err) => {
-      toast.error("Failed to toggle channel", errorMessage(err));
+      toast.error(m.channels.toastToggleFailed, errorMessage(err));
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: (id: number) => api.channels.remove(id),
     onSuccess: () => {
-      toast.success("Channel deleted");
+      toast.success(m.channels.toastDeleted);
       setDeletingChannel(null);
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
     },
     onError: (err) => {
-      toast.error("Failed to delete channel", errorMessage(err));
+      toast.error(m.channels.toastDeleteFailed, errorMessage(err));
     },
   });
 
@@ -203,10 +191,10 @@ export function ChannelsView() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-bold tracking-tight">
-            Trusted Delivery Channels
+            {m.channels.title}
           </h1>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            Credentials & destinations are ChaCha20-Poly1305 encrypted and locked exclusively to WebUI (never exposed to MCP prompts).
+            {m.channels.subtitle}
           </p>
         </div>
         <Button
@@ -217,20 +205,20 @@ export function ChannelsView() {
           }}
         >
           <Plus className="h-3.5 w-3.5" />
-          New Trusted Channel
+          {m.channels.newChannel}
         </Button>
       </div>
 
       {/* Channels List */}
       {channelsQuery.isLoading ? (
         <Card className="p-8 text-center text-xs text-zinc-500">
-          Loading trusted channels…
+          {m.channels.loading}
         </Card>
       ) : (channelsQuery.data?.length ?? 0) === 0 ? (
         <EmptyState
           icon={Radio}
-          title="No trusted channels configured"
-          description="Set up an SMTP inbox, a Telegram chat/topic (Bot API 10.4), or a Notion data source (2026-03-11) before creating delivery routes."
+          title={m.channels.emptyTitle}
+          description={m.channels.emptyDesc}
           action={
             <Button
               size="sm"
@@ -240,14 +228,14 @@ export function ChannelsView() {
               }}
             >
               <Plus className="h-3.5 w-3.5" />
-              Configure First Channel
+              {m.channels.configureFirst}
             </Button>
           }
         />
       ) : (
         <div className="grid gap-3.5 lg:grid-cols-2">
           {(channelsQuery.data ?? []).map((ch) => {
-            const meta = kindMeta(ch.kind);
+            const meta = kindMeta(ch.kind, m);
             const Icon = meta.icon;
             const hasCooldown =
               ch.cooldown_until &&
@@ -267,27 +255,22 @@ export function ChannelsView() {
                           <h3 className="text-sm font-semibold">{ch.name}</h3>
                           <Badge variant="outline">{meta.label}</Badge>
                           {!ch.enabled && (
-                            <Badge variant="default">Disabled</Badge>
+                            <Badge variant="default">{m.common.disabled}</Badge>
                           )}
                           {ch.use_proxy && (
                             <Badge variant="outline">
                               <Globe className="h-3 w-3" />
-                              Proxy
+                              {m.common.proxy}
                             </Badge>
                           )}
                         </div>
-                        <p className="mt-0.5 text-[11px] text-zinc-500">
-                          Pacing: min{" "}
-                          <span className="font-mono font-medium text-zinc-700 dark:text-zinc-300">
-                            {formatDurationSecs(ch.min_interval_secs)}
-                          </span>{" "}
-                          + up to{" "}
-                          <span className="font-mono font-medium text-zinc-700 dark:text-zinc-300">
-                            {formatDurationSecs(ch.jitter_max_secs)}
-                          </span>{" "}
-                          jitter
-                          {ch.hourly_quota ? ` · ${ch.hourly_quota}/hr` : ""}
-                          {ch.daily_quota ? ` · ${ch.daily_quota}/day` : ""}
+                        <p className="mt-0.5 font-mono text-[11px] text-zinc-500">
+                          {m.channels.pacingLine(
+                            formatDurationSecs(ch.min_interval_secs),
+                            formatDurationSecs(ch.jitter_max_secs),
+                            ch.hourly_quota,
+                            ch.daily_quota,
+                          )}
                         </p>
                       </div>
                     </div>
@@ -305,7 +288,9 @@ export function ChannelsView() {
                     {ch.config.kind === "smtp" && (
                       <div className="space-y-1">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Server:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.server}
+                          </span>
                           <span className="font-mono">
                             {ch.config.host}:{ch.config.port} (
                             {ch.config.security})
@@ -313,7 +298,7 @@ export function ChannelsView() {
                         </div>
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-zinc-500">
-                            Force-From → To:
+                            {m.channels.card.fromTo}
                           </span>
                           <span className="truncate font-mono">
                             {ch.config.from_address} →{" "}
@@ -321,11 +306,15 @@ export function ChannelsView() {
                           </span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Auth:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.auth}
+                          </span>
                           <span className="inline-flex items-center gap-1 font-mono text-[11px] text-zinc-500">
                             <Lock className="h-3 w-3" />
-                            {ch.config.username || "anonymous"}{" "}
-                            {ch.config.has_password ? "(••••••••)" : "(no pwd)"}
+                            {ch.config.username || m.channels.card.anonymous}{" "}
+                            {ch.config.has_password
+                              ? "(••••••••)"
+                              : m.channels.card.noPassword}
                           </span>
                         </div>
                       </div>
@@ -334,23 +323,31 @@ export function ChannelsView() {
                     {ch.config.kind === "telegram" && (
                       <div className="space-y-1">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Target Chat:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.targetChat}
+                          </span>
                           <span className="font-mono">
                             {ch.config.chat_id}
                             {ch.config.message_thread_id !== null
-                              ? ` (topic #${ch.config.message_thread_id})`
+                              ? m.channels.card.topicSuffix(
+                                  ch.config.message_thread_id,
+                                )
                               : ""}
                           </span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Bot API:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.botApi}
+                          </span>
                           <span className="truncate font-mono text-[11px]">
                             {ch.config.api_base_url ||
                               "https://api.telegram.org"}
                           </span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Bot Token:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.botToken}
+                          </span>
                           <span className="inline-flex items-center gap-1 font-mono text-[11px] text-zinc-500">
                             <Lock className="h-3 w-3" />
                             {ch.config.bot_token_hint}
@@ -365,20 +362,26 @@ export function ChannelsView() {
                     {ch.config.kind === "notion" && (
                       <div className="space-y-1">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Data Source ID:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.dataSourceId}
+                          </span>
                           <span className="truncate font-mono text-[11px]">
                             {ch.config.data_source_id}
                           </span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Required Keys:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.requiredKeys}
+                          </span>
                           <span className="font-mono text-[11px]">
                             {ch.config.column_mapping.title} ·{" "}
                             {ch.config.column_mapping.fc_id}
                           </span>
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-zinc-500">Secret:</span>
+                          <span className="text-zinc-500">
+                            {m.channels.card.secret}
+                          </span>
                           <span className="inline-flex items-center gap-1 font-mono text-[11px] text-zinc-500">
                             <Lock className="h-3 w-3" />
                             {ch.config.secret_hint}
@@ -400,13 +403,15 @@ export function ChannelsView() {
                           }
                         >
                           {ch.capabilities.supports_rich_message
-                            ? "Bot API 10.4 sendRichMessage Ready"
-                            : "sendRichMessage Unsupported (Compact Fallback)"}
+                            ? m.channels.card.richReady
+                            : m.channels.card.richUnsupported}
                         </Badge>
                       )}
                     {ch.capabilities.fallback_reason && (
                       <Badge variant="warning">
-                        Fallback: {ch.capabilities.fallback_reason}
+                        {m.channels.card.fallbackPrefix(
+                          ch.capabilities.fallback_reason,
+                        )}
                       </Badge>
                     )}
                     {hasCooldown && ch.cooldown_until && (
@@ -414,7 +419,9 @@ export function ChannelsView() {
                         variant="warning"
                         title={formatDateTime(ch.cooldown_until)}
                       >
-                        Cooldown {formatRelativeTime(ch.cooldown_until)}
+                        {m.channels.card.cooldownPrefix(
+                          formatRelativeTime(ch.cooldown_until),
+                        )}
                       </Badge>
                     )}
                   </div>
@@ -429,7 +436,7 @@ export function ChannelsView() {
                     loading={testingId === ch.id}
                   >
                     <Send className="h-3.5 w-3.5" />
-                    Send Test
+                    {m.channels.card.sendTest}
                   </Button>
 
                   <div className="flex items-center gap-1">
@@ -442,14 +449,15 @@ export function ChannelsView() {
                       }}
                     >
                       <Pencil className="h-3.5 w-3.5" />
-                      Edit
+                      {m.common.edit}
                     </Button>
                     <Button
                       variant="ghost"
                       size="icon"
                       onClick={() => setDeletingChannel(ch)}
                       className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                      title="Delete channel"
+                      title={m.channels.card.deleteTitle}
+                      aria-label={m.channels.card.deleteTitle}
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>
@@ -477,9 +485,9 @@ export function ChannelsView() {
         onConfirm={() => {
           if (deletingChannel) deleteMutation.mutate(deletingChannel.id);
         }}
-        title="Delete Trusted Channel"
-        description={`Delete "${deletingChannel?.name}"? Any routes and pending delivery tasks bound to this channel will also be removed via CASCADE.`}
-        confirmLabel="Delete Channel"
+        title={m.channels.deleteModalTitle}
+        description={m.channels.deleteModalDesc(deletingChannel?.name ?? "")}
+        confirmLabel={m.channels.deleteModalConfirm}
         loading={deleteMutation.isPending}
       />
     </div>
@@ -499,6 +507,7 @@ function ChannelWizardModal({
   onClose: () => void;
   channel: ChannelDto | null;
 }) {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const isEdit = channel !== null;
@@ -507,11 +516,11 @@ function ChannelWizardModal({
   const [name, setName] = useState(channel?.name ?? "");
   const [minIntervalSecs, setMinIntervalSecs] = useState<number>(
     channel?.min_interval_secs ??
-      kindMeta(channel?.kind ?? "telegram").defaultInterval,
+      kindDefaults(channel?.kind ?? "telegram").defaultInterval,
   );
   const [jitterMaxSecs, setJitterMaxSecs] = useState<number>(
     channel?.jitter_max_secs ??
-      kindMeta(channel?.kind ?? "telegram").defaultJitter,
+      kindDefaults(channel?.kind ?? "telegram").defaultJitter,
   );
   const [hourlyQuota, setHourlyQuota] = useState<string>(
     channel?.hourly_quota !== null && channel?.hourly_quota !== undefined
@@ -588,15 +597,16 @@ function ChannelWizardModal({
   );
   const [schemaInspection, setSchemaInspection] =
     useState<NotionInspectSchemaResponse | null>(null);
-  const [autoCreatedBanner, setAutoCreatedBanner] = useState<string | null>(
-    null,
-  );
+  const [autoCreatedIds, setAutoCreatedIds] = useState<{
+    databaseId: string;
+    dataSourceId: string;
+  } | null>(null);
 
   const [formError, setFormError] = useState<string | null>(null);
 
   const handleKindSwitch = (nextKind: ChannelKind) => {
     setKind(nextKind);
-    const defaults = kindMeta(nextKind);
+    const defaults = kindDefaults(nextKind);
     setMinIntervalSecs(defaults.defaultInterval);
     setJitterMaxSecs(defaults.defaultJitter);
     setFormError(null);
@@ -616,12 +626,13 @@ function ChannelWizardModal({
       setNotionTargetInput(res.data_source_id);
       setNotionDatabaseId(res.database_id);
       setNotionMapping(res.column_mapping);
-      setAutoCreatedBanner(
-        `Created 7-column database (${res.database_id}) → bound data_source_id ${res.data_source_id}.`,
-      );
+      setAutoCreatedIds({
+        databaseId: res.database_id,
+        dataSourceId: res.data_source_id,
+      });
       toast.success(
-        "Notion 7-column database created",
-        `Bound data_source_id: ${res.data_source_id}`,
+        m.channels.wizard.notion.toastCreatedTitle,
+        m.channels.wizard.notion.toastCreatedDesc(res.data_source_id),
       );
     },
     onError: (err) => {
@@ -646,15 +657,17 @@ function ChannelWizardModal({
       setNotionMapping(res.suggested_mapping);
       if (patchMissing && res.patched_columns.length > 0) {
         toast.success(
-          "Patched Notion data source schema",
-          `Added columns: ${res.patched_columns.join(", ")}`,
+          m.channels.wizard.notion.toastPatchedTitle,
+          m.channels.wizard.notion.toastPatchedDesc(
+            res.patched_columns.join(", "),
+          ),
         );
       } else {
         toast.info(
-          "Schema inspected",
+          m.channels.wizard.notion.toastInspectedTitle,
           res.ready
-            ? "Required columns (Title & FC-ID) verified."
-            : "Review missing or mismatched columns below.",
+            ? m.channels.wizard.notion.toastInspectedReady
+            : m.channels.wizard.notion.toastInspectedReview,
         );
       }
     },
@@ -770,7 +783,9 @@ function ChannelWizardModal({
       return api.channels.create(payload);
     },
     onSuccess: () => {
-      toast.success(isEdit ? "Channel updated" : "Trusted channel created");
+      toast.success(
+        isEdit ? m.channels.toastUpdated : m.channels.toastCreated,
+      );
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       onClose();
     },
@@ -784,7 +799,7 @@ function ChannelWizardModal({
     setFormError(null);
 
     if (!name.trim()) {
-      setFormError("Please provide a channel display name.");
+      setFormError(m.channels.wizard.errors.emptyName);
       return;
     }
 
@@ -794,45 +809,35 @@ function ChannelWizardModal({
         !smtpFromAddress.trim() ||
         smtpToAddresses.length === 0
       ) {
-        setFormError(
-          "SMTP host, Force-From address, and at least one trusted recipient To address are required.",
-        );
+        setFormError(m.channels.wizard.errors.smtpRequired);
         return;
       }
       if (smtpSecurity !== "plain" && !isEdit && !smtpPassword) {
-        setFormError(
-          "SMTP password is required for TLS/STARTTLS authentication.",
-        );
+        setFormError(m.channels.wizard.errors.smtpPassword);
         return;
       }
     } else if (kind === "telegram") {
       if (!tgChatId.trim()) {
-        setFormError("Telegram target chat_id is required.");
+        setFormError(m.channels.wizard.errors.tgChatId);
         return;
       }
       if (!isEdit && !tgBotToken.trim()) {
-        setFormError("Telegram Bot Token is required when creating a channel.");
+        setFormError(m.channels.wizard.errors.tgToken);
         return;
       }
     } else if (kind === "notion") {
       if (!isEdit && !notionSecret.trim()) {
-        setFormError(
-          "Notion Integration Secret is required when creating a channel.",
-        );
+        setFormError(m.channels.wizard.errors.notionSecret);
         return;
       }
       const effectiveDsId =
         notionDataSourceId.trim() || notionTargetInput.trim();
       if (!effectiveDsId) {
-        setFormError(
-          "Notion data_source_id is required. Auto-create a database or inspect an existing data source first.",
-        );
+        setFormError(m.channels.wizard.errors.notionDataSource);
         return;
       }
       if (!notionMapping.title.trim() || !notionMapping.fc_id.trim()) {
-        setFormError(
-          "Notion column mapping requires both Title and FC-ID columns.",
-        );
+        setFormError(m.channels.wizard.errors.notionRequiredCols);
         return;
       }
     }
@@ -847,16 +852,22 @@ function ChannelWizardModal({
     <Modal
       open={open}
       onClose={onClose}
-      title={isEdit ? `Edit Channel: ${channel?.name}` : "New Trusted Channel"}
-      description="All secrets are encrypted with ChaCha20-Poly1305. Channels sharing the same underlying credential automatically share pacing locks."
+      title={
+        isEdit
+          ? m.channels.wizard.editTitle(channel?.name ?? "")
+          : m.channels.wizard.newTitle
+      }
+      description={m.channels.wizard.desc}
       size="xl"
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
-            Cancel
+            {m.common.cancel}
           </Button>
           <Button onClick={handleSubmit} loading={saveMutation.isPending}>
-            {isEdit ? "Save Channel" : "Create Channel"}
+            {isEdit
+              ? m.channels.wizard.saveChannel
+              : m.channels.wizard.createChannel}
           </Button>
         </>
       }
@@ -866,8 +877,8 @@ function ChannelWizardModal({
         {!isEdit && (
           <div className="grid grid-cols-3 gap-2.5">
             {(["telegram", "smtp", "notion"] as const).map((k) => {
-              const m = kindMeta(k);
-              const Icon = m.icon;
+              const meta = kindMeta(k, m);
+              const Icon = meta.icon;
               const selected = kind === k;
               return (
                 <button
@@ -881,7 +892,7 @@ function ChannelWizardModal({
                   }`}
                 >
                   <Icon className="h-4 w-4 shrink-0" />
-                  <span className="text-xs font-semibold">{m.label}</span>
+                  <span className="text-xs font-semibold">{meta.label}</span>
                 </button>
               );
             })}
@@ -890,17 +901,17 @@ function ChannelWizardModal({
 
         {/* Channel Name */}
         <div>
-          <Label htmlFor="ch-name">Channel Remark Name</Label>
+          <Label htmlFor="ch-name">{m.channels.wizard.nameLabel}</Label>
           <Input
             id="ch-name"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder={
               kind === "smtp"
-                ? "Personal Reading Inbox"
+                ? m.channels.wizard.namePlaceholderSmtp
                 : kind === "telegram"
-                  ? "Tech Alerts Topic"
-                  : "Notion Knowledge Base"
+                  ? m.channels.wizard.namePlaceholderTg
+                  : m.channels.wizard.namePlaceholderNotion
             }
             className="mt-1.5"
           />
@@ -910,11 +921,11 @@ function ChannelWizardModal({
         {kind === "smtp" && (
           <div className="space-y-3.5 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
             <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-              SMTP Server & rss2email Force-From Envelope
+              {m.channels.wizard.smtp.heading}
             </h3>
             <div className="grid gap-3 sm:grid-cols-3">
               <div>
-                <Label>SMTP Host</Label>
+                <Label>{m.channels.wizard.smtp.hostLabel}</Label>
                 <Input
                   value={smtpHost}
                   onChange={(e) => setSmtpHost(e.target.value)}
@@ -923,7 +934,7 @@ function ChannelWizardModal({
                 />
               </div>
               <div>
-                <Label>Port</Label>
+                <Label>{m.channels.wizard.smtp.portLabel}</Label>
                 <Input
                   type="number"
                   value={smtpPort}
@@ -932,7 +943,7 @@ function ChannelWizardModal({
                 />
               </div>
               <div>
-                <Label>Transport Security</Label>
+                <Label>{m.channels.wizard.smtp.securityLabel}</Label>
                 <Select
                   value={smtpSecurity}
                   onChange={(e) => {
@@ -944,16 +955,20 @@ function ChannelWizardModal({
                   }}
                   className="mt-1"
                 >
-                  <option value="start_tls">STARTTLS (587)</option>
-                  <option value="tls">Implicit TLS / SMTPS (465)</option>
-                  <option value="plain">Plain Local Relay (25)</option>
+                  <option value="start_tls">
+                    {m.channels.wizard.smtp.secStartTls}
+                  </option>
+                  <option value="tls">{m.channels.wizard.smtp.secTls}</option>
+                  <option value="plain">
+                    {m.channels.wizard.smtp.secPlain}
+                  </option>
                 </Select>
               </div>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
-                <Label>SMTP Username</Label>
+                <Label>{m.channels.wizard.smtp.usernameLabel}</Label>
                 <Input
                   value={smtpUsername}
                   onChange={(e) => setSmtpUsername(e.target.value)}
@@ -962,14 +977,14 @@ function ChannelWizardModal({
                 />
               </div>
               <div>
-                <Label>SMTP App Password</Label>
+                <Label>{m.channels.wizard.smtp.passwordLabel}</Label>
                 <Input
                   type="password"
                   value={smtpPassword}
                   onChange={(e) => setSmtpPassword(e.target.value)}
                   placeholder={
                     initialSmtp?.has_password
-                      ? "Stored (••••••••) — leave blank to keep"
+                      ? m.channels.wizard.smtp.passwordStoredPlaceholder
                       : "••••••••••••"
                   }
                   className="mt-1 font-mono text-xs"
@@ -979,32 +994,28 @@ function ChannelWizardModal({
 
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
-                <Label>Force-From Address (SPF/DKIM Verified)</Label>
+                <Label>{m.channels.wizard.smtp.fromLabel}</Label>
                 <Input
                   value={smtpFromAddress}
                   onChange={(e) => setSmtpFromAddress(e.target.value)}
                   placeholder="rss@yourdomain.com"
                   className="mt-1 font-mono text-xs"
                 />
-                <FieldHint>
-                  Display name dynamically adopts each feed’s title; injects deterministic{" "}
-                  <code className="font-mono">Message-ID</code> &{" "}
-                  <code className="font-mono">List-Id</code>.
-                </FieldHint>
+                <FieldHint>{m.channels.wizard.smtp.fromHint}</FieldHint>
               </div>
               <div>
-                <Label>Reply-To Address (Optional)</Label>
+                <Label>{m.channels.wizard.smtp.replyToLabel}</Label>
                 <Input
                   value={smtpReplyTo}
                   onChange={(e) => setSmtpReplyTo(e.target.value)}
-                  placeholder="Optional Reply-To header"
+                  placeholder={m.channels.wizard.smtp.replyToPlaceholder}
                   className="mt-1 font-mono text-xs"
                 />
               </div>
             </div>
 
             <div>
-              <Label>Trusted Recipient Addresses (Press Enter to add)</Label>
+              <Label>{m.channels.wizard.smtp.toLabel}</Label>
               <div className="mt-1">
                 <TagInput
                   values={smtpToAddresses}
@@ -1021,18 +1032,20 @@ function ChannelWizardModal({
         {kind === "telegram" && (
           <div className="space-y-3.5 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
             <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-              Telegram Bot API 10.4 Endpoint & Target
+              {m.channels.wizard.telegram.heading}
             </h3>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="sm:col-span-2">
-                <Label>Bot Token</Label>
+                <Label>{m.channels.wizard.telegram.tokenLabel}</Label>
                 <Input
                   type="password"
                   value={tgBotToken}
                   onChange={(e) => setTgBotToken(e.target.value)}
                   placeholder={
                     initialTg
-                      ? `Stored (${initialTg.bot_token_hint}) — leave blank to keep`
+                      ? m.channels.wizard.telegram.tokenStoredPlaceholder(
+                          initialTg.bot_token_hint,
+                        )
                       : "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
                   }
                   className="mt-1 font-mono text-xs"
@@ -1040,7 +1053,7 @@ function ChannelWizardModal({
               </div>
 
               <div>
-                <Label>Target Chat ID or @Channel</Label>
+                <Label>{m.channels.wizard.telegram.chatIdLabel}</Label>
                 <Input
                   value={tgChatId}
                   onChange={(e) => setTgChatId(e.target.value)}
@@ -1050,38 +1063,36 @@ function ChannelWizardModal({
               </div>
 
               <div>
-                <Label>Forum Topic Thread ID (Optional)</Label>
+                <Label>{m.channels.wizard.telegram.threadIdLabel}</Label>
                 <Input
                   type="number"
                   value={tgThreadId}
                   onChange={(e) => setTgThreadId(e.target.value)}
-                  placeholder="e.g. 42"
+                  placeholder={m.channels.wizard.telegram.threadIdPlaceholder}
                   className="mt-1 font-mono text-xs"
                 />
               </div>
 
               <div className="sm:col-span-2">
-                <Label>Custom Bot API Base URL (Optional)</Label>
+                <Label>{m.channels.wizard.telegram.apiBaseLabel}</Label>
                 <Input
                   value={tgApiBaseUrl}
                   onChange={(e) => setTgApiBaseUrl(e.target.value)}
-                  placeholder="https://api.telegram.org (supports reverse proxy or Local Bot API Server)"
+                  placeholder={m.channels.wizard.telegram.apiBasePlaceholder}
                   className="mt-1 font-mono text-xs"
                 />
-                <FieldHint>
-                  FeedCourier probes <code className="font-mono">sendRichMessage</code> capability on save and automatically falls back to Compact Card if a self-hosted Local Bot API lags Bot API 10.3+.
-                </FieldHint>
+                <FieldHint>{m.channels.wizard.telegram.apiBaseHint}</FieldHint>
               </div>
             </div>
           </div>
         )}
 
-        {/* 3. Notion Specific Form (2026-03-11: Auto-Create DB OR Bind Existing Data Source) */}
+        {/* 3. Notion Specific Form (Auto-Create DB OR Bind Existing Database) */}
         {kind === "notion" && (
           <div className="space-y-4 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-                Notion Data Source (API 2026-03-11 · Markdown v2)
+                {m.channels.wizard.notion.heading}
               </h3>
               <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-800 dark:bg-zinc-950">
                 <button
@@ -1093,7 +1104,7 @@ function ChannelWizardModal({
                       : "text-zinc-600 dark:text-zinc-400"
                   }`}
                 >
-                  1. Auto-Create 7-Column DB
+                  {m.channels.wizard.notion.modeInit}
                 </button>
                 <button
                   type="button"
@@ -1104,20 +1115,22 @@ function ChannelWizardModal({
                       : "text-zinc-600 dark:text-zinc-400"
                   }`}
                 >
-                  2. Bind Existing Data Source
+                  {m.channels.wizard.notion.modeBind}
                 </button>
               </div>
             </div>
 
             <div>
-              <Label>Notion Internal Integration Secret</Label>
+              <Label>{m.channels.wizard.notion.secretLabel}</Label>
               <Input
                 type="password"
                 value={notionSecret}
                 onChange={(e) => setNotionSecret(e.target.value)}
                 placeholder={
                   initialNotion
-                    ? `Stored (${initialNotion.secret_hint}) — leave blank to keep`
+                    ? m.channels.wizard.notion.secretStoredPlaceholder(
+                        initialNotion.secret_hint,
+                      )
                     : "ntn_••••••••••••"
                 }
                 className="mt-1 font-mono text-xs"
@@ -1127,21 +1140,11 @@ function ChannelWizardModal({
             {notionMode === "init_db" ? (
               <div className="space-y-3 rounded-lg border border-zinc-200/80 bg-zinc-50/70 p-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
                 <p className="text-xs text-zinc-600 dark:text-zinc-400">
-                  Zero-friction setup: FeedCourier calls{" "}
-                  <code className="font-mono">POST /v1/databases</code> with{" "}
-                  <code className="font-mono">
-                    initial_data_source.properties
-                  </code>{" "}
-                  to provision{" "}
-                  <code className="font-mono">
-                    Title, Link, Source, Published, State, Tag, FC-ID
-                  </code>{" "}
-                  and binds the resulting{" "}
-                  <code className="font-mono">data_source_id</code>.
+                  {m.channels.wizard.notion.initIntro}
                 </p>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div>
-                    <Label>Authorized Parent Page ID or URL</Label>
+                    <Label>{m.channels.wizard.notion.parentPageLabel}</Label>
                     <Input
                       value={notionParentPageId}
                       onChange={(e) => setNotionParentPageId(e.target.value)}
@@ -1150,7 +1153,7 @@ function ChannelWizardModal({
                     />
                   </div>
                   <div>
-                    <Label>New Database Title</Label>
+                    <Label>{m.channels.wizard.notion.dbTitleLabel}</Label>
                     <Input
                       value={notionDbTitle}
                       onChange={(e) => setNotionDbTitle(e.target.value)}
@@ -1167,7 +1170,7 @@ function ChannelWizardModal({
                       setFormError(null);
                       if (!notionSecret.trim() || !notionParentPageId.trim()) {
                         setFormError(
-                          "Enter both Notion Integration Secret and Parent Page ID/URL to initialize a database.",
+                          m.channels.wizard.errors.notionInitInputs,
                         );
                         return;
                       }
@@ -1176,7 +1179,7 @@ function ChannelWizardModal({
                     loading={initNotionDbMutation.isPending}
                   >
                     <Sparkles className="h-3.5 w-3.5 text-emerald-600" />
-                    Auto-Create 7-Column Database Now
+                    {m.channels.wizard.notion.autoCreateBtn}
                   </Button>
 
                   {notionDataSourceId && (
@@ -1186,17 +1189,22 @@ function ChannelWizardModal({
                   )}
                 </div>
 
-                {autoCreatedBanner && (
+                {autoCreatedIds && (
                   <div className="flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300">
                     <CheckCircle2 className="h-4 w-4 shrink-0" />
-                    <span>{autoCreatedBanner}</span>
+                    <span>
+                      {m.channels.wizard.notion.autoCreatedBanner(
+                        autoCreatedIds.databaseId,
+                        autoCreatedIds.dataSourceId,
+                      )}
+                    </span>
                   </div>
                 )}
               </div>
             ) : (
               <div className="space-y-3 rounded-lg border border-zinc-200/80 bg-zinc-50/70 p-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
                 <div>
-                  <Label>Existing Data Source ID or Database URL</Label>
+                  <Label>{m.channels.wizard.notion.existingTargetLabel}</Label>
                   <div className="mt-1 flex flex-col gap-2 sm:flex-row">
                     <Input
                       value={notionTargetInput}
@@ -1204,7 +1212,7 @@ function ChannelWizardModal({
                         setNotionTargetInput(e.target.value);
                         setNotionDataSourceId(e.target.value);
                       }}
-                      placeholder="data_source_id or https://www.notion.so/..."
+                      placeholder="data_source_id / https://www.notion.so/..."
                       className="flex-1 font-mono text-xs"
                     />
                     <Button
@@ -1214,13 +1222,13 @@ function ChannelWizardModal({
                         setFormError(null);
                         if (!notionSecret.trim() && !isEdit) {
                           setFormError(
-                            "Provide Notion Integration Secret before inspecting schema.",
+                            m.channels.wizard.errors.notionInspectSecret,
                           );
                           return;
                         }
                         if (!notionTargetInput.trim()) {
                           setFormError(
-                            "Enter a Notion data_source_id or database ID/URL.",
+                            m.channels.wizard.errors.notionInspectTarget,
                           );
                           return;
                         }
@@ -1232,7 +1240,7 @@ function ChannelWizardModal({
                       }
                     >
                       <RefreshCw className="h-3.5 w-3.5" />
-                      Inspect Schema
+                      {m.channels.wizard.notion.inspectBtn}
                     </Button>
                   </div>
                 </div>
@@ -1243,12 +1251,9 @@ function ChannelWizardModal({
                     <div className="flex items-center gap-2">
                       <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
                       <span>
-                        <strong>{missingColumnsCount}</strong> standard{" "}
-                        {missingColumnsCount === 1
-                          ? "column is"
-                          : "columns are"}{" "}
-                        missing on this data source (including{" "}
-                        <code className="font-mono">FC-ID</code> if unmapped).
+                        {m.channels.wizard.notion.missingBanner(
+                          missingColumnsCount,
+                        )}
                       </span>
                     </div>
                     <Button
@@ -1261,7 +1266,7 @@ function ChannelWizardModal({
                       }
                     >
                       <Wrench className="h-3.5 w-3.5" />
-                      Confirm & Patch Missing Columns
+                      {m.channels.wizard.notion.patchMissingBtn}
                     </Button>
                   </div>
                 )}
@@ -1271,11 +1276,17 @@ function ChannelWizardModal({
                   <table className="w-full text-left text-xs">
                     <thead className="border-b border-zinc-100 bg-zinc-50 text-[11px] text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950">
                       <tr>
-                        <th className="px-3 py-2 font-medium">Field</th>
-                        <th className="px-3 py-2 font-medium">Expected Type</th>
-                        <th className="px-3 py-2 font-medium">Status</th>
                         <th className="px-3 py-2 font-medium">
-                          Mapped Notion Property
+                          {m.channels.wizard.notion.colField}
+                        </th>
+                        <th className="px-3 py-2 font-medium">
+                          {m.channels.wizard.notion.colExpectedType}
+                        </th>
+                        <th className="px-3 py-2 font-medium">
+                          {m.channels.wizard.notion.colStatus}
+                        </th>
+                        <th className="px-3 py-2 font-medium">
+                          {m.channels.wizard.notion.colMappedProp}
                         </th>
                       </tr>
                     </thead>
@@ -1298,11 +1309,13 @@ function ChannelWizardModal({
                                   {col.standardName}
                                 </span>
                                 {col.required && (
-                                  <Badge variant="danger">Required</Badge>
+                                  <Badge variant="danger">
+                                    {m.common.required}
+                                  </Badge>
                                 )}
                               </div>
                               <div className="text-[10px] text-zinc-400">
-                                {col.purpose}
+                                {m.channels.wizard.notion.purposes[col.key]}
                               </div>
                             </td>
                             <td className="px-3 py-2 font-mono text-[11px] text-zinc-500">
@@ -1310,21 +1323,31 @@ function ChannelWizardModal({
                               {inspected?.actual_type &&
                                 inspected.actual_type !== col.expectedType && (
                                   <span className="ml-1 text-rose-500">
-                                    (found: {inspected.actual_type})
+                                    {m.channels.wizard.notion.foundType(
+                                      inspected.actual_type,
+                                    )}
                                   </span>
                                 )}
                             </td>
                             <td className="px-3 py-2">
                               {inspected ? (
                                 inspected.status === "matched" ? (
-                                  <Badge variant="success">Matched</Badge>
+                                  <Badge variant="success">
+                                    {m.channels.wizard.notion.statusMatched}
+                                  </Badge>
                                 ) : inspected.status === "mismatched" ? (
-                                  <Badge variant="warning">Type Mismatch</Badge>
+                                  <Badge variant="warning">
+                                    {m.channels.wizard.notion.statusMismatch}
+                                  </Badge>
                                 ) : (
-                                  <Badge variant="danger">Missing</Badge>
+                                  <Badge variant="danger">
+                                    {m.channels.wizard.notion.statusMissing}
+                                  </Badge>
                                 )
                               ) : (
-                                <Badge variant="outline">Unverified</Badge>
+                                <Badge variant="outline">
+                                  {m.channels.wizard.notion.statusUnverified}
+                                </Badge>
                               )}
                             </td>
                             <td className="px-3 py-2">
@@ -1344,10 +1367,14 @@ function ChannelWizardModal({
                                 >
                                   {col.required ? (
                                     <option value="">
-                                      — Select {col.expectedType} column —
+                                      {m.channels.wizard.notion.selectRequiredOption(
+                                        col.expectedType,
+                                      )}
                                     </option>
                                   ) : (
-                                    <option value="">— Skip field —</option>
+                                    <option value="">
+                                      {m.channels.wizard.notion.skipFieldOption}
+                                    </option>
                                   )}
                                   {compatibleProps.map((p) => (
                                     <option key={p.name} value={p.name}>
@@ -1370,7 +1397,8 @@ function ChannelWizardModal({
                                   placeholder={
                                     col.required
                                       ? col.standardName
-                                      : "Optional (blank to skip)"
+                                      : m.channels.wizard.notion
+                                          .optionalBlankPlaceholder
                                   }
                                   className="h-8 font-mono text-xs"
                                 />
@@ -1390,11 +1418,11 @@ function ChannelWizardModal({
         {/* Shared Pacing & Rate-Limit Guardrails */}
         <div className="space-y-3.5 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
           <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-            Anti-Ban Pacing, Random Jitter & Quota Guardrails
+            {m.channels.wizard.pacing.heading}
           </h3>
           <div className="grid gap-3 sm:grid-cols-4">
             <div>
-              <Label>Min Interval (Secs)</Label>
+              <Label>{m.channels.wizard.pacing.minIntervalLabel}</Label>
               <Input
                 type="number"
                 min={0}
@@ -1404,7 +1432,7 @@ function ChannelWizardModal({
               />
             </div>
             <div>
-              <Label>Max Jitter (Secs)</Label>
+              <Label>{m.channels.wizard.pacing.maxJitterLabel}</Label>
               <Input
                 type="number"
                 min={0}
@@ -1414,24 +1442,24 @@ function ChannelWizardModal({
               />
             </div>
             <div>
-              <Label>Hourly Quota (Opt)</Label>
+              <Label>{m.channels.wizard.pacing.hourlyQuotaLabel}</Label>
               <Input
                 type="number"
                 min={1}
                 value={hourlyQuota}
                 onChange={(e) => setHourlyQuota(e.target.value)}
-                placeholder="Unlimited"
+                placeholder={m.common.unlimited}
                 className="mt-1 font-mono text-xs"
               />
             </div>
             <div>
-              <Label>Daily Quota (Opt)</Label>
+              <Label>{m.channels.wizard.pacing.dailyQuotaLabel}</Label>
               <Input
                 type="number"
                 min={1}
                 value={dailyQuota}
                 onChange={(e) => setDailyQuota(e.target.value)}
-                placeholder="Unlimited"
+                placeholder={m.common.unlimited}
                 className="mt-1 font-mono text-xs"
               />
             </div>
@@ -1442,15 +1470,15 @@ function ChannelWizardModal({
               id="ch-proxy"
               checked={useProxy}
               onCheckedChange={setUseProxy}
-              label="Use Outbound Proxy"
-              description="Route API/SMTP traffic through the global HTTP/SOCKS5 proxy."
+              label={m.channels.wizard.pacing.proxyLabel}
+              description={m.channels.wizard.pacing.proxyDesc}
             />
             <Switch
               id="ch-enabled"
               checked={enabled}
               onCheckedChange={setEnabled}
-              label="Channel Enabled"
-              description="Pause delivery to this destination without deleting routes."
+              label={m.channels.wizard.pacing.enabledLabel}
+              description={m.channels.wizard.pacing.enabledDesc}
             />
           </div>
         </div>

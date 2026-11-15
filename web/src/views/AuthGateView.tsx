@@ -1,12 +1,12 @@
 import { useMutation } from "@tanstack/react-query";
-import { KeyRound, Lock, ShieldCheck } from "lucide-react";
+import { KeyRound, Lock, Moon, ShieldCheck, Sun } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { api } from "@/api/client";
-import { ComplianceFooter } from "@/components/layout/ComplianceFooter";
 import {
   FeedCourierMark,
   useThemeMode,
 } from "@/components/layout/AppShell";
+import { ComplianceFooter } from "@/components/layout/ComplianceFooter";
 import {
   Button,
   Card,
@@ -20,6 +20,7 @@ import {
   Label,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { LocaleSwitchButton, useI18n } from "@/i18n";
 import { errorMessage } from "@/lib/utils";
 
 export interface AuthGateViewProps {
@@ -37,7 +38,8 @@ export function AuthGateView({
   license,
   onAuthenticated,
 }: AuthGateViewProps) {
-  useThemeMode();
+  const { dark, toggleTheme } = useThemeMode();
+  const { m } = useI18n();
   const toast = useToast();
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -52,9 +54,7 @@ export function AuthGateView({
     },
     onSuccess: () => {
       toast.success(
-        setupRequired
-          ? "Admin password initialized"
-          : "Signed in to FeedCourier",
+        setupRequired ? m.auth.toastInitDone : m.auth.toastSignedIn,
       );
       setPassword("");
       setConfirmPassword("");
@@ -71,15 +71,15 @@ export function AuthGateView({
 
     if (setupRequired) {
       if (password.length < 8) {
-        setValidationError("Admin password must be at least 8 characters.");
+        setValidationError(m.auth.errMinLength);
         return;
       }
       if (password !== confirmPassword) {
-        setValidationError("Password confirmation does not match.");
+        setValidationError(m.auth.errMismatch);
         return;
       }
     } else if (!password) {
-      setValidationError("Please enter your admin password.");
+      setValidationError(m.auth.errEmpty);
       return;
     }
 
@@ -88,15 +88,38 @@ export function AuthGateView({
 
   return (
     <div className="flex min-h-screen flex-col bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <div className="flex flex-1 items-center justify-center px-4 py-12">
+      <div className="flex items-center justify-end gap-2 px-4 pt-4">
+        <LocaleSwitchButton />
+        <button
+          type="button"
+          onClick={toggleTheme}
+          title={m.theme.toggleTitle}
+          aria-label={m.theme.toggleTitle}
+          className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+        >
+          {dark ? (
+            <>
+              <Sun className="h-3.5 w-3.5 text-amber-400" />
+              {m.theme.light}
+            </>
+          ) : (
+            <>
+              <Moon className="h-3.5 w-3.5 text-zinc-500" />
+              {m.theme.dark}
+            </>
+          )}
+        </button>
+      </div>
+
+      <div className="flex flex-1 items-center justify-center px-4 py-10">
         <div className="w-full max-w-md space-y-6">
           <div className="flex flex-col items-center text-center">
             <FeedCourierMark className="h-12 w-12" />
             <h1 className="mt-3 text-xl font-bold tracking-tight">
-              FeedCourier Console
+              {m.auth.heading}
             </h1>
             <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              Single-binary Rust subscription delivery gateway · Native MCP
+              {m.auth.subheading}
             </p>
           </div>
 
@@ -109,15 +132,11 @@ export function AuthGateView({
                   <Lock className="h-4 w-4 text-zinc-600 dark:text-zinc-400" />
                 )}
                 <CardTitle>
-                  {setupRequired
-                    ? "Initialize Administrator Password"
-                    : "Administrator Sign In"}
+                  {setupRequired ? m.auth.initTitle : m.auth.loginTitle}
                 </CardTitle>
               </div>
               <CardDescription>
-                {setupRequired
-                  ? "First-time bootstrap: your password will be hashed with Argon2id. Channel credentials remain encrypted at rest with ChaCha20-Poly1305."
-                  : "Enter your administrator password to unlock trusted channels, routing rules, and MCP tokens."}
+                {setupRequired ? m.auth.initDesc : m.auth.loginDesc}
               </CardDescription>
             </CardHeader>
 
@@ -125,7 +144,9 @@ export function AuthGateView({
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div>
                   <Label htmlFor="fc-password">
-                    {setupRequired ? "New Admin Password" : "Password"}
+                    {setupRequired
+                      ? m.auth.newPasswordLabel
+                      : m.auth.passwordLabel}
                   </Label>
                   <Input
                     id="fc-password"
@@ -140,13 +161,17 @@ export function AuthGateView({
                       setValidationError(null);
                     }}
                     placeholder={
-                      setupRequired ? "Minimum 8 characters…" : "••••••••••••"
+                      setupRequired
+                        ? m.auth.minCharsPlaceholder
+                        : "••••••••••••"
                     }
                     className="mt-1.5"
                   />
                   {setupRequired && (
                     <FieldHint>
-                      Tip: You can also pre-seed <code className="font-mono">ADMIN_PASSWORD</code> via environment variable on container boot.
+                      {m.auth.envSeedHintPrefix}{" "}
+                      <code className="font-mono">ADMIN_PASSWORD</code>{" "}
+                      {m.auth.envSeedHintSuffix}
                     </FieldHint>
                   )}
                 </div>
@@ -154,7 +179,7 @@ export function AuthGateView({
                 {setupRequired && (
                   <div>
                     <Label htmlFor="fc-confirm-password">
-                      Confirm Admin Password
+                      {m.auth.confirmPasswordLabel}
                     </Label>
                     <Input
                       id="fc-confirm-password"
@@ -165,7 +190,7 @@ export function AuthGateView({
                         setConfirmPassword(e.target.value);
                         setValidationError(null);
                       }}
-                      placeholder="Re-enter password…"
+                      placeholder={m.auth.confirmPasswordPlaceholder}
                       className="mt-1.5"
                     />
                   </div>
@@ -179,7 +204,7 @@ export function AuthGateView({
                   loading={authMutation.isPending}
                 >
                   <KeyRound className="h-4 w-4" />
-                  {setupRequired ? "Initialize & Sign In" : "Unlock Console"}
+                  {setupRequired ? m.auth.initSubmit : m.auth.loginSubmit}
                 </Button>
               </form>
             </CardContent>

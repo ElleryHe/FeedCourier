@@ -37,49 +37,26 @@ import {
   TagInput,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { useI18n } from "@/i18n";
+import type { Messages } from "@/i18n/en";
 import { errorMessage, validateRegex } from "@/lib/utils";
 
-const TELEGRAM_MODES: Array<{
-  id: TelegramDeliveryMode;
-  label: string;
-  summary: string;
-  icon: typeof FileText;
-}> = [
-  {
-    id: "rich_message",
-    label: "Rich Message (Bot API 10.4)",
-    summary:
-      "Calls sendRichMessage via telegram-rich Rich HTML normalizer with Document::fit block-boundary truncation + Read Original button.",
-    icon: FileText,
-  },
-  {
-    id: "compact_card",
-    label: "Compact Card",
-    summary:
-      "Calls sendMessage (4096-char safe truncation): bold title + source tag + distilled summary + canonical link.",
-    icon: MessageSquareText,
-  },
-  {
-    id: "media_mode",
-    label: "Media Mode",
-    summary:
-      "Extracts all media + 3-line caption (Author / 1st Unicode sentence / URL) with anti-hotlink stream relay & 10-item sendMediaGroup checkpointing.",
-    icon: Image,
-  },
-];
-
-function telegramModeLabel(mode?: TelegramDeliveryMode): string {
+function telegramModeLabel(
+  mode: TelegramDeliveryMode | undefined,
+  m: Messages,
+): string {
   switch (mode) {
     case "compact_card":
-      return "Compact Card";
+      return m.routes.modes.compact_card.label;
     case "media_mode":
-      return "Media Mode";
+      return m.routes.modes.media_mode.label;
     default:
-      return "Rich Message";
+      return m.routes.modes.rich_message.label;
   }
 }
 
 export function RoutesView() {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -129,19 +106,19 @@ export function RoutesView() {
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
     },
     onError: (err) => {
-      toast.error("Failed to toggle route", errorMessage(err));
+      toast.error(m.routes.toastToggleFailed, errorMessage(err));
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: (id: number) => api.routes.remove(id),
     onSuccess: () => {
-      toast.success("Route deleted");
+      toast.success(m.routes.toastDeleted);
       setDeletingRoute(null);
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
     },
     onError: (err) => {
-      toast.error("Failed to delete route", errorMessage(err));
+      toast.error(m.routes.toastDeleteFailed, errorMessage(err));
     },
   });
 
@@ -150,11 +127,9 @@ export function RoutesView() {
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-bold tracking-tight">
-            Routing & Presentation Rules
-          </h1>
+          <h1 className="text-lg font-bold tracking-tight">{m.routes.title}</h1>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            Bind feed sets or tag groups to trusted channels with keyword/regex filters and per-route Telegram presentation modes.
+            {m.routes.subtitle}
           </p>
         </div>
         <Button
@@ -165,20 +140,20 @@ export function RoutesView() {
           }}
         >
           <Plus className="h-3.5 w-3.5" />
-          New Route
+          {m.routes.newRoute}
         </Button>
       </div>
 
       {/* Routes List */}
       {routesQuery.isLoading ? (
         <Card className="p-8 text-center text-xs text-zinc-500">
-          Loading routing rules…
+          {m.routes.loading}
         </Card>
       ) : (routesQuery.data?.length ?? 0) === 0 ? (
         <EmptyState
           icon={GitFork}
-          title="No delivery routes configured"
-          description="Create a route to connect subscriptions (by explicit feed IDs or #tags) to a trusted SMTP, Telegram, or Notion destination."
+          title={m.routes.emptyTitle}
+          description={m.routes.emptyDesc}
           action={
             <Button
               size="sm"
@@ -188,7 +163,7 @@ export function RoutesView() {
               }}
             >
               <Plus className="h-3.5 w-3.5" />
-              Create First Route
+              {m.routes.createFirst}
             </Button>
           }
         />
@@ -212,13 +187,15 @@ export function RoutesView() {
                         {route.name}
                       </span>
                       {!route.enabled && (
-                        <Badge variant="default">Disabled</Badge>
+                        <Badge variant="default">{m.common.disabled}</Badge>
                       )}
                       {targetChannel?.kind === "telegram" && (
                         <Badge variant="info">
-                          {telegramModeLabel(route.options.telegram_mode)}
+                          {telegramModeLabel(route.options.telegram_mode, m)}
                           {route.options.telegram_mode === "compact_card" &&
-                            ` · Preview ${route.options.link_preview === false ? "OFF" : "ON"}`}
+                            (route.options.link_preview === false
+                              ? m.routes.previewOff
+                              : m.routes.previewOn)}
                         </Badge>
                       )}
                     </div>
@@ -230,7 +207,7 @@ export function RoutesView() {
                           const f = feedsById.get(fid);
                           return (
                             <Badge key={fid} variant="outline">
-                              {f?.title || f?.url || `Feed #${fid}`}
+                              {f?.title || f?.url || m.routes.feedFallback(fid)}
                             </Badge>
                           );
                         })}
@@ -243,12 +220,10 @@ export function RoutesView() {
 
                       <ArrowRight className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
 
-                      <Badge
-                        variant={targetChannel ? "success" : "danger"}
-                      >
+                      <Badge variant={targetChannel ? "success" : "danger"}>
                         {targetChannel
                           ? `${targetChannel.name} (${targetChannel.kind.toUpperCase()})`
-                          : `Channel #${route.channel_id}`}
+                          : m.routes.channelFallback(route.channel_id)}
                       </Badge>
                     </div>
 
@@ -309,12 +284,14 @@ export function RoutesView() {
                       }}
                     >
                       <Pencil className="h-3.5 w-3.5" />
-                      Edit
+                      {m.common.edit}
                     </Button>
                     <Button
                       variant="ghost"
                       size="icon"
                       onClick={() => setDeletingRoute(route)}
+                      title={m.common.delete}
+                      aria-label={m.common.delete}
                       className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
                     >
                       <Trash2 className="h-4 w-4" />
@@ -346,9 +323,9 @@ export function RoutesView() {
         onConfirm={() => {
           if (deletingRoute) deleteMutation.mutate(deletingRoute.id);
         }}
-        title="Delete Delivery Route"
-        description={`Delete route "${deletingRoute?.name}"? Pending delivery tasks generated for this route will also be removed.`}
-        confirmLabel="Delete Route"
+        title={m.routes.deleteModalTitle}
+        description={m.routes.deleteModalDesc(deletingRoute?.name ?? "")}
+        confirmLabel={m.routes.deleteModalConfirm}
         loading={deleteMutation.isPending}
       />
     </div>
@@ -374,6 +351,7 @@ function RouteEditorModal({
   channels: ChannelDto[];
   knownTags: string[];
 }) {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const isEdit = route !== null;
@@ -408,6 +386,32 @@ function RouteEditorModal({
   const [formError, setFormError] = useState<string | null>(null);
 
   const selectedChannel = channels.find((c) => c.id === channelId);
+
+  const telegramModes: Array<{
+    id: TelegramDeliveryMode;
+    label: string;
+    summary: string;
+    icon: typeof FileText;
+  }> = [
+    {
+      id: "rich_message",
+      label: m.routes.modes.rich_message.label,
+      summary: m.routes.modes.rich_message.summary,
+      icon: FileText,
+    },
+    {
+      id: "compact_card",
+      label: m.routes.modes.compact_card.label,
+      summary: m.routes.modes.compact_card.summary,
+      icon: MessageSquareText,
+    },
+    {
+      id: "media_mode",
+      label: m.routes.modes.media_mode.label,
+      summary: m.routes.modes.media_mode.summary,
+      icon: Image,
+    },
+  ];
 
   const toggleFeedSelection = (id: number) => {
     setFeedIds((prev) =>
@@ -457,7 +461,7 @@ function RouteEditorModal({
       return api.routes.create(payload);
     },
     onSuccess: () => {
-      toast.success(isEdit ? "Route updated" : "Route created");
+      toast.success(isEdit ? m.routes.toastUpdated : m.routes.toastCreated);
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
       onClose();
     },
@@ -471,27 +475,25 @@ function RouteEditorModal({
     setFormError(null);
 
     if (!name.trim()) {
-      setFormError("Route name is required.");
+      setFormError(m.routes.editor.errEmptyName);
       return;
     }
     if (!channelId) {
-      setFormError("Select a target trusted channel first.");
+      setFormError(m.routes.editor.errNoChannel);
       return;
     }
     if (feedIds.length === 0 && matchTags.length === 0) {
-      setFormError(
-        "Select at least one explicit feed or one #tag for the source selector.",
-      );
+      setFormError(m.routes.editor.errNoSource);
       return;
     }
     const incErr = validateRegex(includeRegex);
     if (incErr) {
-      setFormError(`Include regex syntax error: ${incErr}`);
+      setFormError(m.routes.editor.errIncludeRegex(incErr));
       return;
     }
     const excErr = validateRegex(excludeRegex);
     if (excErr) {
-      setFormError(`Exclude regex syntax error: ${excErr}`);
+      setFormError(m.routes.editor.errExcludeRegex(excErr));
       return;
     }
 
@@ -502,16 +504,20 @@ function RouteEditorModal({
     <Modal
       open={open}
       onClose={onClose}
-      title={isEdit ? `Edit Route: ${route?.name}` : "New Delivery Route"}
-      description="Each matched article generates a dedicated transactional outbox task (1 Task = 1 Entry × 1 Route)."
+      title={
+        isEdit
+          ? m.routes.editor.editTitle(route?.name ?? "")
+          : m.routes.editor.newTitle
+      }
+      description={m.routes.editor.desc}
       size="xl"
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
-            Cancel
+            {m.common.cancel}
           </Button>
           <Button onClick={handleSubmit} loading={saveMutation.isPending}>
-            {isEdit ? "Save Route" : "Create Route"}
+            {isEdit ? m.routes.editor.saveRoute : m.routes.editor.createRoute}
           </Button>
         </>
       }
@@ -519,18 +525,18 @@ function RouteEditorModal({
       <form onSubmit={handleSubmit} className="space-y-5">
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
-            <Label htmlFor="route-name">Route Name</Label>
+            <Label htmlFor="route-name">{m.routes.editor.nameLabel}</Label>
             <Input
               id="route-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="Rust & Systems → Telegram Rich"
+              placeholder={m.routes.editor.namePlaceholder}
               className="mt-1.5"
             />
           </div>
 
           <div>
-            <Label htmlFor="route-channel">Target Trusted Channel</Label>
+            <Label htmlFor="route-channel">{m.routes.editor.channelLabel}</Label>
             <Select
               id="route-channel"
               value={channelId || ""}
@@ -538,7 +544,7 @@ function RouteEditorModal({
               className="mt-1.5"
             >
               {channels.length === 0 ? (
-                <option value="">— Configure a channel first —</option>
+                <option value="">{m.routes.editor.noChannelsOption}</option>
               ) : (
                 channels.map((ch) => (
                   <option key={ch.id} value={ch.id}>
@@ -554,7 +560,7 @@ function RouteEditorModal({
         <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-              Source Selector (Feed IDs OR Tag Match)
+              {m.routes.editor.sourceHeading}
             </h3>
             {feeds.length > 0 && (
               <div className="flex items-center gap-2 text-xs">
@@ -563,7 +569,7 @@ function RouteEditorModal({
                   onClick={() => setFeedIds(feeds.map((f) => f.id))}
                   className="cursor-pointer text-zinc-600 hover:underline dark:text-zinc-300"
                 >
-                  Select all ({feeds.length})
+                  {m.routes.editor.selectAll(feeds.length)}
                 </button>
                 <span className="text-zinc-300">·</span>
                 <button
@@ -571,29 +577,29 @@ function RouteEditorModal({
                   onClick={() => setFeedIds([])}
                   className="cursor-pointer text-zinc-500 hover:underline"
                 >
-                  Clear
+                  {m.common.clear}
                 </button>
               </div>
             )}
           </div>
 
           <div>
-            <Label>Match Tags</Label>
+            <Label>{m.routes.editor.matchTagsLabel}</Label>
             <div className="mt-1">
               <TagInput
                 values={matchTags}
                 onChange={setMatchTags}
                 suggestions={knownTags}
-                placeholder="Match any feed carrying these tags…"
+                placeholder={m.routes.editor.matchTagsPlaceholder}
               />
             </div>
           </div>
 
           <div>
-            <Label>Explicit Subscriptions ({feedIds.length} selected)</Label>
+            <Label>{m.routes.editor.explicitFeedsLabel(feedIds.length)}</Label>
             {feeds.length === 0 ? (
               <p className="mt-1 text-xs text-zinc-400">
-                No feeds added yet — you can still pre-bind by #tag above.
+                {m.routes.editor.noFeedsHint}
               </p>
             ) : (
               <div className="mt-1.5 grid max-h-36 gap-1.5 overflow-y-auto rounded-lg border border-zinc-200 bg-zinc-50/50 p-2 sm:grid-cols-2 dark:border-zinc-800 dark:bg-zinc-950">
@@ -629,7 +635,7 @@ function RouteEditorModal({
         {selectedChannel?.kind === "telegram" && (
           <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
             <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-              Telegram Presentation Mode (Bot API 10.4)
+              {m.routes.editor.tgHeading}
             </h3>
 
             {(selectedChannel.capabilities.supports_rich_message === false ||
@@ -637,23 +643,19 @@ function RouteEditorModal({
               telegramMode === "rich_message" && (
                 <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>
-                    Target Bot API endpoint reported{" "}
-                    <code className="font-mono">sendRichMessage</code>{" "}
-                    unsupported; runtime will gracefully downgrade to Compact Card until upgraded.
-                  </span>
+                  <span>{m.routes.editor.tgFallbackNotice}</span>
                 </div>
               )}
 
             <div className="grid gap-2.5 sm:grid-cols-3">
-              {TELEGRAM_MODES.map((m) => {
-                const Icon = m.icon;
-                const active = telegramMode === m.id;
+              {telegramModes.map((modeOpt) => {
+                const Icon = modeOpt.icon;
+                const active = telegramMode === modeOpt.id;
                 return (
                   <button
-                    key={m.id}
+                    key={modeOpt.id}
                     type="button"
-                    onClick={() => setTelegramMode(m.id)}
+                    onClick={() => setTelegramMode(modeOpt.id)}
                     className={`flex cursor-pointer flex-col justify-between rounded-lg border p-3 text-left transition-colors ${
                       active
                         ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
@@ -662,7 +664,9 @@ function RouteEditorModal({
                   >
                     <div className="flex items-center gap-2">
                       <Icon className="h-4 w-4 shrink-0" />
-                      <span className="text-xs font-semibold">{m.label}</span>
+                      <span className="text-xs font-semibold">
+                        {modeOpt.label}
+                      </span>
                     </div>
                     <p
                       className={`mt-2 text-[11px] leading-snug ${
@@ -671,7 +675,7 @@ function RouteEditorModal({
                           : "text-zinc-500 dark:text-zinc-400"
                       }`}
                     >
-                      {m.summary}
+                      {modeOpt.summary}
                     </p>
                   </button>
                 );
@@ -684,8 +688,8 @@ function RouteEditorModal({
                   id="tg-link-preview"
                   checked={linkPreview}
                   onCheckedChange={setLinkPreview}
-                  label="Enable Telegram Link Preview (LinkPreviewOptions)"
-                  description="Allow Telegram to render an OpenGraph webpage preview card beneath the compact message."
+                  label={m.routes.editor.linkPreviewLabel}
+                  description={m.routes.editor.linkPreviewDesc}
                 />
               </div>
             )}
@@ -695,41 +699,41 @@ function RouteEditorModal({
         {/* Content Filter Rules */}
         <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
           <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-            Keyword & Regex Filters (Title + Cleaned Body)
+            {m.routes.editor.filtersHeading}
           </h3>
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
-              <Label>Include Keywords (Match Any)</Label>
+              <Label>{m.routes.editor.includeKeywordsLabel}</Label>
               <div className="mt-1">
                 <TagInput
                   values={includeKeywords}
                   onChange={setIncludeKeywords}
-                  placeholder="Leave empty to allow all…"
+                  placeholder={m.routes.editor.includeKeywordsPlaceholder}
                 />
               </div>
             </div>
             <div>
-              <Label>Exclude Keywords (Block Any)</Label>
+              <Label>{m.routes.editor.excludeKeywordsLabel}</Label>
               <div className="mt-1">
                 <TagInput
                   values={excludeKeywords}
                   onChange={setExcludeKeywords}
-                  placeholder="Sponsored, Hiring…"
+                  placeholder={m.routes.editor.excludeKeywordsPlaceholder}
                 />
               </div>
             </div>
             <div>
-              <Label>Include Regex (Optional)</Label>
+              <Label>{m.routes.editor.includeRegexLabel}</Label>
               <Input
                 value={includeRegex}
                 onChange={(e) => setIncludeRegex(e.target.value)}
                 placeholder="(?i)\b(release|cve-\d+)\b"
                 className="mt-1 font-mono text-xs"
               />
-              <FieldHint>Evaluated via Rust regex crate (RE2-safe).</FieldHint>
+              <FieldHint>{m.routes.editor.regexHint}</FieldHint>
             </div>
             <div>
-              <Label>Exclude Regex (Optional)</Label>
+              <Label>{m.routes.editor.excludeRegexLabel}</Label>
               <Input
                 value={excludeRegex}
                 onChange={(e) => setExcludeRegex(e.target.value)}
@@ -745,8 +749,8 @@ function RouteEditorModal({
             id="route-enabled"
             checked={enabled}
             onCheckedChange={setEnabled}
-            label="Route Active"
-            description="When disabled, newly discovered feed items will not enqueue tasks for this route."
+            label={m.routes.editor.activeLabel}
+            description={m.routes.editor.activeDesc}
           />
         </div>
 

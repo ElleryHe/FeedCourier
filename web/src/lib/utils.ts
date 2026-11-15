@@ -1,6 +1,7 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { ApiError } from "@/api/client";
+import { getCurrentLocale, getMessages } from "@/i18n";
 
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
@@ -13,13 +14,12 @@ export function errorMessage(err: unknown): string {
   if (err instanceof Error) {
     return err.message;
   }
-  return "Unexpected error occurred";
+  return getMessages().common.unexpectedError;
 }
 
 function parseDateValue(val: string | number | null | undefined): Date | null {
   if (val === null || val === undefined || val === "") return null;
   if (typeof val === "number") {
-    // Unix epoch seconds vs milliseconds
     const ms = val < 1e12 ? val * 1000 : val;
     const d = new Date(ms);
     return Number.isNaN(d.getTime()) ? null : d;
@@ -39,7 +39,8 @@ export function formatDateTime(
 ): string {
   const d = parseDateValue(value);
   if (!d) return value ? String(value) : "—";
-  return d.toLocaleString(undefined, {
+  const locale = getCurrentLocale();
+  return d.toLocaleString(locale === "zh-CN" ? "zh-CN" : "en-US", {
     year: "numeric",
     month: "short",
     day: "2-digit",
@@ -55,23 +56,48 @@ export function formatRelativeTime(
 ): string {
   const d = parseDateValue(value);
   if (!d) return value ? String(value) : "—";
+  const isZh = getCurrentLocale() === "zh-CN";
   const diffSec = Math.round((d.getTime() - Date.now()) / 1000);
   const absSec = Math.abs(diffSec);
 
-  if (absSec < 5) return "just now";
+  if (absSec < 5) return isZh ? "刚刚" : "just now";
   if (absSec < 60) {
-    return diffSec > 0 ? `in ${absSec}s` : `${absSec}s ago`;
+    return isZh
+      ? diffSec > 0
+        ? `${absSec} 秒后`
+        : `${absSec} 秒前`
+      : diffSec > 0
+        ? `in ${absSec}s`
+        : `${absSec}s ago`;
   }
   const absMin = Math.round(absSec / 60);
   if (absMin < 60) {
-    return diffSec > 0 ? `in ${absMin}m` : `${absMin}m ago`;
+    return isZh
+      ? diffSec > 0
+        ? `${absMin} 分钟后`
+        : `${absMin} 分钟前`
+      : diffSec > 0
+        ? `in ${absMin}m`
+        : `${absMin}m ago`;
   }
   const absHr = Math.round(absMin / 60);
   if (absHr < 48) {
-    return diffSec > 0 ? `in ${absHr}h` : `${absHr}h ago`;
+    return isZh
+      ? diffSec > 0
+        ? `${absHr} 小时后`
+        : `${absHr} 小时前`
+      : diffSec > 0
+        ? `in ${absHr}h`
+        : `${absHr}h ago`;
   }
   const absDays = Math.round(absHr / 24);
-  return diffSec > 0 ? `in ${absDays}d` : `${absDays}d ago`;
+  return isZh
+    ? diffSec > 0
+      ? `${absDays} 天后`
+      : `${absDays} 天前`
+    : diffSec > 0
+      ? `in ${absDays}d`
+      : `${absDays}d ago`;
 }
 
 export function formatDurationSecs(secs: number): string {
@@ -109,7 +135,7 @@ export function validateRegex(pattern: string): string | null {
     new RegExp(trimmed);
     return null;
   } catch (err) {
-    return err instanceof Error ? err.message : "Invalid regular expression";
+    return err instanceof Error ? err.message : getMessages().common.invalidRegex;
   }
 }
 

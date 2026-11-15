@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
+import { LocaleSwitchButton, useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { ComplianceFooter } from "./ComplianceFooter";
 
@@ -131,46 +132,47 @@ export function AppShell({
 }: AppShellProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const { dark, toggleTheme } = useThemeMode();
+  const { m } = useI18n();
 
   const navItems: NavItem[] = [
     {
       id: "overview",
-      label: "Overview",
-      subtitle: "Telemetry & Snapshot",
+      label: m.shell.nav.overview.label,
+      subtitle: m.shell.nav.overview.subtitle,
       icon: Activity,
     },
     {
       id: "feeds",
-      label: "Feeds",
-      subtitle: "RSS / Atom / Readability",
+      label: m.shell.nav.feeds.label,
+      subtitle: m.shell.nav.feeds.subtitle,
       icon: Rss,
       badge: circuitOpenCount > 0 ? circuitOpenCount : undefined,
       badgeAlert: circuitOpenCount > 0,
     },
     {
       id: "channels",
-      label: "Channels",
-      subtitle: "SMTP · Telegram · Notion",
+      label: m.shell.nav.channels.label,
+      subtitle: m.shell.nav.channels.subtitle,
       icon: Radio,
     },
     {
       id: "routes",
-      label: "Routes",
-      subtitle: "Filters & Delivery Modes",
+      label: m.shell.nav.routes.label,
+      subtitle: m.shell.nav.routes.subtitle,
       icon: GitFork,
     },
     {
       id: "tasks",
-      label: "Outbox",
-      subtitle: "Leases & Dead-Letter",
+      label: m.shell.nav.tasks.label,
+      subtitle: m.shell.nav.tasks.subtitle,
       icon: Inbox,
       badge: deadLetterCount > 0 ? deadLetterCount : undefined,
       badgeAlert: deadLetterCount > 0,
     },
     {
       id: "settings",
-      label: "System & MCP",
-      subtitle: "Proxy · SSRF · AI Tokens",
+      label: m.shell.nav.settings.label,
+      subtitle: m.shell.nav.settings.subtitle,
       icon: Settings,
     },
   ];
@@ -194,14 +196,14 @@ export function AppShell({
                 </span>
               </div>
               <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                Delivery Gateway
+                {m.shell.subtitle}
               </p>
             </div>
           </div>
           <button
             type="button"
             onClick={() => setMobileMenuOpen(false)}
-            aria-label="Close navigation menu"
+            aria-label={m.shell.closeNav}
             className="rounded-md p-1 text-zinc-500 hover:bg-zinc-100 lg:hidden dark:hover:bg-zinc-800"
           >
             <X className="h-4 w-4" />
@@ -209,7 +211,7 @@ export function AppShell({
         </div>
 
         {/* Navigation Items */}
-        <nav className="space-y-1 p-3" aria-label="Main navigation">
+        <nav className="space-y-1 p-3" aria-label={m.shell.mainNav}>
           {navItems.map((item) => {
             const Icon = item.icon;
             const active = activeSection === item.id;
@@ -271,33 +273,36 @@ export function AppShell({
       {/* Bottom Controls */}
       <div className="space-y-1.5 border-t border-zinc-200/80 p-3 dark:border-zinc-800/80">
         <div className="flex items-center gap-1.5">
+          <LocaleSwitchButton className="flex-1" />
           <button
             type="button"
             onClick={toggleTheme}
+            title={m.theme.toggleTitle}
+            aria-label={m.theme.toggleTitle}
             className="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
           >
             {dark ? (
               <>
                 <Sun className="h-3.5 w-3.5 text-amber-400" />
-                Light
+                {m.theme.light}
               </>
             ) : (
               <>
                 <Moon className="h-3.5 w-3.5 text-zinc-500" />
-                Dark
+                {m.theme.dark}
               </>
             )}
           </button>
-          <button
-            type="button"
-            onClick={onLogout}
-            disabled={loggingOut}
-            className="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-rose-900 dark:hover:bg-rose-950/50 dark:hover:text-rose-300"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-            Sign out
-          </button>
         </div>
+        <button
+          type="button"
+          onClick={onLogout}
+          disabled={loggingOut}
+          className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-rose-900 dark:hover:bg-rose-950/50 dark:hover:text-rose-300"
+        >
+          <LogOut className="h-3.5 w-3.5" />
+          {m.shell.signOut}
+        </button>
       </div>
     </div>
   );
@@ -331,7 +336,7 @@ export function AppShell({
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
-              aria-label="Open navigation menu"
+              aria-label={m.shell.openNav}
               className="rounded-md border border-zinc-200 p-1.5 text-zinc-700 dark:border-zinc-800 dark:text-zinc-200"
             >
               <Menu className="h-4 w-4" />
@@ -341,9 +346,12 @@ export function AppShell({
               FeedCourier
             </span>
           </div>
-          <span className="rounded bg-zinc-100 px-2 py-0.5 text-xs font-medium capitalize dark:bg-zinc-800">
-            {activeSection}
-          </span>
+          <div className="flex items-center gap-2">
+            <LocaleSwitchButton className="px-2 py-1" />
+            <span className="rounded bg-zinc-100 px-2 py-0.5 text-xs font-medium dark:bg-zinc-800">
+              {m.shell.nav[activeSection].label}
+            </span>
+          </div>
         </header>
 
         <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-6 lg:px-8">
