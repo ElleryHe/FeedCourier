@@ -284,7 +284,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Sync Docker Hub description and README
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@v5
         continue-on-error: true
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
