@@ -18,6 +18,7 @@ master.key
 /docs/.vitepress/dist
 /docs/.vitepress/cache
 /docs/.wrangler
+/.wrangler
 
 # OS & editor files
 .DS_Store

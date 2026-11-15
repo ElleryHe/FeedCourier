@@ -1,7 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "feedcourier-docs",
-  "compatibility_date": "2026-11-15",
+  "name": "feedcourier",
+  "compatibility_date": "2026-11-01",
+  "build": {
+    "command": "pnpm run build"
+  },
   "assets": {
     "directory": "./.vitepress/dist",
     "html_handling": "auto-trailing-slash",

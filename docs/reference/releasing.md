@@ -68,12 +68,13 @@ In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd
 
 ## Documentation Site Deployment (`feedcourier.ellery.me`)
 
-The bilingual VitePress documentation site in `docs/` deploys to **Cloudflare Workers Static Assets** via `docs/wrangler.jsonc`:
+The bilingual VitePress documentation site in `docs/` deploys to **Cloudflare Workers Static Assets** via `wrangler.jsonc` (`docs/wrangler.jsonc`):
 
 | Setting | Value |
 | :--- | :--- |
-| **Root Directory** | `docs` |
-| **Build Command** | `pnpm install --frozen-lockfile && pnpm build` |
+| **Worker Name** | `feedcourier` |
+| **Root Directory** | `/` (or `docs`) |
+| **Build Command** | `pnpm --dir docs install --frozen-lockfile && pnpm --dir docs build` |
 | **Deploy Command** | `npx wrangler deploy` |
-| **Output Directory** | `./.vitepress/dist` |
+| **Output Directory** | `./docs/.vitepress/dist` (`./.vitepress/dist` inside `docs/`) |
 | **Custom Domain** | `https://feedcourier.ellery.me` (`Production branch: main`, preview URLs generated automatically on `develop`) |
