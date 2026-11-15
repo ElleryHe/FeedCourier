@@ -12,6 +12,11 @@ web/node_modules/
 web/dist/
 web/.vite/
 
+# Documentation site sources & build artifacts
+docs/
+wrangler.jsonc
+.wrangler/
+
 # Git metadata & CI definitions
 .git/
 .github/

@@ -28,7 +28,7 @@ jobs:
           version: 10
 
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -62,7 +62,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config
 
       - name: Download compiled WebUI dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist
@@ -99,3 +99,28 @@ jobs:
         with:
           command: check
           command-arguments: licenses bans sources
+
+  docs:
+    name: Docs Site (VitePress & Links)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: docs/pnpm-lock.yaml
+
+      - name: Install docs dependencies
+        run: pnpm --dir docs install --frozen-lockfile
+
+      - name: Build VitePress documentation site
+        run: pnpm --dir docs build

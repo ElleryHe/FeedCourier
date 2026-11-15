@@ -1,0 +1,20 @@
+{
+  "$schema": "docs/node_modules/wrangler/config-schema.json",
+  "name": "feedcourier",
+  "compatibility_date": "2026-11-01",
+  "build": {
+    "command": "pnpm --dir docs install --frozen-lockfile && pnpm --dir docs build"
+  },
+  "assets": {
+    "directory": "./docs/.vitepress/dist",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    {
+      "pattern": "feedcourier.ellery.me",
+      "custom_domain": true
+    }
+  ],
+  "previews": {}
+}

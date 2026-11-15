@@ -13,6 +13,13 @@ master.key
 /web/dist
 /web/.vite
 
+# Documentation site dependencies & build output
+/docs/node_modules
+/docs/.vitepress/dist
+/docs/.vitepress/cache
+/docs/.wrangler
+/.wrangler
+
 # OS & editor files
 .DS_Store
 .env
