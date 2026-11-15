@@ -32,7 +32,7 @@ export interface ActionAckResponse {
 
 export const DEFAULT_REPO_URL = "https://github.com/ElleryHe/FeedCourier";
 export const DEFAULT_LICENSE = "AGPL-3.0";
-export const DEFAULT_VERSION = "0.1.0";
+export const DEFAULT_VERSION = "0.1.2";
 
 /** `GET /api/v1/auth/status` */
 export interface AuthStatusResponse {
