@@ -88,11 +88,12 @@ git push origin v0.1.2
 
 中英双语文档站基于 **VitePress** + **`vitepress-plugin-mermaid`** 构建，托管于 **Cloudflare Workers Static Assets**。
 
-配置文件位于根目录 `wrangler.jsonc`（及 `docs/wrangler.jsonc`）：
+配置文件位于 `docs/wrangler.jsonc`：
 
 - **Worker 名称（Worker name）**：`feedcourier`
-- **构建根目录（Root directory）**：`/`（或 `docs`）
-- **构建命令（Build command）**：`pnpm --dir docs install --frozen-lockfile && pnpm --dir docs build`
-- **静态产物目录（Assets directory）**：`./docs/.vitepress/dist`（`docs/` 内为 `./.vitepress/dist`）
+- **构建根目录（Root directory）**：`docs`（注意填写目录名 `docs`，不要带通配符）
+- **构建监控路径（Build watch paths）**：`docs/**`（仅当 `docs/` 目录下文件变更时触发构建）
+- **构建命令（Build command）**：`pnpm run build`
+- **静态产物目录（Assets directory）**：`./.vitepress/dist`
 - **部署命令（Deploy command）**：`npx wrangler deploy`（非生产分支 / PR 预览命令为 `npx wrangler preview`，配置 `"previews": {}`）
-- **自定义域名路由**：`https://feedcourier.ellery.me`（推送至 `develop` 分支时自动生成 Cloudflare Preview URL，合入 `main` 分支后发布至生产域名）。
+- **自定义域名路由**：`https://feedcourier.ellery.me`（推送至 `develop` 分支且涉及 `docs/**` 变更时自动生成 Cloudflare Preview URL，合入 `main` 分支后发布至生产域名）。

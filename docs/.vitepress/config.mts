@@ -163,9 +163,17 @@ export default withMermaid(
         themeConfig: {
           nav: [
             {
-              text: "User Guide",
+              text: "Overview",
               link: "/guide/introduction",
-              activeMatch: "^/(guide|channels|mcp)/",
+            },
+            {
+              text: "Quick Start",
+              link: "/guide/quick-start",
+            },
+            {
+              text: "User Guide",
+              link: "/guide/configuration",
+              activeMatch: "^/(guide/(configuration|operations)|channels/|mcp/)",
             },
             {
               text: "Architecture",
@@ -198,9 +206,17 @@ export default withMermaid(
         themeConfig: {
           nav: [
             {
-              text: "使用手册",
+              text: "项目简介",
               link: "/zh/guide/introduction",
-              activeMatch: "^/zh/(guide|channels|mcp)/",
+            },
+            {
+              text: "快速开始",
+              link: "/zh/guide/quick-start",
+            },
+            {
+              text: "使用手册",
+              link: "/zh/guide/configuration",
+              activeMatch: "^/zh/(guide/(configuration|operations)|channels/|mcp/)",
             },
             {
               text: "架构手册",
