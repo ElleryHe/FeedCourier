@@ -126,11 +126,32 @@ jobs:
         run: pnpm --dir docs build
 
   docker-web-stage:
-    name: Dockerfile Web Stage (node:26-alpine)
+    name: Dockerfile & Entrypoint Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Lint docker-entrypoint.sh with ShellCheck
+        run: shellcheck docker-entrypoint.sh
+
+      - name: Verify entrypoint privilege drop on root-owned bind mount
+        run: |
+          HOST_DATA="$(mktemp -d)"
+          sudo chown 0:0 "${HOST_DATA}"
+          sudo chmod 0755 "${HOST_DATA}"
+          docker run --rm \
+            -v "${PWD}/docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh:ro" \
+            -v "${HOST_DATA}:/data" \
+            debian:bookworm-slim sh -eu -c '
+              groupadd --gid 10001 feedcourier
+              useradd --uid 10001 --gid feedcourier --home-dir /data --no-create-home --no-log-init --shell /usr/sbin/nologin feedcourier
+              printf "#!/bin/sh\nset -eu\n[ \"\$(id -u):\$(id -g)\" = \"10001:10001\" ]\ntouch /data/probe\n" > /usr/local/bin/feedcourier
+              chmod 0755 /usr/local/bin/feedcourier
+              exec /usr/local/bin/docker-entrypoint.sh
+            '
+          test "$(stat -c '%u:%g' "${HOST_DATA}/probe")" = "10001:10001"
+          sudo rm -rf "${HOST_DATA}"
 
       - name: Verify Dockerfile web-builder stage
         run: docker build --target web-builder -t feedcourier-web-builder:ci .
