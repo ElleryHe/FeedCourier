@@ -81,7 +81,7 @@ curl -fL -b cookies.txt \
 
 ### Caddy 配置示例（自动签发 HTTPS 证书）
 
-```caddyfile
+```txt
 feedcourier.example.com {
     reverse_proxy 127.0.0.1:8080 {
         flush_interval -1
