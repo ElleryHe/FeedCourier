@@ -12,6 +12,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -357,11 +358,13 @@ export interface TagInputProps {
 export function TagInput({
   values,
   onChange,
-  placeholder = "Type and press Enter…",
+  placeholder,
   suggestions = [],
   mono = false,
 }: TagInputProps) {
+  const { m } = useI18n();
   const [draft, setDraft] = useState("");
+  const resolvedPlaceholder = placeholder ?? m.common.typeAndPressEnter;
 
   const addValue = (raw: string) => {
     const cleaned = raw.trim();
@@ -398,7 +401,7 @@ export function TagInput({
             <button
               type="button"
               onClick={() => onChange(values.filter((v) => v !== val))}
-              aria-label={`Remove ${val}`}
+              aria-label={m.common.removeItem(val)}
               className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-100"
             >
               <X className="h-3 w-3" />
@@ -412,7 +415,7 @@ export function TagInput({
           onBlur={() => {
             if (draft.trim()) addValue(draft);
           }}
-          placeholder={values.length === 0 ? placeholder : ""}
+          placeholder={values.length === 0 ? resolvedPlaceholder : ""}
           className={cn(
             "min-w-[120px] flex-1 bg-transparent text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none dark:text-zinc-100 dark:placeholder:text-zinc-500",
             mono && "font-mono text-xs",
@@ -424,13 +427,15 @@ export function TagInput({
             onClick={() => addValue(draft)}
             className="inline-flex items-center gap-0.5 rounded bg-zinc-900 px-1.5 py-0.5 text-[11px] font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {m.common.add}
           </button>
         )}
       </div>
       {unusedSuggestions.length > 0 && (
         <div className="flex flex-wrap items-center gap-1">
-          <span className="text-[11px] text-zinc-400">Suggestions:</span>
+          <span className="text-[11px] text-zinc-400">
+            {m.common.suggestions}
+          </span>
           {unusedSuggestions.slice(0, 8).map((tag) => (
             <button
               key={tag}
@@ -478,6 +483,8 @@ export function Modal({
   children,
   footer,
 }: ModalProps) {
+  const { m } = useI18n();
+
   useEffect(() => {
     if (!open) return;
     const handleKey = (e: globalThis.KeyboardEvent) => {
@@ -524,7 +531,7 @@ export function Modal({
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close dialog"
+            aria-label={m.common.closeDialog}
             className="rounded-md p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
           >
             <X className="h-4 w-4" />
@@ -563,10 +570,11 @@ export function ConfirmDialog({
   onConfirm,
   title,
   description,
-  confirmLabel = "Confirm",
+  confirmLabel,
   destructive = true,
   loading = false,
 }: ConfirmDialogProps) {
+  const { m } = useI18n();
   return (
     <Modal
       open={open}
@@ -576,14 +584,14 @@ export function ConfirmDialog({
       footer={
         <>
           <Button variant="outline" onClick={onClose} disabled={loading}>
-            Cancel
+            {m.common.cancel}
           </Button>
           <Button
             variant={destructive ? "destructive" : "primary"}
             onClick={onConfirm}
             loading={loading}
           >
-            {confirmLabel}
+            {confirmLabel ?? m.common.confirm}
           </Button>
         </>
       }

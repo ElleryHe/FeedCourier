@@ -1,5 +1,8 @@
 ---
 layout: home
+title: "FeedCourier"
+titleTemplate: ":title — Self-Hosted RSS, Atom & JSON Feed Delivery Service"
+description: "Self-hosted RSS, Atom, and JSON Feed subscription delivery service built with Rust, SQLite, and React. Delivers articles to SMTP Email, Telegram, and Notion, with an embedded WebUI and MCP server."
 
 hero:
   name: "FeedCourier"

@@ -1,3 +1,7 @@
+---
+description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、routes、delivery_tasks、sessions、mcp_tokens 与 system_settings。"
+---
+
 # SQLite 数据库表结构参考
 
 FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql)。所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，所有外键关联均启用 **`ON DELETE CASCADE`** 级联清理。

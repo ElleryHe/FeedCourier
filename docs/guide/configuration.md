@@ -1,3 +1,7 @@
+---
+description: "Configure FeedCourier environment variables, HTTP and SOCKS5 outbound proxies, per-feed and per-channel proxy toggles, and private network SSRF allowlists."
+---
+
 # Configuration & Proxy
 
 FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment, both of which have default values. Outbound proxy settings and private network allowlists can be initialized via environment variables on first launch and updated at any time from the WebUI under **Settings**.

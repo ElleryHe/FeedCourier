@@ -51,7 +51,7 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
-  # Or pin an exact release: elleryhe/feedcourier:0.1.2
+  # Or pin an exact release: elleryhe/feedcourier:0.1.3
 ```
 
 ### Docker Compose
@@ -59,7 +59,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.2
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.3
     container_name: feedcourier
     restart: unless-stopped
     ports:

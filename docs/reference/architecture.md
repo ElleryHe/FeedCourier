@@ -1,3 +1,7 @@
+---
+description: "Internal architecture of FeedCourier: Rust module layout, SHA-256 deduplication, SQLite WAL pools, payload garbage collection, and lease-based outbox scheduling."
+---
+
 # System Architecture
 
 This document describes FeedCourier's internal module layout, data flow, four-tier SHA-256 fingerprint deduplication, SQLite WAL read/write connection pools, `NOT EXISTS` payload garbage collection, and the lease-based outbox state machine (`lease_until` + `credential_group_key`).

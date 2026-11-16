@@ -1,3 +1,7 @@
+---
+description: "将 Claude Desktop、Cursor 或其他 AI 客户端接入 FeedCourier Streamable HTTP /mcp 端点，配置 readonly 与 admin 双权限 Bearer 令牌。"
+---
+
 # 客户端接入与安全说明
 
 FeedCourier 在同一个 HTTP 监听端口（默认 `0.0.0.0:8080`）上提供了符合 Model Context Protocol 规范的 **Streamable HTTP 接口（`/mcp`）**。

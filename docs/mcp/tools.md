@@ -1,3 +1,7 @@
+---
+description: "Reference for FeedCourier's 7 MCP tools covering feed status inspection, article preview, failed delivery diagnostics, feed management, and route configuration."
+---
+
 # Tools Overview
 
 FeedCourier exposes **7 structured MCP tools** across two permission scopes (`readonly` and `admin`). All tools return structured JSON responses.

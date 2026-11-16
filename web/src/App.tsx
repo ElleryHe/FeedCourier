@@ -17,6 +17,7 @@ import {
 import { ComplianceFooter } from "@/components/layout/ComplianceFooter";
 import { Button, Card, CardContent } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { LocaleSwitchButton, useI18n } from "@/i18n";
 import { errorMessage } from "@/lib/utils";
 import { AuthGateView } from "@/views/AuthGateView";
 import { ChannelsView } from "@/views/ChannelsView";
@@ -46,6 +47,7 @@ function parseHashSection(): NavSection {
 
 export function App() {
   useThemeMode();
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -97,11 +99,11 @@ export function App() {
     mutationFn: () => api.auth.logout(),
     onSuccess: () => {
       queryClient.clear();
-      toast.info("Signed out");
+      toast.info(m.shell.signedOut);
       void authQuery.refetch();
     },
     onError: (err) => {
-      toast.error("Sign out failed", errorMessage(err));
+      toast.error(m.shell.signOutFailed, errorMessage(err));
     },
   });
 
@@ -116,7 +118,7 @@ export function App() {
         <div className="flex flex-1 items-center justify-center">
           <div className="flex items-center gap-2.5 text-xs text-zinc-500">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Connecting to FeedCourier gateway…
+            {m.shell.connecting}
           </div>
         </div>
         <ComplianceFooter
@@ -132,6 +134,9 @@ export function App() {
   if (authQuery.isError) {
     return (
       <div className="flex min-h-screen flex-col bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+        <div className="flex justify-end px-4 pt-4">
+          <LocaleSwitchButton />
+        </div>
         <div className="flex flex-1 items-center justify-center px-4">
           <Card className="w-full max-w-md">
             <CardContent className="space-y-4 pt-6">
@@ -139,10 +144,10 @@ export function App() {
                 <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
                 <div>
                   <h2 className="text-sm font-semibold">
-                    Backend API Unreachable
+                    {m.shell.backendUnreachableTitle}
                   </h2>
                   <p className="mt-1 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-                    Could not reach{" "}
+                    {m.shell.backendUnreachablePrefix}{" "}
                     <code className="font-mono">/api/v1/auth/status</code>:{" "}
                     {errorMessage(authQuery.error)}
                   </p>
@@ -155,7 +160,7 @@ export function App() {
                 loading={authQuery.isFetching}
               >
                 <RefreshCw className="h-4 w-4" />
-                Retry Connection
+                {m.shell.retryConnection}
               </Button>
             </CardContent>
           </Card>

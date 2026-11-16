@@ -1,0 +1,688 @@
+export const en = {
+  common: {
+    refresh: "Refresh",
+    retry: "Retry",
+    cancel: "Cancel",
+    close: "Close",
+    save: "Save",
+    edit: "Edit",
+    delete: "Delete",
+    confirm: "Confirm",
+    add: "Add",
+    clear: "Clear",
+    all: "All",
+    rows: "Rows:",
+    disabled: "Disabled",
+    proxy: "Proxy",
+    readability: "Readability",
+    unlimited: "Unlimited",
+    never: "Never",
+    required: "Required",
+    suggestions: "Suggestions:",
+    typeAndPressEnter: "Type and press Enter…",
+    removeItem: (item: string) => `Remove ${item}`,
+    closeDialog: "Close dialog",
+    dismissNotification: "Dismiss notification",
+    unexpectedError: "Unexpected error occurred",
+    invalidRegex: "Invalid regular expression",
+    requestFailedHttp: (status: number) => `Request failed with HTTP ${status}`,
+  },
+
+  locale: {
+    consoleTitle: "FeedCourier Console",
+    switchLabel: "中文",
+    switchTitle: "Switch interface language to Simplified Chinese (切换为简体中文)",
+  },
+
+  theme: {
+    light: "Light",
+    dark: "Dark",
+    toggleTitle: "Toggle color theme",
+  },
+
+  footer: {
+    sourceRepository: "Source Repository",
+  },
+
+  shell: {
+    subtitle: "Delivery Service",
+    openNav: "Open navigation menu",
+    closeNav: "Close navigation menu",
+    mainNav: "Main navigation",
+    signOut: "Sign out",
+    signedOut: "Signed out",
+    signOutFailed: "Sign out failed",
+    connecting: "Connecting to FeedCourier…",
+    backendUnreachableTitle: "Backend API Unreachable",
+    backendUnreachablePrefix: "Could not reach",
+    retryConnection: "Retry Connection",
+    nav: {
+      overview: {
+        label: "Overview",
+        subtitle: "Status & Maintenance",
+      },
+      feeds: {
+        label: "Feeds",
+        subtitle: "RSS · Atom · JSON Feed",
+      },
+      channels: {
+        label: "Channels",
+        subtitle: "SMTP · Telegram · Notion",
+      },
+      routes: {
+        label: "Routes",
+        subtitle: "Filters & Delivery Modes",
+      },
+      tasks: {
+        label: "Outbox",
+        subtitle: "Queue & Dead-Letter",
+      },
+      settings: {
+        label: "System & MCP",
+        subtitle: "Proxy · SSRF · MCP Tokens",
+      },
+    },
+  },
+
+  status: {
+    feed: {
+      active: "Active",
+      backoff: "Backoff",
+      circuit_open: "Circuit Open",
+      paused: "Paused",
+    },
+    task: {
+      queued: "Queued",
+      delivering: "Delivering",
+      deliveringLeased: "Delivering (Leased)",
+      retrying: "Retrying",
+      deferred: "Deferred",
+      quotaDeferred: "Quota Deferred",
+      dead_letter: "Dead Letter",
+      delivered: "Delivered",
+    },
+  },
+
+  auth: {
+    heading: "FeedCourier Console",
+    subheading: "Self-hosted RSS, Atom & JSON Feed delivery service · MCP Server",
+    initTitle: "Initialize Administrator Password",
+    loginTitle: "Administrator Sign In",
+    initDesc:
+      "First-time setup: your password is hashed with Argon2id, and channel credentials are encrypted at rest with ChaCha20-Poly1305.",
+    loginDesc:
+      "Enter your administrator password to manage feeds, delivery channels, routing rules, and MCP tokens.",
+    newPasswordLabel: "New Admin Password",
+    passwordLabel: "Password",
+    minCharsPlaceholder: "Minimum 8 characters…",
+    envSeedHintPrefix: "Tip: You can also set",
+    envSeedHintSuffix: "via environment variable on container startup.",
+    confirmPasswordLabel: "Confirm Admin Password",
+    confirmPasswordPlaceholder: "Re-enter password…",
+    initSubmit: "Initialize & Sign In",
+    loginSubmit: "Sign In",
+    toastInitDone: "Administrator password initialized",
+    toastSignedIn: "Signed in to FeedCourier",
+    errMinLength: "Administrator password must be at least 8 characters.",
+    errMismatch: "Password confirmation does not match.",
+    errEmpty: "Please enter your administrator password.",
+  },
+
+  overview: {
+    title: "System Overview",
+    subtitle:
+      "Polling status, outbox task queue, channel rate-limit cooldowns, and SQLite database maintenance.",
+    loadError: "Unable to load overview metrics:",
+    subscriptionHealth: "Subscription Health",
+    manageFeeds: "Manage feeds →",
+    outboxHeading: "Outbox Task Queue (1 Task = 1 Entry × 1 Route)",
+    inspectOutbox: "Inspect outbox →",
+    fingerprintsTitle: "Fingerprints & Cached Payloads",
+    fingerprintsDesc:
+      "SHA-256 fingerprints are retained permanently to prevent duplicate sends; cached HTML and media metadata are cleaned up after the retention window.",
+    permanentFingerprints: "Permanent Fingerprints",
+    permanentFingerprintsSub: "SHA-256 deduplication index",
+    activePayloads: "Active Cached Payloads",
+    activePayloadsSub: "In-flight or within retention window",
+    cooldownsTitle: "Active Channel Cooldowns",
+    channelsLink: "Channels →",
+    cooldownsDesc:
+      "Downstream rate-limit pauses (SMTP 421/45x, Telegram retry_after, Notion 429) shared across channels using the same credentials.",
+    noCooldowns:
+      "All delivery channels are sending normally — no active cooldowns.",
+    resumes: (rel: string) => `Resumes ${rel}`,
+    maintenanceTitle: "SQLite WAL Maintenance",
+    maintenanceDescPrefix: "Clean up expired article bodies immediately or download an online",
+    maintenanceDescSuffix: "database snapshot.",
+    runGcNow: "Clean Up Expired Payloads Now",
+    downloadSnapshot: "Download Online SQLite Snapshot (.db)",
+    snapshotNote:
+      "Snapshots include feeds, encrypted channels, routes, tasks, and deduplication fingerprints.",
+    gcDoneTitle: "Payload cleanup completed",
+    gcDoneDesc: (count: number) =>
+      `Cleaned cached bodies from ${count} finished ${count === 1 ? "entry" : "entries"}; SHA-256 fingerprints retained.`,
+    gcFailedTitle: "Payload cleanup failed",
+    backupDoneTitle: "SQLite snapshot downloaded",
+    backupDoneDesc: (filename: string) => `Saved ${filename}`,
+    backupFailedTitle: "Snapshot backup failed",
+  },
+
+  feeds: {
+    title: "Subscriptions & Full-Text Extraction",
+    subtitle:
+      "RSS, Atom, and JSON Feed polling with SSRF protection, conditional ETag/Last-Modified requests, optional Readability full-text extraction, and deduplication.",
+    livePreview: "Live Preview",
+    importOpml: "Import OPML",
+    exportOpml: "Export OPML",
+    addFeed: "Add Feed",
+    searchPlaceholder: "Filter by title, URL, or #tag…",
+    loading: "Loading subscriptions…",
+    emptyTitle: "No feeds configured yet",
+    emptyFilteredTitle: "No feeds match your current filter",
+    emptyDesc:
+      "Add an RSS, Atom, or JSON Feed URL, or import an existing OPML file with silent initialization.",
+    emptyFilteredDesc:
+      "Try clearing your search query or switching status tabs.",
+    addFirstFeed: "Add First Feed",
+    failsBadge: (count: number) => `${count} ${count === 1 ? "fail" : "fails"}`,
+    intervalLabel: "Interval:",
+    nextPollLabel: "Next poll:",
+    pausedLower: "paused",
+    resetAndPoll: "Reset & Poll",
+    pollNow: "Poll Now",
+    pollButtonTitle:
+      "Reset circuit breaker / backoff and poll this feed immediately",
+    fullTextOn: "Full Text: ON",
+    fullTextOff: "Full Text: OFF",
+    fullTextToggleTitle: "Toggle Readability full-text extraction",
+    previewButtonTitle: "Preview feed & test filter rules",
+    resumePollingTitle: "Resume feed polling",
+    pausePollingTitle: "Pause feed polling",
+    editFeedTitle: "Edit feed settings",
+    deleteFeedTitle: "Delete feed",
+    toastNotModifiedTitle: "304 Not Modified",
+    toastNotModifiedDesc: "Upstream returned 304 Not Modified; schedule updated.",
+    toastPolledTitle: "Feed polled",
+    toastPolledDesc: (entries: number, tasks: number) =>
+      `Discovered ${entries} new ${entries === 1 ? "entry" : "entries"} (${tasks} ${tasks === 1 ? "task" : "tasks"} enqueued).`,
+    toastPollFailed: "Immediate poll failed",
+    toastUpdateFailed: "Failed to update feed",
+    toastRemoved: "Feed removed",
+    toastDeleteFailed: "Failed to delete feed",
+    toastOpmlExported: "OPML exported",
+    toastOpmlExportedDesc: (filename: string) => `Downloaded ${filename}`,
+    toastOpmlExportFailed: "OPML export failed",
+    toastUpdated: "Feed updated",
+    toastAdded: "Feed added",
+    deleteModalTitle: "Delete Subscription",
+    deleteModalDesc: (name: string) =>
+      `Remove "${name}"? Stored entry fingerprints and delivery tasks for this feed will also be deleted.`,
+    deleteModalConfirm: "Delete Feed",
+    editor: {
+      editTitle: "Edit Subscription",
+      addTitle: "Add Subscription",
+      desc: "Configure polling interval, tags (used for route matching and Notion Tag sync), and full-text extraction.",
+      previewUrl: "Preview URL",
+      saveChanges: "Save Changes",
+      subscribe: "Subscribe",
+      urlLabel: "Feed URL (RSS / Atom / JSON Feed)",
+      titleLabel: "Custom Title Override (Optional)",
+      titlePlaceholder: "Auto-detected from feed if left blank",
+      intervalLabel: "Poll Interval (Seconds)",
+      tagsLabel: "Tags (Route matching & Notion Tag sync)",
+      tagsPlaceholder: "e.g. rust, security, ai…",
+      readabilityLabel: "Readability Full-Text Extraction",
+      readabilityDesc:
+        "Fetch the original article webpage for summary-only feeds; automatically falls back to the feed summary if blocked or unreachable.",
+      proxyLabel: "Use Outbound Proxy",
+      proxyDesc:
+        "Fetch this feed and its article webpages via the configured HTTP/SOCKS5 outbound proxy.",
+      silentInitLabel: "Silent Initialization (Prevent Backlog Flood)",
+      silentInitDesc:
+        "Record SHA-256 fingerprints for existing articles on first poll without sending historical items.",
+      pushLatestLabel: "Send Latest 1 Entry on First Sync",
+      pushLatestDesc:
+        "Enqueue only the single newest item during silent initialization to verify delivery.",
+      errInvalidUrl: "Please enter a valid http:// or https:// feed URL.",
+      errMinInterval: "Poll interval must be at least 60 seconds.",
+    },
+    preview: {
+      title: "Live Feed & Filter Preview",
+      desc: "Test-fetch a feed URL, inspect Readability full-text extraction, and dry-run keyword or regex filters before subscribing.",
+      subscribeWithSettings: "Subscribe with Settings",
+      fetchAndPreview: "Fetch & Preview",
+      readabilitySwitch: "Readability Full-Text",
+      proxySwitch: "Use Outbound Proxy",
+      hideFilters: "Hide Filter Dry-Run",
+      showFilters: "Test Filter Rules",
+      includeKeywordsLabel: "Include Keywords (Match Any)",
+      includeKeywordsPlaceholder: "Add keyword…",
+      excludeKeywordsLabel: "Exclude Keywords (Block Any)",
+      excludeKeywordsPlaceholder: "Sponsor, Ad…",
+      includeRegexLabel: "Include Regex",
+      excludeRegexLabel: "Exclude Regex",
+      errInvalidUrl: "Enter a valid http:// or https:// feed URL.",
+      errIncludeRegex: (msg: string) => `Include regex invalid: ${msg}`,
+      errExcludeRegex: (msg: string) => `Exclude regex invalid: ${msg}`,
+      untitledFeed: "Untitled Feed",
+      itemsCount: (count: number) => `${count} ${count === 1 ? "item" : "items"}`,
+      matchedSummary: "Matched:",
+      matchedBadge: "Matched",
+      filteredBadge: "Filtered",
+      mediaCount: (count: number) => `${count} media`,
+      filterNote: (reason: string) => `Filter note: ${reason}`,
+      firstSentenceTag: "[1st sentence] ",
+      collapse: "Collapse",
+      body: "Body",
+    },
+    opml: {
+      title: "Import OPML Subscriptions",
+      desc: "Upload an .opml / .xml file or paste OPML 2.0 XML directly. Nested OPML folders are mapped to feed tags.",
+      importBtn: "Import Feeds",
+      fileLabel: "Select OPML File",
+      xmlLabel: "OPML XML Content",
+      dedupHint:
+        "Existing feeds with identical URLs are automatically skipped.",
+      silentInitLabel: "Silent Initialization (Recommended)",
+      silentInitDesc:
+        "Record SHA-256 fingerprints for existing articles on initial sync so imported feeds do not flood your channels.",
+      errEmptyXml: "Please upload or paste OPML XML content.",
+      toastDoneTitle: "OPML import complete",
+      toastDoneDesc: (imported: number, skipped: number) =>
+        `Imported ${imported} ${imported === 1 ? "feed" : "feeds"} (${skipped} existing skipped).`,
+    },
+  },
+
+  channels: {
+    title: "Delivery Channels",
+    subtitle:
+      "Channel credentials and recipient targets are encrypted at rest with ChaCha20-Poly1305 and managed exclusively in WebUI (never exposed to MCP clients).",
+    newChannel: "New Channel",
+    loading: "Loading delivery channels…",
+    emptyTitle: "No delivery channels configured",
+    emptyDesc:
+      "Configure an SMTP email account, a Telegram bot chat/topic, or a Notion database before creating delivery routes.",
+    configureFirst: "Configure First Channel",
+    kindLabels: {
+      smtp: "SMTP Email",
+      telegram: "Telegram Bot",
+      notion: "Notion Database",
+    },
+    pacingLine: (
+      minDur: string,
+      jitterDur: string,
+      hourly: number | null,
+      daily: number | null,
+    ) =>
+      `Send rate: min ${minDur} + up to ${jitterDur} jitter${hourly ? ` · ${hourly}/hr` : ""}${daily ? ` · ${daily}/day` : ""}`,
+    card: {
+      server: "Server:",
+      fromTo: "From → To:",
+      auth: "Auth:",
+      anonymous: "anonymous",
+      noPassword: "(no password)",
+      targetChat: "Target Chat:",
+      topicSuffix: (id: number) => ` (topic #${id})`,
+      botApi: "Bot API:",
+      botToken: "Bot Token:",
+      dataSourceId: "Data Source ID:",
+      requiredKeys: "Required Keys:",
+      secret: "Secret:",
+      richReady: "Rich Message Supported",
+      richUnsupported: "Rich Message Unsupported (Compact Fallback)",
+      fallbackPrefix: (reason: string) => `Fallback: ${reason}`,
+      cooldownPrefix: (rel: string) => `Cooldown ${rel}`,
+      sendTest: "Send Test",
+      deleteTitle: "Delete channel",
+    },
+    toastTestOk: "Channel test succeeded",
+    toastTestIssue: "Channel test reported an issue",
+    toastTestFailed: "Channel test failed",
+    toastToggleFailed: "Failed to toggle channel",
+    toastDeleted: "Channel deleted",
+    toastDeleteFailed: "Failed to delete channel",
+    toastUpdated: "Channel updated",
+    toastCreated: "Channel created",
+    deleteModalTitle: "Delete Delivery Channel",
+    deleteModalDesc: (name: string) =>
+      `Delete "${name}"? Any routes and pending delivery tasks bound to this channel will also be removed.`,
+    deleteModalConfirm: "Delete Channel",
+    wizard: {
+      editTitle: (name: string) => `Edit Channel: ${name}`,
+      newTitle: "New Delivery Channel",
+      desc: "Secrets are encrypted with ChaCha20-Poly1305. Channels sharing the same credentials share rate-limit cooldowns automatically.",
+      saveChannel: "Save Channel",
+      createChannel: "Create Channel",
+      nameLabel: "Channel Name",
+      namePlaceholderSmtp: "Personal Reading Inbox",
+      namePlaceholderTg: "Tech Updates Topic",
+      namePlaceholderNotion: "Reading Database",
+      smtp: {
+        heading: "SMTP Server & Sender Settings",
+        hostLabel: "SMTP Host",
+        portLabel: "Port",
+        securityLabel: "Connection Security",
+        secStartTls: "STARTTLS (587)",
+        secTls: "Implicit TLS / SMTPS (465)",
+        secPlain: "Plain Local Relay (25)",
+        usernameLabel: "SMTP Username",
+        passwordLabel: "SMTP Password / App Password",
+        passwordStoredPlaceholder: "Stored (••••••••) — leave blank to keep",
+        fromLabel: "From Address (SPF/DKIM Verified)",
+        fromHint:
+          "Display name adopts each feed's title, with deterministic Message-ID and List-ID headers.",
+        replyToLabel: "Reply-To Address (Optional)",
+        replyToPlaceholder: "Optional Reply-To address",
+        toLabel: "Recipient Addresses (Press Enter to add)",
+      },
+      telegram: {
+        heading: "Telegram Bot & Target Chat",
+        tokenLabel: "Bot Token",
+        tokenStoredPlaceholder: (hint: string) =>
+          `Stored (${hint}) — leave blank to keep`,
+        chatIdLabel: "Target Chat ID or @Channel",
+        threadIdLabel: "Forum Topic Thread ID (Optional)",
+        threadIdPlaceholder: "e.g. 42",
+        apiBaseLabel: "Custom Bot API Base URL (Optional)",
+        apiBasePlaceholder:
+          "https://api.telegram.org (supports reverse proxy or Local Bot API Server)",
+        apiBaseHint:
+          "Checks Rich Message support on save and falls back to Compact Card automatically if unsupported by a custom endpoint.",
+      },
+      notion: {
+        heading: "Notion Database Connection",
+        modeInit: "1. Auto-Create 7-Column DB",
+        modeBind: "2. Bind Existing Database",
+        secretLabel: "Notion Internal Integration Secret",
+        secretStoredPlaceholder: (hint: string) =>
+          `Stored (${hint}) — leave blank to keep`,
+        initIntro:
+          "Creates a new Notion database under your authorized parent page with the 7 standard columns (Title, Link, Source, Published, State, Tag, FC-ID) and binds its data source automatically.",
+        parentPageLabel: "Authorized Parent Page ID or URL",
+        dbTitleLabel: "New Database Title",
+        autoCreateBtn: "Create 7-Column Database Now",
+        autoCreatedBanner: (dbId: string, dsId: string) =>
+          `Created 7-column database (${dbId}) → bound data_source_id ${dsId}.`,
+        toastCreatedTitle: "Notion database created",
+        toastCreatedDesc: (dsId: string) => `Bound data_source_id: ${dsId}`,
+        existingTargetLabel: "Existing Data Source ID or Database URL",
+        inspectBtn: "Inspect Schema",
+        missingBanner: (count: number) =>
+          `${count} standard ${count === 1 ? "column is" : "columns are"} missing on this database (including FC-ID if unmapped).`,
+        patchMissingBtn: "Add Missing Columns",
+        toastPatchedTitle: "Updated Notion database schema",
+        toastPatchedDesc: (cols: string) => `Added columns: ${cols}`,
+        toastInspectedTitle: "Schema inspected",
+        toastInspectedReady: "Required columns (Title & FC-ID) verified.",
+        toastInspectedReview: "Review missing or mismatched columns below.",
+        colField: "Field",
+        colExpectedType: "Expected Type",
+        colStatus: "Status",
+        colMappedProp: "Mapped Notion Property",
+        foundType: (actual: string) => `(found: ${actual})`,
+        statusMatched: "Matched",
+        statusMismatch: "Type Mismatch",
+        statusMissing: "Missing",
+        statusUnverified: "Unverified",
+        selectRequiredOption: (expectedType: string) =>
+          `— Select ${expectedType} column —`,
+        skipFieldOption: "— Skip field —",
+        optionalBlankPlaceholder: "Optional (blank to skip)",
+        purposes: {
+          title: "Article title",
+          fc_id: "SHA-256 fingerprint for deduplication",
+          link: "Original article URL",
+          source: "Feed source title",
+          published: "Publication timestamp",
+          state: "UnRead / Read reading state",
+          tag: "Synced subscription tags",
+        },
+      },
+      pacing: {
+        heading: "Send Rate, Random Jitter & Quotas",
+        minIntervalLabel: "Min Interval (Secs)",
+        maxJitterLabel: "Max Jitter (Secs)",
+        hourlyQuotaLabel: "Hourly Quota (Opt)",
+        dailyQuotaLabel: "Daily Quota (Opt)",
+        proxyLabel: "Use Outbound Proxy",
+        proxyDesc: "Route SMTP or API requests through the global outbound proxy.",
+        enabledLabel: "Channel Enabled",
+        enabledDesc: "Pause delivery to this channel without deleting routes.",
+      },
+      errors: {
+        emptyName: "Please enter a channel name.",
+        smtpRequired:
+          "SMTP host, From address, and at least one recipient To address are required.",
+        smtpPassword:
+          "SMTP password is required for TLS / STARTTLS authentication.",
+        tgChatId: "Telegram target chat_id is required.",
+        tgToken: "Telegram Bot Token is required when creating a channel.",
+        notionSecret:
+          "Notion Integration Secret is required when creating a channel.",
+        notionInitInputs:
+          "Enter both Notion Integration Secret and Parent Page ID/URL to create a database.",
+        notionInspectSecret:
+          "Enter Notion Integration Secret before inspecting schema.",
+        notionInspectTarget:
+          "Enter a Notion data_source_id or database ID/URL.",
+        notionDataSource:
+          "Notion data_source_id is required. Create a database or inspect an existing database first.",
+        notionRequiredCols:
+          "Notion column mapping requires both Title and FC-ID columns.",
+      },
+    },
+  },
+
+  routes: {
+    title: "Routing & Presentation Rules",
+    subtitle:
+      "Connect feeds or tag groups to delivery channels with keyword/regex filters and per-route Telegram presentation modes.",
+    newRoute: "New Route",
+    loading: "Loading routing rules…",
+    emptyTitle: "No delivery routes configured",
+    emptyDesc:
+      "Create a route to connect subscriptions (by feed selection or #tags) to an SMTP, Telegram, or Notion channel.",
+    createFirst: "Create First Route",
+    previewOn: " · Preview ON",
+    previewOff: " · Preview OFF",
+    feedFallback: (id: number) => `Feed #${id}`,
+    channelFallback: (id: number) => `Channel #${id}`,
+    toastToggleFailed: "Failed to toggle route",
+    toastDeleted: "Route deleted",
+    toastDeleteFailed: "Failed to delete route",
+    toastUpdated: "Route updated",
+    toastCreated: "Route created",
+    deleteModalTitle: "Delete Delivery Route",
+    deleteModalDesc: (name: string) =>
+      `Delete route "${name}"? Pending delivery tasks for this route will also be removed.`,
+    deleteModalConfirm: "Delete Route",
+    modes: {
+      rich_message: {
+        label: "Rich Message",
+        summary:
+          "Formats full articles with headings, quotes, code blocks, lists, and inline links, plus a Read Original button.",
+      },
+      compact_card: {
+        label: "Compact Card",
+        summary:
+          "Sends a concise message card with bold title, source tag, summary excerpt, and article link.",
+      },
+      media_mode: {
+        label: "Media Mode",
+        summary:
+          "Sends extracted images/videos as an album with a 3-line caption (author, opening sentence, link) and stream relay fallback.",
+      },
+    },
+    editor: {
+      editTitle: (name: string) => `Edit Route: ${name}`,
+      newTitle: "New Delivery Route",
+      desc: "Each matched article enqueues an independent delivery task (1 Task = 1 Entry × 1 Route).",
+      saveRoute: "Save Route",
+      createRoute: "Create Route",
+      nameLabel: "Route Name",
+      namePlaceholder: "Tech Feeds → Telegram",
+      channelLabel: "Target Delivery Channel",
+      noChannelsOption: "— Configure a channel first —",
+      sourceHeading: "Source Selector (Explicit Feeds OR Tag Match)",
+      selectAll: (count: number) => `Select all (${count})`,
+      matchTagsLabel: "Match Tags",
+      matchTagsPlaceholder: "Match any feed carrying these tags…",
+      explicitFeedsLabel: (count: number) =>
+        `Explicit Subscriptions (${count} selected)`,
+      noFeedsHint:
+        "No feeds added yet — you can still bind by #tag above.",
+      tgHeading: "Telegram Presentation Mode",
+      tgFallbackNotice:
+        "This Bot API endpoint reported Rich Message unsupported; deliveries will automatically fall back to Compact Card.",
+      linkPreviewLabel: "Enable Webpage Link Preview",
+      linkPreviewDesc:
+        "Allow Telegram to display a webpage preview card below the Compact Card message.",
+      filtersHeading: "Keyword & Regex Filters (Title + Cleaned Body)",
+      includeKeywordsLabel: "Include Keywords (Match Any)",
+      includeKeywordsPlaceholder: "Leave empty to allow all…",
+      excludeKeywordsLabel: "Exclude Keywords (Block Any)",
+      excludeKeywordsPlaceholder: "Sponsored, Hiring…",
+      includeRegexLabel: "Include Regex (Optional)",
+      regexHint: "Evaluated with linear-time Rust regex syntax.",
+      excludeRegexLabel: "Exclude Regex (Optional)",
+      activeLabel: "Route Active",
+      activeDesc:
+        "When disabled, newly fetched articles will not enqueue tasks for this route.",
+      errEmptyName: "Route name is required.",
+      errNoChannel: "Select a target delivery channel first.",
+      errNoSource:
+        "Select at least one explicit feed or enter at least one #tag.",
+      errIncludeRegex: (msg: string) => `Include regex syntax error: ${msg}`,
+      errExcludeRegex: (msg: string) => `Exclude regex syntax error: ${msg}`,
+    },
+  },
+
+  tasks: {
+    title: "Outbox Queue & Dead-Letter Log",
+    subtitle:
+      "Lease-based delivery queue, crash-recovery checkpoints, and failed task diagnostics.",
+    retrySelected: (count: number) => `Retry Selected (${count})`,
+    retryAllDeadLetter: "Retry All Dead-Letter",
+    loading: "Loading outbox tasks…",
+    emptyTitle: "No delivery tasks in this view",
+    emptyDesc:
+      "When subscribed feeds publish new articles matching an active route, delivery tasks appear here.",
+    colSelect: "Select",
+    colEntry: "Entry",
+    colRouteChannel: "Route → Channel",
+    colStatusLease: "Status & Checkpoint",
+    colAttemptsCode: "Attempts / Code",
+    colTiming: "Timing",
+    colActions: "Actions",
+    selectTaskAria: (id: number) => `Select task #${id}`,
+    payloadPurged: (entryId: number) =>
+      `Entry #${entryId} (payload cleaned up)`,
+    leasePrefix: (rel: string) => `Lease ${rel}`,
+    createdPrefix: (rel: string) => `Created: ${rel}`,
+    donePrefix: (rel: string) => `Done: ${rel}`,
+    nextPrefix: (rel: string) => `Next: ${rel}`,
+    inspectTitle: "Inspect checkpoint & diagnostic log",
+    checkpoints: {
+      smtp: "SMTP Msg-ID",
+      tgCompact: "TG fallback→compact",
+      tgBatch: (offset: number) => `TG batch #${offset}`,
+      notionAsync: (id: string) => `Notion async:${id}`,
+      notionPage: (id: string) => `Notion page:${id}`,
+      notionFcId: "Notion FC-ID check",
+      notionDefault: "Notion checkpoint",
+    },
+    modal: {
+      title: (id: number) => `Task #${id} Diagnostics`,
+      requeueBtn: "Requeue Task",
+      status: "Status",
+      attempts: "Attempts",
+      lastStatusCode: "Last Status Code",
+      leaseUntil: "Lease Until",
+      nextAttempt: "Next Attempt",
+      completedAt: "Completed At",
+      resumeCheckpoint: "Resume Checkpoint",
+      noCheckpoint: "// No intermediate checkpoint recorded",
+      diagnosticLog: "Downstream Diagnostic Log",
+      noDiagnosticLog: "No error or diagnostic output recorded.",
+    },
+    confirmAllTitle: "Retry All Dead-Letter Tasks",
+    confirmAllDesc:
+      "Requeue every dead-letter task whose article payload is still cached?",
+    confirmAllBtn: "Requeue All Dead-Letter",
+    toastRequeuedTitle: "Tasks requeued",
+    toastRequeuedDesc: (count: number) =>
+      `Requeued ${count} ${count === 1 ? "task" : "tasks"} into the outbox queue.`,
+    toastRetryFailed: "Retry failed",
+  },
+
+  settings: {
+    title: "System Network & MCP Server",
+    subtitle:
+      "Configure outbound HTTP/SOCKS5 proxy settings, private-network SSRF allowlists, and scoped MCP Bearer tokens.",
+    networkTitle: "Outbound Proxy & SSRF Allowlist",
+    networkDesc:
+      "FeedCourier blocks loopback, link-local, cloud metadata, and private IPs at DNS connect time across every redirect hop. Add internal CIDRs or hostnames below only for trusted self-hosted services (such as FreshRSS, RSSHub, or a Local Bot API Server).",
+    proxyLabel: "Global Outbound Proxy URL (HTTP / HTTPS / SOCKS5)",
+    proxyPlaceholder:
+      "socks5h://127.0.0.1:1080 or http://proxy.lan:7890 (leave empty to disable)",
+    proxyHint:
+      "Used by feeds and channels that enable the Use Outbound Proxy option.",
+    ssrfLabel: "SSRF Private-Network Allowlist (CIDRs & Hostnames)",
+    ssrfPlaceholder: "e.g. 10.0.0.5/32, rsshub.internal, *.lan…",
+    ssrfHint:
+      "Press Enter after each CIDR block or internal hostname. Cloud metadata IPs remain blocked unless explicitly listed as /32 or /128.",
+    saveNetwork: "Save Network Settings",
+    errInvalidProxy:
+      "Outbound proxy URL must start with http://, https://, socks5://, or socks5h://.",
+    toastSettingsSaved: "Network settings saved",
+    mcpTitle: "MCP Server (/mcp) · Bearer Tokens",
+    mcpDesc:
+      "Streamable HTTP Model Context Protocol endpoint. Channel secrets and recipient addresses are never exposed to MCP clients, and external feed content is wrapped with untrusted-content tags.",
+    clientLabel: "Client / Agent Label",
+    clientPlaceholder: "Claude Desktop / Cursor",
+    scopeLabel: "Permission Scope",
+    scopeReadonlyTitle: "Readonly Inspection",
+    scopeAdminTitle: "Admin Management",
+    issueToken: "Issue MCP Token",
+    errEmptyTokenLabel:
+      "Enter a descriptive token label (e.g. Claude Desktop).",
+    loadingTokens: "Loading MCP tokens…",
+    emptyTokensTitle: "No MCP tokens issued yet",
+    emptyTokensDesc:
+      "Issue a readonly or admin Bearer token above to connect Claude Desktop, Cursor, or another MCP client.",
+    colName: "Name",
+    colPrefix: "Token Prefix",
+    colScope: "Scope",
+    colLastUsed: "Last Used",
+    colCreated: "Created",
+    colRevoke: "Revoke",
+    revokeTitle: "Revoke token",
+    toastTokenIssued: "MCP Bearer token issued",
+    toastTokenRevoked: "MCP token revoked",
+    toastRevokeFailed: "Failed to revoke token",
+    toastTokenCopied: "Bearer token copied",
+    toastJsonCopied: "MCP client JSON copied",
+    revealTitle: "Save Your New MCP Bearer Token",
+    revealDesc:
+      "Only the SHA-256 hash is stored in SQLite. This plaintext token is shown only once.",
+    revealConfirm: "I Have Saved This Token",
+    plaintextLabel: (scope: string) => `Plaintext Bearer Token (${scope})`,
+    copyToken: "Copy Token",
+    clientJsonLabel: "MCP Client JSON Configuration",
+    copyJson: "Copy JSON",
+    revokeModalTitle: "Revoke MCP Token",
+    revokeModalDesc: (name: string, prefix: string) =>
+      `Immediately revoke "${name}" (${prefix}…)? Connected MCP clients using this token will receive 401 Unauthorized.`,
+    revokeModalConfirm: "Revoke Token",
+  },
+};
+
+type WidenMessages<T> = {
+  readonly [K in keyof T]: T[K] extends (...args: infer A) => string
+    ? (...args: A) => string
+    : T[K] extends object
+      ? WidenMessages<T[K]>
+      : string;
+};
+
+export type Messages = WidenMessages<typeof en>;

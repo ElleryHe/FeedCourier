@@ -1,3 +1,7 @@
+---
+description: "CI/CD and release pipeline reference for FeedCourier covering GitHub Actions checks, multi-platform binary builds, Docker Hub multi-arch images, and VitePress deployment."
+---
+
 # Release & CI/CD Pipeline
 
 FeedCourier uses two GitHub Actions workflows—**CI** (`.github/workflows/ci.yml`) and **Release** (`.github/workflows/release.yml`)—to run automated checks, verify internal documentation links, compile multi-platform binaries, and publish multi-architecture Docker Hub images.
@@ -26,7 +30,7 @@ Every push to `main` or `develop` and every pull request runs:
 
 ## Automated Release Workflow (`.github/workflows/release.yml`)
 
-Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.2 && git push origin v0.1.2`) triggers the automated release pipeline:
+Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.3 && git push origin v0.1.3`) triggers the automated release pipeline:
 
 ```mermaid
 flowchart LR
@@ -55,7 +59,7 @@ All four `.tar.gz` archives are hashed into `SHA256SUMS.txt`, paired with the ma
 In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd64`, `linux/arm64`) image to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
 
 - **Published Image Tags**:
-  - `<version>` (e.g., `0.1.2`)
+  - `<version>` (e.g., `0.1.3`)
   - `<major>.<minor>` (e.g., `0.1`)
   - `<major>` (enabled from `1.0.0`+)
   - `latest` (for stable non-prerelease tags)

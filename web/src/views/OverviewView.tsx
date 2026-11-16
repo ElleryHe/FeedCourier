@@ -27,6 +27,7 @@ import {
   CardTitle,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { useI18n } from "@/i18n";
 import {
   cn,
   errorMessage,
@@ -45,6 +46,7 @@ export function OverviewView({
   onNavigateTasks,
   onNavigateSection,
 }: OverviewViewProps) {
+  const { locale, m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -58,23 +60,26 @@ export function OverviewView({
     mutationFn: () => api.maintenance.runGc(),
     onSuccess: (res) => {
       toast.success(
-        "Payload GC completed",
-        `Purged transient content from ${res.purged_entries} closed ${res.purged_entries === 1 ? "entry" : "entries"}; SHA-256 fingerprints retained.`,
+        m.overview.gcDoneTitle,
+        m.overview.gcDoneDesc(res.purged_entries),
       );
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err) => {
-      toast.error("Payload GC failed", errorMessage(err));
+      toast.error(m.overview.gcFailedTitle, errorMessage(err));
     },
   });
 
   const backupMutation = useMutation({
     mutationFn: () => api.maintenance.downloadBackup(),
     onSuccess: (filename) => {
-      toast.success("SQLite snapshot downloaded", `Saved ${filename}`);
+      toast.success(
+        m.overview.backupDoneTitle,
+        m.overview.backupDoneDesc(filename),
+      );
     },
     onError: (err) => {
-      toast.error("Snapshot backup failed", errorMessage(err));
+      toast.error(m.overview.backupFailedTitle, errorMessage(err));
     },
   });
 
@@ -89,28 +94,28 @@ export function OverviewView({
   }> = [
     {
       key: "active",
-      label: "Active",
+      label: m.status.feed.active,
       count: data?.feeds.active ?? 0,
       icon: CheckCircle2,
       tone: "text-emerald-600 dark:text-emerald-400",
     },
     {
       key: "backoff",
-      label: "Backoff",
+      label: m.status.feed.backoff,
       count: data?.feeds.backoff ?? 0,
       icon: Clock,
       tone: "text-amber-600 dark:text-amber-400",
     },
     {
       key: "circuit_open",
-      label: "Circuit Open",
+      label: m.status.feed.circuit_open,
       count: data?.feeds.circuit_open ?? 0,
       icon: ShieldAlert,
       tone: "text-rose-600 dark:text-rose-400",
     },
     {
       key: "paused",
-      label: "Paused",
+      label: m.status.feed.paused,
       count: data?.feeds.paused ?? 0,
       icon: PauseCircle,
       tone: "text-zinc-500 dark:text-zinc-400",
@@ -125,37 +130,37 @@ export function OverviewView({
   }> = [
     {
       key: "queued",
-      label: "Queued",
+      label: m.status.task.queued,
       count: data?.tasks.queued ?? 0,
       badge: "default",
     },
     {
       key: "delivering",
-      label: "Delivering (Leased)",
+      label: m.status.task.deliveringLeased,
       count: data?.tasks.delivering ?? 0,
       badge: "info",
     },
     {
       key: "retrying",
-      label: "Retrying",
+      label: m.status.task.retrying,
       count: data?.tasks.retrying ?? 0,
       badge: "warning",
     },
     {
       key: "deferred",
-      label: "Quota Deferred",
+      label: m.status.task.quotaDeferred,
       count: data?.tasks.deferred ?? 0,
       badge: "warning",
     },
     {
       key: "dead_letter",
-      label: "Dead Letter",
+      label: m.status.task.dead_letter,
       count: data?.tasks.dead_letter ?? 0,
       badge: "danger",
     },
     {
       key: "delivered",
-      label: "Delivered",
+      label: m.status.task.delivered,
       count: data?.tasks.delivered ?? 0,
       badge: "success",
     },
@@ -166,9 +171,11 @@ export function OverviewView({
       {/* Page Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-bold tracking-tight">System Overview</h1>
+          <h1 className="text-lg font-bold tracking-tight">
+            {m.overview.title}
+          </h1>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            Real-time polling health, transactional outbox leases, channel pacing cooldowns, and SQLite maintenance.
+            {m.overview.subtitle}
           </p>
         </div>
         <Button
@@ -178,7 +185,7 @@ export function OverviewView({
           loading={overviewQuery.isFetching}
         >
           <RefreshCw className="h-3.5 w-3.5" />
-          Refresh
+          {m.common.refresh}
         </Button>
       </div>
 
@@ -188,7 +195,7 @@ export function OverviewView({
             <div className="flex items-center gap-2.5 text-xs text-rose-700 dark:text-rose-300">
               <AlertTriangle className="h-4 w-4 shrink-0" />
               <span>
-                Unable to load overview metrics: {errorMessage(overviewQuery.error)}
+                {m.overview.loadError} {errorMessage(overviewQuery.error)}
               </span>
             </div>
             <Button
@@ -196,7 +203,7 @@ export function OverviewView({
               size="sm"
               onClick={() => void overviewQuery.refetch()}
             >
-              Retry
+              {m.common.retry}
             </Button>
           </CardContent>
         </Card>
@@ -206,14 +213,14 @@ export function OverviewView({
       <section className="space-y-2.5">
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase dark:text-zinc-400">
-            Subscription Health
+            {m.overview.subscriptionHealth}
           </h2>
           <button
             type="button"
             onClick={() => onNavigateFeeds()}
             className="cursor-pointer text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
           >
-            Manage feeds →
+            {m.overview.manageFeeds}
           </button>
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -245,14 +252,14 @@ export function OverviewView({
       <section className="space-y-2.5">
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase dark:text-zinc-400">
-            Transactional Outbox & Leases (1 Task = 1 Entry × 1 Route)
+            {m.overview.outboxHeading}
           </h2>
           <button
             type="button"
             onClick={() => onNavigateTasks()}
             className="cursor-pointer text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
           >
-            Inspect outbox →
+            {m.overview.inspectOutbox}
           </button>
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -284,42 +291,42 @@ export function OverviewView({
           <CardHeader>
             <div className="flex items-center gap-2">
               <Fingerprint className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-              <CardTitle>Fingerprints & Ephemeral Payloads</CardTitle>
+              <CardTitle>{m.overview.fingerprintsTitle}</CardTitle>
             </div>
-            <CardDescription>
-              SHA-256 fingerprints stay forever to prevent duplicates; HTML & media metadata burn after delivery + retention window.
-            </CardDescription>
+            <CardDescription>{m.overview.fingerprintsDesc}</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="flex items-center justify-between rounded-lg bg-zinc-50 px-3.5 py-2.5 dark:bg-zinc-950">
               <div>
                 <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
-                  Permanent Fingerprints
+                  {m.overview.permanentFingerprints}
                 </div>
                 <div className="text-[11px] text-zinc-500">
-                  4-tier dedup SHA-256 index
+                  {m.overview.permanentFingerprintsSub}
                 </div>
               </div>
               <span className="font-mono text-lg font-bold">
                 {overviewQuery.isLoading
                   ? "—"
-                  : (data?.entries.total_fingerprints ?? 0).toLocaleString()}
+                  : (data?.entries.total_fingerprints ?? 0).toLocaleString(
+                      locale,
+                    )}
               </span>
             </div>
 
             <div className="flex items-center justify-between rounded-lg bg-zinc-50 px-3.5 py-2.5 dark:bg-zinc-950">
               <div>
                 <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
-                  Active Cached Payloads
+                  {m.overview.activePayloads}
                 </div>
                 <div className="text-[11px] text-zinc-500">
-                  In-flight or within retry retention window
+                  {m.overview.activePayloadsSub}
                 </div>
               </div>
               <span className="font-mono text-lg font-bold text-emerald-600 dark:text-emerald-400">
                 {overviewQuery.isLoading
                   ? "—"
-                  : (data?.entries.active_payloads ?? 0).toLocaleString()}
+                  : (data?.entries.active_payloads ?? 0).toLocaleString(locale)}
               </span>
             </div>
           </CardContent>
@@ -331,27 +338,23 @@ export function OverviewView({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Send className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-                <CardTitle>Active Channel Cooldowns</CardTitle>
+                <CardTitle>{m.overview.cooldownsTitle}</CardTitle>
               </div>
               <button
                 type="button"
                 onClick={() => onNavigateSection("channels")}
                 className="cursor-pointer text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200"
               >
-                Channels →
+                {m.overview.channelsLink}
               </button>
             </div>
-            <CardDescription>
-              Downstream rate-limit locks (SMTP 421/45x, Telegram retry_after, Notion 429) shared across credential groups.
-            </CardDescription>
+            <CardDescription>{m.overview.cooldownsDesc}</CardDescription>
           </CardHeader>
           <CardContent>
             {!data || data.active_cooldowns.length === 0 ? (
               <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-zinc-200 px-3.5 py-5 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
                 <Sparkles className="h-4 w-4 shrink-0 text-emerald-500" />
-                <span>
-                  All delivery channels are pacing normally — no active cooldown locks.
-                </span>
+                <span>{m.overview.noCooldowns}</span>
               </div>
             ) : (
               <div className="space-y-2">
@@ -372,7 +375,7 @@ export function OverviewView({
                       variant="warning"
                       title={formatDateTime(cd.cooldown_until)}
                     >
-                      Resumes {formatRelativeTime(cd.cooldown_until)}
+                      {m.overview.resumes(formatRelativeTime(cd.cooldown_until))}
                     </Badge>
                   </div>
                 ))}
@@ -386,10 +389,12 @@ export function OverviewView({
           <CardHeader>
             <div className="flex items-center gap-2">
               <Database className="h-4 w-4 text-zinc-700 dark:text-zinc-300" />
-              <CardTitle>SQLite WAL Maintenance</CardTitle>
+              <CardTitle>{m.overview.maintenanceTitle}</CardTitle>
             </div>
             <CardDescription>
-              Reclaim closed article payloads via <code className="font-mono">NOT EXISTS</code> GC or download a zero-downtime <code className="font-mono">VACUUM INTO</code> snapshot.
+              {m.overview.maintenanceDescPrefix}{" "}
+              <code className="font-mono">VACUUM INTO</code>{" "}
+              {m.overview.maintenanceDescSuffix}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-2.5">
@@ -400,7 +405,7 @@ export function OverviewView({
               loading={gcMutation.isPending}
             >
               <Trash2 className="h-4 w-4 text-zinc-500" />
-              Run Ephemeral Payload GC Now
+              {m.overview.runGcNow}
             </Button>
 
             <Button
@@ -410,12 +415,12 @@ export function OverviewView({
               loading={backupMutation.isPending}
             >
               <Download className="h-4 w-4 text-zinc-700 dark:text-zinc-200" />
-              Download Online SQLite Snapshot (.db)
+              {m.overview.downloadSnapshot}
             </Button>
 
             <p className="flex items-center gap-1.5 pt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
               <Archive className="h-3.5 w-3.5 shrink-0" />
-              Snapshots include feeds, channels (encrypted), routes, tasks & fingerprints.
+              {m.overview.snapshotNote}
             </p>
           </CardContent>
         </Card>

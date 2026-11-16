@@ -4,6 +4,7 @@ import {
   DEFAULT_REPO_URL,
   DEFAULT_VERSION,
 } from "@/api/types";
+import { useI18n } from "@/i18n";
 
 export interface ComplianceFooterProps {
   version?: string;
@@ -21,6 +22,7 @@ export function ComplianceFooter({
   repoUrl = DEFAULT_REPO_URL,
   license = DEFAULT_LICENSE,
 }: ComplianceFooterProps) {
+  const { m } = useI18n();
   const safeRepoUrl = repoUrl.trim() || DEFAULT_REPO_URL;
   const normalizedVersion = version.startsWith("v") ? version : `v${version}`;
 
@@ -48,7 +50,7 @@ export function ComplianceFooter({
           rel="noopener noreferrer"
           className="inline-flex items-center gap-1 font-medium text-zinc-600 underline-offset-4 hover:text-zinc-900 hover:underline dark:text-zinc-300 dark:hover:text-white"
         >
-          Source Repository
+          {m.footer.sourceRepository}
           <ExternalLink className="h-3 w-3" />
         </a>
       </div>

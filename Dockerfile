@@ -33,19 +33,21 @@ RUN cargo build --release --locked \
     && strip /build/FeedCourier/target/release/feedcourier
 
 # =============================================================================
-# Stage 3: Minimal non-root Debian Bookworm runtime
+# Stage 3: Minimal Debian Bookworm runtime (drops privileges to UID/GID 10001)
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 feedcourier \
-    && useradd --system --uid 10001 --gid feedcourier --home-dir /data --no-create-home --shell /usr/sbin/nologin feedcourier \
+    && groupadd --gid 10001 feedcourier \
+    && useradd --uid 10001 --gid feedcourier --home-dir /data --no-create-home --no-log-init --shell /usr/sbin/nologin feedcourier \
     && mkdir -p /data \
     && chown -R feedcourier:feedcourier /data
 
 COPY --from=rust-builder /build/FeedCourier/target/release/feedcourier /usr/local/bin/feedcourier
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 ENV DATA_DIR=/data \
     LISTEN_ADDR=0.0.0.0:8080
@@ -53,6 +55,5 @@ ENV DATA_DIR=/data \
 VOLUME ["/data"]
 EXPOSE 8080
 
-USER feedcourier
-
-ENTRYPOINT ["/usr/local/bin/feedcourier"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/usr/local/bin/feedcourier"]

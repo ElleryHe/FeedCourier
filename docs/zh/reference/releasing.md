@@ -1,3 +1,7 @@
+---
+description: "FeedCourier 持续集成、自动化发版与文档站部署说明：GitHub Actions 检查、四平台二进制构建、Docker Hub 多架构镜像与 Cloudflare 静态部署。"
+---
+
 # 持续集成、自动化发版与文档部署
 
 FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.github/workflows/release.yml`）执行代码检查、许可证合规校验、四平台二进制编译与 Docker Hub 多架构镜像构建，并通过 Cloudflare Workers Static Assets 部署中英双语文档站（`feedcourier.ellery.me`）。
@@ -26,11 +30,11 @@ FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.g
 
 ## 2. 自动化版本发布流水线（`.github/workflows/release.yml`）
 
-当推送符合语义化版本规范的 Git 标签（`v*.*.*`，如 `v0.1.2`）时，自动触发发布流水线：
+当推送符合语义化版本规范的 Git 标签（`v*.*.*`，如 `v0.1.3`）时，自动触发发布流水线：
 
 ```mermaid
 flowchart LR
-    Tag["git push origin v0.1.2"] --> Web["web-dist: 构建 React 19 前端"]
+    Tag["git push origin v0.1.3"] --> Web["web-dist: 构建 React 19 前端"]
     Web --> Linux["binaries: 构建 Linux x86_64 & aarch64"]
     Web --> Mac["binaries-macos: 构建 macOS arm64 & x86_64"]
     Web --> Docker["docker: 推送 Docker Hub 多架构镜像"]
@@ -48,7 +52,7 @@ flowchart LR
 ### 第二步：Docker Hub 多架构镜像推送
 - 通过 Docker Buildx 与 QEMU 构建 **`linux/amd64` + `linux/arm64`** 多架构镜像并推送至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
 - **镜像标签规则**：
-  - `<version>`（如 `0.1.2`）
+  - `<version>`（如 `0.1.3`）
   - `<major>.<minor>`（如 `0.1`）
   - `<major>`（自 `1.0.0` 正式版起启用）
   - `latest`（仅对不带 `-rc` / `-beta` / `-alpha` 后缀的正式版标签更新）
@@ -61,7 +65,7 @@ flowchart LR
 
 ## 3. 标准发版操作清单（Release Checklist）
 
-发布新版本（例如从 `develop` 合入 `main` 发布 `v0.1.2`）时，按以下步骤操作：
+发布新版本（例如从 `develop` 合入 `main` 发布 `v0.1.3`）时，按以下步骤操作：
 
 ```bash
 # 1. 在 develop 分支完成并通过本地检查
@@ -77,8 +81,8 @@ git checkout main
 git merge --ff-only develop
 git push origin main
 
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 ---

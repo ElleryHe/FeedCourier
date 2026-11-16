@@ -1,3 +1,7 @@
+---
+description: "配置 FeedCourier Notion 投递通道：将 RSS、Atom 与 JSON Feed 新文章自动写入 Notion 数据库页面属性，并将完整正文转换为 Notion 内容块。"
+---
+
 # Notion
 
 Notion 通道可将订阅源的新文章自动同步到指定的 Notion 数据库中，每篇文章生成一条数据库页面记录，同时写入文章元数据属性并将完整正文转换为 Notion 页面内容块。

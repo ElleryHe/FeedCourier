@@ -1,3 +1,7 @@
+---
+description: "Push RSS, Atom, and JSON Feed updates to Telegram private chats, groups, supergroup forum topics, and channels using Rich, Compact, or Media modes."
+---
+
 # Telegram
 
 The Telegram channel delivers articles to **private chats**, **groups**, **supergroup forum topics**, and **broadcast channels**. Each route pointing to a Telegram channel can independently choose between three presentation modes: **Rich Message**, **Compact Card**, and **Media Mode**.

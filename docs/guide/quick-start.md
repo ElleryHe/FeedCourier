@@ -1,3 +1,7 @@
+---
+description: "Deploy FeedCourier with Docker Run, Docker Compose, prebuilt Linux and macOS binaries, or from source, and initialize the WebUI administrator password."
+---
+
 # Quick Start
 
 FeedCourier runs as a standalone binary or a multi-architecture Docker image (`linux/amd64`, `linux/arm64`) with the web console and SQLite database migrations bundled inside.
@@ -16,7 +20,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
   # Or pin a specific release version:
-  # elleryhe/feedcourier:0.1.2
+  # elleryhe/feedcourier:0.1.3
 ```
 
 Once the container starts:
@@ -34,7 +38,7 @@ Create a `docker-compose.yml` file:
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.2
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.3
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -68,7 +72,7 @@ curl -s http://127.0.0.1:8080/api/v1/health
 {
   "status": "ok",
   "app": "FeedCourier",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "AGPL-3.0",
   "repo_url": "https://github.com/ElleryHe/FeedCourier"
 }
@@ -91,7 +95,7 @@ Download, verify, and run:
 
 ```bash
 # Example for Linux x86_64 (replace VERSION as appropriate)
-VERSION="0.1.2"
+VERSION="0.1.3"
 TARGET="x86_64-unknown-linux-gnu"
 
 curl -LO "https://github.com/ElleryHe/FeedCourier/releases/download/v${VERSION}/feedcourier-${VERSION}-${TARGET}.tar.gz"

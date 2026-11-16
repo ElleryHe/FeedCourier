@@ -1,3 +1,7 @@
+---
+description: "REST API reference for FeedCourier (/api/v1/*) covering authentication, overview metrics, feeds, OPML import/export, channels, routes, tasks, backups, and MCP tokens."
+---
+
 # REST API Reference (`/api/v1/*`)
 
 The embedded React 19 WebUI communicates with the Rust backend through a JSON REST API mounted under **`/api/v1/*`** (`src/api/mod.rs`, `src/api/auth.rs`, `src/api/dto.rs`, `src/api/handlers.rs`). These endpoints can also be called directly from automation scripts or `curl`.
@@ -26,7 +30,7 @@ Liveness probe and AGPLv3 compliance metadata endpoint.
   ```json
   {
     "name": "FeedCourier",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"

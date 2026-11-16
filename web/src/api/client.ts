@@ -34,6 +34,7 @@ import type {
   UpdateRouteRequest,
   UpdateSystemSettingsRequest,
 } from "./types";
+import { getMessages } from "@/i18n";
 
 const API_BASE = "/api/v1";
 
@@ -75,7 +76,9 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
         message?: string;
       };
       const message =
-        data.error ?? data.message ?? `Request failed with HTTP ${res.status}`;
+        data.error ??
+        data.message ??
+        getMessages().common.requestFailedHttp(res.status);
       return new ApiError(res.status, message, data.code, data.details);
     } catch {
       // Fall through to text fallback
@@ -86,7 +89,7 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
     res.status,
     text.length > 0 && text.length < 300
       ? text
-      : `Request failed with HTTP ${res.status}`,
+      : getMessages().common.requestFailedHttp(res.status),
   );
 }
 

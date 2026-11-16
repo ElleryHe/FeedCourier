@@ -1,3 +1,7 @@
+---
+description: "介绍 FeedCourier 的功能定位与工作流程：自托管拉取 RSS、Atom 与 JSON Feed 订阅源，去重过滤后自动投递至 SMTP 邮件、Telegram 与 Notion，并提供 MCP 接口。"
+---
+
 # 项目简介
 
 ## FeedCourier 是什么

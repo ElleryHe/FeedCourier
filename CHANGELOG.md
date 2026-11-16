@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-16
+
+### Added
+
+- **WebUI Bilingual (`English` / `简体中文`) Internationalization (`web/`)**:
+  - Added zero-dependency, strongly typed English and Simplified Chinese dictionaries (`web/src/i18n/en.ts`, `web/src/i18n/zh.ts`, `web/src/i18n/index.tsx`) with automatic browser language detection (`zh*` → `zh-CN`, fallback `en`), `localStorage` (`fc-locale`) persistence, and live `<html lang>`, page title, and relative-time formatting synchronization.
+  - Added one-click language switching and full bilingual UI coverage across `AuthGateView`, `AppShell` (desktop sidebar and mobile top bar), `OverviewView`, `FeedsView`, `ChannelsView`, `RoutesView`, `TasksView`, `SettingsView`, and shared UI primitives while preserving raw backend diagnostic logs intact.
+- **Documentation Site `robots.txt` & Static Build-Time SEO (`docs/`)**:
+  - Added `docs/public/robots.txt` (`Allow: /`, `Sitemap: https://feedcourier.ellery.me/sitemap.xml`) and a `1200×630` static social preview card (`docs/public/og-image.png`).
+  - Added unique `description` frontmatter across all 34 English and Simplified Chinese documentation pages, and configured VitePress `transformHead` to inject `<link rel="canonical">`, bidirectional `hreflang` (`en-US`, `zh-CN`, `x-default`), Open Graph / Twitter Card metadata, `404` `noindex`, and home-page `Schema.org` `SoftwareApplication` JSON-LD at static build time.
+
+### Changed
+
+- **Container Entrypoint Automatic Bind-Mount Ownership & Privilege Drop (`Dockerfile`, `docker-entrypoint.sh`)**:
+  - Added `docker-entrypoint.sh` using pre-installed `setpriv` (`util-linux` in `debian:bookworm-slim`) so containers started as `root` automatically create/fix ownership on `$DATA_DIR` (`/data`) and `exec` as non-root `10001:10001` (PID 1) with `--inh-caps=-all`, while passing through directly when started with `--user`.
+  - Added `shellcheck` linting and a root-owned `0755` bind-mount privilege-drop verification step to `.github/workflows/ci.yml`.
+
 ## [0.1.2] - 2026-11-15
 
 ### Added
@@ -82,7 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Encrypted Credential Vault & Scoped Auth**: Channel credentials are encrypted at rest with `ChaCha20-Poly1305` AEAD (`master.key`, `0600`); WebUI administrator passwords use `Argon2id` PHC hashing with `HttpOnly` session cookies (`fc_session`); and `/mcp` Bearer tokens are stored exclusively as `SHA-256` hashes.
 - **MCP Trust Boundaries & Untrusted Content Framing**: Channel secrets and recipient targets (email addresses, `chat_id`, `data_source_id`) are strictly locked to the WebUI and opaque to `/mcp` tools, while untrusted external feed text surfaced to AI agents is sanitized, truncated, and isolated inside `<untrusted_feed_content>` XML boundary tags (`src/mcp/sanitize.rs`), complemented by `ammonia` HTML sanitization across ingest and delivery pipelines.
 
-[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ElleryHe/FeedCourier/releases/tag/v0.1.0

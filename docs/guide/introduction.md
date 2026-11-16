@@ -1,3 +1,7 @@
+---
+description: "Overview of FeedCourier, a self-hosted RSS, Atom, and JSON Feed delivery service for SMTP Email, Telegram, and Notion with deduplication and MCP support."
+---
+
 # Project Overview
 
 **FeedCourier** is a self-hosted subscription delivery service that polls RSS, Atom, and JSON Feed sources and delivers new articles to **Email (SMTP)**, **Telegram**, and **Notion**.

@@ -3,6 +3,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { ApiError } from "@/api/client";
 import { ToastProvider } from "@/components/ui/toast";
+import { I18nProvider } from "@/i18n";
 import { App } from "./App";
 import "./index.css";
 
@@ -28,10 +29,12 @@ if (!rootEl) {
 
 createRoot(rootEl).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <ToastProvider>
-        <App />
-      </ToastProvider>
-    </QueryClientProvider>
+    <I18nProvider>
+      <QueryClientProvider client={queryClient}>
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      </QueryClientProvider>
+    </I18nProvider>
   </StrictMode>,
 );

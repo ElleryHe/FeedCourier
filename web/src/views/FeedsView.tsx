@@ -47,6 +47,8 @@ import {
   Textarea,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { useI18n } from "@/i18n";
+import type { Messages } from "@/i18n/en";
 import {
   errorMessage,
   formatDateTime,
@@ -68,23 +70,27 @@ const POLL_PRESETS = [
   { label: "6h", secs: 21600 },
 ];
 
-function healthBadge(status: FeedHealthStatus): {
+function healthBadge(
+  status: FeedHealthStatus,
+  m: Messages,
+): {
   label: string;
   variant: BadgeVariant;
 } {
   switch (status) {
     case "active":
-      return { label: "Active", variant: "success" };
+      return { label: m.status.feed.active, variant: "success" };
     case "backoff":
-      return { label: "Backoff", variant: "warning" };
+      return { label: m.status.feed.backoff, variant: "warning" };
     case "circuit_open":
-      return { label: "Circuit Open", variant: "danger" };
+      return { label: m.status.feed.circuit_open, variant: "danger" };
     case "paused":
-      return { label: "Paused", variant: "default" };
+      return { label: m.status.feed.paused, variant: "default" };
   }
 }
 
 export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -139,16 +145,18 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
     },
     onSuccess: (res) => {
       toast.success(
-        res.not_modified ? "304 Not Modified" : "Feed polled",
         res.not_modified
-          ? "Feed returned 304 Not Modified; schedule updated."
-          : `Discovered ${res.new_entries} new entries (${res.enqueued_tasks} tasks enqueued).`,
+          ? m.feeds.toastNotModifiedTitle
+          : m.feeds.toastPolledTitle,
+        res.not_modified
+          ? m.feeds.toastNotModifiedDesc
+          : m.feeds.toastPolledDesc(res.new_entries, res.enqueued_tasks),
       );
       void queryClient.invalidateQueries({ queryKey: ["feeds"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err) => {
-      toast.error("Immediate poll failed", errorMessage(err));
+      toast.error(m.feeds.toastPollFailed, errorMessage(err));
     },
     onSettled: () => {
       setPollingFeedId(null);
@@ -163,30 +171,33 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err) => {
-      toast.error("Failed to update feed", errorMessage(err));
+      toast.error(m.feeds.toastUpdateFailed, errorMessage(err));
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: (id: number) => api.feeds.remove(id),
     onSuccess: () => {
-      toast.success("Feed removed");
+      toast.success(m.feeds.toastRemoved);
       setDeletingFeed(null);
       void queryClient.invalidateQueries({ queryKey: ["feeds"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err) => {
-      toast.error("Failed to delete feed", errorMessage(err));
+      toast.error(m.feeds.toastDeleteFailed, errorMessage(err));
     },
   });
 
   const exportOpmlMutation = useMutation({
     mutationFn: () => api.feeds.exportOpml(),
     onSuccess: (filename) => {
-      toast.success("OPML exported", `Downloaded ${filename}`);
+      toast.success(
+        m.feeds.toastOpmlExported,
+        m.feeds.toastOpmlExportedDesc(filename),
+      );
     },
     onError: (err) => {
-      toast.error("OPML export failed", errorMessage(err));
+      toast.error(m.feeds.toastOpmlExportFailed, errorMessage(err));
     },
   });
 
@@ -224,11 +235,9 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-bold tracking-tight">
-            Subscriptions & Readability
-          </h1>
+          <h1 className="text-lg font-bold tracking-tight">{m.feeds.title}</h1>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            RSS / Atom / JSON Feed polling with SSRF protection, conditional ETag requests, per-feed Readability full-text extraction, and 4-tier deduplication.
+            {m.feeds.subtitle}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -238,7 +247,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
             onClick={() => openPreviewModal()}
           >
             <Eye className="h-3.5 w-3.5" />
-            Live Preview
+            {m.feeds.livePreview}
           </Button>
           <Button
             variant="outline"
@@ -246,7 +255,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
             onClick={() => setOpmlOpen(true)}
           >
             <Upload className="h-3.5 w-3.5" />
-            Import OPML
+            {m.feeds.importOpml}
           </Button>
           <Button
             variant="outline"
@@ -255,11 +264,11 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
             loading={exportOpmlMutation.isPending}
           >
             <Download className="h-3.5 w-3.5" />
-            Export OPML
+            {m.feeds.exportOpml}
           </Button>
           <Button size="sm" onClick={() => openCreateModal()}>
             <Plus className="h-3.5 w-3.5" />
-            Add Feed
+            {m.feeds.addFeed}
           </Button>
         </div>
       </div>
@@ -269,11 +278,11 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
         <div className="flex flex-wrap items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-800 dark:bg-zinc-900">
           {(
             [
-              { id: "all", label: "All" },
-              { id: "active", label: "Active" },
-              { id: "backoff", label: "Backoff" },
-              { id: "circuit_open", label: "Circuit Open" },
-              { id: "paused", label: "Paused" },
+              { id: "all", label: m.common.all },
+              { id: "active", label: m.status.feed.active },
+              { id: "backoff", label: m.status.feed.backoff },
+              { id: "circuit_open", label: m.status.feed.circuit_open },
+              { id: "paused", label: m.status.feed.paused },
             ] as const
           ).map((tab) => (
             <button
@@ -296,7 +305,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
           <Input
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Filter by title, URL, or #tag…"
+            placeholder={m.feeds.searchPlaceholder}
             className="pl-8"
           />
         </div>
@@ -305,27 +314,27 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
       {/* Feed List */}
       {feedsQuery.isLoading ? (
         <Card className="p-8 text-center text-xs text-zinc-500">
-          Loading subscriptions…
+          {m.feeds.loading}
         </Card>
       ) : filteredFeeds.length === 0 ? (
         <EmptyState
           icon={Rss}
           title={
             (feedsQuery.data?.length ?? 0) === 0
-              ? "No feeds configured yet"
-              : "No feeds match your current filter"
+              ? m.feeds.emptyTitle
+              : m.feeds.emptyFilteredTitle
           }
           description={
             (feedsQuery.data?.length ?? 0) === 0
-              ? "Subscribe to an RSS, Atom, or JSON Feed, or import an existing OPML file with silent initialization."
-              : "Try clearing your search query or switching health status tabs."
+              ? m.feeds.emptyDesc
+              : m.feeds.emptyFilteredDesc
           }
           action={
             (feedsQuery.data?.length ?? 0) === 0 ? (
               <div className="flex items-center gap-2">
                 <Button size="sm" onClick={() => openCreateModal()}>
                   <Plus className="h-3.5 w-3.5" />
-                  Add First Feed
+                  {m.feeds.addFirstFeed}
                 </Button>
                 <Button
                   variant="outline"
@@ -333,7 +342,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                   onClick={() => setOpmlOpen(true)}
                 >
                   <Upload className="h-3.5 w-3.5" />
-                  Import OPML
+                  {m.feeds.importOpml}
                 </Button>
               </div>
             ) : undefined
@@ -342,7 +351,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
       ) : (
         <div className="space-y-2.5">
           {filteredFeeds.map((feed) => {
-            const badge = healthBadge(feed.health_status);
+            const badge = healthBadge(feed.health_status, m);
             const isPaused = feed.health_status === "paused";
             return (
               <Card key={feed.id} className="p-4">
@@ -368,20 +377,19 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                       <Badge variant={badge.variant}>{badge.label}</Badge>
                       {feed.consecutive_failures > 0 && (
                         <Badge variant="warning">
-                          {feed.consecutive_failures} fail
-                          {feed.consecutive_failures === 1 ? "" : "s"}
+                          {m.feeds.failsBadge(feed.consecutive_failures)}
                         </Badge>
                       )}
                       {feed.fetch_full_content && (
                         <Badge variant="info">
                           <BookOpen className="h-3 w-3" />
-                          Readability
+                          {m.common.readability}
                         </Badge>
                       )}
                       {feed.use_proxy && (
                         <Badge variant="outline">
                           <Globe className="h-3 w-3" />
-                          Proxy
+                          {m.common.proxy}
                         </Badge>
                       )}
                     </div>
@@ -398,17 +406,17 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                       </a>
                       <span>·</span>
                       <span>
-                        Interval:{" "}
+                        {m.feeds.intervalLabel}{" "}
                         <strong className="font-mono font-medium text-zinc-700 dark:text-zinc-300">
                           {formatDurationSecs(feed.poll_interval_secs)}
                         </strong>
                       </span>
                       <span>·</span>
                       <span title={formatDateTime(feed.next_poll_at)}>
-                        Next poll:{" "}
+                        {m.feeds.nextPollLabel}{" "}
                         <strong className="font-medium text-zinc-700 dark:text-zinc-300">
                           {isPaused
-                            ? "paused"
+                            ? m.feeds.pausedLower
                             : formatRelativeTime(feed.next_poll_at)}
                         </strong>
                       </span>
@@ -445,12 +453,12 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                       size="sm"
                       onClick={() => pollMutation.mutate(feed.id)}
                       loading={pollingFeedId === feed.id}
-                      title="Reset circuit breaker / backoff and trigger immediate poll"
+                      title={m.feeds.pollButtonTitle}
                     >
                       <RefreshCw className="h-3.5 w-3.5" />
                       {feed.health_status === "circuit_open"
-                        ? "Reset & Poll"
-                        : "Poll Now"}
+                        ? m.feeds.resetAndPoll
+                        : m.feeds.pollNow}
                     </Button>
 
                     <Button
@@ -464,10 +472,12 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                           },
                         })
                       }
-                      title="Toggle Readability full-text extraction"
+                      title={m.feeds.fullTextToggleTitle}
                     >
                       <BookOpen className="h-3.5 w-3.5" />
-                      {feed.fetch_full_content ? "Full Text: ON" : "Full Text: OFF"}
+                      {feed.fetch_full_content
+                        ? m.feeds.fullTextOn
+                        : m.feeds.fullTextOff}
                     </Button>
 
                     <Button
@@ -480,7 +490,8 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                           use_proxy: feed.use_proxy,
                         })
                       }
-                      title="Preview feed & test filters"
+                      title={m.feeds.previewButtonTitle}
+                      aria-label={m.feeds.previewButtonTitle}
                     >
                       <Eye className="h-4 w-4" />
                     </Button>
@@ -496,7 +507,16 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                           },
                         })
                       }
-                      title={isPaused ? "Resume feed polling" : "Pause feed polling"}
+                      title={
+                        isPaused
+                          ? m.feeds.resumePollingTitle
+                          : m.feeds.pausePollingTitle
+                      }
+                      aria-label={
+                        isPaused
+                          ? m.feeds.resumePollingTitle
+                          : m.feeds.pausePollingTitle
+                      }
                     >
                       {isPaused ? (
                         <Play className="h-4 w-4 text-emerald-600" />
@@ -512,7 +532,8 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                         setEditingFeed(feed);
                         setEditorOpen(true);
                       }}
-                      title="Edit feed settings"
+                      title={m.feeds.editFeedTitle}
+                      aria-label={m.feeds.editFeedTitle}
                     >
                       <Pencil className="h-4 w-4" />
                     </Button>
@@ -521,7 +542,8 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                       variant="ghost"
                       size="icon"
                       onClick={() => setDeletingFeed(feed)}
-                      title="Delete feed"
+                      title={m.feeds.deleteFeedTitle}
+                      aria-label={m.feeds.deleteFeedTitle}
                       className="text-rose-600 hover:bg-rose-50 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-950/40"
                     >
                       <Trash2 className="h-4 w-4" />
@@ -578,9 +600,11 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
         onConfirm={() => {
           if (deletingFeed) deleteMutation.mutate(deletingFeed.id);
         }}
-        title="Delete Subscription"
-        description={`Remove "${deletingFeed?.title || deletingFeed?.url}"? Associated entry fingerprints and delivery tasks for this feed will be cascaded.`}
-        confirmLabel="Delete Feed"
+        title={m.feeds.deleteModalTitle}
+        description={m.feeds.deleteModalDesc(
+          deletingFeed?.title || deletingFeed?.url || "",
+        )}
+        confirmLabel={m.feeds.deleteModalConfirm}
         loading={deleteMutation.isPending}
       />
     </div>
@@ -614,6 +638,7 @@ function FeedEditorModal({
     use_proxy: boolean;
   }) => void;
 }) {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const isEdit = feed !== null;
@@ -663,7 +688,7 @@ function FeedEditorModal({
       return api.feeds.create(payload);
     },
     onSuccess: () => {
-      toast.success(isEdit ? "Feed updated" : "Feed added");
+      toast.success(isEdit ? m.feeds.toastUpdated : m.feeds.toastAdded);
       void queryClient.invalidateQueries({ queryKey: ["feeds"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
       onClose();
@@ -677,11 +702,11 @@ function FeedEditorModal({
     e.preventDefault();
     setFormError(null);
     if (!isValidHttpUrl(url)) {
-      setFormError("Please enter a valid http:// or https:// feed URL.");
+      setFormError(m.feeds.editor.errInvalidUrl);
       return;
     }
     if (!Number.isFinite(pollIntervalSecs) || pollIntervalSecs < 60) {
-      setFormError("Poll interval must be at least 60 seconds.");
+      setFormError(m.feeds.editor.errMinInterval);
       return;
     }
     saveMutation.mutate();
@@ -691,8 +716,8 @@ function FeedEditorModal({
     <Modal
       open={open}
       onClose={onClose}
-      title={isEdit ? "Edit Subscription" : "Add Subscription"}
-      description="Configure polling cadence, multi-tags (synced to Routes & Notion Tag), and Readability full-text extraction."
+      title={isEdit ? m.feeds.editor.editTitle : m.feeds.editor.addTitle}
+      description={m.feeds.editor.desc}
       footer={
         <>
           {isValidHttpUrl(url) && (
@@ -708,21 +733,21 @@ function FeedEditorModal({
               className="mr-auto"
             >
               <Eye className="h-4 w-4" />
-              Preview URL
+              {m.feeds.editor.previewUrl}
             </Button>
           )}
           <Button variant="outline" onClick={onClose}>
-            Cancel
+            {m.common.cancel}
           </Button>
           <Button onClick={handleSubmit} loading={saveMutation.isPending}>
-            {isEdit ? "Save Changes" : "Subscribe"}
+            {isEdit ? m.feeds.editor.saveChanges : m.feeds.editor.subscribe}
           </Button>
         </>
       }
     >
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
-          <Label htmlFor="feed-url">Feed URL (RSS / Atom / JSON Feed)</Label>
+          <Label htmlFor="feed-url">{m.feeds.editor.urlLabel}</Label>
           <Input
             id="feed-url"
             value={url}
@@ -735,18 +760,18 @@ function FeedEditorModal({
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
-            <Label htmlFor="feed-title">Custom Title Override (Optional)</Label>
+            <Label htmlFor="feed-title">{m.feeds.editor.titleLabel}</Label>
             <Input
               id="feed-title"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="Auto-detected from feed XML if blank"
+              placeholder={m.feeds.editor.titlePlaceholder}
               className="mt-1.5"
             />
           </div>
 
           <div>
-            <Label htmlFor="feed-interval">Poll Interval (Seconds)</Label>
+            <Label htmlFor="feed-interval">{m.feeds.editor.intervalLabel}</Label>
             <div className="mt-1.5 flex items-center gap-1.5">
               <Input
                 id="feed-interval"
@@ -778,13 +803,13 @@ function FeedEditorModal({
         </div>
 
         <div>
-          <Label>Tags (Multi-select routing & Notion Tag sync)</Label>
+          <Label>{m.feeds.editor.tagsLabel}</Label>
           <div className="mt-1.5">
             <TagInput
               values={tags}
               onChange={setTags}
               suggestions={knownTags}
-              placeholder="e.g. rust, security, ai…"
+              placeholder={m.feeds.editor.tagsPlaceholder}
             />
           </div>
         </div>
@@ -794,24 +819,24 @@ function FeedEditorModal({
             id="feed-readability"
             checked={fetchFullContent}
             onCheckedChange={setFetchFullContent}
-            label="Readability Full-Text Extraction (dom_smoothie)"
-            description="Fetch the canonical article webpage for summary-only feeds using an isolated concurrency semaphore; falls back gracefully to feed summary on anti-bot errors."
+            label={m.feeds.editor.readabilityLabel}
+            description={m.feeds.editor.readabilityDesc}
           />
 
           <Switch
             id="feed-proxy"
             checked={useProxy}
             onCheckedChange={setUseProxy}
-            label="Route Through Outbound Proxy"
-            description="Fetch this feed and its Readability / media requests via the configured HTTP/SOCKS5 outbound proxy."
+            label={m.feeds.editor.proxyLabel}
+            description={m.feeds.editor.proxyDesc}
           />
 
           <Switch
             id="feed-silent-init"
             checked={silentInit}
             onCheckedChange={setSilentInit}
-            label="Silent Initialization (Anti-Flood Protection)"
-            description="Record SHA-256 fingerprints for existing historical items on first sync without flooding downstream channels."
+            label={m.feeds.editor.silentInitLabel}
+            description={m.feeds.editor.silentInitDesc}
           />
 
           {!isEdit && silentInit && (
@@ -820,8 +845,8 @@ function FeedEditorModal({
                 id="feed-push-latest"
                 checked={pushLatestOne}
                 onCheckedChange={setPushLatestOne}
-                label="Verify Connectivity with Latest 1 Entry"
-                description="Enqueue only the single newest item during silent initialization to confirm end-to-end delivery."
+                label={m.feeds.editor.pushLatestLabel}
+                description={m.feeds.editor.pushLatestDesc}
               />
             </div>
           )}
@@ -856,6 +881,7 @@ function FeedPreviewModal({
     use_proxy: boolean;
   }) => void;
 }) {
+  const { m } = useI18n();
   const [url, setUrl] = useState(initialUrl);
   const [fetchFullContent, setFetchFullContent] = useState(
     initialFetchFullContent,
@@ -901,17 +927,17 @@ function FeedPreviewModal({
     e.preventDefault();
     setValidationErr(null);
     if (!isValidHttpUrl(url)) {
-      setValidationErr("Enter a valid http:// or https:// feed URL.");
+      setValidationErr(m.feeds.preview.errInvalidUrl);
       return;
     }
     const incErr = validateRegex(includeRegex);
     if (incErr) {
-      setValidationErr(`Include regex invalid: ${incErr}`);
+      setValidationErr(m.feeds.preview.errIncludeRegex(incErr));
       return;
     }
     const excErr = validateRegex(excludeRegex);
     if (excErr) {
-      setValidationErr(`Exclude regex invalid: ${excErr}`);
+      setValidationErr(m.feeds.preview.errExcludeRegex(excErr));
       return;
     }
     previewMutation.mutate();
@@ -923,13 +949,13 @@ function FeedPreviewModal({
     <Modal
       open={open}
       onClose={onClose}
-      title="Live Feed & Filter Preview"
-      description="Test-fetch any feed via the SSRF-guarded HTTP client, compare Readability extraction, and dry-run keyword/regex filters."
+      title={m.feeds.preview.title}
+      description={m.feeds.preview.desc}
       size="2xl"
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
-            Close
+            {m.common.close}
           </Button>
           {isValidHttpUrl(url) && (
             <Button
@@ -942,7 +968,7 @@ function FeedPreviewModal({
               }
             >
               <Plus className="h-4 w-4" />
-              Subscribe with Settings
+              {m.feeds.preview.subscribeWithSettings}
             </Button>
           )}
         </>
@@ -963,7 +989,7 @@ function FeedPreviewModal({
               className="shrink-0"
             >
               <Eye className="h-4 w-4" />
-              Fetch & Preview
+              {m.feeds.preview.fetchAndPreview}
             </Button>
           </div>
 
@@ -979,7 +1005,7 @@ function FeedPreviewModal({
                   htmlFor="preview-readability"
                   className="cursor-pointer text-xs font-medium"
                 >
-                  Readability Full-Text
+                  {m.feeds.preview.readabilitySwitch}
                 </label>
               </div>
               <div className="flex items-center gap-2">
@@ -992,7 +1018,7 @@ function FeedPreviewModal({
                   htmlFor="preview-proxy"
                   className="cursor-pointer text-xs font-medium"
                 >
-                  Use Outbound Proxy
+                  {m.feeds.preview.proxySwitch}
                 </label>
               </div>
             </div>
@@ -1003,34 +1029,36 @@ function FeedPreviewModal({
               className="inline-flex cursor-pointer items-center gap-1 text-xs font-medium text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
             >
               <Filter className="h-3.5 w-3.5" />
-              {showFilters ? "Hide Filter Dry-Run" : "Test Filter Rules"}
+              {showFilters
+                ? m.feeds.preview.hideFilters
+                : m.feeds.preview.showFilters}
             </button>
           </div>
 
           {showFilters && (
             <div className="grid gap-3 rounded-lg border border-zinc-200 p-3.5 sm:grid-cols-2 dark:border-zinc-800">
               <div>
-                <Label>Include Keywords (OR)</Label>
+                <Label>{m.feeds.preview.includeKeywordsLabel}</Label>
                 <div className="mt-1">
                   <TagInput
                     values={includeKeywords}
                     onChange={setIncludeKeywords}
-                    placeholder="Add keyword…"
+                    placeholder={m.feeds.preview.includeKeywordsPlaceholder}
                   />
                 </div>
               </div>
               <div>
-                <Label>Exclude Keywords (ANY)</Label>
+                <Label>{m.feeds.preview.excludeKeywordsLabel}</Label>
                 <div className="mt-1">
                   <TagInput
                     values={excludeKeywords}
                     onChange={setExcludeKeywords}
-                    placeholder="Sponsor, Ad…"
+                    placeholder={m.feeds.preview.excludeKeywordsPlaceholder}
                   />
                 </div>
               </div>
               <div>
-                <Label>Include Regex</Label>
+                <Label>{m.feeds.preview.includeRegexLabel}</Label>
                 <Input
                   value={includeRegex}
                   onChange={(e) => setIncludeRegex(e.target.value)}
@@ -1039,7 +1067,7 @@ function FeedPreviewModal({
                 />
               </div>
               <div>
-                <Label>Exclude Regex</Label>
+                <Label>{m.feeds.preview.excludeRegexLabel}</Label>
                 <Input
                   value={excludeRegex}
                   onChange={(e) => setExcludeRegex(e.target.value)}
@@ -1072,12 +1100,14 @@ function FeedPreviewModal({
                   />
                 )}
                 <span className="text-sm font-semibold">
-                  {result.feed_title || "Untitled Feed"}
+                  {result.feed_title || m.feeds.preview.untitledFeed}
                 </span>
-                <Badge variant="mono">{result.items.length} items</Badge>
+                <Badge variant="mono">
+                  {m.feeds.preview.itemsCount(result.items.length)}
+                </Badge>
               </div>
               <span className="text-xs text-zinc-500">
-                Matched:{" "}
+                {m.feeds.preview.matchedSummary}{" "}
                 <strong>
                   {result.items.filter((i) => i.matched_filter).length}
                 </strong>{" "}
@@ -1100,20 +1130,20 @@ function FeedPreviewModal({
                           {item.matched_filter ? (
                             <Badge variant="success">
                               <Check className="h-3 w-3" />
-                              Matched
+                              {m.feeds.preview.matchedBadge}
                             </Badge>
                           ) : (
                             <Badge variant="default">
                               <X className="h-3 w-3" />
-                              Filtered
+                              {m.feeds.preview.filteredBadge}
                             </Badge>
                           )}
                           {item.full_content_extracted && (
-                            <Badge variant="info">Readability</Badge>
+                            <Badge variant="info">{m.common.readability}</Badge>
                           )}
                           {item.media_urls.length > 0 && (
                             <Badge variant="outline">
-                              {item.media_urls.length} media
+                              {m.feeds.preview.mediaCount(item.media_urls.length)}
                             </Badge>
                           )}
                           <span className="font-mono text-[10px] text-zinc-400">
@@ -1136,13 +1166,13 @@ function FeedPreviewModal({
                         </div>
                         {item.filter_reason && (
                           <p className="mt-0.5 text-[11px] text-amber-600 dark:text-amber-400">
-                            Filter note: {item.filter_reason}
+                            {m.feeds.preview.filterNote(item.filter_reason)}
                           </p>
                         )}
                         {item.first_sentence && (
                           <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
                             <span className="font-mono text-[10px] text-zinc-400">
-                              [1st sentence]{" "}
+                              {m.feeds.preview.firstSentenceTag}
                             </span>
                             {item.first_sentence}
                           </p>
@@ -1158,7 +1188,9 @@ function FeedPreviewModal({
                         }
                       >
                         <FileCode2 className="h-3.5 w-3.5" />
-                        {expanded ? "Collapse" : "Body"}
+                        {expanded
+                          ? m.feeds.preview.collapse
+                          : m.feeds.preview.body}
                       </Button>
                     </div>
 
@@ -1198,6 +1230,7 @@ function OpmlImportModal({
   open: boolean;
   onClose: () => void;
 }) {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const [opmlXml, setOpmlXml] = useState("");
@@ -1212,8 +1245,11 @@ function OpmlImportModal({
       }),
     onSuccess: (res) => {
       toast.success(
-        "OPML import complete",
-        `Imported ${res.imported_count} feeds (${res.skipped_existing_count} existing skipped).`,
+        m.feeds.opml.toastDoneTitle,
+        m.feeds.opml.toastDoneDesc(
+          res.imported_count,
+          res.skipped_existing_count,
+        ),
       );
       void queryClient.invalidateQueries({ queryKey: ["feeds"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
@@ -1239,17 +1275,17 @@ function OpmlImportModal({
     <Modal
       open={open}
       onClose={onClose}
-      title="Import OPML Subscriptions"
-      description="Upload an .opml / .xml file or paste OPML 2.0 XML directly. Nested OPML folders are automatically mapped to feed tags."
+      title={m.feeds.opml.title}
+      description={m.feeds.opml.desc}
       footer={
         <>
           <Button variant="outline" onClick={onClose}>
-            Cancel
+            {m.common.cancel}
           </Button>
           <Button
             onClick={() => {
               if (!opmlXml.trim()) {
-                setErr("Please upload or paste OPML XML content.");
+                setErr(m.feeds.opml.errEmptyXml);
                 return;
               }
               importMutation.mutate();
@@ -1257,14 +1293,14 @@ function OpmlImportModal({
             loading={importMutation.isPending}
           >
             <Upload className="h-4 w-4" />
-            Import Feeds
+            {m.feeds.opml.importBtn}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
         <div>
-          <Label htmlFor="opml-file">Select OPML File</Label>
+          <Label htmlFor="opml-file">{m.feeds.opml.fileLabel}</Label>
           <Input
             id="opml-file"
             type="file"
@@ -1275,7 +1311,7 @@ function OpmlImportModal({
         </div>
 
         <div>
-          <Label htmlFor="opml-xml">OPML XML Content</Label>
+          <Label htmlFor="opml-xml">{m.feeds.opml.xmlLabel}</Label>
           <Textarea
             id="opml-xml"
             value={opmlXml}
@@ -1287,9 +1323,7 @@ function OpmlImportModal({
             rows={7}
             className="mt-1.5 font-mono text-xs"
           />
-          <FieldHint>
-            Existing feeds with matching URLs are safely deduplicated and skipped.
-          </FieldHint>
+          <FieldHint>{m.feeds.opml.dedupHint}</FieldHint>
         </div>
 
         <div className="rounded-lg border border-zinc-200/80 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">
@@ -1297,8 +1331,8 @@ function OpmlImportModal({
             id="opml-silent-init"
             checked={silentInit}
             onCheckedChange={setSilentInit}
-            label="Silent Initialization (Recommended)"
-            description="Record SHA-256 fingerprints for backlog articles during initial sync so imported feeds do not flood your channels."
+            label={m.feeds.opml.silentInitLabel}
+            description={m.feeds.opml.silentInitDesc}
           />
         </div>
 

@@ -1,3 +1,7 @@
+---
+description: "Back up and restore the FeedCourier SQLite WAL database and master.key, configure payload retention cleanup, and set up reverse proxies and monitoring."
+---
+
 # Backup & Maintenance
 
 FeedCourier stores all persistent state in a single directory (`/data`), runs periodic cleanup for delivered article bodies, and supports online SQLite backups while the service is running.

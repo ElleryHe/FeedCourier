@@ -24,6 +24,8 @@ import {
   Select,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
+import { useI18n } from "@/i18n";
+import type { Messages } from "@/i18n/en";
 import {
   errorMessage,
   formatDateTime,
@@ -34,49 +36,56 @@ export interface TasksViewProps {
   initialStatusFilter?: TaskStatus | "all";
 }
 
-function statusBadge(status: TaskStatus): {
+function statusBadge(
+  status: TaskStatus,
+  m: Messages,
+): {
   label: string;
   variant: BadgeVariant;
 } {
   switch (status) {
     case "queued":
-      return { label: "Queued", variant: "default" };
+      return { label: m.status.task.queued, variant: "default" };
     case "delivering":
-      return { label: "Delivering", variant: "info" };
+      return { label: m.status.task.delivering, variant: "info" };
     case "delivered":
-      return { label: "Delivered", variant: "success" };
+      return { label: m.status.task.delivered, variant: "success" };
     case "retrying":
-      return { label: "Retrying", variant: "warning" };
+      return { label: m.status.task.retrying, variant: "warning" };
     case "deferred":
-      return { label: "Deferred", variant: "warning" };
+      return { label: m.status.task.deferred, variant: "warning" };
     case "dead_letter":
-      return { label: "Dead Letter", variant: "danger" };
+      return { label: m.status.task.dead_letter, variant: "danger" };
   }
 }
 
-function summarizeCheckpoint(cp: DeliveryCheckpoint | null): string | null {
+function summarizeCheckpoint(
+  cp: DeliveryCheckpoint | null,
+  m: Messages,
+): string | null {
   if (!cp) return null;
   switch (cp.kind) {
     case "smtp":
-      return "SMTP Msg-ID";
+      return m.tasks.checkpoints.smtp;
     case "telegram":
-      if (cp.degraded_to_compact) return "TG degraded→compact";
-      return `TG batch #${cp.next_batch_offset}`;
+      if (cp.degraded_to_compact) return m.tasks.checkpoints.tgCompact;
+      return m.tasks.checkpoints.tgBatch(cp.next_batch_offset);
     case "notion":
       if (cp.async_task_id) {
-        return `Notion async:${cp.async_task_id.slice(0, 8)}`;
+        return m.tasks.checkpoints.notionAsync(cp.async_task_id.slice(0, 8));
       }
       if (cp.page_id) {
-        return `Notion page:${cp.page_id.slice(0, 8)}`;
+        return m.tasks.checkpoints.notionPage(cp.page_id.slice(0, 8));
       }
       if (cp.create_initiated) {
-        return "Notion FC-ID check";
+        return m.tasks.checkpoints.notionFcId;
       }
-      return "Notion checkpoint";
+      return m.tasks.checkpoints.notionDefault;
   }
 }
 
 export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -104,8 +113,8 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
       api.tasks.retry(payload),
     onSuccess: (res) => {
       toast.success(
-        "Tasks requeued",
-        `Requeued ${res.requeued_count} ${res.requeued_count === 1 ? "task" : "tasks"} into the transactional outbox.`,
+        m.tasks.toastRequeuedTitle,
+        m.tasks.toastRequeuedDesc(res.requeued_count),
       );
       setSelectedIds([]);
       setConfirmRetryAllOpen(false);
@@ -113,7 +122,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err) => {
-      toast.error("Retry failed", errorMessage(err));
+      toast.error(m.tasks.toastRetryFailed, errorMessage(err));
     },
   });
 
@@ -131,11 +140,9 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-bold tracking-tight">
-            Transactional Outbox & Dead-Letter Log
-          </h1>
+          <h1 className="text-lg font-bold tracking-tight">{m.tasks.title}</h1>
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            Atomic lease scheduling (<code className="font-mono">lease_until</code>), crash-safe <code className="font-mono">checkpoint</code> resume, and dead-letter diagnostics.
+            {m.tasks.subtitle}
           </p>
         </div>
 
@@ -147,17 +154,21 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
               loading={retryMutation.isPending}
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              Retry Selected ({selectedIds.length})
+              {m.tasks.retrySelected(selectedIds.length)}
             </Button>
           )}
           <Button
             variant="secondary"
             size="sm"
             onClick={() => setConfirmRetryAllOpen(true)}
-            disabled={statusFilter !== "all" && statusFilter !== "dead_letter" && deadLetterCount === 0}
+            disabled={
+              statusFilter !== "all" &&
+              statusFilter !== "dead_letter" &&
+              deadLetterCount === 0
+            }
           >
             <RotateCcw className="h-3.5 w-3.5" />
-            Retry All Dead-Letter
+            {m.tasks.retryAllDeadLetter}
           </Button>
           <Button
             variant="outline"
@@ -166,7 +177,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
             loading={tasksQuery.isFetching}
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            Refresh
+            {m.common.refresh}
           </Button>
         </div>
       </div>
@@ -176,13 +187,13 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
         <div className="flex flex-wrap items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-800 dark:bg-zinc-900">
           {(
             [
-              { id: "all", label: "All" },
-              { id: "queued", label: "Queued" },
-              { id: "delivering", label: "Delivering" },
-              { id: "retrying", label: "Retrying" },
-              { id: "deferred", label: "Deferred" },
-              { id: "dead_letter", label: "Dead Letter" },
-              { id: "delivered", label: "Delivered" },
+              { id: "all", label: m.common.all },
+              { id: "queued", label: m.status.task.queued },
+              { id: "delivering", label: m.status.task.delivering },
+              { id: "retrying", label: m.status.task.retrying },
+              { id: "deferred", label: m.status.task.deferred },
+              { id: "dead_letter", label: m.status.task.dead_letter },
+              { id: "delivered", label: m.status.task.delivered },
             ] as const
           ).map((tab) => (
             <button
@@ -204,7 +215,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
         </div>
 
         <div className="flex items-center gap-2">
-          <span className="text-xs text-zinc-500">Rows:</span>
+          <span className="text-xs text-zinc-500">{m.common.rows}</span>
           <Select
             value={limit}
             onChange={(e) => setLimit(Number(e.target.value))}
@@ -220,13 +231,13 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
       {/* Tasks Table */}
       {tasksQuery.isLoading ? (
         <Card className="p-8 text-center text-xs text-zinc-500">
-          Loading outbox tasks…
+          {m.tasks.loading}
         </Card>
       ) : tasks.length === 0 ? (
         <EmptyState
           icon={Inbox}
-          title="No delivery tasks in this view"
-          description="When subscribed feeds discover new entries matching an active route, outbox tasks appear here with lease & checkpoint state."
+          title={m.tasks.emptyTitle}
+          description={m.tasks.emptyDesc}
         />
       ) : (
         <Card className="overflow-hidden">
@@ -235,22 +246,32 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
               <thead className="border-b border-zinc-200 bg-zinc-50/80 text-[11px] text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-950/60">
                 <tr>
                   <th className="w-8 px-3 py-2.5">
-                    <span className="sr-only">Select</span>
+                    <span className="sr-only">{m.tasks.colSelect}</span>
                   </th>
-                  <th className="px-3 py-2.5 font-medium">Entry</th>
-                  <th className="px-3 py-2.5 font-medium">Route → Channel</th>
-                  <th className="px-3 py-2.5 font-medium">Status & Lease</th>
-                  <th className="px-3 py-2.5 font-medium">Attempts / Code</th>
-                  <th className="px-3 py-2.5 font-medium">Timing</th>
+                  <th className="px-3 py-2.5 font-medium">
+                    {m.tasks.colEntry}
+                  </th>
+                  <th className="px-3 py-2.5 font-medium">
+                    {m.tasks.colRouteChannel}
+                  </th>
+                  <th className="px-3 py-2.5 font-medium">
+                    {m.tasks.colStatusLease}
+                  </th>
+                  <th className="px-3 py-2.5 font-medium">
+                    {m.tasks.colAttemptsCode}
+                  </th>
+                  <th className="px-3 py-2.5 font-medium">
+                    {m.tasks.colTiming}
+                  </th>
                   <th className="px-3 py-2.5 text-right font-medium">
-                    Actions
+                    {m.tasks.colActions}
                   </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/80">
                 {tasks.map((task) => {
-                  const badge = statusBadge(task.status);
-                  const cpSummary = summarizeCheckpoint(task.checkpoint);
+                  const badge = statusBadge(task.status, m);
+                  const cpSummary = summarizeCheckpoint(task.checkpoint, m);
                   const canRetry =
                     task.status === "dead_letter" ||
                     task.status === "retrying" ||
@@ -267,7 +288,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             type="checkbox"
                             checked={selectedIds.includes(task.id)}
                             onChange={() => toggleSelect(task.id)}
-                            aria-label={`Select task #${task.id}`}
+                            aria-label={m.tasks.selectTaskAria(task.id)}
                             className="accent-zinc-900 dark:accent-emerald-500"
                           />
                         )}
@@ -284,7 +305,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             </span>
                           ) : (
                             <span className="italic text-zinc-400">
-                              Entry #{task.entry_id} (payload purged)
+                              {m.tasks.payloadPurged(task.entry_id)}
                             </span>
                           )}
                           {task.entry_url && (
@@ -330,7 +351,9 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             className="mt-1 font-mono text-[10px] text-sky-600 dark:text-sky-400"
                             title={formatDateTime(task.lease_until)}
                           >
-                            Lease {formatRelativeTime(task.lease_until)}
+                            {m.tasks.leasePrefix(
+                              formatRelativeTime(task.lease_until),
+                            )}
                           </div>
                         )}
                       </td>
@@ -351,15 +374,21 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
 
                       <td className="px-3 py-3 text-[11px] text-zinc-500">
                         <div title={formatDateTime(task.created_at)}>
-                          Created: {formatRelativeTime(task.created_at)}
+                          {m.tasks.createdPrefix(
+                            formatRelativeTime(task.created_at),
+                          )}
                         </div>
                         {task.completed_at ? (
                           <div title={formatDateTime(task.completed_at)}>
-                            Done: {formatRelativeTime(task.completed_at)}
+                            {m.tasks.donePrefix(
+                              formatRelativeTime(task.completed_at),
+                            )}
                           </div>
                         ) : task.next_attempt_at ? (
                           <div title={formatDateTime(task.next_attempt_at)}>
-                            Next: {formatRelativeTime(task.next_attempt_at)}
+                            {m.tasks.nextPrefix(
+                              formatRelativeTime(task.next_attempt_at),
+                            )}
                           </div>
                         ) : null}
                       </td>
@@ -376,14 +405,15 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                               loading={retryMutation.isPending}
                             >
                               <RotateCcw className="h-3 w-3" />
-                              Retry
+                              {m.common.retry}
                             </Button>
                           )}
                           <Button
                             variant="ghost"
                             size="icon"
                             onClick={() => setInspectingTask(task)}
-                            title="Inspect checkpoint & diagnostic log"
+                            title={m.tasks.inspectTitle}
+                            aria-label={m.tasks.inspectTitle}
                           >
                             <FileSearch className="h-4 w-4" />
                           </Button>
@@ -403,7 +433,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
         <Modal
           open={inspectingTask !== null}
           onClose={() => setInspectingTask(null)}
-          title={`Task #${inspectingTask.id} Diagnostics`}
+          title={m.tasks.modal.title(inspectingTask.id)}
           description={`${inspectingTask.route_name} → ${inspectingTask.channel_name} (${inspectingTask.channel_kind.toUpperCase()})`}
           size="lg"
           footer={
@@ -418,14 +448,14 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                   }}
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
-                  Requeue Task
+                  {m.tasks.modal.requeueBtn}
                 </Button>
               )}
               <Button
                 variant="outline"
                 onClick={() => setInspectingTask(null)}
               >
-                Close
+                {m.common.close}
               </Button>
             </>
           }
@@ -433,37 +463,39 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
           <div className="space-y-4 text-xs">
             <div className="grid grid-cols-2 gap-3 rounded-lg border border-zinc-200 bg-zinc-50/60 p-3 sm:grid-cols-3 dark:border-zinc-800 dark:bg-zinc-950">
               <div>
-                <div className="text-zinc-500">Status</div>
-                <div className="mt-0.5 font-mono font-semibold">
-                  {inspectingTask.status}
+                <div className="text-zinc-500">{m.tasks.modal.status}</div>
+                <div className="mt-0.5 font-semibold">
+                  {statusBadge(inspectingTask.status, m).label}
                 </div>
               </div>
               <div>
-                <div className="text-zinc-500">Attempts</div>
+                <div className="text-zinc-500">{m.tasks.modal.attempts}</div>
                 <div className="mt-0.5 font-mono font-semibold">
                   {inspectingTask.attempt_count}
                 </div>
               </div>
               <div>
-                <div className="text-zinc-500">Last Status Code</div>
+                <div className="text-zinc-500">
+                  {m.tasks.modal.lastStatusCode}
+                </div>
                 <div className="mt-0.5 font-mono font-semibold">
                   {inspectingTask.last_status_code ?? "—"}
                 </div>
               </div>
               <div>
-                <div className="text-zinc-500">Lease Until</div>
+                <div className="text-zinc-500">{m.tasks.modal.leaseUntil}</div>
                 <div className="mt-0.5 font-mono text-[11px]">
                   {formatDateTime(inspectingTask.lease_until)}
                 </div>
               </div>
               <div>
-                <div className="text-zinc-500">Next Attempt</div>
+                <div className="text-zinc-500">{m.tasks.modal.nextAttempt}</div>
                 <div className="mt-0.5 font-mono text-[11px]">
                   {formatDateTime(inspectingTask.next_attempt_at)}
                 </div>
               </div>
               <div>
-                <div className="text-zinc-500">Completed At</div>
+                <div className="text-zinc-500">{m.tasks.modal.completedAt}</div>
                 <div className="mt-0.5 font-mono text-[11px]">
                   {formatDateTime(inspectingTask.completed_at)}
                 </div>
@@ -472,22 +504,22 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
 
             <div>
               <div className="mb-1 font-semibold text-zinc-700 dark:text-zinc-300">
-                Resume Checkpoint (<code className="font-mono">checkpoint_json</code>)
+                {m.tasks.modal.resumeCheckpoint} (
+                <code className="font-mono">checkpoint_json</code>)
               </div>
               <pre className="overflow-x-auto rounded-lg bg-zinc-900 p-3 font-mono text-[11px] text-emerald-300">
                 {inspectingTask.checkpoint
                   ? JSON.stringify(inspectingTask.checkpoint, null, 2)
-                  : "// No intermediate checkpoint recorded"}
+                  : m.tasks.modal.noCheckpoint}
               </pre>
             </div>
 
             <div>
               <div className="mb-1 font-semibold text-zinc-700 dark:text-zinc-300">
-                Downstream Diagnostic Log
+                {m.tasks.modal.diagnosticLog}
               </div>
               <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-900 p-3 font-mono text-[11px] text-zinc-200">
-                {inspectingTask.diagnostic_log ||
-                  "No error or diagnostic output recorded."}
+                {inspectingTask.diagnostic_log || m.tasks.modal.noDiagnosticLog}
               </pre>
             </div>
           </div>
@@ -499,9 +531,9 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
         open={confirmRetryAllOpen}
         onClose={() => setConfirmRetryAllOpen(false)}
         onConfirm={() => retryMutation.mutate({ all_dead_letter: true })}
-        title="Retry All Dead-Letter Tasks"
-        description="Requeue every dead_letter task whose entry payload is still available back into the queued state?"
-        confirmLabel="Requeue All Dead-Letter"
+        title={m.tasks.confirmAllTitle}
+        description={m.tasks.confirmAllDesc}
+        confirmLabel={m.tasks.confirmAllBtn}
         destructive={false}
         loading={retryMutation.isPending}
       />

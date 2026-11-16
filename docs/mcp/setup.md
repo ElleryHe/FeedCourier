@@ -1,3 +1,7 @@
+---
+description: "Connect Claude Desktop, Cursor, or custom AI clients to FeedCourier's Streamable HTTP /mcp endpoint using scoped readonly or admin Bearer tokens."
+---
+
 # Client Setup & Security
 
 FeedCourier provides a built-in **Model Context Protocol (MCP)** server at **`/mcp`** over the **Streamable HTTP** transport on the same port as the WebUI (default `0.0.0.0:8080`).

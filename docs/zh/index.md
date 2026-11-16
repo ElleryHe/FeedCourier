@@ -1,5 +1,8 @@
 ---
 layout: home
+title: "FeedCourier"
+titleTemplate: ":title — 自托管 RSS / Atom / JSON Feed 订阅投递服务"
+description: "基于 Rust、SQLite 与 React 构建的自托管 RSS / Atom / JSON Feed 订阅投递服务，支持过滤并投递文章至 SMTP 邮件、Telegram 与 Notion，内置 Web 管理控制台与 MCP 服务端。"
 
 hero:
   name: "FeedCourier"

@@ -1,3 +1,7 @@
+---
+description: "配置 FeedCourier 投递通道的最小发送间隔、随机抖动、每小时与每日发送配额、共享凭据限流保护，以及路由关键词与正则表达式过滤规则。"
+---
+
 # 发送频率、配额与过滤
 
 当订阅源集中更新时，如果在短时间内向 SMTP 服务器、Telegram 或 Notion 连续发送大量请求，容易触发下游平台的频率限制（如 SMTP `421`/`451` 临时限制、Telegram `429 Too Many Requests` 或 Notion `429 Rate Limited`）。

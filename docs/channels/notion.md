@@ -1,3 +1,7 @@
+---
+description: "Sync RSS, Atom, and JSON Feed entries into a Notion database with structured page properties, tags, and full article content converted to Notion blocks."
+---
+
 # Notion
 
 The Notion channel saves each matched feed entry as a page in a Notion database, writing both structured database properties (title, link, source, publish date, reading state, and tags) and the full article body converted into Notion blocks.
