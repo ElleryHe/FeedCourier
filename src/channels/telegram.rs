@@ -30,7 +30,7 @@ use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
     DeliveryOutcome, TelegramCapabilities, TelegramChannelConfig, TelegramDeliveryMode,
 };
-use crate::db::models::{Entry, Feed, MediaAttachment, MediaAttachmentKind, now_unix};
+use crate::db::models::{AppLocale, Entry, Feed, MediaAttachment, MediaAttachmentKind, now_unix};
 use crate::error::{AppError, AppResult};
 
 /// Default official Telegram Bot API base URL.
@@ -70,6 +70,14 @@ pub struct FetchedMedia {
     pub bytes: Bytes,
     pub content_type: Option<String>,
     pub filename: String,
+}
+
+/// Extracted video dimensions and duration for Telegram `sendVideo` / `InputMediaVideo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoMetadata {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_secs: Option<u32>,
 }
 
 /// Injectable streaming media downloader used when Telegram fails to fetch an anti-hotlinked URL.
@@ -323,12 +331,14 @@ pub struct TelegramSender {
     proxy_url: Option<String>,
     media_fetcher: Arc<dyn MediaStreamFetcher>,
     upload_semaphore: Arc<Semaphore>,
+    locale: AppLocale,
 }
 
 impl std::fmt::Debug for TelegramSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelegramSender")
             .field("has_proxy", &self.proxy_url.is_some())
+            .field("locale", &self.locale)
             .field(
                 "available_upload_permits",
                 &self.upload_semaphore.available_permits(),
@@ -370,7 +380,24 @@ impl TelegramSender {
             proxy_url,
             media_fetcher,
             upload_semaphore: Arc::clone(&GLOBAL_MEDIA_UPLOAD_SEMAPHORE),
+            locale: AppLocale::En,
         }
+    }
+
+    /// Set the delivery template locale on this `TelegramSender` (builder style).
+    pub fn with_locale(mut self, locale: AppLocale) -> Self {
+        self.locale = locale;
+        self
+    }
+
+    /// Update the active delivery template locale.
+    pub fn set_locale(&mut self, locale: AppLocale) {
+        self.locale = locale;
+    }
+
+    /// Current delivery template locale.
+    pub const fn locale(&self) -> AppLocale {
+        self.locale
     }
 
     fn bot_api_client(&self, use_proxy: bool) -> AppResult<reqwest::Client> {
@@ -515,7 +542,7 @@ impl TelegramSender {
         }
 
         let client = self.bot_api_client(ctx.channel.use_proxy)?;
-        let rich_message = build_rich_message_payload(ctx.feed, ctx.entry);
+        let rich_message = build_rich_message_payload_with_locale(ctx.feed, ctx.entry, self.locale);
 
         let mut payload = json!({
             "chat_id": cfg.chat_id.trim(),
@@ -590,7 +617,7 @@ impl TelegramSender {
         }
 
         let client = self.bot_api_client(ctx.channel.use_proxy)?;
-        let html_text = format_compact_card_html(ctx.feed, ctx.entry);
+        let html_text = format_compact_card_html_with_locale(ctx.feed, ctx.entry, self.locale);
         let canonical_url = ctx
             .entry
             .canonical_url
@@ -676,7 +703,12 @@ impl TelegramSender {
                 });
             }
 
-            let text = format_media_mode_caption(ctx.feed, ctx.entry, MAX_MESSAGE_UTF16_UNITS);
+            let text = format_media_mode_caption_with_locale(
+                ctx.feed,
+                ctx.entry,
+                MAX_MESSAGE_UTF16_UNITS,
+                self.locale,
+            );
             let msg_id = match self
                 .send_plain_text_fallback(&client, cfg, ctx, &text)
                 .await
@@ -716,7 +748,12 @@ impl TelegramSender {
             });
         }
 
-        let base_caption = format_media_mode_caption(ctx.feed, ctx.entry, MAX_CAPTION_UTF16_UNITS);
+        let base_caption = format_media_mode_caption_with_locale(
+            ctx.feed,
+            ctx.entry,
+            MAX_CAPTION_UTF16_UNITS,
+            self.locale,
+        );
 
         for (batch_idx, batch) in batches.iter().enumerate().skip(state.next_batch_offset) {
             let caption_for_batch = if batch_idx == 0 {
@@ -787,44 +824,60 @@ impl TelegramSender {
         }
 
         if eligible.is_empty() {
-            let text =
-                compose_degraded_text_message(ctx.feed, ctx.entry, batch_idx, &degraded_urls);
+            let text = compose_degraded_text_message(
+                ctx.feed,
+                ctx.entry,
+                batch_idx,
+                &degraded_urls,
+                self.locale,
+            );
             let id = self
                 .send_plain_text_fallback(client, cfg, ctx, &text)
                 .await?;
             return Ok(vec![id]);
         }
 
-        let (initial_caption, overflow_urls) =
-            append_degraded_links_to_caption(base_caption, &degraded_urls, ctx.entry);
+        // Step 1: For photo/audio/explicit-document batches, try passing external URLs directly to
+        // Telegram first. Videos and extensionless/ambiguous attachments skip Step 1 and go straight
+        // to Step 2 so we can magic-byte sniff, normalize `.mp4` + `video/mp4`, and attach `width`,
+        // `height`, `duration`, and `supports_streaming: true` (preventing Telegram from silently
+        // downgrading video URLs to unpreviewable `Document` files).
+        if eligible.iter().all(|item| can_try_direct_url_pass(item)) {
+            let (initial_caption, overflow_urls, next_media_idx) = append_degraded_links_to_caption(
+                base_caption,
+                &degraded_urls,
+                ctx.entry,
+                self.locale,
+            );
 
-        // Step 1: Try passing external URLs directly to Telegram first.
-        match self
-            .send_eligible_by_url(client, cfg, &eligible, initial_caption.as_deref())
-            .await
-        {
-            Ok(mut ids) => {
-                if !overflow_urls.is_empty() {
-                    let overflow_text = format_overflow_links(&overflow_urls);
-                    let extra_id = self
-                        .send_plain_text_fallback(client, cfg, ctx, &overflow_text)
-                        .await?;
-                    ids.push(extra_id);
+            match self
+                .send_eligible_by_url(client, cfg, &eligible, initial_caption.as_deref())
+                .await
+            {
+                Ok(mut ids) => {
+                    if !overflow_urls.is_empty() {
+                        let overflow_text =
+                            format_overflow_links(&overflow_urls, next_media_idx, self.locale);
+                        let extra_id = self
+                            .send_plain_text_fallback(client, cfg, ctx, &overflow_text)
+                            .await?;
+                        ids.push(extra_id);
+                    }
+                    return Ok(ids);
                 }
-                return Ok(ids);
+                Err(err) if err.is_url_media_fetch_error() => {
+                    // Fall through to streaming multipart upload below!
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) if err.is_url_media_fetch_error() => {
-                // Fall through to streaming multipart upload below!
-            }
-            Err(err) => return Err(err),
         }
 
-        // Step 2: Anti-hotlink fallback — stream attachments into memory under semaphore & byte caps.
-        let mut uploaded: Vec<(&MediaAttachment, FetchedMedia)> =
-            Vec::with_capacity(eligible.len());
+        // Step 2: Stream attachments into memory under semaphore & byte caps, sniff magic bytes,
+        // extract MP4 dimensions/duration, and upload via `multipart/form-data`.
+        let mut uploaded: Vec<PreparedUploadItem> = Vec::with_capacity(eligible.len());
 
         for item in eligible {
-            let max_bytes = max_bytes_for_kind(item.kind);
+            let fetch_cap = max_bytes_for_kind(item.kind);
             let _permit = self
                 .upload_semaphore
                 .acquire()
@@ -833,11 +886,17 @@ impl TelegramSender {
 
             match self
                 .media_fetcher
-                .fetch_media(item.url.trim(), max_bytes, ctx.channel.use_proxy)
+                .fetch_media(item.url.trim(), fetch_cap, ctx.channel.use_proxy)
                 .await
             {
-                Ok(fetched) if !fetched.bytes.is_empty() && fetched.bytes.len() <= max_bytes => {
-                    uploaded.push((item, fetched));
+                Ok(fetched) if !fetched.bytes.is_empty() && fetched.bytes.len() <= fetch_cap => {
+                    let prepared = normalize_and_inspect_media(item, fetched);
+                    let final_cap = max_bytes_for_kind(prepared.kind);
+                    if prepared.bytes.len() <= final_cap {
+                        uploaded.push(prepared);
+                    } else {
+                        degraded_urls.push(item.url.trim().to_owned());
+                    }
                 }
                 Ok(_) | Err(_) => {
                     degraded_urls.push(item.url.trim().to_owned());
@@ -846,23 +905,29 @@ impl TelegramSender {
         }
 
         if uploaded.is_empty() {
-            let text =
-                compose_degraded_text_message(ctx.feed, ctx.entry, batch_idx, &degraded_urls);
+            let text = compose_degraded_text_message(
+                ctx.feed,
+                ctx.entry,
+                batch_idx,
+                &degraded_urls,
+                self.locale,
+            );
             let id = self
                 .send_plain_text_fallback(client, cfg, ctx, &text)
                 .await?;
             return Ok(vec![id]);
         }
 
-        let (multipart_caption, multipart_overflow) =
-            append_degraded_links_to_caption(base_caption, &degraded_urls, ctx.entry);
+        let (multipart_caption, multipart_overflow, next_media_idx) =
+            append_degraded_links_to_caption(base_caption, &degraded_urls, ctx.entry, self.locale);
 
         let mut ids = self
             .send_uploaded_multipart(client, cfg, &uploaded, multipart_caption.as_deref())
             .await?;
 
         if !multipart_overflow.is_empty() {
-            let overflow_text = format_overflow_links(&multipart_overflow);
+            let overflow_text =
+                format_overflow_links(&multipart_overflow, next_media_idx, self.locale);
             let extra_id = self
                 .send_plain_text_fallback(client, cfg, ctx, &overflow_text)
                 .await?;
@@ -891,11 +956,15 @@ impl TelegramSender {
                     "chat_id": cfg.chat_id.trim(),
                     field_name: item.url.trim(),
                 });
+                if item.kind == MediaAttachmentKind::Video {
+                    payload["supports_streaming"] = json!(true);
+                }
                 if let Some(thread_id) = cfg.message_thread_id {
                     payload["message_thread_id"] = json!(thread_id);
                 }
                 if let Some(cap) = group_caption.filter(|s| !s.is_empty()) {
                     payload["caption"] = json!(cap);
+                    payload["parse_mode"] = json!("HTML");
                 }
                 let id = self
                     .call_json_single_message(client, cfg, method, &payload)
@@ -908,10 +977,14 @@ impl TelegramSender {
                         "type": media_group_type_str(item.kind),
                         "media": item.url.trim(),
                     });
+                    if item.kind == MediaAttachmentKind::Video {
+                        entry_obj["supports_streaming"] = json!(true);
+                    }
                     if idx == 0
                         && let Some(cap) = group_caption.filter(|s| !s.is_empty())
                     {
                         entry_obj["caption"] = json!(cap);
+                        entry_obj["parse_mode"] = json!("HTML");
                     }
                     media_arr.push(entry_obj);
                 }
@@ -935,7 +1008,7 @@ impl TelegramSender {
         &self,
         client: &reqwest::Client,
         cfg: &TelegramChannelConfig,
-        uploaded: &[(&MediaAttachment, FetchedMedia)],
+        uploaded: &[PreparedUploadItem],
         caption: Option<&str>,
     ) -> Result<Vec<i64>, TgCallError> {
         let mut all_ids = Vec::with_capacity(uploaded.len());
@@ -944,16 +1017,30 @@ impl TelegramSender {
         for (group_idx, group) in sub_groups.into_iter().enumerate() {
             let group_caption = if group_idx == 0 { caption } else { None };
             if group.len() == 1 {
-                let (item, fetched) = group[0];
+                let item = group[0];
                 let (method, field_name) = single_media_method_and_field(item.kind);
                 let mut form = Form::new().text("chat_id", cfg.chat_id.trim().to_owned());
                 if let Some(thread_id) = cfg.message_thread_id {
                     form = form.text("message_thread_id", thread_id.to_string());
                 }
                 if let Some(cap) = group_caption.filter(|s| !s.is_empty()) {
-                    form = form.text("caption", cap.to_owned());
+                    form = form
+                        .text("caption", cap.to_owned())
+                        .text("parse_mode", "HTML".to_owned());
                 }
-                let part = build_multipart_file_part(fetched, item.kind)?;
+                if item.kind == MediaAttachmentKind::Video {
+                    form = form.text("supports_streaming", "true".to_owned());
+                    if let Some(w) = item.video_meta.width {
+                        form = form.text("width", w.to_string());
+                    }
+                    if let Some(h) = item.video_meta.height {
+                        form = form.text("height", h.to_string());
+                    }
+                    if let Some(d) = item.video_meta.duration_secs {
+                        form = form.text("duration", d.to_string());
+                    }
+                }
+                let part = build_prepared_multipart_part(item)?;
                 form = form.part(field_name, part);
 
                 let id = self
@@ -967,20 +1054,33 @@ impl TelegramSender {
                 }
 
                 let mut media_arr = Vec::with_capacity(group.len());
-                for (idx, (item, fetched)) in group.iter().enumerate() {
+                for (idx, item) in group.iter().enumerate() {
                     let attach_name = format!("file{idx}");
                     let mut media_obj = json!({
                         "type": media_group_type_str(item.kind),
                         "media": format!("attach://{attach_name}"),
                     });
+                    if item.kind == MediaAttachmentKind::Video {
+                        media_obj["supports_streaming"] = json!(true);
+                        if let Some(w) = item.video_meta.width {
+                            media_obj["width"] = json!(w);
+                        }
+                        if let Some(h) = item.video_meta.height {
+                            media_obj["height"] = json!(h);
+                        }
+                        if let Some(d) = item.video_meta.duration_secs {
+                            media_obj["duration"] = json!(d);
+                        }
+                    }
                     if idx == 0
                         && let Some(cap) = group_caption.filter(|s| !s.is_empty())
                     {
                         media_obj["caption"] = json!(cap);
+                        media_obj["parse_mode"] = json!("HTML");
                     }
                     media_arr.push(media_obj);
 
-                    let part = build_multipart_file_part(fetched, item.kind)?;
+                    let part = build_prepared_multipart_part(item)?;
                     form = form.part(attach_name, part);
                 }
 
@@ -1022,7 +1122,8 @@ impl TelegramSender {
 
         let mut payload = json!({
             "chat_id": cfg.chat_id.trim(),
-            "text": truncate_utf16(text, MAX_MESSAGE_UTF16_UNITS, ""),
+            "text": text,
+            "parse_mode": "HTML",
             "link_preview_options": link_preview_options,
         });
         if let Some(thread_id) = cfg.message_thread_id {
@@ -1140,24 +1241,32 @@ impl ChannelSender for TelegramSender {
             .map(|u| format!("@{u}"))
             .unwrap_or_else(|| "bot".to_owned());
 
+        let locale = self.locale;
         if caps.supports_rich_message {
+            let repo_btn_label = if locale.is_zh() {
+                "FeedCourier 源码仓库"
+            } else {
+                "FeedCourier Repository"
+            };
             let fit = FitOptions {
-                tail: vec![Block::link_button(
-                    "FeedCourier Repository",
-                    crate::config::REPO_URL,
-                )],
+                tail: vec![Block::link_button(repo_btn_label, crate::config::REPO_URL)],
                 ..FitOptions::default()
             };
-            let rich = normalize(
-                &format!(
+            let rich_body = if locale.is_zh() {
+                format!(
+                    "<h1>FeedCourier 已连接</h1><p>已通过 <b>{}</b> 验证向会话 <code>{}</code> 的 Telegram 富文本消息投递。</p>",
+                    escape_html(&bot_label),
+                    escape_html(cfg.chat_id.trim())
+                )
+            } else {
+                format!(
                     "<h1>FeedCourier Connected</h1><p>Verified Telegram Bot API 10.4 rich message delivery via <b>{}</b> to chat <code>{}</code>.</p>",
                     escape_html(&bot_label),
                     escape_html(cfg.chat_id.trim())
-                ),
-                &ParseOptions::default(),
-                &fit,
-            )
-            .into_input_rich_message();
+                )
+            };
+            let rich =
+                normalize(&rich_body, &ParseOptions::default(), &fit).into_input_rich_message();
 
             let mut payload = json!({
                 "chat_id": cfg.chat_id.trim(),
@@ -1177,14 +1286,25 @@ impl ChannelSender for TelegramSender {
             }
         }
 
-        let mut payload = json!({
-            "chat_id": cfg.chat_id.trim(),
-            "text": format!(
+        let compact_test_text = if locale.is_zh() {
+            format!(
+                "<b>FeedCourier 已连接</b>\n已通过 <b>{}</b> 验证向会话 <code>{}</code> 的 Telegram 消息投递。\n<i>模式：快讯卡片（富文本支持：{}）</i>",
+                escape_html(&bot_label),
+                escape_html(cfg.chat_id.trim()),
+                caps.supports_rich_message
+            )
+        } else {
+            format!(
                 "<b>FeedCourier Connected</b>\nVerified Telegram delivery via <b>{}</b> to chat <code>{}</code>.\n<i>Mode: Compact Card (sendRichMessage supported: {})</i>",
                 escape_html(&bot_label),
                 escape_html(cfg.chat_id.trim()),
                 caps.supports_rich_message
-            ),
+            )
+        };
+
+        let mut payload = json!({
+            "chat_id": cfg.chat_id.trim(),
+            "text": compact_test_text,
             "parse_mode": "HTML",
         });
         if let Some(thread_id) = cfg.message_thread_id {
@@ -1205,12 +1325,26 @@ impl ChannelSender for TelegramSender {
 
 /// Build a Bot API 10.4 [`InputRichMessage`] using `telegram-rich` normalization and limits fitting.
 pub fn build_rich_message_payload(feed: &Feed, entry: &Entry) -> InputRichMessage {
+    build_rich_message_payload_with_locale(feed, entry, AppLocale::En)
+}
+
+/// Build a Bot API 10.4 [`InputRichMessage`] localized to `locale`.
+pub fn build_rich_message_payload_with_locale(
+    feed: &Feed,
+    entry: &Entry,
+    locale: AppLocale,
+) -> InputRichMessage {
+    let default_title = if locale.is_zh() {
+        "无标题"
+    } else {
+        "Untitled"
+    };
     let title = entry
         .title
         .as_deref()
         .map(collapse_single_line)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Untitled".to_owned());
+        .unwrap_or_else(|| default_title.to_owned());
 
     let canonical_url = entry
         .canonical_url
@@ -1276,16 +1410,23 @@ pub fn build_rich_message_payload(feed: &Feed, entry: &Entry) -> InputRichMessag
         None => ParseOptions::default(),
     };
 
+    let (read_original_label, truncation_text) = if locale.is_zh() {
+        ("阅读原文", "文章较长已截断，点击下方按钮阅读全文。")
+    } else {
+        (
+            "Read original",
+            "Article truncated — tap below to read the full post.",
+        )
+    };
+
     let tail = match fallback_url {
-        Some(url) => vec![Block::link_button("Read original", url)],
+        Some(url) => vec![Block::link_button(read_original_label, url)],
         None => Vec::new(),
     };
 
     let fit_opts = FitOptions {
         tail,
-        truncation_notice: vec![Block::paragraph(
-            "Article truncated — tap below to read the full post.",
-        )],
+        truncation_notice: vec![Block::paragraph(truncation_text)],
         ..FitOptions::default()
     };
 
@@ -1294,12 +1435,26 @@ pub fn build_rich_message_payload(feed: &Feed, entry: &Entry) -> InputRichMessag
 
 /// Format `TelegramDeliveryMode::CompactCard` HTML strictly bounded to `<= 4096` UTF-16 code units.
 pub fn format_compact_card_html(feed: &Feed, entry: &Entry) -> String {
+    format_compact_card_html_with_locale(feed, entry, AppLocale::En)
+}
+
+/// Format `TelegramDeliveryMode::CompactCard` HTML localized to `locale`.
+pub fn format_compact_card_html_with_locale(
+    feed: &Feed,
+    entry: &Entry,
+    locale: AppLocale,
+) -> String {
+    let default_title = if locale.is_zh() {
+        "无标题"
+    } else {
+        "Untitled"
+    };
     let raw_title = entry
         .title
         .as_deref()
         .map(collapse_single_line)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Untitled".to_owned());
+        .unwrap_or_else(|| default_title.to_owned());
     let title = truncate_utf16(&raw_title, 300, "…");
 
     let raw_meta = format_source_author_line(feed, entry);
@@ -1319,9 +1474,15 @@ pub fn format_compact_card_html(feed: &Feed, entry: &Entry) -> String {
         header.push_str("</i>");
     }
 
+    let read_original_label = if locale.is_zh() {
+        "阅读原文"
+    } else {
+        "Read original"
+    };
+
     let footer = match canonical_url {
         Some(url) => format!(
-            "\n\n<a href=\"{}\">Read original</a>",
+            "\n\n<a href=\"{}\">{read_original_label}</a>",
             escape_html_attr(url)
         ),
         None => String::new(),
@@ -1362,11 +1523,21 @@ pub fn format_compact_card_html(feed: &Feed, entry: &Entry) -> String {
     format!("{header}{footer}")
 }
 
-/// Format `TelegramDeliveryMode::MediaMode` strict 3-line minimalist caption:
-/// 1. Author (fallback to `feed.title`)
-/// 2. `entry.first_sentence` without trailing `.` or `。` (fallback to `entry.title` without `.` / `。`)
-/// 3. `entry.canonical_url` (omitted cleanly when `None`)
+/// Format `TelegramDeliveryMode::MediaMode` strict 3-line minimalist HTML caption (`AppLocale::En` default):
+/// 1. Author (fallback to `feed.title`), HTML-escaped
+/// 2. `entry.first_sentence` without trailing `.` or `。` (fallback to `entry.title`), HTML-escaped
+/// 3. `<a href="{entry.canonical_url}">Link</a>` (`链接` when `AppLocale::ZhCn`; omitted when `None`)
 pub fn format_media_mode_caption(feed: &Feed, entry: &Entry, max_utf16_units: usize) -> String {
+    format_media_mode_caption_with_locale(feed, entry, max_utf16_units, AppLocale::En)
+}
+
+/// Format `TelegramDeliveryMode::MediaMode` 3-line minimalist HTML caption localized to `locale`.
+pub fn format_media_mode_caption_with_locale(
+    feed: &Feed,
+    entry: &Entry,
+    max_utf16_units: usize,
+    locale: AppLocale,
+) -> String {
     let line1_raw = entry
         .author
         .as_deref()
@@ -1377,7 +1548,8 @@ pub fn format_media_mode_caption(feed: &Feed, entry: &Entry, max_utf16_units: us
             (!ft.is_empty()).then_some(ft)
         })
         .unwrap_or_else(|| "Feed".to_owned());
-    let line1 = truncate_utf16(&line1_raw, 160.min(max_utf16_units / 3), "…");
+    let line1_plain = truncate_utf16(&line1_raw, 160.min(max_utf16_units / 3), "…");
+    let line1 = escape_html(&line1_plain);
 
     let sentence_source = entry
         .first_sentence
@@ -1395,20 +1567,31 @@ pub fn format_media_mode_caption(feed: &Feed, entry: &Entry, max_utf16_units: us
         })
         .unwrap_or_else(|| "Update".to_owned());
 
-    let line3 = entry
+    let canonical_url = entry
         .canonical_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let reserved = utf16_len(&line1) + 1 + line3.map(|u| 1 + utf16_len(u)).unwrap_or(0);
-    let line2_budget = max_utf16_units.saturating_sub(reserved);
-    let mut line2 = truncate_utf16(&sentence_source, line2_budget, "…");
-    line2 = strip_trailing_sentence_period(&line2);
+    let link_label = if locale.is_zh() { "链接" } else { "Link" };
+    let line3_html =
+        canonical_url.map(|url| format!("<a href=\"{}\">{link_label}</a>", escape_html_attr(url)));
 
-    match line3 {
-        Some(url) if reserved <= max_utf16_units => format!("{line1}\n{line2}\n{url}"),
-        _ => truncate_utf16(&format!("{line1}\n{line2}"), max_utf16_units, "…"),
+    let visible_reserved = utf16_len(&line1_plain)
+        + 1
+        + canonical_url
+            .map(|_| 1 + utf16_len(link_label))
+            .unwrap_or(0);
+    let line2_budget = max_utf16_units.saturating_sub(visible_reserved).max(16);
+    let mut line2_plain = truncate_utf16(&sentence_source, line2_budget, "…");
+    line2_plain = strip_trailing_sentence_period(&line2_plain);
+    let line2 = escape_html(&line2_plain);
+
+    match line3_html {
+        Some(link_tag) if visible_reserved <= max_utf16_units => {
+            format!("{line1}\n{line2}\n{link_tag}")
+        }
+        _ => format!("{line1}\n{line2}"),
     }
 }
 
@@ -1475,14 +1658,459 @@ fn partition_compatible_media<'a>(items: &[&'a MediaAttachment]) -> Vec<Vec<&'a 
     groups
 }
 
+#[derive(Debug, Clone)]
+struct PreparedUploadItem {
+    kind: MediaAttachmentKind,
+    bytes: Bytes,
+    mime_type: String,
+    filename: String,
+    video_meta: VideoMetadata,
+}
+
+fn can_try_direct_url_pass(item: &MediaAttachment) -> bool {
+    match item.kind {
+        // Videos must go through our stream fetcher + MP4 metadata parser + multipart upload:
+        // Telegram's URL mode silently downgrades videos to unpreviewable `Document` files (with
+        // HTTP 200 OK) whenever the origin CDN omits a `.mp4` extension, serves `octet-stream`,
+        // or lacks streaming/dimension hints.
+        MediaAttachmentKind::Video => false,
+        MediaAttachmentKind::Image | MediaAttachmentKind::Audio => true,
+        // Extensionless or generic `<enclosure>` URLs are classified as `Document` at ingest;
+        // only use direct URL mode when the attachment is explicitly a known document type.
+        MediaAttachmentKind::Document => is_explicit_document_attachment(item),
+    }
+}
+
+fn is_explicit_document_attachment(item: &MediaAttachment) -> bool {
+    if let Some(mime) = item.mime_type.as_deref().map(str::trim) {
+        let lower = mime.to_ascii_lowercase();
+        if lower.starts_with("application/pdf")
+            || lower.starts_with("application/zip")
+            || lower.starts_with("application/x-rar")
+            || lower.starts_with("application/x-7z")
+            || lower.starts_with("application/gzip")
+            || lower.starts_with("application/x-tar")
+            || lower.starts_with("application/msword")
+            || lower.starts_with("application/vnd.")
+            || lower.starts_with("application/epub+zip")
+            || lower.starts_with("application/rtf")
+            || lower.starts_with("text/")
+        {
+            return true;
+        }
+    }
+
+    let path = Url::parse(&item.url)
+        .ok()
+        .map(|u| u.path().to_ascii_lowercase())
+        .unwrap_or_else(|| item.url.to_ascii_lowercase());
+
+    [
+        ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".doc", ".docx",
+        ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".tsv", ".epub", ".rtf", ".json", ".xml",
+    ]
+    .iter()
+    .any(|ext| path.ends_with(ext))
+}
+
+fn normalize_and_inspect_media(
+    item: &MediaAttachment,
+    fetched: FetchedMedia,
+) -> PreparedUploadItem {
+    let sniffed = sniff_media_bytes(&fetched.bytes);
+
+    let kind = match (item.kind, sniffed) {
+        (MediaAttachmentKind::Document, Some((detected_kind, _, _))) => detected_kind,
+        (MediaAttachmentKind::Image, Some((MediaAttachmentKind::Video, _, _))) => {
+            MediaAttachmentKind::Video
+        }
+        (original, _) => original,
+    };
+
+    let (mime_type, canonical_ext) = match kind {
+        MediaAttachmentKind::Video => {
+            if let Some((MediaAttachmentKind::Video, m, ext)) = sniffed {
+                (m.to_owned(), Some(ext))
+            } else if fetched
+                .content_type
+                .as_deref()
+                .or(item.mime_type.as_deref())
+                .is_some_and(|m| m.eq_ignore_ascii_case("video/webm"))
+            {
+                ("video/webm".to_owned(), Some("webm"))
+            } else {
+                // Always normalize ISO-BMFF / QuickTime / generic video streams to `video/mp4` + `.mp4`
+                // so Telegram renders an inline streaming player instead of a raw file attachment.
+                ("video/mp4".to_owned(), Some("mp4"))
+            }
+        }
+        MediaAttachmentKind::Image => {
+            if let Some((MediaAttachmentKind::Image, m, ext)) = sniffed {
+                (m.to_owned(), Some(ext))
+            } else {
+                match fetched
+                    .content_type
+                    .as_deref()
+                    .or(item.mime_type.as_deref())
+                {
+                    Some("image/png") => ("image/png".to_owned(), Some("png")),
+                    Some("image/webp") => ("image/webp".to_owned(), Some("webp")),
+                    Some("image/gif") => ("image/gif".to_owned(), Some("gif")),
+                    _ => ("image/jpeg".to_owned(), Some("jpg")),
+                }
+            }
+        }
+        MediaAttachmentKind::Audio => {
+            if let Some((MediaAttachmentKind::Audio, m, ext)) = sniffed {
+                (m.to_owned(), Some(ext))
+            } else {
+                match fetched
+                    .content_type
+                    .as_deref()
+                    .or(item.mime_type.as_deref())
+                {
+                    Some("audio/ogg") => ("audio/ogg".to_owned(), Some("ogg")),
+                    Some("audio/mp4" | "audio/x-m4a") => ("audio/mp4".to_owned(), Some("m4a")),
+                    _ => ("audio/mpeg".to_owned(), Some("mp3")),
+                }
+            }
+        }
+        MediaAttachmentKind::Document => {
+            if let Some((MediaAttachmentKind::Document, m, ext)) = sniffed {
+                (m.to_owned(), Some(ext))
+            } else {
+                let m = fetched
+                    .content_type
+                    .as_deref()
+                    .or(item.mime_type.as_deref())
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                (m, None)
+            }
+        }
+    };
+
+    let filename = match canonical_ext {
+        Some(ext) => ensure_filename_extension(&fetched.filename, ext),
+        None => fetched.filename,
+    };
+
+    let video_meta = if kind == MediaAttachmentKind::Video {
+        parse_mp4_metadata(&fetched.bytes)
+    } else {
+        VideoMetadata::default()
+    };
+
+    PreparedUploadItem {
+        kind,
+        bytes: fetched.bytes,
+        mime_type,
+        filename,
+        video_meta,
+    }
+}
+
+fn ensure_filename_extension(raw_filename: &str, canonical_ext: &str) -> String {
+    let expected_suffix = format!(".{canonical_ext}");
+    if raw_filename
+        .to_ascii_lowercase()
+        .ends_with(&expected_suffix)
+    {
+        return raw_filename.to_owned();
+    }
+
+    let stem = raw_filename
+        .rsplit_once('.')
+        .map(|(base, _)| base)
+        .filter(|base| !base.is_empty())
+        .unwrap_or(raw_filename);
+    let clean_stem = if stem.is_empty() { "media" } else { stem };
+    format!("{clean_stem}.{canonical_ext}")
+}
+
+/// Inspect magic bytes at the start of a downloaded media buffer to detect actual container format.
+pub fn sniff_media_bytes(
+    bytes: &[u8],
+) -> Option<(MediaAttachmentKind, &'static str, &'static str)> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some((MediaAttachmentKind::Image, "image/jpeg", "jpg"));
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some((MediaAttachmentKind::Image, "image/png", "png"));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some((MediaAttachmentKind::Image, "image/gif", "gif"));
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some((MediaAttachmentKind::Image, "image/webp", "webp"));
+    }
+
+    // ISO Base Media File Format (`ftyp` box at offset 4..8): MP4, M4V, MOV, M4A, 3GP
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let major_brand = &bytes[8..12];
+        if matches!(major_brand, b"M4A " | b"M4B ") {
+            return Some((MediaAttachmentKind::Audio, "audio/mp4", "m4a"));
+        }
+        if !matches!(major_brand, b"avif" | b"avis" | b"heic" | b"heix" | b"mif1") {
+            return Some((MediaAttachmentKind::Video, "video/mp4", "mp4"));
+        }
+    }
+    if bytes.len() >= 8 && matches!(&bytes[4..8], b"moov" | b"wide") {
+        let meta = parse_mp4_metadata(bytes);
+        if meta.width.is_some() || meta.duration_secs.is_some() {
+            return Some((MediaAttachmentKind::Video, "video/mp4", "mp4"));
+        }
+    }
+
+    // WebM / Matroska EBML header
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some((MediaAttachmentKind::Video, "video/webm", "webm"));
+    }
+
+    // MP3 (ID3v2 tag or MPEG ADTS sync word)
+    if bytes.starts_with(b"ID3")
+        || (bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0)
+    {
+        return Some((MediaAttachmentKind::Audio, "audio/mpeg", "mp3"));
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some((MediaAttachmentKind::Audio, "audio/ogg", "ogg"));
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some((MediaAttachmentKind::Document, "application/pdf", "pdf"));
+    }
+
+    None
+}
+
+/// Lightweight, zero-dependency ISO-BMFF (`MP4` / `MOV` / `M4V`) parser that extracts
+/// display `width`, `height`, and `duration_secs` from `moov -> mvhd / tkhd / stsd`.
+pub fn parse_mp4_metadata(bytes: &[u8]) -> VideoMetadata {
+    let mut meta = VideoMetadata::default();
+    let Some(moov_payload) = find_mp4_box_payload(bytes, b"moov") else {
+        return meta;
+    };
+
+    if let Some(mvhd) = find_mp4_box_payload(moov_payload, b"mvhd") {
+        meta.duration_secs = parse_mvhd_or_mdhd_duration(mvhd);
+    }
+
+    for (box_type, trak_payload) in Mp4BoxIter::new(moov_payload) {
+        if &box_type != b"trak" {
+            continue;
+        }
+
+        if meta.duration_secs.is_none()
+            && let Some(mdia) = find_mp4_box_payload(trak_payload, b"mdia")
+            && let Some(mdhd) = find_mp4_box_payload(mdia, b"mdhd")
+        {
+            meta.duration_secs = parse_mvhd_or_mdhd_duration(mdhd);
+        }
+
+        if meta.width.is_none() || meta.height.is_none() {
+            let mut tkhd_dims: Option<(u32, u32, bool)> = None;
+            if let Some(tkhd) = find_mp4_box_payload(trak_payload, b"tkhd") {
+                tkhd_dims = parse_tkhd_dimensions(tkhd);
+            }
+
+            let rotated_90_or_270 = tkhd_dims.map(|(_, _, r)| r).unwrap_or(false);
+            if let Some((w, h, _)) = tkhd_dims
+                && w > 0
+                && h > 0
+            {
+                meta.width = Some(w);
+                meta.height = Some(h);
+                continue;
+            }
+
+            if let Some(mdia) = find_mp4_box_payload(trak_payload, b"mdia")
+                && let Some(minf) = find_mp4_box_payload(mdia, b"minf")
+                && let Some(stbl) = find_mp4_box_payload(minf, b"stbl")
+                && let Some(stsd) = find_mp4_box_payload(stbl, b"stsd")
+                && let Some((w, h)) = parse_stsd_dimensions(stsd)
+            {
+                let (final_w, final_h) = if rotated_90_or_270 { (h, w) } else { (w, h) };
+                meta.width = Some(final_w);
+                meta.height = Some(final_h);
+            }
+        }
+    }
+
+    meta
+}
+
+struct Mp4BoxIter<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Mp4BoxIter<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+}
+
+impl<'a> Iterator for Mp4BoxIter<'a> {
+    type Item = ([u8; 4], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset.checked_add(8)? > self.data.len() {
+            return None;
+        }
+        let size32 =
+            u32::from_be_bytes(self.data[self.offset..self.offset + 4].try_into().ok()?) as usize;
+        let box_type: [u8; 4] = self.data[self.offset + 4..self.offset + 8]
+            .try_into()
+            .ok()?;
+
+        let (header_len, total_size) = if size32 == 1 {
+            if self.offset.checked_add(16)? > self.data.len() {
+                return None;
+            }
+            let size64 = u64::from_be_bytes(
+                self.data[self.offset + 8..self.offset + 16]
+                    .try_into()
+                    .ok()?,
+            );
+            let total = usize::try_from(size64).ok()?;
+            if total < 16 {
+                return None;
+            }
+            (16usize, total)
+        } else if size32 == 0 {
+            (8usize, self.data.len() - self.offset)
+        } else if size32 >= 8 {
+            (8usize, size32)
+        } else {
+            return None;
+        };
+
+        let end = self.offset.checked_add(total_size)?;
+        if end > self.data.len() {
+            self.offset = self.data.len();
+            return None;
+        }
+        let payload = &self.data[self.offset + header_len..end];
+        self.offset = end;
+        Some((box_type, payload))
+    }
+}
+
+fn find_mp4_box_payload<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]> {
+    for (box_type, payload) in Mp4BoxIter::new(data) {
+        if &box_type == target {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn parse_mvhd_or_mdhd_duration(payload: &[u8]) -> Option<u32> {
+    let version = *payload.first()?;
+    let (timescale, duration) = if version == 0 {
+        if payload.len() < 20 {
+            return None;
+        }
+        let ts = u32::from_be_bytes(payload[12..16].try_into().ok()?);
+        let dur = u32::from_be_bytes(payload[16..20].try_into().ok()?);
+        if dur == u32::MAX {
+            return None;
+        }
+        (ts, u64::from(dur))
+    } else if version == 1 {
+        if payload.len() < 32 {
+            return None;
+        }
+        let ts = u32::from_be_bytes(payload[20..24].try_into().ok()?);
+        let dur = u64::from_be_bytes(payload[24..32].try_into().ok()?);
+        if dur == u64::MAX {
+            return None;
+        }
+        (ts, dur)
+    } else {
+        return None;
+    };
+
+    if timescale == 0 || duration == 0 {
+        return None;
+    }
+
+    let secs = ((duration as f64) / (timescale as f64)).round();
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    u32::try_from(secs as u64).ok().map(|s| s.max(1))
+}
+
+fn parse_tkhd_dimensions(payload: &[u8]) -> Option<(u32, u32, bool)> {
+    let version = *payload.first()?;
+    let (matrix_offset, dims_offset) = match version {
+        0 if payload.len() >= 84 => (40usize, 76usize),
+        1 if payload.len() >= 96 => (52usize, 88usize),
+        _ => return None,
+    };
+
+    let a = i32::from_be_bytes(payload[matrix_offset..matrix_offset + 4].try_into().ok()?);
+    let b = i32::from_be_bytes(
+        payload[matrix_offset + 4..matrix_offset + 8]
+            .try_into()
+            .ok()?,
+    );
+    let c = i32::from_be_bytes(
+        payload[matrix_offset + 12..matrix_offset + 16]
+            .try_into()
+            .ok()?,
+    );
+    let d = i32::from_be_bytes(
+        payload[matrix_offset + 16..matrix_offset + 20]
+            .try_into()
+            .ok()?,
+    );
+
+    let rotated_90_or_270 = a == 0 && d == 0 && (b != 0 || c != 0);
+
+    let width_fixed = u32::from_be_bytes(payload[dims_offset..dims_offset + 4].try_into().ok()?);
+    let height_fixed =
+        u32::from_be_bytes(payload[dims_offset + 4..dims_offset + 8].try_into().ok()?);
+    let width = width_fixed >> 16;
+    let height = height_fixed >> 16;
+
+    let (final_w, final_h) = if rotated_90_or_270 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    Some((final_w, final_h, rotated_90_or_270))
+}
+
+fn parse_stsd_dimensions(payload: &[u8]) -> Option<(u32, u32)> {
+    if payload.len() < 16 {
+        return None;
+    }
+    for (entry_type, entry_payload) in Mp4BoxIter::new(&payload[8..]) {
+        if matches!(
+            &entry_type,
+            b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"vp08" | b"vp09" | b"av01" | b"mp4v"
+        ) && entry_payload.len() >= 28
+        {
+            let w = u32::from(u16::from_be_bytes(entry_payload[24..26].try_into().ok()?));
+            let h = u32::from(u16::from_be_bytes(entry_payload[26..28].try_into().ok()?));
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
+    }
+    None
+}
+
 fn partition_compatible_uploaded<'a>(
-    items: &'a [(&'a MediaAttachment, FetchedMedia)],
-) -> Vec<Vec<&'a (&'a MediaAttachment, FetchedMedia)>> {
-    let mut groups: Vec<Vec<&'a (&'a MediaAttachment, FetchedMedia)>> = Vec::new();
+    items: &'a [PreparedUploadItem],
+) -> Vec<Vec<&'a PreparedUploadItem>> {
+    let mut groups: Vec<Vec<&'a PreparedUploadItem>> = Vec::new();
     for item in items {
-        let b = bucket_for(item.0.kind);
+        let b = bucket_for(item.kind);
         if let Some(last) = groups.last_mut()
-            && bucket_for(last[0].0.kind) == b
+            && bucket_for(last[0].kind) == b
         {
             last.push(item);
         } else {
@@ -1492,25 +2120,21 @@ fn partition_compatible_uploaded<'a>(
     groups
 }
 
-fn build_multipart_file_part(
-    fetched: &FetchedMedia,
-    kind: MediaAttachmentKind,
-) -> Result<Part, TgCallError> {
-    let len = fetched.bytes.len() as u64;
-    let part = Part::stream_with_length(reqwest::Body::from(fetched.bytes.clone()), len)
-        .file_name(fetched.filename.clone());
+fn build_prepared_multipart_part(item: &PreparedUploadItem) -> Result<Part, TgCallError> {
+    let len = item.bytes.len() as u64;
+    let part = Part::stream_with_length(reqwest::Body::from(item.bytes.clone()), len)
+        .file_name(item.filename.clone());
 
-    let default_mime = match kind {
+    let default_mime = match item.kind {
         MediaAttachmentKind::Image => "image/jpeg",
         MediaAttachmentKind::Video => "video/mp4",
         MediaAttachmentKind::Audio => "audio/mpeg",
         MediaAttachmentKind::Document => "application/octet-stream",
     };
-    let mime = fetched.content_type.as_deref().unwrap_or(default_mime);
-    part.mime_str(mime)
+    part.mime_str(&item.mime_type)
         .or_else(|_| {
-            Part::stream_with_length(reqwest::Body::from(fetched.bytes.clone()), len)
-                .file_name(fetched.filename.clone())
+            Part::stream_with_length(reqwest::Body::from(item.bytes.clone()), len)
+                .file_name(item.filename.clone())
                 .mime_str(default_mime)
         })
         .map_err(|err| TgCallError {
@@ -1521,31 +2145,54 @@ fn build_multipart_file_part(
         })
 }
 
+fn format_media_hyperlink(url: &str, index_one_based: usize, locale: AppLocale) -> String {
+    let label = if locale.is_zh() {
+        format!("媒体 {index_one_based}")
+    } else {
+        format!("Media {index_one_based}")
+    };
+    format!("<a href=\"{}\">{label}</a>", escape_html_attr(url))
+}
+
 fn append_degraded_links_to_caption(
     base_caption: Option<&str>,
     degraded_urls: &[String],
     entry: &Entry,
-) -> (Option<String>, Vec<String>) {
+    locale: AppLocale,
+) -> (Option<String>, Vec<String>, usize) {
     let canonical = entry.canonical_url.as_deref().map(str::trim);
     let mut current = base_caption.unwrap_or("").to_owned();
     let mut overflow = Vec::new();
+    let mut has_link_line = current.contains("<a href=");
+    let mut media_idx = 0usize;
+    let mut first_overflow_idx = 1usize;
 
     for url in degraded_urls {
         if canonical == Some(url.as_str()) && base_caption.is_some() {
             continue;
         }
-        let sep = if current.is_empty() { "" } else { "\n" };
-        let needed = utf16_len(sep) + utf16_len(url);
-        if utf16_len(&current) + needed <= MAX_CAPTION_UTF16_UNITS {
+        media_idx += 1;
+        let tag = format_media_hyperlink(url, media_idx, locale);
+        let sep = if current.is_empty() {
+            ""
+        } else if has_link_line {
+            " · "
+        } else {
+            "\n"
+        };
+        let needed = utf16_len(sep) + utf16_len(&tag);
+        if overflow.is_empty() && utf16_len(&current) + needed <= MAX_CAPTION_UTF16_UNITS {
             current.push_str(sep);
-            current.push_str(url);
+            current.push_str(&tag);
+            has_link_line = true;
+            first_overflow_idx = media_idx + 1;
         } else {
             overflow.push(url.clone());
         }
     }
 
     let opt = (!current.is_empty()).then_some(current);
-    (opt, overflow)
+    (opt, overflow, first_overflow_idx)
 }
 
 fn compose_degraded_text_message(
@@ -1553,34 +2200,47 @@ fn compose_degraded_text_message(
     entry: &Entry,
     batch_idx: usize,
     degraded_urls: &[String],
+    locale: AppLocale,
 ) -> String {
     let canonical = entry.canonical_url.as_deref().map(str::trim);
     let mut out = if batch_idx == 0 {
-        format_media_mode_caption(feed, entry, MAX_MESSAGE_UTF16_UNITS)
+        format_media_mode_caption_with_locale(feed, entry, MAX_MESSAGE_UTF16_UNITS, locale)
     } else {
         String::new()
     };
+    let mut has_link_line = out.contains("<a href=");
+    let mut media_idx = 0usize;
 
     for url in degraded_urls {
         if batch_idx == 0 && canonical == Some(url.as_str()) {
             continue;
         }
-        let sep = if out.is_empty() { "" } else { "\n" };
-        if utf16_len(&out) + utf16_len(sep) + utf16_len(url) <= MAX_MESSAGE_UTF16_UNITS {
+        media_idx += 1;
+        let tag = format_media_hyperlink(url, media_idx, locale);
+        let sep = if out.is_empty() {
+            ""
+        } else if has_link_line {
+            " · "
+        } else {
+            "\n"
+        };
+        if utf16_len(&out) + utf16_len(sep) + utf16_len(&tag) <= MAX_MESSAGE_UTF16_UNITS {
             out.push_str(sep);
-            out.push_str(url);
+            out.push_str(&tag);
+            has_link_line = true;
         }
     }
     out
 }
 
-fn format_overflow_links(urls: &[String]) -> String {
+fn format_overflow_links(urls: &[String], start_media_idx: usize, locale: AppLocale) -> String {
     let mut out = String::new();
-    for url in urls {
-        let sep = if out.is_empty() { "" } else { "\n" };
-        if utf16_len(&out) + utf16_len(sep) + utf16_len(url) <= MAX_MESSAGE_UTF16_UNITS {
+    for (idx, url) in urls.iter().enumerate() {
+        let tag = format_media_hyperlink(url, start_media_idx + idx, locale);
+        let sep = if out.is_empty() { "" } else { " · " };
+        if utf16_len(&out) + utf16_len(sep) + utf16_len(&tag) <= MAX_MESSAGE_UTF16_UNITS {
             out.push_str(sep);
-            out.push_str(url);
+            out.push_str(&tag);
         }
     }
     out

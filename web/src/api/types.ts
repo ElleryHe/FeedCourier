@@ -637,17 +637,22 @@ export interface RetryTasksResponse {
 // 7. System Settings & MCP Tokens (`/api/v1/settings`, `/api/v1/mcp-tokens*`)
 // ---------------------------------------------------------------------------
 
+export type SystemLocale = "en" | "zh-CN";
+
 /** `GET /api/v1/settings` & `PUT /api/v1/settings` */
 export interface SystemSettingsDto {
   /** Global HTTP / SOCKS5 proxy URL (e.g. `"socks5h://127.0.0.1:1080"`), or `null` when unset. */
   outbound_proxy_url: string | null;
   /** CIDR ranges (e.g. `"10.0.0.0/8"`) or internal hostnames (e.g. `"rsshub.internal"`) allowed past SSRF private-IP block. */
   ssrf_allowlist: string[];
+  /** Active system locale for downstream push notification templates (`"en"` | `"zh-CN"`). */
+  locale?: SystemLocale | null;
 }
 
 export interface UpdateSystemSettingsRequest {
-  outbound_proxy_url: string | null;
-  ssrf_allowlist: string[];
+  outbound_proxy_url?: string | null;
+  ssrf_allowlist?: string[];
+  locale?: SystemLocale;
 }
 
 export type McpTokenScope = "readonly" | "admin";

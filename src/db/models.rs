@@ -20,6 +20,65 @@ pub const SETTING_OUTBOUND_PROXY_URL: &str = "outbound_proxy_url";
 /// Well-known `system_settings.key` for SSRF CIDR/hostname allowlist entries (`Vec<String>`).
 pub const SETTING_SSRF_ALLOWLIST: &str = "ssrf_allowlist";
 
+/// Well-known `system_settings.key` for the system UI and delivery template locale (`AppLocale`).
+pub const SETTING_LOCALE: &str = "locale";
+
+/// Supported system UI and delivery template locales (`system_settings.locale`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum AppLocale {
+    #[default]
+    #[serde(rename = "en", alias = "en-US", alias = "en_US")]
+    En,
+    #[serde(rename = "zh-CN", alias = "zh", alias = "zh_CN", alias = "zh-Hans")]
+    ZhCn,
+}
+
+impl AppLocale {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::ZhCn => "zh-CN",
+        }
+    }
+
+    pub const fn is_zh(self) -> bool {
+        matches!(self, Self::ZhCn)
+    }
+
+    pub fn parse_lossy(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("zh") {
+            Some(Self::ZhCn)
+        } else if lower.starts_with("en") {
+            Some(Self::En)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for AppLocale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AppLocale {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_lossy(s).ok_or_else(|| {
+            AppError::Validation(format!(
+                "unsupported locale '{s}' (expected 'en' or 'zh-CN')"
+            ))
+        })
+    }
+}
+
 /// Return current UTC Unix timestamp in seconds.
 pub fn now_unix() -> i64 {
     Utc::now().timestamp()

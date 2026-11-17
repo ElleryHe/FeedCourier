@@ -26,7 +26,8 @@ use crate::config::AppConfig;
 use crate::crypto::MasterKey;
 use crate::db::Database;
 use crate::db::models::{
-    Channel, DeliveryTask, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, now_unix,
+    AppLocale, Channel, DeliveryTask, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL,
+    SETTING_SSRF_ALLOWLIST, now_unix,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
@@ -176,6 +177,19 @@ pub async fn load_persisted_net_settings(
     })
 }
 
+/// Resolve persisted system locale from SQLite `system_settings`, falling back to `AppConfig::locale`
+/// when `SETTING_LOCALE` has not yet been set via `PUT /api/v1/settings`.
+pub async fn load_persisted_locale(
+    config: &AppConfig,
+    db: &Database,
+) -> AppResult<Option<AppLocale>> {
+    match db.get_setting_typed::<Option<String>>(SETTING_LOCALE).await {
+        Ok(Some(Some(raw))) => Ok(AppLocale::parse_lossy(&raw).or(config.locale)),
+        Ok(Some(None)) | Ok(None) => Ok(config.locale),
+        Err(_) => Ok(config.locale),
+    }
+}
+
 /// Normalize a `NetSettings` payload (trimming whitespace and deduplicating allowlist entries).
 pub fn normalize_net_settings(settings: NetSettings) -> NetSettings {
     let outbound_proxy_url = settings
@@ -298,13 +312,15 @@ impl DeliveryDispatcher {
         http: ProtectedHttpClient,
     ) -> AppResult<Self> {
         let net_settings = http.settings();
+        let initial_locale = config.locale.unwrap_or_default();
         let media_fetcher = Arc::new(ProtectedMediaFetcher::new(http.clone()));
         let ingest = IngestEngine::new(db.clone(), http.clone());
-        let smtp_sender = SmtpSender::new();
+        let smtp_sender = SmtpSender::new().with_locale(initial_locale);
         let telegram_sender = TelegramSender::with_proxy_and_fetcher(
             net_settings.outbound_proxy_url.clone(),
             Arc::clone(&media_fetcher) as Arc<dyn MediaStreamFetcher>,
-        );
+        )
+        .with_locale(initial_locale);
         let notion_sender = Arc::new(NotionSender::new(net_settings.outbound_proxy_url)?);
 
         Ok(Self {
@@ -332,16 +348,44 @@ impl DeliveryDispatcher {
         })
     }
 
-    /// Construct a [`DeliveryDispatcher`] resolving initial [`NetSettings`] from SQLite
-    /// `system_settings` (with fallback to `AppConfig` environment defaults).
+    /// Construct a [`DeliveryDispatcher`] resolving initial [`NetSettings`] and [`AppLocale`]
+    /// from SQLite `system_settings` (with fallback to `AppConfig` environment defaults).
     pub async fn from_db_settings(
         config: AppConfig,
         db: Database,
         master_key: MasterKey,
     ) -> AppResult<Self> {
         let net_settings = load_persisted_net_settings(&config, &db).await?;
+        let persisted_locale = load_persisted_locale(&config, &db).await?;
         let http = ProtectedHttpClient::new(net_settings)?;
-        Self::new(config, db, master_key, http)
+        let dispatcher = Self::new(config, db, master_key, http)?;
+        if let Some(locale) = persisted_locale {
+            dispatcher.set_locale(locale);
+        }
+        Ok(dispatcher)
+    }
+
+    /// Builder-style locale override for delivery templates.
+    pub fn with_locale(self, locale: AppLocale) -> Self {
+        self.set_locale(locale);
+        self
+    }
+
+    /// Current active [`AppLocale`] for downstream channel templates.
+    pub fn locale(&self) -> AppLocale {
+        self.inner
+            .telegram_sender
+            .read()
+            .expect("TelegramSender RwLock poisoned")
+            .locale()
+    }
+
+    /// Hot-update the active [`AppLocale`] across [`SmtpSender`] and [`TelegramSender`].
+    pub fn set_locale(&self, locale: AppLocale) {
+        self.inner.smtp_sender.set_locale(locale);
+        if let Ok(mut guard) = self.inner.telegram_sender.write() {
+            guard.set_locale(locale);
+        }
     }
 
     /// Replace the `NotionSender` instance (e.g. pointing at a `wiremock` base URL in tests).
@@ -487,11 +531,13 @@ impl DeliveryDispatcher {
             .notion_sender
             .set_outbound_proxy(normalized.outbound_proxy_url.clone())?;
 
-        // Swap a fresh proxy-configured TelegramSender sharing `ProtectedMediaFetcher`.
+        // Swap a fresh proxy-configured TelegramSender sharing `ProtectedMediaFetcher` and active locale.
+        let current_locale = self.locale();
         let next_telegram = TelegramSender::with_proxy_and_fetcher(
             normalized.outbound_proxy_url,
             Arc::clone(&self.inner.media_fetcher) as Arc<dyn MediaStreamFetcher>,
-        );
+        )
+        .with_locale(current_locale);
         {
             let mut guard = self
                 .inner

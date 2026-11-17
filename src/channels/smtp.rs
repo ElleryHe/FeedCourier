@@ -23,7 +23,7 @@ use crate::channels::{
     DeliveryOutcome, SmtpChannelConfig, SmtpSecurity,
 };
 use crate::crypto::sha256_hex;
-use crate::db::models::{Entry, Feed, unix_to_datetime};
+use crate::db::models::{AppLocale, Entry, Feed, unix_to_datetime};
 use crate::error::{AppError, AppResult};
 
 /// Maximum UTF-8 byte budget for the rendered HTML email part (`95 KiB`), keeping the
@@ -37,7 +37,7 @@ pub const PLAIN_TEXT_WRAP_WIDTH: usize = 78;
 pub const DEFAULT_SMTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 const EMAIL_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="{{ html_lang }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -61,21 +61,21 @@ const EMAIL_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     </div>
     {% if truncated %}
     <div style="margin:22px 0 0 0;padding:14px 16px;background-color:#f9fafb;border-left:3px solid #2563eb;border-radius:4px;font-size:14px;color:#374151;">
-      Article preview was shortened to prevent email client clipping.
+      {{ truncation_notice }}
       {% if continue_url %}
-      <a href="{{ continue_url }}" style="color:#2563eb;font-weight:600;text-decoration:none;">Continue reading original article →</a>
+      <a href="{{ continue_url }}" style="color:#2563eb;font-weight:600;text-decoration:none;">{{ continue_label }}</a>
       {% else %}
-      <span>Continue reading original article →</span>
+      <span>{{ continue_label }}</span>
       {% endif %}
     </div>
     {% endif %}
     <div style="margin-top:28px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:14px;color:#6b7280;">
       {% if original_url %}
       <p style="margin:0 0 8px 0;">
-        <a href="{{ original_url }}" style="color:#2563eb;font-weight:600;text-decoration:none;">Read original →</a>
+        <a href="{{ original_url }}" style="color:#2563eb;font-weight:600;text-decoration:none;">{{ read_original_label }}</a>
       </p>
       {% endif %}
-      <p style="margin:0;font-size:12px;color:#9ca3af;">Delivered by FeedCourier · {{ feed_title }}</p>
+      <p style="margin:0;font-size:12px;color:#9ca3af;">{{ delivered_by_text }}</p>
     </div>
   </div>
 </body>
@@ -96,12 +96,14 @@ pub struct BuiltEmail {
 pub struct SmtpSender {
     timeout: Duration,
     transports: Arc<RwLock<HashMap<String, AsyncSmtpTransport<Tokio1Executor>>>>,
+    locale: Arc<RwLock<AppLocale>>,
 }
 
 impl std::fmt::Debug for SmtpSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SmtpSender")
             .field("timeout", &self.timeout)
+            .field("locale", &self.locale())
             .finish()
     }
 }
@@ -123,7 +125,26 @@ impl SmtpSender {
         Self {
             timeout,
             transports: Arc::new(RwLock::new(HashMap::new())),
+            locale: Arc::new(RwLock::new(AppLocale::En)),
         }
+    }
+
+    /// Set the delivery template locale on this `SmtpSender` (builder style).
+    pub fn with_locale(self, locale: AppLocale) -> Self {
+        self.set_locale(locale);
+        self
+    }
+
+    /// Update the active delivery template locale at runtime.
+    pub fn set_locale(&self, locale: AppLocale) {
+        if let Ok(mut guard) = self.locale.write() {
+            *guard = locale;
+        }
+    }
+
+    /// Current delivery template locale.
+    pub fn locale(&self) -> AppLocale {
+        self.locale.read().map(|g| *g).unwrap_or(AppLocale::En)
     }
 
     /// Obtain or create a pooled `AsyncSmtpTransport` matching `cfg`.
@@ -187,6 +208,25 @@ impl SmtpSender {
         route_id: i64,
         existing_message_id: Option<&str>,
     ) -> AppResult<BuiltEmail> {
+        Self::build_entry_email_with_locale(
+            cfg,
+            feed,
+            entry,
+            route_id,
+            existing_message_id,
+            AppLocale::En,
+        )
+    }
+
+    /// Render and assemble an RFC 5322 `multipart/alternative` email localized to `locale`.
+    pub fn build_entry_email_with_locale(
+        cfg: &SmtpChannelConfig,
+        feed: &Feed,
+        entry: &Entry,
+        route_id: i64,
+        existing_message_id: Option<&str>,
+        locale: AppLocale,
+    ) -> AppResult<BuiltEmail> {
         let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
             AppError::Validation(format!(
                 "invalid SMTP from_address '{}': {err}",
@@ -207,7 +247,13 @@ impl SmtpSender {
             .as_deref()
             .map(sanitize_header_text)
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("Untitled update from {sanitized_feed}"));
+            .unwrap_or_else(|| {
+                if locale.is_zh() {
+                    format!("来自 {sanitized_feed} 的未命名更新")
+                } else {
+                    format!("Untitled update from {sanitized_feed}")
+                }
+            });
 
         let message_id = existing_message_id
             .map(str::trim)
@@ -218,8 +264,8 @@ impl SmtpSender {
             });
 
         let list_id = list_id_value(feed.id, &from_domain);
-        let (html_body, html_truncated) = render_entry_html(feed, entry, &entry_title)?;
-        let plain_body = render_plain_fallback(&html_body, feed, entry, &entry_title);
+        let (html_body, html_truncated) = render_entry_html(feed, entry, &entry_title, locale)?;
+        let plain_body = render_plain_fallback(&html_body, feed, entry, &entry_title, locale);
 
         let mut builder = Message::builder()
             .from(from_mailbox)
@@ -277,19 +323,25 @@ impl ChannelSender for SmtpSender {
             _ => None,
         };
 
-        let built =
-            match Self::build_entry_email(cfg, ctx.feed, ctx.entry, ctx.route.id, prior_msg_id) {
-                Ok(built) => built,
-                Err(err) => {
-                    return Ok(DeliveryOutcome::PermanentFailure {
-                        status_code: None,
-                        checkpoint: prior_msg_id.map(|id| DeliveryCheckpoint::Smtp {
-                            message_id: id.to_owned(),
-                        }),
-                        diagnostic: err.to_string(),
-                    });
-                }
-            };
+        let built = match Self::build_entry_email_with_locale(
+            cfg,
+            ctx.feed,
+            ctx.entry,
+            ctx.route.id,
+            prior_msg_id,
+            self.locale(),
+        ) {
+            Ok(built) => built,
+            Err(err) => {
+                return Ok(DeliveryOutcome::PermanentFailure {
+                    status_code: None,
+                    checkpoint: prior_msg_id.map(|id| DeliveryCheckpoint::Smtp {
+                        message_id: id.to_owned(),
+                    }),
+                    diagnostic: err.to_string(),
+                });
+            }
+        };
 
         let checkpoint = DeliveryCheckpoint::Smtp {
             message_id: built.message_id.clone(),
@@ -352,19 +404,39 @@ impl ChannelSender for SmtpSender {
             .as_bytes(),
         );
         let message_id = format!("<fc-test-{}@{from_domain}>", &probe_nonce[..16]);
-        let subject = "FeedCourier SMTP Channel Verification";
+        let locale = self.locale();
+        let (subject, body_html, read_original_label, delivered_by_text) = if locale.is_zh() {
+            (
+                "FeedCourier SMTP 通道连通性验证",
+                "<p>你的 FeedCourier SMTP 投递通道已配置就绪。</p><p>该通道上的所有订阅推送均严格采用 <strong>Force-From</strong> 发件人对齐策略，确保符合 SPF、DKIM 与 DMARC 校验要求。</p>",
+                "访问源码仓库 →",
+                "由 FeedCourier 投递 · FeedCourier",
+            )
+        } else {
+            (
+                "FeedCourier SMTP Channel Verification",
+                "<p>Your FeedCourier SMTP delivery channel is configured and ready.</p><p>All feed deliveries on this channel use strict <strong>Force-From</strong> alignment for SPF, DKIM, and DMARC compliance.</p>",
+                "Read original →",
+                "Delivered by FeedCourier · FeedCourier",
+            )
+        };
 
         let env = template_env();
         let html_body = env
             .get_template("email")
             .and_then(|tmpl| {
                 tmpl.render(context! {
+                    html_lang => locale.as_str(),
                     subject => subject,
                     feed_title => "FeedCourier",
                     entry_title => subject,
                     meta_line => format!("Force-From: {} · Security: {:?}", cfg.from_address.trim(), cfg.security),
-                    body_html => "<p>Your FeedCourier SMTP delivery channel is configured and ready.</p><p>All feed deliveries on this channel use strict <strong>Force-From</strong> alignment for SPF, DKIM, and DMARC compliance.</p>",
+                    body_html => body_html,
                     truncated => false,
+                    truncation_notice => "",
+                    continue_label => "",
+                    read_original_label => read_original_label,
+                    delivered_by_text => delivered_by_text,
                     continue_url => Option::<String>::None,
                     original_url => Some(crate::config::REPO_URL),
                 })
@@ -588,7 +660,12 @@ fn template_env() -> Environment<'static> {
     env
 }
 
-fn render_entry_html(feed: &Feed, entry: &Entry, entry_title: &str) -> AppResult<(String, bool)> {
+fn render_entry_html(
+    feed: &Feed,
+    entry: &Entry,
+    entry_title: &str,
+    locale: AppLocale,
+) -> AppResult<(String, bool)> {
     let env = template_env();
     let tmpl = env
         .get_template("email")
@@ -625,16 +702,38 @@ fn render_entry_html(feed: &Feed, entry: &Entry, entry_title: &str) -> AppResult
         Some(meta_parts.join(" · "))
     };
 
-    let raw_body_html = build_body_html(entry);
+    let (truncation_notice, continue_label, read_original_label, delivered_by_text) =
+        if locale.is_zh() {
+            (
+                "为避免邮件客户端折叠截断，正文预览已精简。",
+                "继续阅读原文 →",
+                "阅读原文 →",
+                format!("由 FeedCourier 投递 · {feed_title}"),
+            )
+        } else {
+            (
+                "Article preview was shortened to prevent email client clipping.",
+                "Continue reading original article →",
+                "Read original →",
+                format!("Delivered by FeedCourier · {feed_title}"),
+            )
+        };
+
+    let raw_body_html = build_body_html(entry, locale);
 
     let full_html = tmpl
         .render(context! {
+            html_lang => locale.as_str(),
             subject => entry_title,
             feed_title => &feed_title,
             entry_title => entry_title,
             meta_line => &meta_line,
             body_html => &raw_body_html,
             truncated => false,
+            truncation_notice => truncation_notice,
+            continue_label => continue_label,
+            read_original_label => read_original_label,
+            delivered_by_text => &delivered_by_text,
             continue_url => continue_url,
             original_url => original_url,
         })
@@ -647,12 +746,17 @@ fn render_entry_html(feed: &Feed, entry: &Entry, entry_title: &str) -> AppResult
     // Measure template shell size with truncation notice enabled so we stay strictly <= 95 KiB.
     let shell_html = tmpl
         .render(context! {
+            html_lang => locale.as_str(),
             subject => entry_title,
             feed_title => &feed_title,
             entry_title => entry_title,
             meta_line => &meta_line,
             body_html => "",
             truncated => true,
+            truncation_notice => truncation_notice,
+            continue_label => continue_label,
+            read_original_label => read_original_label,
+            delivered_by_text => &delivered_by_text,
             continue_url => continue_url,
             original_url => original_url,
         })
@@ -663,12 +767,17 @@ fn render_entry_html(feed: &Feed, entry: &Entry, entry_title: &str) -> AppResult
         let shortened_body = truncate_html_cleanly(&raw_body_html, body_budget);
         let candidate = tmpl
             .render(context! {
+                html_lang => locale.as_str(),
                 subject => entry_title,
                 feed_title => &feed_title,
                 entry_title => entry_title,
                 meta_line => &meta_line,
                 body_html => &shortened_body,
                 truncated => true,
+                truncation_notice => truncation_notice,
+                continue_label => continue_label,
+                read_original_label => read_original_label,
+                delivered_by_text => &delivered_by_text,
                 continue_url => continue_url,
                 original_url => original_url,
             })
@@ -687,7 +796,7 @@ fn render_entry_html(feed: &Feed, entry: &Entry, entry_title: &str) -> AppResult
     Ok((shell_html, true))
 }
 
-fn build_body_html(entry: &Entry) -> String {
+fn build_body_html(entry: &Entry, locale: AppLocale) -> String {
     if let Some(html) = entry
         .content_html
         .as_deref()
@@ -730,7 +839,11 @@ fn build_body_html(entry: &Entry) -> String {
         return out;
     }
 
-    "<p><em>No article body available in feed.</em></p>".to_owned()
+    if locale.is_zh() {
+        "<p><em>订阅源未提供正文内容。</em></p>".to_owned()
+    } else {
+        "<p><em>No article body available in feed.</em></p>".to_owned()
+    }
 }
 
 fn render_plain_fallback(
@@ -738,6 +851,7 @@ fn render_plain_fallback(
     feed: &Feed,
     entry: &Entry,
     entry_title: &str,
+    locale: AppLocale,
 ) -> String {
     if let Ok(text) = html2text::from_read(rendered_html.as_bytes(), PLAIN_TEXT_WRAP_WIDTH)
         && !text.trim().is_empty()
@@ -759,7 +873,11 @@ fn render_plain_fallback(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
     {
-        fallback.push_str("Read original: ");
+        if locale.is_zh() {
+            fallback.push_str("阅读原文: ");
+        } else {
+            fallback.push_str("Read original: ");
+        }
         fallback.push_str(url.trim());
         fallback.push('\n');
     }
