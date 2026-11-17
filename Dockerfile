@@ -14,7 +14,27 @@ COPY web/ ./
 RUN pnpm build
 
 # =============================================================================
-# Stage 2: Build single-binary Rust service (embedding `web/dist`)
+# Stage 2: Normalize Cargo manifests so version bumps do not bust dep cache
+# =============================================================================
+FROM --platform=$BUILDPLATFORM node:26-alpine AS cargo-recipe
+
+WORKDIR /recipe
+
+COPY Cargo.toml Cargo.lock ./
+RUN awk ' \
+      /^\[package\]$/ { in_pkg = 1 } \
+      /^\[/ && !/^\[package\]$/ { in_pkg = 0 } \
+      in_pkg && /^version = "/ { print "version = \"0.0.0\""; next } \
+      { print } \
+    ' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml \
+    && awk ' \
+      /^name = "feedcourier"$/ { is_fc = 1; print; next } \
+      is_fc && /^version = "/ { print "version = \"0.0.0\""; is_fc = 0; next } \
+      { print } \
+    ' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
+
+# =============================================================================
+# Stage 3: Build single-binary Rust service (caching external dependencies)
 # =============================================================================
 FROM rust:1-bookworm AS rust-builder
 
@@ -23,6 +43,20 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build/FeedCourier
+
+# Pre-compile all external crates; cached across src/, web/, and version changes
+COPY --from=cargo-recipe /recipe/Cargo.toml ./Cargo.toml
+COPY --from=cargo-recipe /recipe/Cargo.lock ./Cargo.lock
+RUN mkdir -p src \
+    && printf "" > src/lib.rs \
+    && printf "fn main() {}\n" > src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf src \
+       target/release/feedcourier* \
+       target/release/deps/feedcourier* \
+       target/release/deps/libfeedcourier* \
+       target/release/.fingerprint/feedcourier-* \
+       target/release/incremental/feedcourier*
 
 COPY Cargo.toml Cargo.lock LICENSE ./
 COPY migrations ./migrations
@@ -33,7 +67,7 @@ RUN cargo build --release --locked \
     && strip /build/FeedCourier/target/release/feedcourier
 
 # =============================================================================
-# Stage 3: Minimal Debian Bookworm runtime (drops privileges to UID/GID 10001)
+# Stage 4: Minimal Debian Bookworm runtime (drops privileges to UID/GID 10001)
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 

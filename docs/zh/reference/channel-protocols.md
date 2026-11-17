@@ -85,16 +85,16 @@ flowchart TD
   - 若自建 Local Bot API Server 版本低于 `10.2` 并返回 `404 Not Found`（或未知方法描述），则记录 `supports_rich_message: false` 与 `bot_api_version: "<10.2"`，持久化至 `channels.capabilities_json`。
 - 当 `supports_rich_message` 为 `false`，或运行期调用 `sendRichMessage` 遭遇方法不支持错误时，`TelegramSender` 自动降级调用 `CompactCard`（`sendMessage`，`parse_mode: "HTML"`，受 `MAX_MESSAGE_UTF16_UNITS = 4,096` UTF-16 代码单元限制，并通过 `link_preview_options` 控制链接预览）。
 
-### 3. `MediaMode` 三行文案、两阶段防盗链上传与 10 项分批断点
-- **三行精简文案（`MAX_CAPTION_UTF16_UNITS = 1,024`）**：
-  - 第 1 行：粗体文章标题（`<b>Title</b>`）；
-  - 第 2 行：入库阶段由 `unicode-segmentation`（`unicode_sentences`）提取的正文首句 `entries.first_sentence`；
-  - 第 3 行：原文超链接（`<a href="...">Original</a>`）。
-  - 整体严格按 UTF-16 代码单元截断至 $\le 1,024$（当条目不含任何可用媒体时，自动回退为 `CompactCard` 文本卡片）。
-- **两阶段媒体投递与防盗链内存流中转**：
-  - **阶段 1（URL 直传）**：优先将媒体原始 URL 提交给 Telegram 服务器（单媒体的 `sendPhoto` / `sendVideo` / `sendAudio` / `sendDocument`，或多媒体的 `sendMediaGroup`）。
-  - **阶段 2（流式 `multipart/form-data` 回退）**：若源站开启防盗链导致 Telegram 抓取失败，`TelegramSender` 向进程级全局信号量 `GLOBAL_MEDIA_UPLOAD_SEMAPHORE`（`MAX_CONCURRENT_MEDIA_UPLOADS = 2`）申请许可，通过 `ProtectedMediaFetcher` 自动携带源站 `Referer: <scheme>://<host>/` 请求头将媒体流式读取至内存 `Bytes` 缓冲区（不写入磁盘临时文件），再以 `multipart/form-data`（`attach://file{i}`）上传至 Telegram。
-  - **体积上限与超限降级**：图片上限为 `MAX_PHOTO_BYTES = 10 MiB`，视频/音频/文档上限为 `MAX_MEDIA_BYTES = 50 MiB`。若 `Content-Length` 或流式累计字节超出上限，连接立即中止，该媒体项自动降级为文末直达链接。
+### 3. `MediaMode` 三行超链接文案、按类型智能分流与 10 项分批断点
+- **三行精简 HTML 文案（`MAX_CAPTION_UTF16_UNITS = 1,024`，`parse_mode: "HTML"`）**：
+  - 第 1 行：经 HTML 转义的文章作者（无作者时回退为订阅源名称）；
+  - 第 2 行：入库阶段由 `unicode-segmentation`（`unicode_sentences`）提取并经 HTML 转义的正文首句 `entries.first_sentence`；
+  - 第 3 行：随 `system_settings.locale` 本地化的原文超链接（中文为 `<a href="...">链接</a>`，英文为 `<a href="...">Link</a>`）。
+  - 可见字符严格按 UTF-16 代码单元截断至 $\le 1,024$（当条目不含任何可用媒体时，发送相同三行格式的 HTML 消息）。
+- **按类型智能分流、文件头魔数嗅探与纯 Rust MP4 元数据提取**：
+  - **阶段 1（图片、音频与明确后缀文档的 URL 直传）**：优先将原始 URL 提交给 Telegram 服务器（`sendPhoto` / `sendAudio` / `sendDocument` / `sendMediaGroup`），遇防盗链或拉取失败时自动转入阶段 2。
+  - **阶段 2（内存流式 `multipart/form-data` 上传与视频流式化管线）**：视频（`Video`）及无明确后缀的通用 `<enclosure>` 附件跳过 Telegram URL 直传（避免无 `.mp4` 后缀或 `application/octet-stream` 视频被 Telegram 静默降级为不可预览的 `Document` 文件并返回 `200 OK`），向全局信号量 `GLOBAL_MEDIA_UPLOAD_SEMAPHORE`（`MAX_CONCURRENT_MEDIA_UPLOADS = 2`）申请许可后，由 `ProtectedMediaFetcher` 携带源站 `Referer` 将字节流读取至内存 `Bytes` 缓冲区；通过 `sniff_media_bytes` 嗅探容器魔数（`ftyp`/`moov`、WebM EBML、JPEG/PNG/GIF/WebP、MP3/Ogg、PDF）将误判的附件自动升级并将视频 MIME/后缀统一归一化为 `video/mp4` + `.mp4`，同时由零外部依赖的 `parse_mp4_metadata` 解析 ISO-BMFF `moov -> mvhd / tkhd / stsd` Box（支持 90°/270° 手机竖屏旋转矩阵自动对调宽高），在 `sendVideo` 与 `sendMediaGroup`（`InputMediaVideo`）中注入 `supports_streaming: true`、`width`、`height` 与 `duration`。
+  - **体积上限与超限降级**：图片上限为 `MAX_PHOTO_BYTES = 10 MiB`，视频/音频/文档上限为 `MAX_MEDIA_BYTES = 50 MiB`。若超出上限则立即中止下载流，并以 ` · <a href="...">媒体 N</a>`（`Media N`）超链接形式紧凑追加在第三行末尾。
 - **`sendMediaGroup` 10 项分批与 `checkpoint_json` 续传**：
   - 当单篇文章包含超过 `MEDIA_GROUP_BATCH_SIZE = 10` 个媒体项时，自动拆分为每组最多 10 项的多个批次（仅首批次携带三行文案）；
   - 每组发送成功后立即调用 `CheckpointSink::save_checkpoint` 更新 `next_batch_offset` 与 `sent_message_ids`。若后续批次触发 `429 Too Many Requests` 或进程重启，恢复执行时直接从 `media_items[next_batch_offset..]` 继续发送。

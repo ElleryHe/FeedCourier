@@ -488,6 +488,28 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
         json!(["127.0.0.1/32", "::1/128"])
     );
 
+    // 3b. Partial `PUT /api/v1/settings` with `{ "locale": "zh-CN" }` updates system locale
+    //     without clobbering `ssrf_allowlist` or `outbound_proxy_url`.
+    let (status, _, locale_body) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({ "locale": "zh-CN" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let locale_json = parse_json(&locale_body);
+    assert_eq!(locale_json["locale"], json!("zh-CN"));
+    assert_eq!(
+        locale_json["ssrf_allowlist"],
+        json!(["127.0.0.1/32", "::1/128"])
+    );
+    assert_eq!(
+        h.dispatcher.locale(),
+        feedcourier::db::models::AppLocale::ZhCn
+    );
+
     // Verify `ProtectedMediaFetcher` also shares the hot-reloaded SSRF allowlist immediately.
     use feedcourier::channels::telegram::MediaStreamFetcher as _;
     let media_fetcher: std::sync::Arc<ProtectedMediaFetcher> = h.dispatcher.media_fetcher();

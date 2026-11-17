@@ -153,5 +153,11 @@ jobs:
           test "$(stat -c '%u:%g' "${HOST_DATA}/probe")" = "10001:10001"
           sudo rm -rf "${HOST_DATA}"
 
-      - name: Verify Dockerfile web-builder stage
-        run: docker build --target web-builder -t feedcourier-web-builder:ci .
+      - name: Verify Dockerfile web-builder and cargo-recipe stages
+        run: |
+          docker build --target web-builder -t feedcourier-web-builder:ci .
+          docker build --target cargo-recipe -t feedcourier-cargo-recipe:ci .
+          docker run --rm feedcourier-cargo-recipe:ci sh -eu -c '
+            grep -q "^version = \"0.0.0\"$" /recipe/Cargo.toml
+            awk "/^name = \"feedcourier\"\$/{f=1;next} f && /^version = /{exit (\$0 != \"version = \\\"0.0.0\\\"\")}" /recipe/Cargo.lock
+          '

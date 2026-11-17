@@ -42,7 +42,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   ```json
   {
     "name": "FeedCourier",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"
@@ -56,7 +56,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   {
     "setup_required": false,
     "authenticated": true,
-    "version": "0.1.3",
+    "version": "0.1.4",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "license": "AGPL-3.0"
   }
@@ -203,8 +203,8 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/settings` | 获取当前生效的全局出站代理（`outbound_proxy_url`）与内网 SSRF 白名单（`ssrf_allowlist`）。 |
-| `PUT` | `/api/v1/settings` | 修改并热重载 `outbound_proxy_url` 与 `ssrf_allowlist`，同步持久化至 `system_settings` 表。 |
+| `GET` | `/api/v1/settings` | 获取当前生效的全局出站代理（`outbound_proxy_url`）、内网 SSRF 白名单（`ssrf_allowlist`）及推送文案语言（`locale`）。 |
+| `PUT` | `/api/v1/settings` | 修改并热重载 `outbound_proxy_url`、`ssrf_allowlist` 或 `locale`（`"en"` \| `"zh-CN"`），支持局部更新并持久化至 `system_settings` 表。 |
 | `GET` | `/api/v1/mcp-tokens` | 获取已签发的 MCP Bearer Token 元数据列表（仅含 `id`、`name`、`token_prefix`、`scope`、`last_used_at`，不含明文）。 |
 | `POST` | `/api/v1/mcp-tokens` | 签发新 MCP 令牌（请求体 `{ "name": "cursor", "scope": "readonly" \| "admin" }`），返回仅展示一次的 `plaintext_token` 与 `client_config_json`。 |
 | `DELETE` | `/api/v1/mcp-tokens/{id}` | 立即吊销并删除指定 MCP 令牌。 |

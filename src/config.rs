@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::db::models::AppLocale;
 use crate::error::{AppError, AppResult};
 
 /// Canonical application name.
@@ -49,6 +50,8 @@ pub struct AppConfig {
     pub retention_hours: u64,
     /// Maximum connections in the concurrent SQLite read pool (`DB_READ_MAX_CONNECTIONS`).
     pub read_pool_max_connections: u32,
+    /// Optional initial locale for delivery templates (`LOCALE`, e.g. `en` or `zh-CN`).
+    pub locale: Option<AppLocale>,
 }
 
 impl Default for AppConfig {
@@ -64,6 +67,7 @@ impl Default for AppConfig {
             outbound_proxy: None,
             retention_hours: DEFAULT_RETENTION_HOURS,
             read_pool_max_connections: DEFAULT_READ_POOL_MAX_CONNECTIONS,
+            locale: None,
         }
     }
 }
@@ -135,6 +139,13 @@ impl AppConfig {
             None => DEFAULT_READ_POOL_MAX_CONNECTIONS,
         };
 
+        let locale = match non_empty("LOCALE") {
+            Some(raw) => Some(AppLocale::parse_lossy(&raw).ok_or_else(|| {
+                AppError::Config(format!("invalid LOCALE '{raw}' (expected 'en' or 'zh-CN')"))
+            })?),
+            None => None,
+        };
+
         Ok(Self {
             data_dir,
             listen_addr,
@@ -144,6 +155,7 @@ impl AppConfig {
             outbound_proxy,
             retention_hours,
             read_pool_max_connections,
+            locale,
         })
     }
 

@@ -12,7 +12,7 @@ use crate::channels::{
 use crate::config::{LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::MasterKey;
 use crate::db::models::{
-    Channel, DeliveryTaskDetail, DeliveryTaskStatus, Feed, FeedHealthStatus, McpToken,
+    AppLocale, Channel, DeliveryTaskDetail, DeliveryTaskStatus, Feed, FeedHealthStatus, McpToken,
     McpTokenScope, OverviewSnapshot, Route, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
@@ -753,14 +753,18 @@ pub struct RetryTasksResponse {
 pub struct SystemSettingsDto {
     pub outbound_proxy_url: Option<String>,
     pub ssrf_allowlist: Vec<String>,
+    #[serde(default)]
+    pub locale: Option<AppLocale>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateSystemSettingsRequest {
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub outbound_proxy_url: Option<Option<String>>,
     #[serde(default)]
-    pub outbound_proxy_url: Option<String>,
+    pub ssrf_allowlist: Option<Vec<String>>,
     #[serde(default)]
-    pub ssrf_allowlist: Vec<String>,
+    pub locale: Option<AppLocale>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

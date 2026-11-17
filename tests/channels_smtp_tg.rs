@@ -19,7 +19,8 @@ use feedcourier::channels::smtp::{MAX_EMAIL_HTML_BYTES, SmtpSender, deterministi
 use feedcourier::channels::telegram::{
     DefaultMediaStreamFetcher, FetchedMedia, MAX_CAPTION_UTF16_UNITS, MAX_MESSAGE_UTF16_UNITS,
     MAX_PHOTO_BYTES, MediaStreamFetcher, TelegramSender, format_compact_card_html,
-    format_media_mode_caption,
+    format_compact_card_html_with_locale, format_media_mode_caption,
+    format_media_mode_caption_with_locale, parse_mp4_metadata,
 };
 use feedcourier::channels::{
     ChannelConfig, ChannelKind, ChannelSender, CheckpointSink, DeliveryCheckpoint, DeliveryContext,
@@ -28,8 +29,8 @@ use feedcourier::channels::{
 };
 use feedcourier::crypto::sha256_hex;
 use feedcourier::db::models::{
-    Channel, DeliveryTask, DeliveryTaskStatus, Entry, Feed, FeedHealthStatus, MediaAttachment,
-    MediaAttachmentKind, Route,
+    AppLocale, Channel, DeliveryTask, DeliveryTaskStatus, Entry, Feed, FeedHealthStatus,
+    MediaAttachment, MediaAttachmentKind, Route,
 };
 use feedcourier::error::{AppError, AppResult};
 
@@ -1028,10 +1029,20 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
     let mut zh_entry = sample_entry("caption-zh", Vec::new());
     zh_entry.author = None; // Fallback to `feed.title`
     zh_entry.first_sentence = Some("这是一段按 Unicode 切分的首句测试。".to_owned());
-    let cap_zh = format_media_mode_caption(&feed, &zh_entry, MAX_CAPTION_UTF16_UNITS);
+    let cap_en = format_media_mode_caption(&feed, &zh_entry, MAX_CAPTION_UTF16_UNITS);
+    assert_eq!(
+        cap_en,
+        "Visual Photography\n这是一段按 Unicode 切分的首句测试\n<a href=\"https://blog.example.com/posts/zero-copy-rust\">Link</a>"
+    );
+    let cap_zh = format_media_mode_caption_with_locale(
+        &feed,
+        &zh_entry,
+        MAX_CAPTION_UTF16_UNITS,
+        AppLocale::ZhCn,
+    );
     assert_eq!(
         cap_zh,
-        "Visual Photography\n这是一段按 Unicode 切分的首句测试\nhttps://blog.example.com/posts/zero-copy-rust"
+        "Visual Photography\n这是一段按 Unicode 切分的首句测试\n<a href=\"https://blog.example.com/posts/zero-copy-rust\">链接</a>"
     );
 
     let mut no_url_entry = sample_entry("caption-en", Vec::new());
@@ -1087,9 +1098,10 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         let reqs = zero_server.received_requests().await.expect("reqs");
         assert_eq!(reqs.len(), 1);
         let body: Value = serde_json::from_slice(&reqs[0].body).expect("json");
+        assert_eq!(body["parse_mode"], "HTML");
         assert_eq!(
             body["text"],
-            "Alice Chen\nWelcome to FeedCourier, a pure-Rust delivery gateway\nhttps://blog.example.com/posts/zero-copy-rust"
+            "Alice Chen\nWelcome to FeedCourier, a pure-Rust delivery gateway\n<a href=\"https://blog.example.com/posts/zero-copy-rust\">Link</a>"
         );
         assert_eq!(body["link_preview_options"]["is_disabled"], false);
     }
@@ -1215,9 +1227,10 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         req0_json["media"][0]["media"],
         "https://cdn.example.com/gallery/img01.jpg"
     );
+    assert_eq!(req0_json["media"][0]["parse_mode"], "HTML");
     assert_eq!(
         req0_json["media"][0]["caption"],
-        "Alice Chen\nWelcome to FeedCourier, a pure-Rust delivery gateway\nhttps://blog.example.com/posts/zero-copy-rust"
+        "Alice Chen\nWelcome to FeedCourier, a pure-Rust delivery gateway\n<a href=\"https://blog.example.com/posts/zero-copy-rust\">Link</a>"
     );
     assert!(req0_json["media"][1].get("caption").is_none());
 
@@ -1594,4 +1607,251 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             }
         ));
     }
+}
+
+fn build_synthetic_mp4_bytes(
+    width: u16,
+    height: u16,
+    timescale: u32,
+    duration: u32,
+    rotate_90: bool,
+) -> Vec<u8> {
+    fn mp4_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(total as usize);
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    let ftyp = mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41");
+
+    let mut mvhd_payload = vec![0u8; 100];
+    mvhd_payload[12..16].copy_from_slice(&timescale.to_be_bytes());
+    mvhd_payload[16..20].copy_from_slice(&duration.to_be_bytes());
+    let mvhd = mp4_box(b"mvhd", &mvhd_payload);
+
+    let mut tkhd_payload = vec![0u8; 84];
+    tkhd_payload[3] = 0x07; // flags: track_enabled | track_in_movie | track_in_preview
+    if rotate_90 {
+        // 90° rotation matrix: a = 0, b = 0x00010000, c = -0x00010000, d = 0
+        tkhd_payload[40..44].copy_from_slice(&0i32.to_be_bytes());
+        tkhd_payload[44..48].copy_from_slice(&0x0001_0000i32.to_be_bytes());
+        tkhd_payload[52..56].copy_from_slice(&(-0x0001_0000i32).to_be_bytes());
+        tkhd_payload[56..60].copy_from_slice(&0i32.to_be_bytes());
+    } else {
+        // Identity matrix: a = 0x00010000, d = 0x00010000
+        tkhd_payload[40..44].copy_from_slice(&0x0001_0000i32.to_be_bytes());
+        tkhd_payload[56..60].copy_from_slice(&0x0001_0000i32.to_be_bytes());
+    }
+    tkhd_payload[76..80].copy_from_slice(&(u32::from(width) << 16).to_be_bytes());
+    tkhd_payload[80..84].copy_from_slice(&(u32::from(height) << 16).to_be_bytes());
+    let tkhd = mp4_box(b"tkhd", &tkhd_payload);
+
+    let trak = mp4_box(b"trak", &tkhd);
+    let mut moov_children = Vec::new();
+    moov_children.extend_from_slice(&mvhd);
+    moov_children.extend_from_slice(&trak);
+    let moov = mp4_box(b"moov", &moov_children);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&moov);
+    out
+}
+
+#[tokio::test]
+async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks() {
+    // 1) Unit check: `parse_mp4_metadata` extracts width, height, duration, and 90° portrait swap
+    let landscape_mp4 = build_synthetic_mp4_bytes(1280, 720, 1000, 15_200, false);
+    let meta_landscape = parse_mp4_metadata(&landscape_mp4);
+    assert_eq!(meta_landscape.width, Some(1280));
+    assert_eq!(meta_landscape.height, Some(720));
+    assert_eq!(meta_landscape.duration_secs, Some(15));
+
+    let portrait_mp4 = build_synthetic_mp4_bytes(1920, 1080, 600, 5_400, true);
+    let meta_portrait = parse_mp4_metadata(&portrait_mp4);
+    assert_eq!(
+        meta_portrait.width,
+        Some(1080),
+        "90° rotation matrix must swap display width/height to portrait"
+    );
+    assert_eq!(meta_portrait.height, Some(1920));
+    assert_eq!(meta_portrait.duration_secs, Some(9));
+
+    // 2) Video attachment skips URL-first mode and uploads directly via multipart with
+    //    `supports_streaming=true`, `width`, `height`, `duration`, `video/mp4`, and `.mp4` filename
+    //    even when the origin CDN served `application/octet-stream` and `clip.bin`!
+    let tg_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_VID/sendVideo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 4201 }
+        })))
+        .mount(&tg_server)
+        .await;
+
+    let video_url = "https://cdn.example.org/stream/12345?token=abc";
+    let mut blobs = HashMap::new();
+    blobs.insert(
+        video_url.to_owned(),
+        FetchedMedia {
+            bytes: Bytes::from(landscape_mp4.clone()),
+            content_type: Some("application/octet-stream".to_owned()),
+            filename: "12345.bin".to_owned(),
+        },
+    );
+
+    let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher {
+        blobs: blobs.clone(),
+    }))
+    .with_locale(AppLocale::ZhCn);
+
+    let feed = sample_feed(9, "Video Feed");
+    let media_opts = RouteOptions {
+        telegram_mode: TelegramDeliveryMode::MediaMode,
+        link_preview: true,
+    };
+    let route = sample_route(21, media_opts.clone());
+    let task = sample_task(route.id);
+    let channel = sample_channel(ChannelKind::Telegram, "{}");
+    let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+        bot_token: "TOK_VID".to_owned(),
+        chat_id: "-100888".to_owned(),
+        message_thread_id: None,
+        api_base_url: Some(tg_server.uri()),
+    });
+
+    let video_entry = sample_entry(
+        "video-entry",
+        vec![MediaAttachment {
+            url: video_url.to_owned(),
+            mime_type: Some("video/quicktime".to_owned()),
+            kind: MediaAttachmentKind::Video,
+            length_bytes: None,
+            caption: None,
+        }],
+    );
+
+    let ctx = DeliveryContext {
+        task: &task,
+        entry: &video_entry,
+        feed: &feed,
+        route: &route,
+        route_options: media_opts.clone(),
+        channel: &channel,
+        channel_config: &cfg,
+        checkpoint: None,
+        checkpoint_sink: None,
+    };
+
+    let outcome = sender.send(&ctx).await.expect("send video");
+    assert!(matches!(outcome, DeliveryOutcome::Delivered { .. }));
+
+    let reqs = tg_server.received_requests().await.expect("video reqs");
+    assert_eq!(
+        reqs.len(),
+        1,
+        "Video must skip direct URL mode and perform a single multipart upload"
+    );
+    let content_type = reqs[0]
+        .headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.contains("multipart/form-data"),
+        "expected multipart/form-data, got {content_type}"
+    );
+    let body_str = String::from_utf8_lossy(&reqs[0].body);
+    assert!(
+        body_str.contains("name=\"supports_streaming\"\r\n\r\ntrue"),
+        "missing supports_streaming=true in multipart body:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("name=\"width\"\r\n\r\n1280"),
+        "missing width=1280 in multipart body:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("name=\"height\"\r\n\r\n720"),
+        "missing height=720 in multipart body:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("name=\"duration\"\r\n\r\n15"),
+        "missing duration=15 in multipart body:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("filename=\"12345.mp4\""),
+        "filename must be normalized from .bin to .mp4:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("Content-Type: video/mp4"),
+        "MIME must be normalized from application/octet-stream to video/mp4:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("<a href=\"https://blog.example.com/posts/zero-copy-rust\">链接</a>"),
+        "caption must use Chinese hyperlink label `链接` under AppLocale::ZhCn:\n{body_str}"
+    );
+
+    // 3) Extensionless `<enclosure>` classified as `Document` at ingest is promoted to `sendVideo`
+    //    via `ftyp` magic-byte sniffing!
+    let tg_server_doc = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_VID/sendVideo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 4202 }
+        })))
+        .mount(&tg_server_doc)
+        .await;
+
+    let doc_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+        bot_token: "TOK_VID".to_owned(),
+        chat_id: "-100888".to_owned(),
+        message_thread_id: None,
+        api_base_url: Some(tg_server_doc.uri()),
+    });
+    let misclassified_entry = sample_entry(
+        "misclassified-doc-video",
+        vec![MediaAttachment {
+            url: video_url.to_owned(),
+            mime_type: Some("application/octet-stream".to_owned()),
+            kind: MediaAttachmentKind::Document,
+            length_bytes: None,
+            caption: None,
+        }],
+    );
+    let doc_ctx = DeliveryContext {
+        task: &task,
+        entry: &misclassified_entry,
+        feed: &feed,
+        route: &route,
+        route_options: media_opts,
+        channel: &channel,
+        channel_config: &doc_cfg,
+        checkpoint: None,
+        checkpoint_sink: None,
+    };
+    let doc_outcome = sender
+        .send(&doc_ctx)
+        .await
+        .expect("send promoted doc->video");
+    assert!(matches!(doc_outcome, DeliveryOutcome::Delivered { .. }));
+    let doc_reqs = tg_server_doc.received_requests().await.expect("doc reqs");
+    assert_eq!(doc_reqs.len(), 1);
+    assert_eq!(
+        doc_reqs[0].url.path(),
+        "/botTOK_VID/sendVideo",
+        "extensionless Document containing MP4 bytes must be promoted to sendVideo"
+    );
+
+    // 4) Chinese CompactCard template (`阅读原文`)
+    let compact_zh = format_compact_card_html_with_locale(&feed, &video_entry, AppLocale::ZhCn);
+    assert!(
+        compact_zh
+            .contains("<a href=\"https://blog.example.com/posts/zero-copy-rust\">阅读原文</a>"),
+        "CompactCard under ZhCn must render 阅读原文: {compact_zh}"
+    );
 }

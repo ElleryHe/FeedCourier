@@ -47,7 +47,7 @@ function parseHashSection(): NavSection {
 
 export function App() {
   useThemeMode();
-  const { m } = useI18n();
+  const { locale, m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -94,6 +94,25 @@ export function App() {
     enabled: authenticated,
     refetchInterval: 20_000,
   });
+
+  const settingsLocaleQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.settings.get(),
+    enabled: authenticated,
+  });
+
+  useEffect(() => {
+    if (!authenticated || !settingsLocaleQuery.data) return;
+    if (settingsLocaleQuery.data.locale === locale) return;
+    void api.settings
+      .update({ locale })
+      .then((updated) => {
+        queryClient.setQueryData(["settings"], updated);
+      })
+      .catch(() => {
+        // Ignore transient background locale sync errors
+      });
+  }, [authenticated, locale, queryClient, settingsLocaleQuery.data]);
 
   const logoutMutation = useMutation({
     mutationFn: () => api.auth.logout(),

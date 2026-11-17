@@ -33,14 +33,14 @@ use crate::channels::{ChannelConfig, ChannelKind, ChannelSender};
 use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::hash_token;
 use crate::db::models::{
-    DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewFeed, NewRoute,
+    DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewFeed, NewRoute, SETTING_LOCALE,
     SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, UpdateChannel, UpdateFeed, UpdateRoute,
     now_unix, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::{ContentFilterRules, FeedPreviewResponse};
 use crate::net::NetSettings;
-use crate::scheduler::normalize_net_settings;
+use crate::scheduler::{load_persisted_locale, normalize_net_settings};
 
 // ===========================================================================
 // Public Health Check
@@ -803,9 +803,11 @@ pub async fn retry_tasks(
 /// `GET /api/v1/settings`
 pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<SystemSettingsDto>> {
     let settings = state.http().settings();
+    let locale = load_persisted_locale(state.config(), state.db()).await?;
     Ok(Json(SystemSettingsDto {
         outbound_proxy_url: settings.outbound_proxy_url,
         ssrf_allowlist: settings.ssrf_allowlist,
+        locale,
     }))
 }
 
@@ -814,29 +816,49 @@ pub async fn update_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSystemSettingsRequest>,
 ) -> AppResult<Json<SystemSettingsDto>> {
-    let normalized = normalize_net_settings(NetSettings {
-        outbound_proxy_url: req.outbound_proxy_url,
-        ssrf_allowlist: req.ssrf_allowlist,
-    });
+    let current_net = state.http().settings();
+    let has_only_locale =
+        req.locale.is_some() && req.outbound_proxy_url.is_none() && req.ssrf_allowlist.is_none();
 
-    // Validate CIDRs/hostnames & proxy URL and hot-reload runtime clients FIRST.
-    state
-        .runtime()
-        .reload_network_settings(normalized.clone())?;
+    let next_net = if has_only_locale {
+        current_net
+    } else {
+        let normalized = normalize_net_settings(NetSettings {
+            outbound_proxy_url: req.outbound_proxy_url.flatten(),
+            ssrf_allowlist: req.ssrf_allowlist.unwrap_or_default(),
+        });
 
-    // Persist validated settings to SQLite `system_settings`.
-    state
-        .db()
-        .set_setting_typed(SETTING_OUTBOUND_PROXY_URL, &normalized.outbound_proxy_url)
-        .await?;
-    state
-        .db()
-        .set_setting_typed(SETTING_SSRF_ALLOWLIST, &normalized.ssrf_allowlist)
-        .await?;
+        // Validate CIDRs/hostnames & proxy URL and hot-reload runtime clients FIRST.
+        state
+            .runtime()
+            .reload_network_settings(normalized.clone())?;
+
+        // Persist validated settings to SQLite `system_settings`.
+        state
+            .db()
+            .set_setting_typed(SETTING_OUTBOUND_PROXY_URL, &normalized.outbound_proxy_url)
+            .await?;
+        state
+            .db()
+            .set_setting_typed(SETTING_SSRF_ALLOWLIST, &normalized.ssrf_allowlist)
+            .await?;
+        normalized
+    };
+
+    if let Some(locale) = req.locale {
+        state.runtime().set_locale(locale);
+        state
+            .db()
+            .set_setting_typed(SETTING_LOCALE, &locale.as_str())
+            .await?;
+    }
+
+    let persisted_locale = load_persisted_locale(state.config(), state.db()).await?;
 
     Ok(Json(SystemSettingsDto {
-        outbound_proxy_url: normalized.outbound_proxy_url,
-        ssrf_allowlist: normalized.ssrf_allowlist,
+        outbound_proxy_url: next_net.outbound_proxy_url,
+        ssrf_allowlist: next_net.ssrf_allowlist,
+        locale: persisted_locale,
     }))
 }
 

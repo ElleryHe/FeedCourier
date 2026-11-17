@@ -18,7 +18,7 @@ use crate::config::AppConfig;
 use crate::crypto::{MasterKey, hash_password};
 use crate::db::Database;
 use crate::db::models::{
-    SETTING_ADMIN_PASSWORD_HASH, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST,
+    SETTING_ADMIN_PASSWORD_HASH, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST,
 };
 use crate::error::AppResult;
 use crate::ingest::IngestEngine;
@@ -181,6 +181,12 @@ pub async fn bootstrap_env_settings(config: &AppConfig, db: &Database) -> AppRes
         && db.get_setting(SETTING_OUTBOUND_PROXY_URL).await?.is_none()
     {
         db.set_setting_typed(SETTING_OUTBOUND_PROXY_URL, proxy_url)
+            .await?;
+    }
+    if let Some(locale) = config.locale
+        && db.get_setting(SETTING_LOCALE).await?.is_none()
+    {
+        db.set_setting_typed(SETTING_LOCALE, &locale.as_str())
             .await?;
     }
     Ok(())

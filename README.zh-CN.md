@@ -51,7 +51,7 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
-  # 或锁定精确版本：elleryhe/feedcourier:0.1.3
+  # 或锁定精确版本：elleryhe/feedcourier:0.1.4
 ```
 
 ### Docker Compose
@@ -59,7 +59,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.3
+    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.4
     container_name: feedcourier
     restart: unless-stopped
     ports:

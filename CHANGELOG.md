@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-18
+
+### Added
+
+- **System Locale Persistence & Localized Push Templates (`src/channels/`, `src/api/`, `web/`)**:
+  - Added `AppLocale` (`en` / `zh-CN`) backed by SQLite `system_settings.locale` (with optional `LOCALE` environment variable preset and partial `{ "locale": ... }` hot-updates on `GET`/`PUT /api/v1/settings`), automatically synchronized whenever the administrator signs into the WebUI or switches UI languages.
+  - Localized fixed notification strings across Telegram (`Link` / `链接`, `Media N` / `媒体 N`, `Read original` / `阅读原文`, truncation notice, and channel test messages) and SMTP email templates (`Read original →` / `阅读原文 →`, truncation notice, and footer).
+
+### Changed
+
+- **Native Multi-Runner Container Builds & Cargo Dependency Layer Caching (`.github/workflows/release.yml`, `Dockerfile`)**:
+  - Replaced QEMU user-mode `linux/arm64` emulation in the release workflow with parallel native builds on `ubuntu-24.04` (`linux/amd64`) and `ubuntu-24.04-arm` (`linux/arm64`) using `push-by-digest`, followed by `docker buildx imagetools create` multi-arch manifest merging.
+  - Added a version-neutral `cargo-recipe` manifest sanitization stage in `Dockerfile` so Cargo dependency compilation layers remain cached across semantic version bumps.
+- **Telegram `media_mode` Hyperlink Captions (`src/channels/telegram.rs`)**:
+  - Switched `MediaMode` captions and zero-media fallback messages to `parse_mode: "HTML"`, rendering the source permalink as a clean `<a href="...">Link</a>` (`链接` in `zh-CN`) hyperlink and compactly appending oversized media fallbacks on the same line (` · Media N` / ` · 媒体 N`).
+- **Minimalist OpenGraph & Social Preview Banner (`docs/`)**:
+  - Replaced `docs/public/og-image.png` with a streamlined `1280×640` (`2:1`) dark topographic signal-wave brand banner (`og:image:width = 1280`, `og:image:height = 640`).
+
+### Fixed
+
+- **Telegram `media_mode` Inline Video Playback & Pure-Rust MP4 Metadata Extraction (`src/channels/telegram.rs`)**:
+  - Bypassed Telegram's direct URL pass-through for `Video` attachments and ambiguous/extensionless `<enclosure>` items so origin CDNs omitting `.mp4` extensions or serving `application/octet-stream` never cause Telegram to silently downgrade videos into unpreviewable `Document` files.
+  - Added magic-byte container sniffing (`sniff_media_bytes`) to promote misclassified attachments and normalize video multipart uploads to `video/mp4` + `.mp4`, paired with a zero-dependency ISO-BMFF (`MP4`/`MOV`/`M4V`) `moov -> mvhd / tkhd / stsd` parser (`parse_mp4_metadata`, including 90°/270° portrait rotation matrix handling) so `sendVideo` and `sendMediaGroup` (`InputMediaVideo`) always carry `supports_streaming: true`, `width`, `height`, and `duration`.
+
 ## [0.1.3] - 2026-11-16
 
 ### Added
@@ -99,7 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Encrypted Credential Vault & Scoped Auth**: Channel credentials are encrypted at rest with `ChaCha20-Poly1305` AEAD (`master.key`, `0600`); WebUI administrator passwords use `Argon2id` PHC hashing with `HttpOnly` session cookies (`fc_session`); and `/mcp` Bearer tokens are stored exclusively as `SHA-256` hashes.
 - **MCP Trust Boundaries & Untrusted Content Framing**: Channel secrets and recipient targets (email addresses, `chat_id`, `data_source_id`) are strictly locked to the WebUI and opaque to `/mcp` tools, while untrusted external feed text surfaced to AI agents is sanitized, truncated, and isolated inside `<untrusted_feed_content>` XML boundary tags (`src/mcp/sanitize.rs`), complemented by `ammonia` HTML sanitization across ingest and delivery pipelines.
 
-[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.0...v0.1.1

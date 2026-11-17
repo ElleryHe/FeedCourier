@@ -30,14 +30,15 @@ FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.g
 
 ## 2. 自动化版本发布流水线（`.github/workflows/release.yml`）
 
-当推送符合语义化版本规范的 Git 标签（`v*.*.*`，如 `v0.1.3`）时，自动触发发布流水线：
+当推送符合语义化版本规范的 Git 标签（`v*.*.*`，如 `v0.1.4`）时，自动触发发布流水线：
 
 ```mermaid
 flowchart LR
-    Tag["git push origin v0.1.3"] --> Web["web-dist: 构建 React 19 前端"]
+    Tag["git push origin v0.1.4"] --> Web["web-dist: 构建 React 19 前端"]
     Web --> Linux["binaries: 构建 Linux x86_64 & aarch64"]
     Web --> Mac["binaries-macos: 构建 macOS arm64 & x86_64"]
-    Web --> Docker["docker: 推送 Docker Hub 多架构镜像"]
+    Web --> DockerBuild["docker-build: 原生双架构并行构建\n(ubuntu-24.04 & ubuntu-24.04-arm)"]
+    DockerBuild --> Docker["docker: 合并推送多架构 Manifest"]
     Linux & Mac & Docker --> Rel["release: 校验 4 平台包 + 生成 SHA256SUMS.txt + 提取 CHANGELOG 发布 GitHub Release"]
 ```
 
@@ -49,10 +50,10 @@ flowchart LR
   - `feedcourier-<version>-aarch64-apple-darwin.tar.gz`（`macos-latest`）
   - `feedcourier-<version>-x86_64-apple-darwin.tar.gz`（`macos-latest`）
 
-### 第二步：Docker Hub 多架构镜像推送
-- 通过 Docker Buildx 与 QEMU 构建 **`linux/amd64` + `linux/arm64`** 多架构镜像并推送至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
+### 第二步：Docker Hub 原生双架构镜像并行构建与合并推送
+- `docker-build` 矩阵任务分别在原生 `ubuntu-24.04`（`linux/amd64`）与 `ubuntu-24.04-arm`（`linux/arm64`）运行器上并行编译镜像（无需 QEMU 指令模拟，按架构独立缓存 Cargo 外部依赖层），并按不可变摘要（`push-by-digest`）推送分片；随后由 `docker` 任务调用 `docker buildx imagetools create` 合并生成统一的多架构 Manifest 并发布至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
 - **镜像标签规则**：
-  - `<version>`（如 `0.1.3`）
+  - `<version>`（如 `0.1.4`）
   - `<major>.<minor>`（如 `0.1`）
   - `<major>`（自 `1.0.0` 正式版起启用）
   - `latest`（仅对不带 `-rc` / `-beta` / `-alpha` 后缀的正式版标签更新）
@@ -65,7 +66,7 @@ flowchart LR
 
 ## 3. 标准发版操作清单（Release Checklist）
 
-发布新版本（例如从 `develop` 合入 `main` 发布 `v0.1.3`）时，按以下步骤操作：
+发布新版本（例如从 `develop` 合入 `main` 发布 `v0.1.4`）时，按以下步骤操作：
 
 ```bash
 # 1. 在 develop 分支完成并通过本地检查
@@ -81,8 +82,8 @@ git checkout main
 git merge --ff-only develop
 git push origin main
 
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 ---

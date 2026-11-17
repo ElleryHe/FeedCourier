@@ -30,7 +30,7 @@ Liveness probe and AGPLv3 compliance metadata endpoint.
   ```json
   {
     "name": "FeedCourier",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"
@@ -130,8 +130,8 @@ Executes an online `VACUUM INTO` snapshot and streams the resulting SQLite datab
 
 | Method & Path | Description |
 | :--- | :--- |
-| `GET /api/v1/settings` | Get runtime network settings (`outbound_proxy_url` and `ssrf_allowlist`). |
-| `PUT /api/v1/settings` | Hot-update `outbound_proxy_url` and `ssrf_allowlist` in `system_settings` and reload `ProtectedHttpClient`. |
+| `GET /api/v1/settings` | Get runtime network and locale settings (`outbound_proxy_url`, `ssrf_allowlist`, and `locale`). |
+| `PUT /api/v1/settings` | Hot-update `outbound_proxy_url`, `ssrf_allowlist`, and/or `locale` (`"en"` \| `"zh-CN"`) in `system_settings` and reload active runtime clients. |
 | `GET /api/v1/mcp-tokens` | List issued MCP Bearer token metadata (`id`, `name`, `token_prefix`, `scope`, `last_used_at`, `created_at`). |
 | `POST /api/v1/mcp-tokens` | Issue a new `readonly` or `admin` MCP Bearer token (`CreateMcpTokenResponse`, returning the one-time `plaintext_token` and `client_config_json`). |
 | `DELETE /api/v1/mcp-tokens/{id}` | Revoke an MCP Bearer token immediately. |

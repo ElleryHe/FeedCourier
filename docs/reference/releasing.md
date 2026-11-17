@@ -30,17 +30,18 @@ Every push to `main` or `develop` and every pull request runs:
 
 ## Automated Release Workflow (`.github/workflows/release.yml`)
 
-Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.3 && git push origin v0.1.3`) triggers the automated release pipeline:
+Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.4 && git push origin v0.1.4`) triggers the automated release pipeline:
 
 ```mermaid
 flowchart LR
     Tag["git push origin v*.*.*"] --> Web["Job 1: Build web/dist\n(Node 24 + pnpm 10)"]
     Web --> Linux["Job 2: Linux Binaries\n(x86_64 & aarch64)"]
     Web --> Mac["Job 3: macOS Binaries\n(arm64 & x86_64)"]
-    Web --> Docker["Job 4: Docker Hub Multi-Arch\n(linux/amd64, linux/arm64)"]
+    Web --> DockerBuild["Job 4a: Native Docker Builds\n(ubuntu-24.04 & ubuntu-24.04-arm)"]
+    DockerBuild --> DockerMerge["Job 4b: Merge Multi-Arch Manifest\n(imagetools create)"]
     Linux --> GH["Job 5: GitHub Release\n(4 .tar.gz + SHA256SUMS.txt + CHANGELOG)"]
     Mac --> GH
-    Docker --> GH
+    DockerMerge --> GH
 ```
 
 ### 1. Version Verification & Multi-Platform Binaries
@@ -56,10 +57,10 @@ All four `.tar.gz` archives are hashed into `SHA256SUMS.txt`, paired with the ma
 
 ### 2. Multi-Arch Docker Hub Publishing (`elleryhe/feedcourier`)
 
-In parallel, the `docker` job builds and pushes a multi-architecture (`linux/amd64`, `linux/arm64`) image to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
+In parallel, `docker-build` compiles `linux/amd64` natively on `ubuntu-24.04` and `linux/arm64` natively on `ubuntu-24.04-arm` (without QEMU emulation, caching external Cargo dependencies independently per architecture and pushing by digest), and `docker` combines both digests via `docker buildx imagetools create` to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
 
 - **Published Image Tags**:
-  - `<version>` (e.g., `0.1.3`)
+  - `<version>` (e.g., `0.1.4`)
   - `<major>.<minor>` (e.g., `0.1`)
   - `<major>` (enabled from `1.0.0`+)
   - `latest` (for stable non-prerelease tags)
