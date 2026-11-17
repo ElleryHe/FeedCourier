@@ -30,30 +30,31 @@ Every push to `main` or `develop` and every pull request runs:
 
 ## Automated Release Workflow (`.github/workflows/release.yml`)
 
-Pushing a semantic version tag matching `v*.*.*` (for example, `git tag v0.1.4 && git push origin v0.1.4`) triggers the automated release pipeline:
+Merging a release PR into `main` with an bumped `version` in `Cargo.toml` (where tag `v<version>` does not yet exist on `origin`) automatically triggers the release pipeline—no manual Git tag push is required. Manual `v*.*.*` tag pushes and `workflow_dispatch` dry-runs remain supported as fallbacks, while non-version-bump commits on `main` are automatically detected and skipped in `prepare`:
 
 ```mermaid
 flowchart LR
-    Tag["git push origin v*.*.*"] --> Web["Job 1: Build web/dist\n(Node 24 + pnpm 10)"]
+    Merge["Merge to main\n(new Cargo.toml version)"] --> Prep["Job 0: prepare\n(Check v<version> tag)"]
+    Prep --> Web["Job 1: Build web/dist\n(Node 24 + pnpm 10)"]
     Web --> Linux["Job 2: Linux Binaries\n(x86_64 & aarch64)"]
     Web --> Mac["Job 3: macOS Binaries\n(arm64 & x86_64)"]
     Web --> DockerBuild["Job 4a: Native Docker Builds\n(ubuntu-24.04 & ubuntu-24.04-arm)"]
     DockerBuild --> DockerMerge["Job 4b: Merge Multi-Arch Manifest\n(imagetools create)"]
-    Linux --> GH["Job 5: GitHub Release\n(4 .tar.gz + SHA256SUMS.txt + CHANGELOG)"]
+    Linux --> GH["Job 5: Push Annotated Tag v<version>\n+ Publish GitHub Release"]
     Mac --> GH
     DockerMerge --> GH
 ```
 
-### 1. Version Verification & Multi-Platform Binaries
+### 1. Planned Version Detection & Multi-Platform Binaries
 
-Before compiling, the workflow verifies that `version` in `Cargo.toml` matches `${GITHUB_REF_NAME#v}` exactly. It then builds locked, stripped release archives containing `feedcourier`, `LICENSE`, `README.md`, and `README.zh-CN.md` for:
+`prepare` inspects `version` in `Cargo.toml` and checks whether `refs/tags/v<version>` already exists on `origin`. When a new version is detected, downstream jobs build locked, stripped release archives containing `feedcourier`, `LICENSE`, `README.md`, and `README.zh-CN.md` for:
 
 - `x86_64-unknown-linux-gnu` (built on `ubuntu-24.04`)
 - `aarch64-unknown-linux-gnu` (built on `ubuntu-24.04-arm`)
 - `aarch64-apple-darwin` (`MACOSX_DEPLOYMENT_TARGET=11.0`)
 - `x86_64-apple-darwin` (`MACOSX_DEPLOYMENT_TARGET=11.0`)
 
-All four `.tar.gz` archives are hashed into `SHA256SUMS.txt`, paired with the matching version section extracted from `CHANGELOG.md`, and published to **GitHub Releases** (automatically marking `-rc`, `-beta`, or `-alpha` tags as pre-releases).
+Once all four `.tar.gz` archives and the multi-arch Docker Hub manifest succeed, the `release` job creates and pushes the annotated Git tag `v<version>` onto the `main` commit, generates `SHA256SUMS.txt`, extracts the matching `CHANGELOG.md` section, and publishes the **GitHub Release** (automatically marking `-rc`, `-beta`, or `-alpha` versions as pre-releases).
 
 ### 2. Multi-Arch Docker Hub Publishing (`elleryhe/feedcourier`)
 
