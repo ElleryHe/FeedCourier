@@ -85,16 +85,16 @@ flowchart TD
   - A `404 Not Found` or unknown-method error on a self-hosted Local Bot API Server `< 10.2` records `supports_rich_message: false` and `bot_api_version: "<10.2"`.
 - Whenever `supports_rich_message` is `false` (or if `sendRichMessage` returns an unsupported-method error at runtime), `TelegramSender` automatically falls back to `CompactCard` (`sendMessage` with `parse_mode: "HTML"`, bounded to `MAX_MESSAGE_UTF16_UNITS = 4,096` UTF-16 code units and respecting `link_preview_options`).
 
-### 3. `MediaMode`: 3-Line Caption, 2-Stage Delivery & 10-Item Batch Checkpointing
-- **3-Line Caption (`MAX_CAPTION_UTF16_UNITS = 1,024`)**:
-  - Line 1: Bold entry title (`<b>Title</b>`);
-  - Line 2: First sentence extracted via `unicode-segmentation` (`unicode_sentences`) stored in `entries.first_sentence`;
-  - Line 3: Original article link (`<a href="...">Original</a>`).
-  - The caption is truncated on a character boundary to at most `1,024` UTF-16 code units (entries without valid media items fall back to `CompactCard`).
-- **2-Stage Media Delivery**:
-  - **Stage 1 (URL-first)**: Submits the upstream media URLs directly to Telegram (`sendPhoto`, `sendVideo`, `sendAudio`, `sendDocument`, or `sendMediaGroup`).
-  - **Stage 2 (In-Memory Streaming `multipart/form-data` Upload)**: If the origin server blocks hotlinking or Telegram fails to fetch the remote URL, `TelegramSender` acquires a permit from the process-wide semaphore `GLOBAL_MEDIA_UPLOAD_SEMAPHORE` (`MAX_CONCURRENT_MEDIA_UPLOADS = 2`), streams the asset into an in-memory `Bytes` buffer via `ProtectedMediaFetcher` with an automatic origin `Referer: <scheme>://<host>/` header (without writing temporary files to disk), and uploads it as `multipart/form-data` (`attach://file{i}`).
-  - **Byte Caps**: Photos are capped at `MAX_PHOTO_BYTES = 10 MiB` (`10,485,760` bytes); videos, audio, and documents are capped at `MAX_MEDIA_BYTES = 50 MiB` (`52,428,800` bytes). Assets exceeding the cap abort the stream immediately and degrade to direct links in the message footer.
+### 3. `MediaMode`: 3-Line Hyperlink Caption, Smart Media Routing & 10-Item Batch Checkpointing
+- **3-Line HTML Caption (`MAX_CAPTION_UTF16_UNITS = 1,024`, `parse_mode: "HTML"`)**:
+  - Line 1: HTML-escaped entry author (or feed title when author is absent);
+  - Line 2: HTML-escaped first sentence extracted via `unicode-segmentation` (`unicode_sentences`) stored in `entries.first_sentence`;
+  - Line 3: Localized hyperlink (`<a href="...">Link</a>` in English / `<a href="...">链接</a>` in Simplified Chinese, following `system_settings.locale`).
+  - Visible text is truncated on a character boundary to at most `1,024` UTF-16 code units (entries without valid media items send the same 3-line HTML message via `sendMessage`).
+- **Smart Per-Type Routing, Magic-Byte Sniffing & ISO-BMFF Metadata Extraction**:
+  - **Stage 1 (Direct URL Pass for Images, Audio & Explicit Documents)**: Submits upstream image/audio URLs directly to Telegram (`sendPhoto`, `sendAudio`, `sendDocument`, or `sendMediaGroup`), falling back to Stage 2 on hotlink (`Referer`) or URL fetch failures.
+  - **Stage 2 (In-Memory Streaming `multipart/form-data` Upload & Video Pipeline)**: Videos (`MediaAttachmentKind::Video`) and unlabeled `<enclosure>` attachments bypass Telegram's URL fetcher (which silently downgrades extensionless or `application/octet-stream` videos into unpreviewable `Document` files with HTTP `200 OK`) and acquire a permit from `GLOBAL_MEDIA_UPLOAD_SEMAPHORE` (`MAX_CONCURRENT_MEDIA_UPLOADS = 2`). `ProtectedMediaFetcher` streams the asset into an in-memory `Bytes` buffer with an origin `Referer` header, `sniff_media_bytes` inspects container magic bytes (`ftyp`/`moov`, WebM EBML, JPEG/PNG/GIF/WebP, MP3/Ogg, PDF) to promote misclassified attachments and normalize video MIME/extensions to `video/mp4` + `.mp4`, and `parse_mp4_metadata` walks ISO-BMFF `moov -> mvhd / tkhd / stsd` boxes (accounting for 90°/270° portrait rotation matrices) so `sendVideo` and `sendMediaGroup` (`InputMediaVideo`) include `supports_streaming: true`, `width`, `height`, and `duration`.
+  - **Byte Caps**: Photos are capped at `MAX_PHOTO_BYTES = 10 MiB` (`10,485,760` bytes); videos, audio, and documents are capped at `MAX_MEDIA_BYTES = 50 MiB` (`52,428,800` bytes). Assets exceeding the cap abort the stream immediately and append compact `<a href="...">Media N</a>` (`媒体 N`) hyperlinks to the 3rd line.
 - **`sendMediaGroup` 10-Item Batching & `checkpoint_json` Resume**:
   - Entries with more than `MEDIA_GROUP_BATCH_SIZE = 10` media attachments are split into sequential 10-item batches (attaching the 3-line caption to the first batch);
   - After each batch succeeds, `CheckpointSink::save_checkpoint` persists `next_batch_offset` and `sent_message_ids` in `delivery_tasks.checkpoint_json`. If a subsequent batch hits a `429 Too Many Requests` cooldown or a process crash, the retry resumes from `media_items[next_batch_offset..]` without duplicating earlier batches.

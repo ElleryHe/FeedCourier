@@ -18,6 +18,7 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 | `ADMIN_PASSWORD` | *（首次访问 WebUI 引导设置）* | 字符串（至少 8 个字符） | 启动时预设或重置 WebUI 管理员口令，启动阶段以 Argon2id 哈希写入数据库。 |
 | `OUTBOUND_PROXY` | *（未设置）* | URL（`http://`、`https://`、`socks5://`、`socks5h://`） | 初始全局出站代理地址。当 `OUTBOUND_PROXY` 未设置时，依次回退读取 `ALL_PROXY`、`HTTPS_PROXY`、`HTTP_PROXY`。仅当数据库尚未保存代理配置时作为初始值写入。 |
 | `SSRF_ALLOWLIST` | *（空）* | 逗号分隔的 CIDR 或主机名 | 初始内网 SSRF 放行白名单（如 `10.0.0.5/32,rsshub.internal,*.lan`）。仅当数据库尚未保存白名单时作为初始值写入。 |
+| `LOCALE` | *（随 WebUI 自动同步）* | `en` 或 `zh-CN` | 初始下游推送文案语言（控制 Telegram 按钮/超链接与 SMTP 邮件模板语言）。登录 WebUI 或切换界面语言时会自动同步并持久化。 |
 | `RETENTION_HOURS` | `24` | 无符号整数（`u64`） | 已完成投递或未命中路由的文章正文与媒体元数据保留小时数，到期后由后台定时任务清理。 |
 | `DB_READ_MAX_CONNECTIONS` | `8` | 正整数（`u32 >= 1`） | SQLite WAL 只读连接池的最大连接数（写连接池固定为 `1`）。 |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | 日志过滤指令 | 日志级别控制，排查问题时可设为 `feedcourier=debug,tower_http=debug`。 |

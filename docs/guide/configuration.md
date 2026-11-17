@@ -18,6 +18,7 @@ FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment
 | `ADMIN_PASSWORD` | *(interactive setup)* | Sets or resets the WebUI administrator password on startup. |
 | `OUTBOUND_PROXY` | *(unset)* | Initial global outbound proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`). Falls back to `ALL_PROXY`, `HTTPS_PROXY`, or `HTTP_PROXY` if unset. |
 | `SSRF_ALLOWLIST` | *(empty)* | Comma-separated internal CIDRs or hostnames permitted for outbound requests (e.g., `10.0.0.5/32,rsshub.internal,*.lan`). |
+| `LOCALE` | *(auto-synced)* | Initial language (`en` or `zh-CN`) for downstream Telegram and SMTP push notification templates. Automatically syncs with the WebUI language switcher once signed in. |
 | `RETENTION_HOURS` | `24` | Hours after discovery to retain article HTML and media metadata once all delivery tasks for that entry have finished. |
 | `DB_READ_MAX_CONNECTIONS` | `8` | Maximum concurrent connections in the read-only SQLite connection pool (minimum `1`). |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | Log level filter (supports `debug`, `warn`, `error`, or module targets such as `feedcourier::scheduler=debug`). |
