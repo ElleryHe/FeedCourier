@@ -1,4 +1,11 @@
-import { defineConfig, type DefaultTheme, type HeadConfig } from "vitepress";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  defineConfig,
+  type DefaultTheme,
+  type HeadConfig,
+  type SiteConfig,
+} from "vitepress";
 import { withMermaid } from "vitepress-plugin-mermaid";
 
 const SITE_ORIGIN = "https://feedcourier.ellery.me";
@@ -111,9 +118,26 @@ export default withMermaid(
     lastUpdated: true,
     sitemap: {
       hostname: SITE_ORIGIN,
+      transformItems(items) {
+        return items.filter(
+          (item) =>
+            !item.url.endsWith("/404") &&
+            !item.url.endsWith("/404.html") &&
+            !/\/v\d+\//.test(item.url),
+        );
+      },
     },
     head: [
       ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
+      [
+        "link",
+        {
+          rel: "alternate",
+          type: "text/plain",
+          href: `${SITE_ORIGIN}/llms.txt`,
+          title: "LLMs Documentation Index",
+        },
+      ],
       ["meta", { name: "theme-color", content: "#10b981" }],
       ["meta", { property: "og:image", content: OG_IMAGE_URL }],
       ["meta", { property: "og:image:type", content: "image/png" }],
@@ -138,7 +162,12 @@ export default withMermaid(
 
       const rel = pageData.relativePath.replace(/\.md$/, "");
       const isZh = rel === "zh/index" || rel.startsWith("zh/");
-      const subPath = isZh ? rel.replace(/^zh\//, "") : rel;
+      const rawSubPath = isZh ? rel.replace(/^zh\//, "") : rel;
+      const isLegacyVersion =
+        pageData.frontmatter.noindex === true ||
+        pageData.frontmatter.version === "legacy" ||
+        /^v\d+(?:\.\d+)*\//.test(rawSubPath);
+      const subPath = rawSubPath.replace(/^v\d+(?:\.\d+)*\//, "");
       const isHome = subPath === "index";
 
       const enPath = isHome ? "/" : `/${subPath}`;
@@ -173,6 +202,10 @@ export default withMermaid(
         ["meta", { name: "twitter:description", content: pageDesc }],
       ];
 
+      if (isLegacyVersion) {
+        tags.push(["meta", { name: "robots", content: "noindex, follow" }]);
+      }
+
       if (isHome) {
         const jsonLd = {
           "@context": "https://schema.org",
@@ -202,6 +235,10 @@ export default withMermaid(
       }
 
       return tags;
+    },
+    buildEnd(siteConfig: SiteConfig) {
+      generateIndexNowKeyFile(siteConfig);
+      generateLlmsArtifacts(siteConfig);
     },
     themeConfig: {
       logo: {
@@ -342,5 +379,107 @@ export default withMermaid(
         chunkSizeWarningLimit: 1600,
       },
     },
-  })
+  }),
 );
+
+function generateIndexNowKeyFile(siteConfig: SiteConfig): void {
+  const key = process.env.INDEXNOW_KEY?.trim();
+  if (!key || !/^[a-zA-Z0-9-]{8,128}$/.test(key)) {
+    return;
+  }
+  writeFileSync(join(siteConfig.outDir, `${key}.txt`), `${key}\n`, "utf-8");
+}
+
+function parseMarkdownDoc(
+  srcDir: string,
+  relLink: string,
+): { title: string; description: string; body: string } {
+  const filePath = join(srcDir, `${relLink.replace(/^\//, "")}.md`);
+  const raw = readFileSync(filePath, "utf-8");
+
+  let description = "";
+  let content = raw;
+  const fmMatch = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n+/);
+  if (fmMatch) {
+    content = raw.slice(fmMatch[0].length);
+    const descMatch = fmMatch[1].match(/^description:\s*["']?(.+?)["']?\s*$/m);
+    if (descMatch) {
+      description = descMatch[1].trim();
+    }
+  }
+
+  // Convert VitePress custom container blocks `::: warning Title` -> `> **Warning: Title**`
+  content = content
+    .replace(
+      /^:::\s*(tip|info|warning|danger|details)(?:\s+(.*))?$/gim,
+      (_, kind: string, label?: string) => {
+        const cap = kind.charAt(0).toUpperCase() + kind.slice(1).toLowerCase();
+        return label?.trim() ? `> **${cap}: ${label.trim()}**` : `> **${cap}**`;
+      },
+    )
+    .replace(/^:::\s*$/gm, "")
+    .trim();
+
+  const titleMatch = content.match(/^#\s+(.+?)(?:\s*\{#.*\})?\s*$/m);
+  const title = titleMatch ? titleMatch[1].trim() : relLink;
+
+  return { title, description, body: content };
+}
+
+function generateLlmsArtifacts(siteConfig: SiteConfig): void {
+  const sections = [...enUserGuideSidebar, ...enArchitectureSidebar];
+  const llmsIndexLines: string[] = [
+    "# FeedCourier",
+    "",
+    "> Self-hosted RSS, Atom, and JSON Feed subscription delivery service built with Rust, SQLite, and React. Polls feeds, extracts full text via Readability, filters articles, and delivers them to SMTP Email, Telegram (Bot API 10.4 Rich Message / Compact Card / Media Mode), and Notion (2026-03-11 Markdown v2), with an embedded web console and a Streamable HTTP `/mcp` server.",
+    "",
+    `- Complete single-file English documentation for LLMs: [llms-full.txt](${SITE_ORIGIN}/llms-full.txt)`,
+    `- Source repository: [github.com/ElleryHe/FeedCourier](https://github.com/ElleryHe/FeedCourier)`,
+    `- License: AGPL-3.0`,
+    "",
+  ];
+
+  const fullDocChunks: string[] = [
+    "# FeedCourier — Complete Documentation",
+    "",
+    "> Canonical documentation source: https://feedcourier.ellery.me",
+    "> License: AGPL-3.0 | Repository: https://github.com/ElleryHe/FeedCourier",
+    "",
+  ];
+
+  for (const group of sections) {
+    if (!group.text || !group.items?.length) continue;
+    llmsIndexLines.push(`## ${group.text}`, "");
+
+    for (const item of group.items) {
+      if (!item.link) continue;
+      const parsed = parseMarkdownDoc(siteConfig.srcDir, item.link);
+      const url = `${SITE_ORIGIN}${item.link}`;
+      const label = item.text || parsed.title;
+      const summary = parsed.description ? `: ${parsed.description}` : "";
+      llmsIndexLines.push(`- [${label}](${url})${summary}`);
+
+      fullDocChunks.push(
+        "---",
+        "",
+        `Source: ${url}`,
+        ...(parsed.description ? [`Description: ${parsed.description}`] : []),
+        "",
+        parsed.body,
+        "",
+      );
+    }
+    llmsIndexLines.push("");
+  }
+
+  writeFileSync(
+    join(siteConfig.outDir, "llms.txt"),
+    `${llmsIndexLines.join("\n").trimEnd()}\n`,
+    "utf-8",
+  );
+  writeFileSync(
+    join(siteConfig.outDir, "llms-full.txt"),
+    `${fullDocChunks.join("\n").trimEnd()}\n`,
+    "utf-8",
+  );
+}

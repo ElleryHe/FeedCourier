@@ -1,5 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
-import { KeyRound, Lock, Moon, ShieldCheck, Sun } from "lucide-react";
+import { KeyRound, Lock, Monitor, Moon, ShieldCheck, Sun } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { api } from "@/api/client";
 import {
@@ -38,7 +38,7 @@ export function AuthGateView({
   license,
   onAuthenticated,
 }: AuthGateViewProps) {
-  const { dark, toggleTheme } = useThemeMode();
+  const { themeMode, toggleTheme } = useThemeMode();
   const { m } = useI18n();
   const toast = useToast();
   const [password, setPassword] = useState("");
@@ -97,14 +97,19 @@ export function AuthGateView({
           aria-label={m.theme.toggleTitle}
           className="inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
         >
-          {dark ? (
+          {themeMode === "system" ? (
             <>
-              <Sun className="h-3.5 w-3.5 text-amber-400" />
+              <Monitor className="h-3.5 w-3.5 text-emerald-500" />
+              {m.theme.system}
+            </>
+          ) : themeMode === "light" ? (
+            <>
+              <Sun className="h-3.5 w-3.5 text-amber-500" />
               {m.theme.light}
             </>
           ) : (
             <>
-              <Moon className="h-3.5 w-3.5 text-zinc-500" />
+              <Moon className="h-3.5 w-3.5 text-indigo-400" />
               {m.theme.dark}
             </>
           )}

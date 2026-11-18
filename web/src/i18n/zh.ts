@@ -37,9 +37,10 @@ export const zhCN: Messages = {
   },
 
   theme: {
+    system: "跟随系统",
     light: "浅色",
     dark: "深色",
-    toggleTitle: "切换深浅色主题",
+    toggleTitle: "切换主题模式（跟随系统 / 浅色 / 深色）",
   },
 
   footer: {
@@ -605,9 +606,14 @@ export const zhCN: Messages = {
   },
 
   settings: {
-    title: "系统网络与 MCP 服务端",
+    title: "系统、语言与 MCP 服务端",
     subtitle:
-      "配置全局 HTTP / SOCKS5 出站代理、内网防 SSRF 放行白名单，以及双权限级别的 MCP Bearer 令牌。",
+      "配置控制台与全局推送语言、HTTP / SOCKS5 出站代理、内网防 SSRF 放行白名单，以及双权限级别的 MCP Bearer 令牌。",
+    languageTitle: "界面与推送语言",
+    languageDesc: "选择管理控制台的界面显示语言。",
+    languageDeliveryHint:
+      "提示：更改面板语言将同步改变 Telegram 与 SMTP 邮件等下游通道的固定推送文案语言（如「阅读原文」按钮与媒体模式「链接」超链接）。",
+    toastLanguageSaved: "语言设置已更新",
     networkTitle: "出站代理与防 SSRF 内网白名单",
     networkDesc:
       "FeedCourier 默认在每次连接建立前拦截环回地址、链路本地地址、云厂商元数据端点及私网 IP（含重定向逐跳重检）。仅在访问授信的自建内网服务（如 FreshRSS、RSSHub 或自建 Local Bot API）时在此添加对应网段或主机名。",

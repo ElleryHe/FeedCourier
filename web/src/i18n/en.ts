@@ -35,9 +35,10 @@ export const en = {
   },
 
   theme: {
+    system: "Auto",
     light: "Light",
     dark: "Dark",
-    toggleTitle: "Toggle color theme",
+    toggleTitle: "Cycle color theme (Auto / Light / Dark)",
   },
 
   footer: {
@@ -616,9 +617,15 @@ export const en = {
   },
 
   settings: {
-    title: "System Network & MCP Server",
+    title: "System, Language & MCP Server",
     subtitle:
-      "Configure outbound HTTP/SOCKS5 proxy settings, private-network SSRF allowlists, and scoped MCP Bearer tokens.",
+      "Configure console and push notification language, outbound HTTP/SOCKS5 proxy settings, private-network SSRF allowlists, and scoped MCP Bearer tokens.",
+    languageTitle: "Interface & Delivery Language",
+    languageDesc:
+      "Select the display language for the management console.",
+    languageDeliveryHint:
+      "Note: Changing the console language also updates the template language used for downstream Telegram and SMTP email deliveries (such as 'Read original' buttons and 'Link' captions).",
+    toastLanguageSaved: "Language updated",
     networkTitle: "Outbound Proxy & SSRF Allowlist",
     networkDesc:
       "FeedCourier blocks loopback, link-local, cloud metadata, and private IPs at DNS connect time across every redirect hop. Add internal CIDRs or hostnames below only for trusted self-hosted services (such as FreshRSS, RSSHub, or a Local Bot API Server).",

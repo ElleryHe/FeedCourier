@@ -3,17 +3,19 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::{ACCEPT, HeaderValue, REFERER};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::channels::notion::NotionSender;
@@ -60,6 +62,9 @@ pub const DEFAULT_OUTBOX_TICK: Duration = Duration::from_secs(2);
 
 /// Default cadence for running `NOT EXISTS` payload GC, session cleanup, and `PRAGMA optimize` (`1h`).
 pub const DEFAULT_MAINTENANCE_TICK: Duration = Duration::from_secs(3600);
+
+/// Hard per-feed timeout (`90s`) guarding against stalled upstream streams or Readability extractions.
+pub const DEFAULT_SINGLE_FEED_POLL_TIMEOUT: Duration = Duration::from_secs(90);
 
 const MEDIA_ACCEPT_HEADER: &str = "image/*,video/*,audio/*,*/*;q=0.8";
 
@@ -578,15 +583,46 @@ impl DeliveryDispatcher {
                         .acquire_owned()
                         .await
                         .expect("feed poll semaphore is never closed");
-                    match ingest.poll_feed(feed.id, false, false).await {
-                        Ok(outcome) => outcome.enqueued_tasks,
-                        Err(err) => {
+                    let ingest_for_task = ingest.clone();
+                    let feed_id = feed.id;
+                    let poll_task = tokio::spawn(async move {
+                        ingest_for_task.poll_feed(feed_id, false, false).await
+                    });
+
+                    match tokio::time::timeout(DEFAULT_SINGLE_FEED_POLL_TIMEOUT, poll_task).await {
+                        Ok(Ok(Ok(outcome))) => outcome.enqueued_tasks,
+                        Ok(Ok(Err(err))) => {
                             warn!(
                                 feed_id = feed.id,
                                 url = %feed.url,
                                 error = %err,
                                 "scheduled feed poll failed"
                             );
+                            0
+                        }
+                        Ok(Err(join_err)) => {
+                            let diag = format!("feed poll task panicked: {join_err}");
+                            error!(
+                                feed_id = feed.id,
+                                url = %feed.url,
+                                error = %diag,
+                                "isolated panic during scheduled feed poll; recording backoff"
+                            );
+                            let _ = ingest.record_poll_failure(&feed, None, &diag).await;
+                            0
+                        }
+                        Err(_) => {
+                            let diag = format!(
+                                "feed poll timed out after {}s",
+                                DEFAULT_SINGLE_FEED_POLL_TIMEOUT.as_secs()
+                            );
+                            warn!(
+                                feed_id = feed.id,
+                                url = %feed.url,
+                                error = %diag,
+                                "scheduled feed poll exceeded hard timeout; recording backoff"
+                            );
+                            let _ = ingest.record_poll_failure(&feed, None, &diag).await;
                             0
                         }
                     }
@@ -901,11 +937,18 @@ impl DeliveryDispatcher {
                     if token.is_cancelled() {
                         break;
                     }
-                    if let Err(err) = dispatcher
-                        .poll_due_feeds_once(DEFAULT_DUE_FEED_BATCH_LIMIT)
-                        .await
-                    {
-                        warn!(error = %err, "poller loop tick failed");
+                    let tick_fut = AssertUnwindSafe(
+                        dispatcher.poll_due_feeds_once(DEFAULT_DUE_FEED_BATCH_LIMIT),
+                    )
+                    .catch_unwind();
+                    match tick_fut.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "poller loop tick failed");
+                        }
+                        Err(_) => {
+                            error!("poller loop caught unexpected panic; continuing next tick");
+                        }
                     }
                 }
             })
@@ -930,16 +973,23 @@ impl DeliveryDispatcher {
                         break;
                     }
                     while !token.is_cancelled() {
-                        match dispatcher
-                            .drain_due_outbox_tasks(DEFAULT_OUTBOX_DRAIN_LIMIT)
-                            .await
-                        {
-                            Ok(n) if n == DEFAULT_OUTBOX_DRAIN_LIMIT => {
+                        let drain_fut = AssertUnwindSafe(
+                            dispatcher.drain_due_outbox_tasks(DEFAULT_OUTBOX_DRAIN_LIMIT),
+                        )
+                        .catch_unwind();
+                        match drain_fut.await {
+                            Ok(Ok(n)) if n == DEFAULT_OUTBOX_DRAIN_LIMIT => {
                                 tokio::task::yield_now().await;
                             }
-                            Ok(_) => break,
-                            Err(err) => {
+                            Ok(Ok(_)) => break,
+                            Ok(Err(err)) => {
                                 warn!(error = %err, "outbox dispatcher loop tick failed");
+                                break;
+                            }
+                            Err(_) => {
+                                error!(
+                                    "outbox dispatcher loop caught unexpected panic; continuing next tick"
+                                );
                                 break;
                             }
                         }
@@ -966,8 +1016,18 @@ impl DeliveryDispatcher {
                     if token.is_cancelled() {
                         break;
                     }
-                    if let Err(err) = dispatcher.run_maintenance_once().await {
-                        warn!(error = %err, "maintenance loop tick failed");
+                    let maint_fut =
+                        AssertUnwindSafe(dispatcher.run_maintenance_once()).catch_unwind();
+                    match maint_fut.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "maintenance loop tick failed");
+                        }
+                        Err(_) => {
+                            error!(
+                                "maintenance loop caught unexpected panic; continuing next tick"
+                            );
+                        }
                     }
                 }
             })

@@ -24,7 +24,7 @@ concurrency:
 jobs:
   prepare:
     name: Detect Release Version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       should_build: ${{ steps.detect.outputs.should_build }}
       should_publish: ${{ steps.detect.outputs.should_publish }}
@@ -120,7 +120,7 @@ jobs:
     name: Build Embedded WebUI Bundle
     needs: prepare
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -147,7 +147,7 @@ jobs:
         run: pnpm --dir web build
 
       - name: Upload compiled WebUI dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -220,7 +220,7 @@ jobs:
           rm -rf "${STAGE_DIR}"
 
       - name: Upload binary archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: feedcourier-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz
@@ -232,7 +232,7 @@ jobs:
       - prepare
       - web-dist
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -284,14 +284,14 @@ jobs:
           done
 
       - name: Upload macOS arm64 binary archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-aarch64-apple-darwin
           path: feedcourier-${{ needs.prepare.outputs.version }}-aarch64-apple-darwin.tar.gz
           if-no-files-found: error
 
       - name: Upload macOS x86_64 binary archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-x86_64-apple-darwin
           path: feedcourier-${{ needs.prepare.outputs.version }}-x86_64-apple-darwin.tar.gz
@@ -380,7 +380,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload platform digest artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-digest-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -465,7 +465,7 @@ jobs:
 
   release:
     name: Publish Git Tag & GitHub Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - prepare
       - binaries

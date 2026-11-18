@@ -4,6 +4,7 @@ import {
   Inbox,
   LogOut,
   Menu,
+  Monitor,
   Moon,
   Radio,
   Rss,
@@ -12,7 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { LocaleSwitchButton, useI18n } from "@/i18n";
+import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { ComplianceFooter } from "./ComplianceFooter";
 
@@ -46,29 +47,98 @@ export interface AppShellProps {
   children: ReactNode;
 }
 
-function getInitialDarkMode(): boolean {
+export type ThemeMode = "system" | "light" | "dark";
+
+const THEME_STORAGE_KEY = "fc-theme";
+
+function readStoredThemeMode(): ThemeMode {
+  if (typeof window === "undefined") return "system";
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (saved === "light" || saved === "dark" || saved === "system") {
+      return saved;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return "system";
+}
+
+function resolveIsDark(mode: ThemeMode): boolean {
   if (typeof window === "undefined") return false;
-  const saved = window.localStorage.getItem("fc-theme");
-  if (saved === "dark") return true;
-  if (saved === "light") return false;
+  if (mode === "dark") return true;
+  if (mode === "light") return false;
   return window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
 
+function applyDomTheme(isDark: boolean): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.classList.toggle("dark", isDark);
+}
+
+let currentThemeMode: ThemeMode = readStoredThemeMode();
+const themeSubscribers = new Set<() => void>();
+let mediaListenerAttached = false;
+
+function ensureSystemMediaListener(): void {
+  if (mediaListenerAttached || typeof window === "undefined") return;
+  mediaListenerAttached = true;
+  applyDomTheme(resolveIsDark(currentThemeMode));
+  const mql = window.matchMedia("(prefers-color-scheme: dark)");
+  const onChange = () => {
+    if (currentThemeMode === "system") {
+      applyDomTheme(resolveIsDark("system"));
+      for (const listener of themeSubscribers) listener();
+    }
+  };
+  mql.addEventListener("change", onChange);
+}
+
+function updateThemeMode(next: ThemeMode): void {
+  currentThemeMode = next;
+  try {
+    if (next === "system") {
+      window.localStorage.removeItem(THEME_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(THEME_STORAGE_KEY, next);
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  applyDomTheme(resolveIsDark(next));
+  for (const listener of themeSubscribers) listener();
+}
+
 export function useThemeMode() {
-  const [dark, setDark] = useState<boolean>(getInitialDarkMode);
+  ensureSystemMediaListener();
+  const [, setTick] = useState(0);
 
   useEffect(() => {
-    const root = document.documentElement;
-    if (dark) {
-      root.classList.add("dark");
-      window.localStorage.setItem("fc-theme", "dark");
-    } else {
-      root.classList.remove("dark");
-      window.localStorage.setItem("fc-theme", "light");
-    }
-  }, [dark]);
+    const listener = () => setTick((t) => t + 1);
+    themeSubscribers.add(listener);
+    applyDomTheme(resolveIsDark(currentThemeMode));
+    return () => {
+      themeSubscribers.delete(listener);
+    };
+  }, []);
 
-  return { dark, toggleTheme: () => setDark((prev) => !prev) };
+  const dark = resolveIsDark(currentThemeMode);
+  const toggleTheme = () => {
+    const next: ThemeMode =
+      currentThemeMode === "system"
+        ? "light"
+        : currentThemeMode === "light"
+          ? "dark"
+          : "system";
+    updateThemeMode(next);
+  };
+
+  return {
+    themeMode: currentThemeMode,
+    dark,
+    setThemeMode: updateThemeMode,
+    toggleTheme,
+  };
 }
 
 export function FeedCourierMark({
@@ -131,7 +201,7 @@ export function AppShell({
   children,
 }: AppShellProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const { dark, toggleTheme } = useThemeMode();
+  const { themeMode, toggleTheme } = useThemeMode();
   const { m } = useI18n();
 
   const navItems: NavItem[] = [
@@ -272,28 +342,30 @@ export function AppShell({
 
       {/* Bottom Controls */}
       <div className="space-y-1.5 border-t border-zinc-200/80 p-3 dark:border-zinc-800/80">
-        <div className="flex items-center gap-1.5">
-          <LocaleSwitchButton className="flex-1" />
-          <button
-            type="button"
-            onClick={toggleTheme}
-            title={m.theme.toggleTitle}
-            aria-label={m.theme.toggleTitle}
-            className="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
-          >
-            {dark ? (
-              <>
-                <Sun className="h-3.5 w-3.5 text-amber-400" />
-                {m.theme.light}
-              </>
-            ) : (
-              <>
-                <Moon className="h-3.5 w-3.5 text-zinc-500" />
-                {m.theme.dark}
-              </>
-            )}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={toggleTheme}
+          title={m.theme.toggleTitle}
+          aria-label={m.theme.toggleTitle}
+          className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+        >
+          {themeMode === "system" ? (
+            <>
+              <Monitor className="h-3.5 w-3.5 text-emerald-500" />
+              {m.theme.system}
+            </>
+          ) : themeMode === "light" ? (
+            <>
+              <Sun className="h-3.5 w-3.5 text-amber-500" />
+              {m.theme.light}
+            </>
+          ) : (
+            <>
+              <Moon className="h-3.5 w-3.5 text-indigo-400" />
+              {m.theme.dark}
+            </>
+          )}
+        </button>
         <button
           type="button"
           onClick={onLogout}
@@ -347,7 +419,6 @@ export function AppShell({
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <LocaleSwitchButton className="px-2 py-1" />
             <span className="rounded bg-zinc-100 px-2 py-0.5 text-xs font-medium dark:bg-zinc-800">
               {m.shell.nav[activeSection].label}
             </span>

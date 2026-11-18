@@ -483,7 +483,9 @@ impl IngestEngine {
         export_opml(&feeds)
     }
 
-    async fn record_poll_failure(
+    /// Record a failed poll on `feed`, applying exponential backoff (`min(base * 2^failures, 6h) + jitter`)
+    /// or tripping `circuit_open` at `circuit_breaker_threshold`.
+    pub async fn record_poll_failure(
         &self,
         feed: &Feed,
         retry_after_secs: Option<u64>,

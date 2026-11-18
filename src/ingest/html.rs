@@ -696,7 +696,7 @@ pub fn html_to_plain_text(html: &str) -> String {
     while idx < bytes.len() {
         if let Some(close_tag) = skip_until_close {
             let pat = format!("</{close_tag}");
-            if let Some(pos) = html[idx..].to_ascii_lowercase().find(&pat) {
+            if let Some(pos) = find_ascii_case_insensitive(&html[idx..], &pat) {
                 let close_start = idx + pos;
                 if let Some(end_gt) = html[close_start..].find('>') {
                     idx = close_start + end_gt + 1;
@@ -854,6 +854,17 @@ fn ends_with_common_abbreviation(s: &str) -> bool {
     )
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle_ascii: &str) -> Option<usize> {
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle_ascii.as_bytes();
+    if n_bytes.is_empty() || h_bytes.len() < n_bytes.len() {
+        return None;
+    }
+    h_bytes
+        .windows(n_bytes.len())
+        .position(|w| w.eq_ignore_ascii_case(n_bytes))
+}
+
 fn decode_basic_html_entities(input: &str) -> String {
     if !input.contains('&') {
         return input.to_string();
@@ -865,10 +876,17 @@ fn decode_basic_html_entities(input: &str) -> String {
     while let Some(amp_idx) = rest.find('&') {
         out.push_str(&rest[..amp_idx]);
         let after_amp = &rest[amp_idx + 1..];
-        let max_entity_len = after_amp.len().min(16);
-        if let Some(semi_idx) = after_amp[..max_entity_len].find(';') {
-            let entity = &after_amp[..semi_idx];
-            if let Some(decoded) = resolve_html_entity(entity) {
+        if let Some(semi_idx) = after_amp
+            .as_bytes()
+            .iter()
+            .take(16)
+            .position(|&b| b == b';')
+        {
+            let entity_bytes = &after_amp.as_bytes()[..semi_idx];
+            if entity_bytes.iter().all(|b| b.is_ascii_graphic())
+                && let Ok(entity) = std::str::from_utf8(entity_bytes)
+                && let Some(decoded) = resolve_html_entity(entity)
+            {
                 out.push_str(&decoded);
                 rest = &after_amp[semi_idx + 1..];
                 continue;
