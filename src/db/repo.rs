@@ -143,6 +143,20 @@ impl Database {
         let health_status = patch.health_status.unwrap_or(current.health_status);
         let now = now_unix();
 
+        let next_poll_at = if patch.health_status == Some(FeedHealthStatus::Active)
+            && current.health_status != FeedHealthStatus::Active
+        {
+            Some(now)
+        } else if patch.poll_interval_secs.is_some() {
+            let max_next = now.saturating_add(poll_interval_secs);
+            match current.next_poll_at {
+                Some(existing) if existing > max_next => Some(max_next),
+                other => other,
+            }
+        } else {
+            current.next_poll_at
+        };
+
         let updated = sqlx::query_as::<_, Feed>(
             r#"
             UPDATE feeds
@@ -156,8 +170,9 @@ impl Database {
                 use_proxy = ?8,
                 silent_init = ?9,
                 health_status = ?10,
-                updated_at = ?11
-            WHERE id = ?12
+                next_poll_at = ?11,
+                updated_at = ?12
+            WHERE id = ?13
             RETURNING *
             "#,
         )
@@ -171,6 +186,7 @@ impl Database {
         .bind(use_proxy)
         .bind(silent_init)
         .bind(health_status)
+        .bind(next_poll_at)
         .bind(now)
         .bind(feed_id)
         .fetch_one(&self.write_pool)

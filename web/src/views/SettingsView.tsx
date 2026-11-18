@@ -5,6 +5,7 @@ import {
   Copy,
   Globe,
   KeyRound,
+  Languages,
   Plus,
   Save,
   ShieldCheck,
@@ -35,7 +36,7 @@ import {
   TagInput,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
-import { useI18n } from "@/i18n";
+import { type Locale, useI18n } from "@/i18n";
 import {
   copyToClipboard,
   errorMessage,
@@ -45,9 +46,27 @@ import {
 } from "@/lib/utils";
 
 export function SettingsView() {
-  const { m } = useI18n();
+  const { locale, setLocale, m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
+
+  const handleSelectLocale = (next: Locale) => {
+    if (next === locale) return;
+    setLocale(next);
+    void api.settings
+      .update({ locale: next })
+      .then((updated) => {
+        queryClient.setQueryData(["settings"], updated);
+        toast.success(
+          next === "zh-CN"
+            ? "语言设置已更新"
+            : "Language updated",
+        );
+      })
+      .catch((err) => {
+        toast.error(errorMessage(err));
+      });
+  };
 
   // --- System Settings (`GET` & `PUT /api/v1/settings`) ---
   const settingsQuery = useQuery({
@@ -187,6 +206,69 @@ export function SettingsView() {
           {m.settings.subtitle}
         </p>
       </div>
+
+      {/* Section 0: Interface & Delivery Language */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Languages className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+            <CardTitle>{m.settings.languageTitle}</CardTitle>
+          </div>
+          <CardDescription>{m.settings.languageDesc}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2.5">
+          <div className="grid gap-2.5 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => handleSelectLocale("zh-CN")}
+              className={`flex cursor-pointer items-center justify-between rounded-lg border px-3.5 py-2.5 text-left transition-colors ${
+                locale === "zh-CN"
+                  ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
+                  : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800/70"
+              }`}
+            >
+              <div>
+                <div className="text-xs font-semibold">简体中文</div>
+                <div
+                  className={`mt-0.5 font-mono text-[11px] ${
+                    locale === "zh-CN"
+                      ? "text-zinc-300 dark:text-zinc-600"
+                      : "text-zinc-500"
+                  }`}
+                >
+                  zh-CN
+                </div>
+              </div>
+              {locale === "zh-CN" && <Check className="h-4 w-4 shrink-0" />}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleSelectLocale("en")}
+              className={`flex cursor-pointer items-center justify-between rounded-lg border px-3.5 py-2.5 text-left transition-colors ${
+                locale === "en"
+                  ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
+                  : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800/70"
+              }`}
+            >
+              <div>
+                <div className="text-xs font-semibold">English</div>
+                <div
+                  className={`mt-0.5 font-mono text-[11px] ${
+                    locale === "en"
+                      ? "text-zinc-300 dark:text-zinc-600"
+                      : "text-zinc-500"
+                  }`}
+                >
+                  en
+                </div>
+              </div>
+              {locale === "en" && <Check className="h-4 w-4 shrink-0" />}
+            </button>
+          </div>
+          <FieldHint>{m.settings.languageDeliveryHint}</FieldHint>
+        </CardContent>
+      </Card>
 
       {/* Section 1: Outbound Proxy & SSRF Guardrails */}
       <Card>

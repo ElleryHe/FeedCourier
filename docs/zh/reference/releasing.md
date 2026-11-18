@@ -30,20 +30,21 @@ FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.g
 
 ## 2. 自动化版本发布流水线（`.github/workflows/release.yml`）
 
-当推送符合语义化版本规范的 Git 标签（`v*.*.*`，如 `v0.1.4`）时，自动触发发布流水线：
+当包含新计划版本号（`Cargo.toml` 中的 `version`）的 PR 合入 `main` 分支，且远端尚不存在对应 `v<version>` 标签时，将**自动触发**完整构建、打标与发版流水线（若 `main` 上的普通提交未升级版本号且对应标签已存在，`prepare` 任务会自动跳过后续构建；同时也兼容手动推送 `v*.*.*` 标签或 `workflow_dispatch` 演练构建）：
 
 ```mermaid
 flowchart LR
-    Tag["git push origin v0.1.4"] --> Web["web-dist: 构建 React 19 前端"]
+    Merge["合入 main 分支\n(Cargo.toml 含新版本号)"] --> Prep["prepare: 检测 v<version> 标签状态"]
+    Prep --> Web["web-dist: 构建 React 19 前端"]
     Web --> Linux["binaries: 构建 Linux x86_64 & aarch64"]
     Web --> Mac["binaries-macos: 构建 macOS arm64 & x86_64"]
     Web --> DockerBuild["docker-build: 原生双架构并行构建\n(ubuntu-24.04 & ubuntu-24.04-arm)"]
     DockerBuild --> Docker["docker: 合并推送多架构 Manifest"]
-    Linux & Mac & Docker --> Rel["release: 校验 4 平台包 + 生成 SHA256SUMS.txt + 提取 CHANGELOG 发布 GitHub Release"]
+    Linux & Mac & Docker --> Rel["release: 自动创建推送 v<version> 附注标签 + SHA256SUMS.txt + 发布 GitHub Release"]
 ```
 
-### 第一步：版本号校验与四平台二进制打包
-- 比对 `Cargo.toml` 中的 `version` 与 Git 标签版本 `${GITHUB_REF_NAME#v}`，若不一致则中止流水线；
+### 第一步：计划版本检测与四平台二进制打包
+- `prepare` 任务读取 `Cargo.toml` 中的 `version` 并检查远端是否存在 `refs/tags/v<version>`；确认需要发版后启动后续编译；
 - 分别在对应运行器上编译并 `strip` 符号表，打包包含 `feedcourier` 单文件二进制、`LICENSE`、`README.md` 与 `README.zh-CN.md` 的四个 `.tar.gz` 归档包：
   - `feedcourier-<version>-x86_64-unknown-linux-gnu.tar.gz`（`ubuntu-24.04`）
   - `feedcourier-<version>-aarch64-unknown-linux-gnu.tar.gz`（`ubuntu-24.04-arm`）
@@ -53,20 +54,20 @@ flowchart LR
 ### 第二步：Docker Hub 原生双架构镜像并行构建与合并推送
 - `docker-build` 矩阵任务分别在原生 `ubuntu-24.04`（`linux/amd64`）与 `ubuntu-24.04-arm`（`linux/arm64`）运行器上并行编译镜像（无需 QEMU 指令模拟，按架构独立缓存 Cargo 外部依赖层），并按不可变摘要（`push-by-digest`）推送分片；随后由 `docker` 任务调用 `docker buildx imagetools create` 合并生成统一的多架构 Manifest 并发布至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
 - **镜像标签规则**：
-  - `<version>`（如 `0.1.4`）
+  - `<version>`（如 `0.1.5`）
   - `<major>.<minor>`（如 `0.1`）
   - `<major>`（自 `1.0.0` 正式版起启用）
   - `latest`（仅对不带 `-rc` / `-beta` / `-alpha` 后缀的正式版标签更新）
 
-### 第三步：`CHANGELOG.md` 提取与 `SHA256SUMS.txt` 发布
-- 通过 `awk` 从根目录 `CHANGELOG.md` 中截取对应 `## [<version>]` 章节的更新说明；
-- 对 4 个平台的 `.tar.gz` 压缩包生成 `SHA256SUMS.txt` 校验文件，并调用 `softprops/action-gh-release` 创建 GitHub Release。
+### 第三步：自动打标、`CHANGELOG.md` 提取与 `SHA256SUMS.txt` 发布
+- 当四平台二进制包与多架构容器镜像**全部构建成功**后，`release` 任务才会在当前 `main` 提交上自动创建并推送附注标签 `v<version>`（避免中途构建失败留下残缺标签，且使用内置 `GITHUB_TOKEN` 推送不会重复触发二次流水线）；
+- 通过 `awk` 从根目录 `CHANGELOG.md` 中截取对应 `## [<version>]` 章节的更新说明，对 4 个平台的 `.tar.gz` 压缩包生成 `SHA256SUMS.txt` 校验文件，并调用 `softprops/action-gh-release` 创建 GitHub Release。
 
 ---
 
 ## 3. 标准发版操作清单（Release Checklist）
 
-发布新版本（例如从 `develop` 合入 `main` 发布 `v0.1.4`）时，按以下步骤操作：
+发布新版本（例如从 `develop` 合入 `main`）时，只需在 `develop` 完成版本准备并合并 PR 即可自动完成打标与发版：
 
 ```bash
 # 1. 在 develop 分支完成并通过本地检查
@@ -76,14 +77,8 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 
-# 2. 更新 Cargo.toml 版本号与 CHANGELOG.md 对应版本章节并提交
-# 3. 合并至 main 分支并推送标签
-git checkout main
-git merge --ff-only develop
-git push origin main
-
-git tag v0.1.4
-git push origin v0.1.4
+# 2. 在 develop 分支更新 Cargo.toml 计划版本号与 CHANGELOG.md 对应版本章节并推送
+# 3. 发起 PR 合入 main 分支 —— 合并后 GitHub Actions 将自动创建 v<version> 标签并发布全平台产物与 Docker 镜像
 ```
 
 ---

@@ -1,0 +1,14 @@
+https://:version.:subdomain.workers.dev/*
+  X-Robots-Tag: noindex, nofollow
+
+https://:project.:subdomain.workers.dev/*
+  X-Robots-Tag: noindex, nofollow
+
+https://:version-:project.:subdomain.workers.dev/*
+  X-Robots-Tag: noindex, nofollow
+
+https://*.workers.dev/*
+  X-Robots-Tag: noindex, nofollow
+
+https://*.pages.dev/*
+  X-Robots-Tag: noindex, nofollow

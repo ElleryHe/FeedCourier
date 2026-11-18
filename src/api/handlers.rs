@@ -230,7 +230,7 @@ pub async fn update_feed(
     };
 
     let updated = state.db().update_feed(feed_id, &patch).await?;
-    if req.health_status == Some(FeedHealthStatus::Active) {
+    if req.health_status == Some(FeedHealthStatus::Active) || req.poll_interval_secs.is_some() {
         state.runtime().notify_poller();
     }
 

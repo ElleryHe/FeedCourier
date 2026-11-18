@@ -2,7 +2,9 @@
 
 Thanks for your interest in improving `FeedCourier`! Well-isolated bug reports
 (especially tricky real-world RSS/Atom/JSON feeds, Readability edge cases, or
-channel delivery regressions) and focused pull requests are very welcome.
+channel delivery regressions) and focused pull requests are very welcome. For
+full system architecture, database schema, and release pipeline details, see
+the [FeedCourier Documentation](https://feedcourier.ellery.me/reference/architecture).
 
 ## Prerequisites
 

@@ -480,6 +480,18 @@ fn html_relative_url_resolution_sanitization_and_unicode_first_sentence() {
         cjk_first.as_deref(),
         Some("纯血 Rust 打造的极简订阅投递网关")
     );
+
+    // Regression check: unescaped `&` followed by multi-byte CJK / emoji characters across all
+    // 0..=20 byte offsets in body text and href attributes must never panic on UTF-8 char boundaries.
+    for pad in 0..=20 {
+        let prefix = "x".repeat(pad);
+        let html_with_cjk_amp = format!(
+            "<p><a href=\"/search?q=1&{prefix}中文参数测试长度超过十六字节=2\">研发 & {prefix}中文标题与内容测试🚀超过十六字节</a> &amp; 正常实体;</p>"
+        );
+        let res = sanitize_and_extract_html(&html_with_cjk_amp, Some(&base));
+        assert!(res.plain_text.contains("中文标题与内容测试"));
+        assert!(res.plain_text.contains("& 正常实体;"));
+    }
 }
 
 // ============================================================================

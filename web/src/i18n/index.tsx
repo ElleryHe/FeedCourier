@@ -52,7 +52,9 @@ export function getMessages(locale: Locale = activeLocale): Messages {
 
 interface I18nContextValue {
   locale: Locale;
+  userChangedLocale: boolean;
   setLocale: (next: Locale) => void;
+  hydrateServerLocale: (serverLocale: Locale) => void;
   toggleLocale: () => void;
   m: Messages;
 }
@@ -61,10 +63,14 @@ const I18nContext = createContext<I18nContextValue | null>(null);
 
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(activeLocale);
+  const [userChangedLocale, setUserChangedLocale] = useState<boolean>(false);
 
-  const setLocale = useCallback((next: Locale) => {
+  const applyLocale = useCallback((next: Locale, markUserChanged: boolean) => {
     activeLocale = next;
     setLocaleState(next);
+    if (markUserChanged) {
+      setUserChangedLocale(true);
+    }
     try {
       window.localStorage.setItem(STORAGE_KEY, next);
     } catch {
@@ -72,9 +78,23 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const setLocale = useCallback(
+    (next: Locale) => {
+      applyLocale(next, true);
+    },
+    [applyLocale],
+  );
+
+  const hydrateServerLocale = useCallback(
+    (serverLocale: Locale) => {
+      applyLocale(serverLocale, false);
+    },
+    [applyLocale],
+  );
+
   const toggleLocale = useCallback(() => {
-    setLocale(locale === "zh-CN" ? "en" : "zh-CN");
-  }, [locale, setLocale]);
+    applyLocale(locale === "zh-CN" ? "en" : "zh-CN", true);
+  }, [locale, applyLocale]);
 
   const m = locale === "zh-CN" ? zhCN : en;
 
@@ -85,8 +105,15 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   }, [locale, m.locale.consoleTitle]);
 
   const value = useMemo<I18nContextValue>(
-    () => ({ locale, setLocale, toggleLocale, m }),
-    [locale, setLocale, toggleLocale, m],
+    () => ({
+      locale,
+      userChangedLocale,
+      setLocale,
+      hydrateServerLocale,
+      toggleLocale,
+      m,
+    }),
+    [locale, userChangedLocale, setLocale, hydrateServerLocale, toggleLocale, m],
   );
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;

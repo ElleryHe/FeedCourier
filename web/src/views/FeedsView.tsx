@@ -114,6 +114,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
   const feedsQuery = useQuery({
     queryKey: ["feeds"],
     queryFn: () => api.feeds.list(),
+    refetchInterval: 30_000,
   });
 
   const allKnownTags = useMemo(() => {

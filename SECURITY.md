@@ -15,7 +15,10 @@ version receives security fixes.
 `FeedCourier` is a self-hosted feed delivery gateway that fetches untrusted
 external feeds, web pages, and media streams, stores encrypted delivery
 credentials in SQLite, and exposes an administrative WebUI, REST API, and
-Streamable HTTP MCP server (`/mcp`). Security-relevant issues include:
+Streamable HTTP MCP server (`/mcp`). For a detailed breakdown of the security
+architecture and trust boundaries, see
+[Security & Isolation](https://feedcourier.ellery.me/reference/security).
+Security-relevant issues include:
 
 - **Outbound SSRF & Redirect Re-Validation (`src/net/ssrf.rs`)**: Bypasses of
   connect-time DNS IP validation (including DNS rebinding, IPv4-mapped IPv6

@@ -17,7 +17,7 @@ concurrency:
 jobs:
   web:
     name: WebUI (TypeScript & Vite)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -44,7 +44,7 @@ jobs:
         run: pnpm --dir web build
 
       - name: Upload compiled WebUI dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -52,7 +52,7 @@ jobs:
 
   rust:
     name: Rust Gateway (fmt, clippy, test, release)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: web
     steps:
       - name: Checkout repository
@@ -89,7 +89,7 @@ jobs:
 
   license-audit:
     name: License & Supply-Chain Audit (cargo-deny)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -102,7 +102,7 @@ jobs:
 
   docs:
     name: Docs Site (VitePress & Links)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -123,11 +123,17 @@ jobs:
         run: pnpm --dir docs install --frozen-lockfile
 
       - name: Build VitePress documentation site
-        run: pnpm --dir docs build
+        run: |
+          pnpm --dir docs build
+          test -s docs/.vitepress/dist/llms.txt
+          test -s docs/.vitepress/dist/llms-full.txt
+          test -s docs/.vitepress/dist/feed.xml
+          test -s docs/.vitepress/dist/atom.xml
+          test -s docs/.vitepress/dist/_headers
 
   docker-web-stage:
     name: Dockerfile & Entrypoint Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

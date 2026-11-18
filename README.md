@@ -14,7 +14,7 @@
   [![Docker Hub](https://img.shields.io/docker/v/elleryhe/feedcourier?sort=semver&label=Docker%20Hub)](https://hub.docker.com/r/elleryhe/feedcourier)
   [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](./LICENSE)
 
-  **English** | [简体中文](./README.zh-CN.md) | [Documentation](https://feedcourier.ellery.me)
+  **English** | [简体中文](./README.zh-CN.md) | [Documentation](https://feedcourier.ellery.me) | [Release RSS](https://feedcourier.ellery.me/feed.xml)
 </div>
 
 ---
@@ -51,7 +51,7 @@ docker run -d \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
   elleryhe/feedcourier:latest
-  # Or pin an exact release: elleryhe/feedcourier:0.1.4
+  # Or pin an exact release: elleryhe/feedcourier:0.1.5
 ```
 
 ### Docker Compose
@@ -59,7 +59,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.4
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.5
     container_name: feedcourier
     restart: unless-stopped
     ports:

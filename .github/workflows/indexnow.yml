@@ -1,0 +1,152 @@
+name: IndexNow
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "CHANGELOG.md"
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "URLs to submit to IndexNow ('changed' for last commit diff, 'all' for full sitemap)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - changed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: indexnow-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    name: Submit Updated Docs URLs to IndexNow
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Resolve changed documentation URLs and submit to IndexNow
+        env:
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          DISPATCH_SCOPE: ${{ inputs.scope || 'changed' }}
+          SITE_HOST: "feedcourier.ellery.me"
+          SITE_ORIGIN: "https://feedcourier.ellery.me"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${INDEXNOW_KEY}" ]]; then
+            echo "::notice::INDEXNOW_KEY secret is not configured; skipping IndexNow URL submission."
+            exit 0
+          fi
+
+          KEY_URL="${SITE_ORIGIN}/${INDEXNOW_KEY}.txt"
+
+          # Determine whether to submit all URLs (workflow_dispatch 'all' or global VitePress config changes)
+          # or only the markdown pages modified in this push.
+          SUBMIT_ALL="false"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && "${DISPATCH_SCOPE}" == "all" ]]; then
+            SUBMIT_ALL="true"
+          elif [[ -z "${BEFORE_SHA}" || "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+            SUBMIT_ALL="true"
+          fi
+
+          CHANGED_FILES=""
+          if [[ "${SUBMIT_ALL}" == "false" ]] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            CHANGED_FILES="$(git diff --name-only "${BEFORE_SHA}" "${AFTER_SHA}" -- 'docs/**' 'CHANGELOG.md')"
+            if printf '%s\n' "${CHANGED_FILES}" | grep -Eq '^docs/(\.vitepress/|public/)'; then
+              SUBMIT_ALL="true"
+            fi
+          else
+            SUBMIT_ALL="true"
+          fi
+
+          URLS_FILE="$(mktemp)"
+          if [[ "${SUBMIT_ALL}" == "false" ]]; then
+            while IFS= read -r file; do
+              [[ -z "${file}" ]] && continue
+              if [[ "${file}" == "CHANGELOG.md" ]]; then
+                echo "${SITE_ORIGIN}/feed.xml" >> "${URLS_FILE}"
+                echo "${SITE_ORIGIN}/atom.xml" >> "${URLS_FILE}"
+              elif [[ "${file}" == docs/*.md ]]; then
+                rel="${file#docs/}"
+                rel="${rel%.md}"
+                if [[ "${rel}" == "404" || "${rel}" == "zh/404" ]]; then
+                  continue
+                elif [[ "${rel}" == "index" ]]; then
+                  echo "${SITE_ORIGIN}/" >> "${URLS_FILE}"
+                elif [[ "${rel}" == "zh/index" ]]; then
+                  echo "${SITE_ORIGIN}/zh/" >> "${URLS_FILE}"
+                else
+                  echo "${SITE_ORIGIN}/${rel}" >> "${URLS_FILE}"
+                fi
+              fi
+            done <<< "${CHANGED_FILES}"
+          fi
+
+          # Wait up to 90s for Cloudflare Workers Builds to finish deploying the key file / updated docs
+          echo "Verifying live IndexNow key file at ${KEY_URL} ..."
+          KEY_READY="false"
+          for attempt in $(seq 1 18); do
+            LIVE_KEY="$(curl -fsSL --max-time 10 "${KEY_URL}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ "${LIVE_KEY}" == "${INDEXNOW_KEY}" ]]; then
+              KEY_READY="true"
+              break
+            fi
+            sleep 5
+          done
+
+          if [[ "${KEY_READY}" != "true" ]]; then
+            echo "::warning::IndexNow key file ${KEY_URL} is not yet reachable or does not match INDEXNOW_KEY (ensure INDEXNOW_KEY is also set in Cloudflare Worker build variables)."
+            exit 0
+          fi
+
+          if [[ "${SUBMIT_ALL}" == "true" ]]; then
+            curl -fsSL --max-time 15 "${SITE_ORIGIN}/sitemap.xml" \
+              | grep -Eo 'https://feedcourier\.ellery\.me[^<]+' \
+              >> "${URLS_FILE}" || true
+            echo "${SITE_ORIGIN}/llms.txt" >> "${URLS_FILE}"
+            echo "${SITE_ORIGIN}/llms-full.txt" >> "${URLS_FILE}"
+            echo "${SITE_ORIGIN}/feed.xml" >> "${URLS_FILE}"
+            echo "${SITE_ORIGIN}/atom.xml" >> "${URLS_FILE}"
+          fi
+
+          sort -u "${URLS_FILE}" -o "${URLS_FILE}"
+          if [[ ! -s "${URLS_FILE}" ]]; then
+            echo "No indexable documentation URLs changed in this commit; nothing to submit."
+            exit 0
+          fi
+
+          echo "Submitting $(wc -l < "${URLS_FILE}" | tr -d ' ') URL(s) to IndexNow:"
+          cat "${URLS_FILE}"
+
+          PAYLOAD="$(jq -Rn \
+            --arg host "${SITE_HOST}" \
+            --arg key "${INDEXNOW_KEY}" \
+            --arg keyLocation "${KEY_URL}" \
+            --slurpfile urls <(jq -R . < "${URLS_FILE}") \
+            '{host: $host, key: $key, keyLocation: $keyLocation, urlList: $urls}')"
+
+          HTTP_CODE="$(curl -sS -o /tmp/indexnow_resp.txt -w '%{http_code}' \
+            -X POST "https://api.indexnow.org/indexnow" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "${PAYLOAD}")"
+
+          echo "IndexNow HTTP status: ${HTTP_CODE}"
+          if [[ "${HTTP_CODE}" != "200" && "${HTTP_CODE}" != "202" ]]; then
+            cat /tmp/indexnow_resp.txt || true
+            echo "::warning::IndexNow API returned unexpected HTTP ${HTTP_CODE}"
+          fi
