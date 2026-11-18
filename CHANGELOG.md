@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-18
+
 ### Added
 
 - **Feed Debug Push (`POST /api/v1/feeds/preview/push`, WebUI preview modal, MCP `test_push_feed_entry`)**: send the latest (or any previewed) live item of a subscribed or ad-hoc feed straight to a chosen channel with a chosen Telegram mode and delivery language. Stateless — no fingerprints, queue tasks, or quota usage; Notion pages use a `test-` prefixed `FC-ID`, so the same item can be re-pushed while tuning.
@@ -170,7 +172,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Encrypted Credential Vault & Scoped Auth**: Channel credentials are encrypted at rest with `ChaCha20-Poly1305` AEAD (`master.key`, `0600`); WebUI administrator passwords use `Argon2id` PHC hashing with `HttpOnly` session cookies (`fc_session`); and `/mcp` Bearer tokens are stored exclusively as `SHA-256` hashes.
 - **MCP Trust Boundaries & Untrusted Content Framing**: Channel secrets and recipient targets (email addresses, `chat_id`, `data_source_id`) are strictly locked to the WebUI and opaque to `/mcp` tools, while untrusted external feed text surfaced to AI agents is sanitized, truncated, and isolated inside `<untrusted_feed_content>` XML boundary tags (`src/mcp/sanitize.rs`), complemented by `ammonia` HTML sanitization across ingest and delivery pipelines.
 
-[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.2...v0.1.3

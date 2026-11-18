@@ -52,7 +52,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
-  # Or pin an exact release: elleryhe/feedcourier:0.1.5
+  # Or pin an exact release: elleryhe/feedcourier:0.1.6
 ```
 
 ### Docker Compose
@@ -60,7 +60,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.5
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.6
     container_name: feedcourier
     restart: unless-stopped
     ports:

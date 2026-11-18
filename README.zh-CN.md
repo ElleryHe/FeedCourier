@@ -52,7 +52,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   -e TZ=Asia/Shanghai \
   elleryhe/feedcourier:latest
-  # 或锁定精确版本：elleryhe/feedcourier:0.1.5
+  # 或锁定精确版本：elleryhe/feedcourier:0.1.6
 ```
 
 ### Docker Compose
@@ -60,7 +60,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.5
+    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.6
     container_name: feedcourier
     restart: unless-stopped
     ports:

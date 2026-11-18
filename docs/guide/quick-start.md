@@ -21,7 +21,7 @@ docker run -d \
   -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
   # Or pin a specific release version:
-  # elleryhe/feedcourier:0.1.5
+  # elleryhe/feedcourier:0.1.6
 ```
 
 Once the container starts:
@@ -39,7 +39,7 @@ Create a `docker-compose.yml` file:
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.5
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.6
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -75,7 +75,7 @@ curl -s http://127.0.0.1:8080/api/v1/health
 {
   "status": "ok",
   "app": "FeedCourier",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "license": "AGPL-3.0",
   "repo_url": "https://github.com/ElleryHe/FeedCourier"
 }
@@ -98,7 +98,7 @@ Download, verify, and run:
 
 ```bash
 # Example for Linux x86_64 (replace VERSION as appropriate)
-VERSION="0.1.5"
+VERSION="0.1.6"
 TARGET="x86_64-unknown-linux-gnu"
 
 curl -LO "https://github.com/ElleryHe/FeedCourier/releases/download/v${VERSION}/feedcourier-${VERSION}-${TARGET}.tar.gz"
