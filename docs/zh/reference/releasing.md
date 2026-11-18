@@ -48,8 +48,8 @@ flowchart LR
 - 分别在对应运行器上编译并 `strip` 符号表，打包包含 `feedcourier` 单文件二进制、`LICENSE`、`README.md` 与 `README.zh-CN.md` 的四个 `.tar.gz` 归档包：
   - `feedcourier-<version>-x86_64-unknown-linux-gnu.tar.gz`（`ubuntu-24.04`）
   - `feedcourier-<version>-aarch64-unknown-linux-gnu.tar.gz`（`ubuntu-24.04-arm`）
-  - `feedcourier-<version>-aarch64-apple-darwin.tar.gz`（`macos-latest`）
-  - `feedcourier-<version>-x86_64-apple-darwin.tar.gz`（`macos-latest`）
+  - `feedcourier-<version>-aarch64-apple-darwin.tar.gz`（`macos-15`，`MACOSX_DEPLOYMENT_TARGET=11.0`）
+  - `feedcourier-<version>-x86_64-apple-darwin.tar.gz`（`macos-15`，`MACOSX_DEPLOYMENT_TARGET=11.0`）
 
 ### 第二步：Docker Hub 原生双架构镜像并行构建与合并推送
 - `docker-build` 矩阵任务分别在原生 `ubuntu-24.04`（`linux/amd64`）与 `ubuntu-24.04-arm`（`linux/arm64`）运行器上并行编译镜像（无需 QEMU 指令模拟，按架构独立缓存 Cargo 外部依赖层），并按不可变摘要（`push-by-digest`）推送分片；随后由 `docker` 任务调用 `docker buildx imagetools create` 合并生成统一的多架构 Manifest 并发布至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
