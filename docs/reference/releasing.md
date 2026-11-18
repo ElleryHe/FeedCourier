@@ -51,8 +51,8 @@ flowchart LR
 
 - `x86_64-unknown-linux-gnu` (built on `ubuntu-24.04`)
 - `aarch64-unknown-linux-gnu` (built on `ubuntu-24.04-arm`)
-- `aarch64-apple-darwin` (built on `macos-15`, `MACOSX_DEPLOYMENT_TARGET=11.0`)
-- `x86_64-apple-darwin` (built on `macos-15`, `MACOSX_DEPLOYMENT_TARGET=11.0`)
+- `aarch64-apple-darwin` (built on `macos-15-intel`, `MACOSX_DEPLOYMENT_TARGET=11.0`)
+- `x86_64-apple-darwin` (built on `macos-15-intel`, `MACOSX_DEPLOYMENT_TARGET=11.0`)
 
 Once all four `.tar.gz` archives and the multi-arch Docker Hub manifest succeed, the `release` job creates and pushes the annotated Git tag `v<version>` onto the `main` commit, generates `SHA256SUMS.txt`, extracts the matching `CHANGELOG.md` section, and publishes the **GitHub Release** (automatically marking `-rc`, `-beta`, or `-alpha` versions as pre-releases).
 

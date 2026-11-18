@@ -232,7 +232,7 @@ jobs:
       - prepare
       - web-dist
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -251,7 +251,7 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: apple-darwin
+          key: apple-darwin-${{ runner.arch }}
 
       - name: Build, strip, and package macOS release archives
         shell: bash
