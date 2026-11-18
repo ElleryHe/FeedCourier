@@ -573,7 +573,7 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
         "readonly token last_used_at must be touched on authenticated request"
     );
 
-    // Verify `tools/list` exposes all 7 tools with valid JSON object schemas.
+    // Verify `tools/list` exposes all 9 tools with valid JSON object schemas.
     let tools = ro_client.list_tools().await;
     let mut tool_names: Vec<String> = tools
         .iter()
@@ -593,9 +593,11 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
             "inspect_failed_deliveries",
             "list_feeds_status",
             "manage_feed",
+            "manage_outbox_queue",
             "preview_feed_latest",
             "reset_and_poll_feed",
             "retry_dead_tasks",
+            "test_push_feed_entry",
         ]
     );
 
@@ -990,6 +992,80 @@ async fn mcp_admin_token_orchestration_and_ops_persist_and_notify() {
     );
     assert!(updated_route.options().link_preview);
 
+    // Route language + delivery windows round-trip through `configure_route`.
+    let schedule_res = admin_client
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "update",
+                "route_id": route_id,
+                "locale": "zh-CN",
+                "active_windows": [{ "start": "22:00", "end": "06:00" }],
+                "active_weekdays": [1, 2, 3]
+            }),
+        )
+        .await;
+    assert_eq!(
+        schedule_res["isError"], false,
+        "configure_route schedule failed: {schedule_res}"
+    );
+    let scheduled = harness
+        .db
+        .get_route(route_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .options();
+    assert_eq!(
+        scheduled.locale,
+        Some(feedcourier::db::models::AppLocale::ZhCn)
+    );
+    assert_eq!(scheduled.active_windows.len(), 1);
+    assert_eq!(scheduled.active_weekdays, vec![1, 2, 3]);
+    // Presentation options survive a schedule-only update.
+    assert_eq!(scheduled.telegram_mode, TelegramDeliveryMode::RichMessage);
+
+    let bad_window_res = admin_client
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "update",
+                "route_id": route_id,
+                "active_windows": [{ "start": "9am", "end": "17:00" }]
+            }),
+        )
+        .await;
+    assert_eq!(bad_window_res["isError"], true);
+
+    // Global outbox queue control.
+    let pause_queue = admin_client
+        .call_tool(
+            "manage_outbox_queue",
+            json!({ "action": "pause", "resume_in_minutes": 30 }),
+        )
+        .await;
+    assert_eq!(pause_queue["isError"], false, "{pause_queue}");
+    let paused_payload = extract_tool_payload(&pause_queue);
+    assert_eq!(paused_payload["paused"], true);
+    assert!(paused_payload["resume_at"].is_i64());
+    let status_queue = admin_client
+        .call_tool("manage_outbox_queue", json!({ "action": "status" }))
+        .await;
+    assert_eq!(extract_tool_payload(&status_queue)["paused"], true);
+    let resume_queue = admin_client
+        .call_tool("manage_outbox_queue", json!({ "action": "resume" }))
+        .await;
+    assert_eq!(extract_tool_payload(&resume_queue)["paused"], false);
+
+    // `clear_cache` on an unknown feed is a clean `not_found`.
+    let clear_missing = admin_client
+        .call_tool(
+            "manage_feed",
+            json!({ "action": "clear_cache", "feed_id": 987_654 }),
+        )
+        .await;
+    assert_eq!(clear_missing["isError"], true);
+    assert_eq!(extract_tool_payload(&clear_missing)["error"], "not_found");
     // 3. `reset_and_poll_feed`: trip feed to `circuit_open`, publish new RSS item, reset & poll!
     harness
         .db

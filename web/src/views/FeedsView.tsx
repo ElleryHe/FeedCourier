@@ -3,6 +3,7 @@ import {
   BookOpen,
   Check,
   Download,
+  Eraser,
   ExternalLink,
   Eye,
   FileCode2,
@@ -15,6 +16,7 @@ import {
   RefreshCw,
   Rss,
   Search,
+  Send,
   ShieldAlert,
   Trash2,
   Upload,
@@ -28,6 +30,8 @@ import type {
   FeedDto,
   FeedHealthStatus,
   FeedPreviewResponse,
+  SystemLocale,
+  TelegramDeliveryMode,
   UpdateFeedRequest,
 } from "@/api/types";
 import {
@@ -42,12 +46,13 @@ import {
   Input,
   Label,
   Modal,
+  Select,
   Switch,
   TagInput,
   Textarea,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
-import { useI18n } from "@/i18n";
+import { type Locale, useI18n } from "@/i18n";
 import type { Messages } from "@/i18n/en";
 import {
   errorMessage,
@@ -109,6 +114,8 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
   const [previewInitialReadability, setPreviewInitialReadability] =
     useState(false);
   const [previewInitialProxy, setPreviewInitialProxy] = useState(false);
+  const [previewFeedId, setPreviewFeedId] = useState<number | null>(null);
+  const [clearingFeed, setClearingFeed] = useState<FeedDto | null>(null);
   const [pollingFeedId, setPollingFeedId] = useState<number | null>(null);
 
   const feedsQuery = useQuery({
@@ -189,6 +196,30 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
     },
   });
 
+  const clearCacheMutation = useMutation({
+    mutationFn: ({ id, pollNow }: { id: number; pollNow: boolean }) =>
+      api.feeds.clearCache(id, { poll_now: pollNow }),
+    onSuccess: (res) => {
+      toast.success(
+        m.feeds.clearCache.toastDoneTitle,
+        res.poll
+          ? m.feeds.clearCache.toastDoneDescPolled(
+              res.deleted_entries,
+              res.poll.new_entries,
+              res.poll.enqueued_tasks,
+            )
+          : m.feeds.clearCache.toastDoneDesc(res.deleted_entries),
+      );
+      setClearingFeed(null);
+      void queryClient.invalidateQueries({ queryKey: ["feeds"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: (err) => {
+      toast.error(m.feeds.clearCache.toastFailed, errorMessage(err));
+    },
+  });
+
   const exportOpmlMutation = useMutation({
     mutationFn: () => api.feeds.exportOpml(),
     onSuccess: (filename) => {
@@ -224,7 +255,9 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
     url: string;
     fetch_full_content: boolean;
     use_proxy: boolean;
+    feed_id?: number;
   }) => {
+    setPreviewFeedId(feed?.feed_id ?? null);
     setPreviewInitialUrl(feed?.url ?? "");
     setPreviewInitialReadability(feed?.fetch_full_content ?? false);
     setPreviewInitialProxy(feed?.use_proxy ?? false);
@@ -489,6 +522,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                           url: feed.url,
                           fetch_full_content: feed.fetch_full_content,
                           use_proxy: feed.use_proxy,
+                          feed_id: feed.id,
                         })
                       }
                       title={m.feeds.previewButtonTitle}
@@ -524,6 +558,16 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                       ) : (
                         <Pause className="h-4 w-4" />
                       )}
+                    </Button>
+
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setClearingFeed(feed)}
+                      title={m.feeds.clearCache.buttonTitle}
+                      aria-label={m.feeds.clearCache.buttonTitle}
+                    >
+                      <Eraser className="h-4 w-4" />
                     </Button>
 
                     <Button
@@ -582,10 +626,23 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
           initialUrl={previewInitialUrl}
           initialFetchFullContent={previewInitialReadability}
           initialUseProxy={previewInitialProxy}
+          feedId={previewFeedId}
           onSubscribe={(settings) => {
             setPreviewOpen(false);
             openCreateModal(settings);
           }}
+        />
+      )}
+
+      {/* Clear Cache Dialog */}
+      {clearingFeed && (
+        <ClearCacheDialog
+          feed={clearingFeed}
+          loading={clearCacheMutation.isPending}
+          onClose={() => setClearingFeed(null)}
+          onConfirm={(pollNow) =>
+            clearCacheMutation.mutate({ id: clearingFeed.id, pollNow })
+          }
         />
       )}
 
@@ -637,6 +694,7 @@ function FeedEditorModal({
     url: string;
     fetch_full_content: boolean;
     use_proxy: boolean;
+    feed_id?: number;
   }) => void;
 }) {
   const { m } = useI18n();
@@ -729,6 +787,8 @@ function FeedEditorModal({
                   url: url.trim(),
                   fetch_full_content: fetchFullContent,
                   use_proxy: useProxy,
+                  feed_id:
+                    feed && feed.url === url.trim() ? feed.id : undefined,
                 })
               }
               className="mr-auto"
@@ -860,6 +920,63 @@ function FeedEditorModal({
 }
 
 // ---------------------------------------------------------------------------
+// Sub-component: Clear Cache Dialog (`POST /api/v1/feeds/:id/clear-cache`)
+// ---------------------------------------------------------------------------
+
+function ClearCacheDialog({
+  feed,
+  loading,
+  onClose,
+  onConfirm,
+}: {
+  feed: FeedDto;
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: (pollNow: boolean) => void;
+}) {
+  const { m } = useI18n();
+  const [pollNow, setPollNow] = useState(true);
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={m.feeds.clearCache.title}
+      size="sm"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose} disabled={loading}>
+            {m.common.cancel}
+          </Button>
+          <Button
+            variant="destructive"
+            onClick={() => onConfirm(pollNow)}
+            loading={loading}
+          >
+            {m.feeds.clearCache.confirm}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <p className="text-sm leading-relaxed text-zinc-600 dark:text-zinc-300">
+          {m.feeds.clearCache.desc(feed.title || feed.url)}
+        </p>
+        <div className="rounded-lg border border-zinc-200/80 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-950/60">
+          <Switch
+            id="clear-cache-poll-now"
+            checked={pollNow}
+            onCheckedChange={setPollNow}
+            label={m.feeds.clearCache.pollNowLabel}
+            description={m.feeds.clearCache.pollNowDesc}
+          />
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sub-component: Live Feed & Filter Preview Modal (`POST /api/v1/feeds/preview`)
 // ---------------------------------------------------------------------------
 
@@ -869,6 +986,7 @@ function FeedPreviewModal({
   initialUrl,
   initialFetchFullContent,
   initialUseProxy,
+  feedId,
   onSubscribe,
 }: {
   open: boolean;
@@ -876,13 +994,16 @@ function FeedPreviewModal({
   initialUrl: string;
   initialFetchFullContent: boolean;
   initialUseProxy: boolean;
+  /** Set when opened from an already-subscribed feed. */
+  feedId: number | null;
   onSubscribe: (settings: {
     url: string;
     fetch_full_content: boolean;
     use_proxy: boolean;
   }) => void;
 }) {
-  const { m } = useI18n();
+  const { m, locale: uiLocale } = useI18n();
+  const toast = useToast();
   const [url, setUrl] = useState(initialUrl);
   const [fetchFullContent, setFetchFullContent] = useState(
     initialFetchFullContent,
@@ -897,6 +1018,73 @@ function FeedPreviewModal({
   const [expandedFingerprint, setExpandedFingerprint] = useState<string | null>(
     null,
   );
+
+  // --- Debug push (`POST /api/v1/feeds/preview/push`) ---
+  const channelsQuery = useQuery({
+    queryKey: ["channels"],
+    queryFn: () => api.channels.list(),
+  });
+  const channels = channelsQuery.data ?? [];
+  const [pushChannelId, setPushChannelId] = useState<number | null>(null);
+  const [pushMode, setPushMode] =
+    useState<TelegramDeliveryMode>("rich_message");
+  const [pushLinkPreview, setPushLinkPreview] = useState(true);
+  const [pushLocale, setPushLocale] = useState<Locale>(uiLocale);
+  const [pushingKey, setPushingKey] = useState<string | null>(null);
+  const [pushResult, setPushResult] = useState<{
+    ok: boolean;
+    message: string;
+    title: string;
+  } | null>(null);
+
+  const activeChannelId = pushChannelId ?? channels[0]?.id ?? null;
+  const activeChannel = channels.find((c) => c.id === activeChannelId);
+
+  const pushMutation = useMutation({
+    mutationFn: ({ fingerprint }: { fingerprint?: string; key: string }) => {
+      if (activeChannelId === null) {
+        throw new Error(m.feeds.preview.debugNoChannel);
+      }
+      const locale: SystemLocale = pushLocale;
+      return api.feeds.previewPush({
+        url: url.trim(),
+        feed_id: feedId ?? undefined,
+        fingerprint_sha256: fingerprint,
+        fetch_full_content: fetchFullContent,
+        use_proxy: useProxy,
+        channel_id: activeChannelId,
+        options:
+          activeChannel?.kind === "telegram"
+            ? {
+                telegram_mode: pushMode,
+                link_preview:
+                  pushMode === "compact_card" ? pushLinkPreview : undefined,
+                locale,
+              }
+            : { locale },
+      });
+    },
+    onMutate: ({ key }) => {
+      setPushingKey(key);
+      setPushResult(null);
+    },
+    onSuccess: (res) => {
+      setPushResult({
+        ok: res.ok,
+        message: res.message,
+        title: res.entry_title,
+      });
+      if (res.ok) {
+        toast.success(m.feeds.preview.debugPushedTitle, res.entry_title);
+      } else {
+        toast.error(m.feeds.preview.debugFailedTitle, res.message);
+      }
+    },
+    onError: (err) => {
+      setPushResult({ ok: false, message: errorMessage(err), title: "" });
+    },
+    onSettled: () => setPushingKey(null),
+  });
 
   const previewMutation = useMutation({
     mutationFn: () => {
@@ -958,7 +1146,7 @@ function FeedPreviewModal({
           <Button variant="outline" onClick={onClose}>
             {m.common.close}
           </Button>
-          {isValidHttpUrl(url) && (
+          {isValidHttpUrl(url) && feedId === null && (
             <Button
               onClick={() =>
                 onSubscribe({
@@ -1089,6 +1277,136 @@ function FeedPreviewModal({
           />
         </form>
 
+        {/* Debug Push Bar */}
+        {isValidHttpUrl(url) && (
+          <div className="space-y-3 rounded-lg border border-sky-200/80 bg-sky-50/40 p-3.5 dark:border-sky-900/50 dark:bg-sky-950/20">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-sky-800 dark:text-sky-200">
+                <Send className="h-3.5 w-3.5" />
+                {m.feeds.preview.debugTitle}
+              </div>
+              <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                {m.feeds.preview.debugHint}
+              </span>
+            </div>
+
+            {channels.length === 0 ? (
+              <p className="text-xs text-zinc-500">
+                {m.feeds.preview.debugNoChannel}
+              </p>
+            ) : (
+              <>
+                <div className="grid gap-2.5 sm:grid-cols-3">
+                  <div>
+                    <Label htmlFor="debug-push-channel">
+                      {m.feeds.preview.debugChannel}
+                    </Label>
+                    <Select
+                      id="debug-push-channel"
+                      value={activeChannelId ?? ""}
+                      onChange={(e) => setPushChannelId(Number(e.target.value))}
+                      className="mt-1 h-8 text-xs"
+                    >
+                      {channels.map((ch) => (
+                        <option key={ch.id} value={ch.id}>
+                          {ch.name} ({ch.kind.toUpperCase()})
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div>
+                    <Label htmlFor="debug-push-locale">
+                      {m.feeds.preview.debugLanguage}
+                    </Label>
+                    <Select
+                      id="debug-push-locale"
+                      value={pushLocale}
+                      onChange={(e) => setPushLocale(e.target.value as Locale)}
+                      className="mt-1 h-8 text-xs"
+                    >
+                      <option value="zh-CN">简体中文</option>
+                      <option value="en">English</option>
+                    </Select>
+                  </div>
+                  {activeChannel?.kind === "telegram" && (
+                    <div>
+                      <Label htmlFor="debug-push-mode">
+                        {m.feeds.preview.debugTelegramMode}
+                      </Label>
+                      <Select
+                        id="debug-push-mode"
+                        value={pushMode}
+                        onChange={(e) =>
+                          setPushMode(e.target.value as TelegramDeliveryMode)
+                        }
+                        className="mt-1 h-8 text-xs"
+                      >
+                        <option value="rich_message">
+                          {m.routes.modes.rich_message.label}
+                        </option>
+                        <option value="compact_card">
+                          {m.routes.modes.compact_card.label}
+                        </option>
+                        <option value="media_mode">
+                          {m.routes.modes.media_mode.label}
+                        </option>
+                      </Select>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  {activeChannel?.kind === "telegram" &&
+                  pushMode === "compact_card" ? (
+                    <div className="flex items-center gap-2">
+                      <Switch
+                        id="debug-push-link-preview"
+                        checked={pushLinkPreview}
+                        onCheckedChange={setPushLinkPreview}
+                      />
+                      <label
+                        htmlFor="debug-push-link-preview"
+                        className="cursor-pointer text-xs font-medium"
+                      >
+                        {m.routes.editor.linkPreviewLabel}
+                      </label>
+                    </div>
+                  ) : (
+                    <span />
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => pushMutation.mutate({ key: "latest" })}
+                    loading={pushingKey === "latest"}
+                    disabled={pushMutation.isPending}
+                  >
+                    <Send className="h-3.5 w-3.5" />
+                    {m.feeds.preview.pushLatest}
+                  </Button>
+                </div>
+              </>
+            )}
+
+            {pushResult && (
+              <div
+                className={`rounded-md border px-3 py-2 text-xs ${
+                  pushResult.ok
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-200"
+                    : "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300"
+                }`}
+              >
+                {pushResult.title && (
+                  <div className="font-semibold">{pushResult.title}</div>
+                )}
+                <div className="break-words whitespace-pre-wrap">
+                  {pushResult.message}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {result && (
           <div className="space-y-3 border-t border-zinc-200 pt-3 dark:border-zinc-800">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1179,20 +1497,39 @@ function FeedPreviewModal({
                           </p>
                         )}
                       </div>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() =>
-                          setExpandedFingerprint(
-                            expanded ? null : item.fingerprint_sha256,
-                          )
-                        }
-                      >
-                        <FileCode2 className="h-3.5 w-3.5" />
-                        {expanded
-                          ? m.feeds.preview.collapse
-                          : m.feeds.preview.body}
-                      </Button>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {channels.length > 0 && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() =>
+                              pushMutation.mutate({
+                                key: item.fingerprint_sha256,
+                                fingerprint: item.fingerprint_sha256,
+                              })
+                            }
+                            loading={pushingKey === item.fingerprint_sha256}
+                            disabled={pushMutation.isPending}
+                          >
+                            <Send className="h-3.5 w-3.5" />
+                            {m.feeds.preview.pushThisItem}
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            setExpandedFingerprint(
+                              expanded ? null : item.fingerprint_sha256,
+                            )
+                          }
+                        >
+                          <FileCode2 className="h-3.5 w-3.5" />
+                          {expanded
+                            ? m.feeds.preview.collapse
+                            : m.feeds.preview.body}
+                        </Button>
+                      </div>
                     </div>
 
                     {expanded && (

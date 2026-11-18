@@ -4,7 +4,7 @@ description: "Push RSS, Atom, and JSON Feed updates to Telegram private chats, g
 
 # Telegram
 
-The Telegram channel delivers articles to **private chats**, **groups**, **supergroup forum topics**, and **broadcast channels**. Each route pointing to a Telegram channel can independently choose between three presentation modes: **Rich Message**, **Compact Card**, and **Media Mode**.
+The Telegram channel delivers articles to **private chats**, **groups**, **supergroup forum topics**, and **broadcast channels**. Each route pointing to a Telegram channel can independently choose between three presentation modes: **Rich Message**, **Compact Card**, and **Media Mode**, and its own delivery language.
 
 ---
 
@@ -28,7 +28,7 @@ The Telegram channel delivers articles to **private chats**, **groups**, **super
 | `message_thread_id` | No | — | Optional forum topic thread ID for supergroups with Topics enabled. |
 | `api_base_url` | No | `https://api.telegram.org` | Optional custom Bot API server URL (for reverse proxies or self-hosted Local Bot API servers). |
 
-Click **Test** to verify the token, check server capabilities, and send a test message.
+Click **Test** to verify the token, check server capabilities, and send a test message (in your current WebUI language).
 
 ---
 
@@ -56,10 +56,14 @@ Best for photography feeds, comics, illustrations, social updates, podcasts, and
 - **3-Line Caption**: Keeps captions concise with three lines:
   1. **Line 1**: Author name (or feed title if no author is listed).
   2. **Line 2**: The first complete sentence of the article text.
-  3. **Line 3**: Hyperlink labeled **`Link`** (`链接` in Simplified Chinese) pointing to the original article.
+  3. **Line 3**: Hyperlink labeled **`Link`** (`链接` in Simplified Chinese, following the route's delivery language) pointing to the original article.
   *(If an entry has no media attachments, Media Mode sends the same 3-line HTML message.)*
 - **Multi-Item Batching**: When an article contains more than 10 images or videos, FeedCourier automatically splits them into media-group batches of up to **10 items** (attaching the 3-line caption to the first item). If a rate limit occurs mid-way through a multi-batch post, retries resume from the remaining batches without resending earlier ones.
 - **Inline Video Streaming & Hotlink Protection Relay**: Images and audio try direct URL delivery first and automatically fall back to in-memory upload (`<= 10 MiB` for photos, `<= 50 MiB` for audio/video) if the origin site enforces hotlink (`Referer`) checks. Videos and unlabeled `<enclosure>` attachments are streamed directly in memory so FeedCourier can inspect container magic bytes, extract MP4 dimensions (including portrait rotation) and duration, and upload them with `supports_streaming: true` for inline playback inside Telegram without writing temporary files to disk.
+
+::: tip Try a Mode Before Saving
+In the **Feed Preview** modal, the **Debug push** bar sends a real item to a Telegram channel with the chosen mode, link preview, and language, without touching the queue. See [Debug Push](/channels/pacing-and-quotas#debug-push-from-the-feed-preview).
+:::
 
 ---
 

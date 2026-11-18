@@ -22,18 +22,20 @@ use crate::channels::notion::NotionSender;
 use crate::channels::smtp::SmtpSender;
 use crate::channels::telegram::{FetchedMedia, MediaStreamFetcher, TelegramSender};
 use crate::channels::{
-    ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext, DeliveryOutcome,
+    ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
+    DeliveryOutcome, RouteOptions,
 };
 use crate::config::AppConfig;
 use crate::crypto::MasterKey;
 use crate::db::Database;
 use crate::db::models::{
-    AppLocale, Channel, DeliveryTask, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL,
-    SETTING_SSRF_ALLOWLIST, now_unix,
+    AppLocale, Channel, DeliveryTask, DeliveryTaskStatus, Feed, FeedHealthStatus, Route,
+    SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, now_unix,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
+use crate::schedule::{has_schedule, next_allowed_at};
 
 /// Default lease duration in seconds granted when a worker claims a `delivery_tasks` row.
 pub const DEFAULT_TASK_LEASE_SECS: i64 = 120;
@@ -646,6 +648,10 @@ impl DeliveryDispatcher {
     /// `retrying`, or `dead_letter`), or `Ok(false)` when no eligible task is currently due.
     pub async fn process_next_outbox_task(&self) -> AppResult<bool> {
         let now = now_unix();
+        let queue_state = self.inner.db.effective_outbox_queue_state(now).await?;
+        if queue_state.is_blocking(now) {
+            return Ok(false);
+        }
         let Some(task) = self
             .inner
             .db
@@ -751,6 +757,25 @@ impl DeliveryDispatcher {
             return Ok(true);
         }
 
+        // 1b. Route delivery windows (system timezone): defer to the next allowed window start.
+        let route_options = route.options();
+        if has_schedule(&route_options) {
+            let tz = self.inner.db.get_timezone().await;
+            let next_window = next_allowed_at(&route_options, now, tz);
+            if next_window > now {
+                self.inner
+                    .db
+                    .mark_task_deferred(
+                        task.id,
+                        next_window,
+                        existing_checkpoint.as_ref(),
+                        "Route delivery window closed; deferred to the next allowed window",
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        }
+
         // 2. Quota & anti-spam pacing pre-check (`mark_task_deferred` restores `attempt_count`).
         let usage = self
             .inner
@@ -838,7 +863,7 @@ impl DeliveryDispatcher {
             entry: &entry,
             feed: &feed,
             route: &route,
-            route_options: route.options(),
+            route_options,
             channel: &channel,
             channel_config: &channel_config,
             checkpoint: existing_checkpoint.clone(),
@@ -867,6 +892,139 @@ impl DeliveryDispatcher {
         }
 
         Ok(true)
+    }
+
+    /// Stateless debug push: fetch the live feed item, render it for `params.channel_id` with the
+    /// requested route options and send it immediately through the channel adapter. Nothing is
+    /// persisted (no entries, fingerprints, tasks or quota usage); Notion pages carry a
+    /// `test-` prefixed `FC-ID`.
+    pub async fn debug_push(&self, params: DebugPushParams) -> AppResult<DebugPushResult> {
+        let channel = self
+            .inner
+            .db
+            .get_channel(params.channel_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("channel {} not found", params.channel_id))
+            })?;
+        let channel_config: ChannelConfig = self
+            .inner
+            .master_key
+            .decrypt_json(&channel.encrypted_config)?;
+
+        let debug = self
+            .inner
+            .ingest
+            .build_debug_entry(
+                &params.url,
+                params.fetch_full_content,
+                params.use_proxy,
+                params.fingerprint.as_deref(),
+            )
+            .await?;
+
+        let now = now_unix();
+        let feed = match params.feed_id {
+            Some(fid) => self
+                .inner
+                .db
+                .get_feed(fid)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("feed {fid} not found")))?,
+            None => Feed {
+                id: 0,
+                url: params.url.clone(),
+                title: debug.feed_title.clone().unwrap_or_default(),
+                site_url: debug.site_url.clone(),
+                favicon_url: debug.favicon_url.clone(),
+                tags_json: "[]".to_string(),
+                poll_interval_secs: 1800,
+                fetch_full_content: params.fetch_full_content,
+                use_proxy: params.use_proxy,
+                etag: None,
+                last_modified: None,
+                health_status: FeedHealthStatus::Active,
+                consecutive_failures: 0,
+                next_poll_at: None,
+                last_error: None,
+                silent_init: false,
+                created_at: now,
+                updated_at: now,
+            },
+        };
+
+        let mut entry = debug.entry;
+        entry.feed_id = feed.id;
+
+        let route = Route {
+            id: 0,
+            name: "Debug push".to_string(),
+            feed_ids_json: "[]".to_string(),
+            match_tags_json: "[]".to_string(),
+            channel_id: channel.id,
+            include_keywords_json: "[]".to_string(),
+            exclude_keywords_json: "[]".to_string(),
+            include_regex: None,
+            exclude_regex: None,
+            options_json: serde_json::to_string(&params.options)?,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let task = DeliveryTask {
+            id: 0,
+            route_id: 0,
+            channel_id: channel.id,
+            entry_id: 0,
+            status: DeliveryTaskStatus::Delivering,
+            lease_until: None,
+            checkpoint_json: None,
+            attempt_count: 1,
+            next_attempt_at: now,
+            last_status_code: None,
+            diagnostic_log: None,
+            completed_at: None,
+            created_at: now,
+        };
+        let ctx = DeliveryContext {
+            task: &task,
+            entry: &entry,
+            feed: &feed,
+            route: &route,
+            route_options: params.options.clone(),
+            channel: &channel,
+            channel_config: &channel_config,
+            checkpoint: None,
+            checkpoint_sink: None,
+        };
+
+        let send_result = match channel.kind {
+            ChannelKind::Smtp => self.inner.smtp_sender.send(&ctx).await,
+            ChannelKind::Telegram => self.telegram_sender().send(&ctx).await,
+            ChannelKind::Notion => self.inner.notion_sender.send(&ctx).await,
+        };
+
+        let entry_title = entry
+            .title
+            .clone()
+            .or_else(|| entry.first_sentence.clone())
+            .unwrap_or_else(|| "(Untitled)".to_string());
+        let (ok, message) = match send_result {
+            Ok(DeliveryOutcome::Delivered { diagnostic, .. }) => {
+                (true, diagnostic.unwrap_or_else(|| "Delivered".to_string()))
+            }
+            Ok(DeliveryOutcome::Retry { diagnostic, .. })
+            | Ok(DeliveryOutcome::Deferred { diagnostic, .. })
+            | Ok(DeliveryOutcome::PermanentFailure { diagnostic, .. }) => (false, diagnostic),
+            Err(err) => (false, err.to_string()),
+        };
+
+        Ok(DebugPushResult {
+            ok,
+            message,
+            entry_title,
+            entry_url: entry.canonical_url.clone(),
+        })
     }
 
     /// Drain up to `max_tasks` currently due outbox tasks sequentially.
@@ -1299,6 +1457,27 @@ impl DeliveryDispatcher {
         }
         Ok(())
     }
+}
+
+/// Input of [`DeliveryDispatcher::debug_push`].
+#[derive(Debug, Clone)]
+pub struct DebugPushParams {
+    pub channel_id: i64,
+    pub url: String,
+    pub feed_id: Option<i64>,
+    pub fingerprint: Option<String>,
+    pub fetch_full_content: bool,
+    pub use_proxy: bool,
+    pub options: RouteOptions,
+}
+
+/// Outcome of [`DeliveryDispatcher::debug_push`].
+#[derive(Debug, Clone)]
+pub struct DebugPushResult {
+    pub ok: bool,
+    pub message: String,
+    pub entry_title: String,
+    pub entry_url: Option<String>,
 }
 
 /// Handle owning the spawned background scheduler tasks (`poller`, `outbox`, `maintenance`).

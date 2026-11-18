@@ -337,6 +337,7 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
             options: RouteOptions {
                 telegram_mode: TelegramDeliveryMode::MediaMode,
                 link_preview: true,
+                ..RouteOptions::default()
             },
             enabled: true,
         })

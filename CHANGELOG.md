@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Feed Debug Push (`POST /api/v1/feeds/preview/push`, WebUI preview modal, MCP `test_push_feed_entry`)**: send the latest (or any previewed) live item of a subscribed or ad-hoc feed straight to a chosen channel with a chosen Telegram mode and delivery language. Stateless — no fingerprints, queue tasks, or quota usage; Notion pages use a `test-` prefixed `FC-ID`, so the same item can be re-pushed while tuning.
+- **Per-Feed Cache Clearing (`POST /api/v1/feeds/{id}/clear-cache`, MCP `manage_feed` `clear_cache`)**: wipes a feed's entries/fingerprints/history tasks and HTTP validators, and optionally re-polls immediately to queue the full backlog again.
+- **Global Queue Pause & Scheduled Resume (`GET`/`PUT /api/v1/tasks/queue`, MCP `manage_outbox_queue`)**: pause delivery now or until a time/duration while feeds keep polling and tasks accumulate; on resume everything is delivered as one merged chronological stream.
+- **Route Delivery Windows & System Timezone**: routes accept daily `active_windows` (`HH:MM`–`HH:MM`, midnight-wrapping) and `active_weekdays`; outside a window tasks stay queued with `next_attempt_at` set to the next window start. The IANA system timezone is configured via `TIMEZONE`/`TZ` or *Settings* (default `America/Los_Angeles`; the English quick start sets `TZ=America/Los_Angeles`, the Chinese one `TZ=Asia/Shanghai`).
+- **Administrator Username & TOTP Two-Factor Authentication**: the WebUI login now uses a username (default `Courier`, override with `ADMIN_USERNAME`) so password managers autofill correctly. *Settings → Account & Security* adds RFC 6238 TOTP (QR + manual secret, encrypted at rest, replay protection), 10 single-use recovery codes, password/username changes (other sessions are revoked on password change), a two-step login challenge with failure throttling, and `RESET_2FA=true` for emergency recovery.
+- **MCP**: `configure_route` gains `locale`, `active_windows`, `active_weekdays`; `list_feeds_status` reports `timezone` and queue state; two new admin tools `manage_outbox_queue` and `test_push_feed_entry` (9 tools total).
+
+### Changed
+
+- **Chronological Backlog Delivery**: new/backlog items are now stored and enqueued oldest → newest (reverse feed order or explicit `published_at`), and the outbox claims tasks by `COALESCE(published_at, discovered_at)`, so a non-silent new subscription no longer pushes the newest article first and several feeds merge into one ordered stream.
+- **Delivery Language Is Per Route**: `RouteOptions.locale` (default = the WebUI language when the route is created) controls SMTP/Telegram template language; routes created before this release inherit the previous system language. The WebUI language switcher is a browser-local preference again (sidebar bottom-left / mobile top bar) and no longer changes delivery.
+- Channel connectivity tests use the current WebUI language.
+
 ## [0.1.5] - 2026-11-18
 
 ### Added

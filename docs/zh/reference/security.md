@@ -1,5 +1,5 @@
 ---
-description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加密、Argon2id 密码哈希、投递目的地锁定、提示词注入隔离与连接层防 SSRF。"
+description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加密、Argon2id 密码哈希、TOTP 两步验证与恢复码、投递目的地锁定、提示词注入隔离与连接层防 SSRF。"
 ---
 
 # 安全与防注入机制
@@ -26,11 +26,22 @@ description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加
 
 ### 3. 口令与令牌哈希存储
 SQLite 数据库中不存储任何明文登录口令、会话 Cookie 或 MCP 令牌：
-- **管理员口令**：使用 **Argon2id**（v19，随机盐）哈希为 PHC 字符串，存储于 `system_settings` 表（`key = 'admin_password_hash'`）；
+- **管理员账号**：用户名存储于 `system_settings` 表（`key = 'admin_username'`，默认 `Courier`，未登录的端点绝不返回），口令使用 **Argon2id**（v19，随机盐）哈希为 PHC 字符串（`key = 'admin_password_hash'`）。环境变量 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 会在每次启动时覆盖二者；
 - **WebUI 会话（`fc_session`）**：下发 `HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000` Cookie，`sessions` 表仅存储令牌的 64 位 SHA-256 十六进制摘要；
 - **MCP Bearer 令牌（`fc_mcp_...`）**：签发时仅在响应中返回一次明文，`mcp_tokens` 表仅持久化 SHA-256 摘要（`token_hash`）与前 15 字符辨识前缀（`token_prefix`）。
 
-### 4. WebUI REST API 与 `/mcp` 的分级脱敏对比
+### 4. 两步验证（TOTP）与恢复码（`src/totp.rs`、`src/api/auth.rs`）
+
+WebUI 管理员可选启用第二重验证（在 **Settings → 账号与安全** 中管理，对应 `/api/v1/account/*`）：
+- **TOTP**：遵循 RFC 6238（HMAC-SHA1、6 位数字、30 秒步长），使用 20 字节随机密钥（以 Base32 展示），并提供 `otpauth://` 链接与内联 SVG 二维码。启用 2FA 需要提供当前口令，并先保存一个*待确认*密钥（`admin_totp_pending`），只有提交了有效验证码后才会转为生效密钥（`admin_totp_secret`）。生效与待确认密钥均使用与通道凭据相同的 ChaCha20-Poly1305 主密钥加密存储。
+- **重放防护**：记录最近一次已接受的时间步（`admin_totp_last_step`），同一验证码不可重复使用。
+- **恢复码**：启用 2FA 时生成 10 个一次性恢复码（`XXXX-XXXX-XXXX`），仅展示**一次**。数据库只保存其 SHA-256 哈希（`admin_recovery_hashes`），使用过的恢复码会被移除；重新生成会替换全部剩余恢复码。
+- **两步登录**：启用 2FA 后，`POST /api/v1/auth/login` 校验用户名与口令后不下发 Cookie，而是返回有效期 5 分钟的 `mfa_token`；`POST /api/v1/auth/login/2fa` 用该令牌加 TOTP 或恢复码换取 `fc_session`。
+- **防暴力破解与用户枚举**：登录失败统一返回不透露具体错误项的 `401`，连续失败会被限流并返回 `429` 与 `Retry-After`。
+- **敏感操作**：关闭 2FA、重新生成恢复码、修改口令或用户名都需要当前口令；启用 2FA 时修改口令还需要当前验证码，并会使其他所有会话失效。
+- **应急恢复**：带 `RESET_2FA=true` 启动一次进程，会删除 TOTP 密钥与全部恢复码并输出 `WARN` 日志。该操作需要控制宿主机环境，而这本身就意味着可以访问 `master.key` 与数据库。重启完成后请移除该变量。
+
+### 5. WebUI REST API 与 `/mcp` 的分级脱敏对比
 
 | 数据接口 | 返回结构体 | 凭据与目的地暴露策略 |
 | :--- | :--- | :--- |
@@ -44,11 +55,11 @@ SQLite 数据库中不存储任何明文登录口令、会话 Cookie 或 MCP 令
 在將 AI Agent 接入自动化网关时，核心风险之一是**数据外带（Data Exfiltration）**：若恶意文章通过提示词注入诱导 AI 创建一个指向攻击者邮箱或攻击者 Telegram 群组的投递通道，网关中的订阅内容或诊断信息将被转发至外部不可信地址。
 
 FeedCourier 在架构层实施 **投递目的地锁定（Destination Lock）**：
-1. **`/mcp` 零通道写接口**：MCP 服务端点不提供任何用于创建、修改、删除或测试投递通道的工具。所有 `channels` 表的变更必须由人类管理员通过受 `fc_session` 保护的 WebUI（`/api/v1/channels*`）完成。
+1. **`/mcp` 零通道写接口**：MCP 服务端点不提供任何用于创建、修改或删除投递通道的工具，也没有任何工具接受通道凭据或目的地址。所有 `channels` 表的变更必须由人类管理员通过受 `fc_session` 保护的 WebUI（`/api/v1/channels*`）完成。
 2. **`configure_route` 强校验整数 `channel_id`**：当持有 `admin` 权限令牌的 AI Agent 调用 `configure_route` 创建或修改路由时，目标通道参数仅接受整数 `channel_id`（`ConfigureRouteParams.channel_id: Option<i64>`），不接受任何原始邮箱地址、Webhook URL、`chat_id` 或 API 密钥。处理器在入库前调用 `db.get_channel(channel_id)` 验证该 ID 必须对应已存在的 WebUI 授信通道。
 3. **双级令牌权限隔离（`readonly` vs `admin`）**：
    - `readonly` 令牌仅可调用只读工具（`list_feeds_status`、`inspect_failed_deliveries`、`preview_feed_latest`）；
-   - `admin` 令牌额外允许管理订阅源、编排指向既有 `channel_id` 的路由、复位熔断源及重投死信任务（`manage_feed`、`configure_route`、`reset_and_poll_feed`、`retry_dead_tasks`），仍无法突破 `channel_id` 边界。
+   - `admin` 令牌额外允许管理订阅源、编排指向既有 `channel_id` 的路由、复位熔断源、重投死信任务、暂停/恢复全局队列及调试推送（`manage_feed`（含 `clear_cache`）、`configure_route`、`reset_and_poll_feed`、`retry_dead_tasks`、`manage_outbox_queue`、`test_push_feed_entry`），仍无法突破 `channel_id` 边界；`test_push_feed_entry` 只会把文章发送到既有通道，无法更改目的地。
 
 ---
 

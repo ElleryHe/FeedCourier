@@ -1,5 +1,5 @@
 ---
-description: "配置 FeedCourier 环境变量、HTTP 与 SOCKS5 出站代理、按订阅源与按通道独立代理开关，以及内网自建服务的 SSRF 白名单。"
+description: "配置 FeedCourier 环境变量（管理员用户名与口令、2FA 重置、系统时区）、HTTP 与 SOCKS5 出站代理、按订阅源与按通道独立代理开关，以及内网自建服务的 SSRF 白名单。"
 ---
 
 # 环境配置与代理
@@ -15,16 +15,24 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 | `DATA_DIR` | `./data`<br>*（Docker 镜像内默认为 `/data`）* | 目录路径 | 持久化数据目录，用于存放 `feedcourier.db`、`master.key` 以及在线备份临时快照。 |
 | `LISTEN_ADDR` | `0.0.0.0:8080` | `SocketAddr`（`IP:Port`） | HTTP 服务监听地址，同时提供 WebUI、`/api/v1/*` 接口与 `/mcp` 端点。 |
 | `MASTER_KEY` | *（缺省自动生成）* | 64 位 Hex 或 Base64（32 字节） | 用于加密通道配置的 ChaCha20-Poly1305 主密钥。未设置时自动在 `<DATA_DIR>/master.key` 生成（权限 `0600`）。 |
+| `ADMIN_USERNAME` | `Courier` | 字符串（1–64 个字符） | WebUI 管理员用户名。设置后会在**每次启动**时覆盖数据库中保存的用户名。 |
 | `ADMIN_PASSWORD` | *（首次访问 WebUI 引导设置）* | 字符串（至少 8 个字符） | 启动时预设或重置 WebUI 管理员口令，启动阶段以 Argon2id 哈希写入数据库。 |
+| `RESET_2FA` | *（未设置）* | `true` | 一次性应急开关：启动时清除 TOTP 密钥与全部恢复码（并输出 `WARN` 日志）。重启完成后请立即移除该变量。参见[丢失验证器](/zh/guide/operations#lost-authenticator-reset-2fa)。 |
+| `TIMEZONE`（或 `TZ`） | `America/Los_Angeles` | IANA 时区名（如 `Asia/Shanghai`） | 用于判定路由投递时间窗口与星期的**系统时区**。仅在数据库尚未保存时区时作为初始值写入，此后以 WebUI **Settings** 中的设置为准。 |
 | `OUTBOUND_PROXY` | *（未设置）* | URL（`http://`、`https://`、`socks5://`、`socks5h://`） | 初始全局出站代理地址。当 `OUTBOUND_PROXY` 未设置时，依次回退读取 `ALL_PROXY`、`HTTPS_PROXY`、`HTTP_PROXY`。仅当数据库尚未保存代理配置时作为初始值写入。 |
 | `SSRF_ALLOWLIST` | *（空）* | 逗号分隔的 CIDR 或主机名 | 初始内网 SSRF 放行白名单（如 `10.0.0.5/32,rsshub.internal,*.lan`）。仅当数据库尚未保存白名单时作为初始值写入。 |
-| `LOCALE` | *（随 WebUI 自动同步）* | `en` 或 `zh-CN` | 初始下游推送文案语言（控制 Telegram 按钮/超链接与 SMTP 邮件模板语言）。登录 WebUI 或切换界面语言时会自动同步并持久化。 |
+| `LOCALE` | *（未设置）* | `en` 或 `zh-CN` | 旧版兼容的回退推送语言：仅用于尚未设置自身投递语言的旧路由。新路由各自保存投递语言；WebUI 界面语言只是浏览器本地偏好，不再同步到服务端。 |
 | `RETENTION_HOURS` | `24` | 无符号整数（`u64`） | 已完成投递或未命中路由的文章正文与媒体元数据保留小时数，到期后由后台定时任务清理。 |
 | `DB_READ_MAX_CONNECTIONS` | `8` | 正整数（`u32 >= 1`） | SQLite WAL 只读连接池的最大连接数（写连接池固定为 `1`）。 |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | 日志过滤指令 | 日志级别控制，排查问题时可设为 `feedcourier=debug,tower_http=debug`。 |
 
 > [!NOTE]
-> `OUTBOUND_PROXY` 与 `SSRF_ALLOWLIST` 会在首次启动时写入数据库的 `system_settings` 表。此后在 WebUI **Settings** 页面修改代理与白名单时，新配置会立即在内存中生效并持久化保存，无需重启服务。
+> `TIMEZONE`/`TZ`、`OUTBOUND_PROXY` 与 `SSRF_ALLOWLIST` 会在首次启动时写入数据库的 `system_settings` 表。此后在 WebUI **Settings** 页面修改时区、代理与白名单时，新配置会立即生效并持久化保存，无需重启服务。
+>
+> `ADMIN_USERNAME` 与 `ADMIN_PASSWORD` 则会在**每次启动**时覆盖已保存的值；设置了 `ADMIN_USERNAME` 时，WebUI 会提示用户名由环境变量管理。`RESET_2FA=true` 只应使用一次，否则每次启动都会清除两步验证。
+
+> [!TIP]
+> Docker 部署请通过 `-e TZ=Asia/Shanghai`（或任意 IANA 时区）传入时区。路由的投递时间窗口按系统时区判定，而不是浏览器所在时区。
 
 ---
 

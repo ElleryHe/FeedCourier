@@ -14,14 +14,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::channels::{ChannelKind, RouteOptions, TelegramDeliveryMode};
+use crate::channels::{ChannelKind, DeliveryTimeWindow, RouteOptions, TelegramDeliveryMode};
 use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION};
 use crate::db::models::{
-    DeliveryTaskStatus, Feed, FeedHealthStatus, McpTokenScope, NewFeed, NewRoute, OverviewSnapshot,
-    Route, UpdateFeed, UpdateRoute, now_unix,
+    AppLocale, DeliveryTaskStatus, Feed, FeedHealthStatus, McpTokenScope, NewFeed, NewRoute,
+    OverviewSnapshot, Route, UpdateFeed, UpdateRoute, now_unix,
 };
 use crate::error::AppError;
 use crate::ingest::{CompiledContentFilter, ContentFilterRules, PREVIEW_MAX_ITEMS};
+use crate::schedule::{OutboxQueueState, validate_schedule};
+use crate::scheduler::DebugPushParams;
 
 use super::McpState;
 use super::auth::{AuthenticatedMcpToken, CURRENT_MCP_TOKEN};
@@ -126,6 +128,50 @@ pub struct ManageFeedParams {
     pub silent_init: Option<bool>,
     /// On `"add"` when `silent_init` is `true`, still enqueue the single newest entry (`false` by default).
     pub push_latest_one: Option<bool>,
+    /// On `"clear_cache"`, immediately re-poll and re-queue the full backlog (`true` by default).
+    pub poll_now: Option<bool>,
+}
+
+/// Daily delivery window (`HH:MM`) in the system timezone. `end < start` wraps midnight;
+/// `start == end` means the whole day.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpTimeWindow {
+    pub start: String,
+    pub end: String,
+}
+
+/// Parameters for `manage_outbox_queue` (`admin` scope ONLY).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ManageOutboxQueueParams {
+    /// `"status"`, `"pause"`, or `"resume"`.
+    pub action: String,
+    /// On `"pause"`, resume automatically after this many minutes.
+    pub resume_in_minutes: Option<i64>,
+    /// On `"pause"`, resume automatically at this RFC 3339 timestamp.
+    pub resume_at: Option<String>,
+}
+
+/// Parameters for `test_push_feed_entry` (`admin` scope ONLY).
+///
+/// Stateless debug push of one live feed item to an existing trusted `channel_id`: nothing is
+/// persisted (no fingerprints, queue tasks, or quota usage).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct TestPushFeedEntryParams {
+    /// Trusted WebUI-configured delivery channel ID.
+    pub channel_id: i64,
+    /// Persisted feed ID (resolves URL, full-content and proxy defaults).
+    pub feed_id: Option<i64>,
+    /// Direct feed URL when `feed_id` is not given.
+    pub url: Option<String>,
+    /// Fingerprint of the item to push (from `preview_feed_latest`); omit for the latest item.
+    pub fingerprint_sha256: Option<String>,
+    pub fetch_full_content: Option<bool>,
+    pub use_proxy: Option<bool>,
+    #[schemars(with = "Option<McpTelegramDeliveryMode>")]
+    pub telegram_mode: Option<TelegramDeliveryMode>,
+    pub link_preview: Option<bool>,
+    /// Delivery language: `"en"` or `"zh-CN"`.
+    pub locale: Option<String>,
 }
 
 /// Parameters for `configure_route` (`admin` scope ONLY).
@@ -161,6 +207,12 @@ pub struct ConfigureRouteParams {
     pub link_preview: Option<bool>,
     /// Whether this route is active (`true` by default).
     pub enabled: Option<bool>,
+    /// Delivery language of this route: `"en"` or `"zh-CN"` (inherits the legacy system locale when unset).
+    pub locale: Option<String>,
+    /// Daily delivery windows in the system timezone (empty array clears; tasks outside a window stay queued).
+    pub active_windows: Option<Vec<McpTimeWindow>>,
+    /// ISO weekdays (1 = Monday … 7 = Sunday) on which windows start (empty array = every day).
+    pub active_weekdays: Option<Vec<u8>>,
 }
 
 /// Parameters for `reset_and_poll_feed` (`admin` scope ONLY).
@@ -208,6 +260,9 @@ pub struct McpRouteSummary {
     pub exclude_regex: Option<String>,
     pub telegram_mode: TelegramDeliveryMode,
     pub link_preview: bool,
+    pub locale: Option<AppLocale>,
+    pub active_windows: Vec<DeliveryTimeWindow>,
+    pub active_weekdays: Vec<u8>,
     pub enabled: bool,
 }
 
@@ -226,6 +281,9 @@ impl From<&Route> for McpRouteSummary {
             exclude_regex: route.exclude_regex.clone(),
             telegram_mode: opts.telegram_mode,
             link_preview: opts.link_preview,
+            locale: opts.locale,
+            active_windows: opts.active_windows,
+            active_weekdays: opts.active_weekdays,
             enabled: route.enabled,
         }
     }
@@ -270,7 +328,24 @@ impl From<&Feed> for McpFeedSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct QueueStatusView {
+    paused: bool,
+    resume_at: Option<i64>,
+}
+
+impl From<OutboxQueueState> for QueueStatusView {
+    fn from(state: OutboxQueueState) -> Self {
+        Self {
+            paused: state.paused,
+            resume_at: if state.paused { state.resume_at } else { None },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct ListFeedsStatusResponse {
+    timezone: String,
+    queue: QueueStatusView,
     overview: OverviewSnapshot,
     channels: Vec<McpChannelSummary>,
     routes: Vec<McpRouteSummary>,
@@ -462,7 +537,13 @@ impl McpServer {
             .map(McpFeedSummary::from)
             .collect();
 
+        let queue = match db.effective_outbox_queue_state(now_unix()).await {
+            Ok(state) => QueueStatusView::from(state),
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
         tool_ok(&ListFeedsStatusResponse {
+            timezone: db.get_timezone().await.name().to_string(),
+            queue,
             overview,
             channels,
             routes,
@@ -896,6 +977,40 @@ impl McpServer {
                     Err(err) => Ok(tool_error_from_app(err)),
                 }
             }
+            "clear_cache" => {
+                let Some(feed_id) = params.feed_id else {
+                    return Ok(tool_error(
+                        "validation_error",
+                        "manage_feed action 'clear_cache' requires 'feed_id'",
+                    ));
+                };
+                match self
+                    .state
+                    .ingest()
+                    .clear_feed_cache(feed_id, params.poll_now.unwrap_or(true))
+                    .await
+                {
+                    Ok(outcome) => {
+                        if outcome.poll.as_ref().is_some_and(|p| p.enqueued_tasks > 0) {
+                            self.state.notify_outbox();
+                        }
+                        tool_ok(&serde_json::json!({
+                            "action": "clear_cache",
+                            "feed_id": feed_id,
+                            "deleted_entries": outcome.deleted_entries,
+                            "initial_poll": outcome.poll.as_ref().map(|p| InitialPollStats {
+                                new_entries: p.new_entries,
+                                enqueued_tasks: p.enqueued_tasks,
+                                not_modified: p.not_modified,
+                            }),
+                            "poll_warning": outcome.poll_error.as_deref().map(|e| {
+                                wrap_untrusted_feed_text("poll_warning", e, MAX_UNTRUSTED_SHORT_CHARS)
+                            }),
+                        }))
+                    }
+                    Err(err) => Ok(tool_error_from_app(err)),
+                }
+            }
             "delete" => {
                 let Some(feed_id) = params.feed_id else {
                     return Ok(tool_error(
@@ -916,7 +1031,7 @@ impl McpServer {
             other => Ok(tool_error(
                 "validation_error",
                 format!(
-                    "invalid manage_feed action '{other}': expected add, update, pause, resume, or delete"
+                    "invalid manage_feed action '{other}': expected add, update, pause, resume, clear_cache, or delete"
                 ),
             )),
         }
@@ -997,10 +1112,29 @@ impl McpServer {
                     return Ok(tool_error_from_app(err));
                 }
 
-                let options = RouteOptions {
+                let locale = match parse_locale_param(params.locale.as_deref()) {
+                    Ok(l) => l,
+                    Err(msg) => return Ok(tool_error("validation_error", msg)),
+                };
+                let mut options = RouteOptions {
                     telegram_mode: params.telegram_mode.unwrap_or_default(),
                     link_preview: params.link_preview.unwrap_or(true),
+                    locale,
+                    active_windows: params
+                        .active_windows
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|w| DeliveryTimeWindow {
+                            start: w.start,
+                            end: w.end,
+                        })
+                        .collect(),
+                    active_weekdays: params.active_weekdays.clone().unwrap_or_default(),
                 };
+                if let Err(err) = validate_schedule(&mut options) {
+                    return Ok(tool_error_from_app(err));
+                }
 
                 let new_route = NewRoute {
                     name: name.to_string(),
@@ -1110,19 +1244,44 @@ impl McpServer {
                     return Ok(tool_error_from_app(err));
                 }
 
-                let options_patch =
-                    if params.telegram_mode.is_some() || params.link_preview.is_some() {
-                        let mut current_opts = existing.options();
-                        if let Some(mode) = params.telegram_mode {
-                            current_opts.telegram_mode = mode;
+                let options_patch = if params.telegram_mode.is_some()
+                    || params.link_preview.is_some()
+                    || params.locale.is_some()
+                    || params.active_windows.is_some()
+                    || params.active_weekdays.is_some()
+                {
+                    let mut current_opts = existing.options();
+                    if let Some(mode) = params.telegram_mode {
+                        current_opts.telegram_mode = mode;
+                    }
+                    if let Some(lp) = params.link_preview {
+                        current_opts.link_preview = lp;
+                    }
+                    if params.locale.is_some() {
+                        match parse_locale_param(params.locale.as_deref()) {
+                            Ok(l) => current_opts.locale = l,
+                            Err(msg) => return Ok(tool_error("validation_error", msg)),
                         }
-                        if let Some(lp) = params.link_preview {
-                            current_opts.link_preview = lp;
-                        }
-                        Some(current_opts)
-                    } else {
-                        None
-                    };
+                    }
+                    if let Some(windows) = params.active_windows.clone() {
+                        current_opts.active_windows = windows
+                            .into_iter()
+                            .map(|w| DeliveryTimeWindow {
+                                start: w.start,
+                                end: w.end,
+                            })
+                            .collect();
+                    }
+                    if let Some(days) = params.active_weekdays.clone() {
+                        current_opts.active_weekdays = days;
+                    }
+                    if let Err(err) = validate_schedule(&mut current_opts) {
+                        return Ok(tool_error_from_app(err));
+                    }
+                    Some(current_opts)
+                } else {
+                    None
+                };
 
                 let patch = UpdateRoute {
                     name: params.name.map(|n| n.trim().to_string()),
@@ -1256,6 +1415,182 @@ impl McpServer {
         self.state.notify_outbox();
         tool_ok(&RetryDeadTasksResponse { requeued_count })
     }
+
+    /// Inspect, pause (optionally with automatic resume), or resume the global outbox queue
+    /// (`admin` token scope required).
+    #[rmcp::tool(
+        name = "manage_outbox_queue",
+        description = "Requires 'admin' MCP token scope. Show, pause (optionally until resume_in_minutes / resume_at), or resume the global delivery queue. While paused feeds keep polling and tasks accumulate; on resume all due tasks are delivered oldest-first across feeds.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn manage_outbox_queue(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ManageOutboxQueueParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(res) = ensure_admin_scope(&ctx, "manage_outbox_queue") {
+            return Ok(res);
+        }
+
+        let db = self.state.db();
+        let now = now_unix();
+        let action = params.action.trim().to_ascii_lowercase();
+        match action.as_str() {
+            "status" => match db.effective_outbox_queue_state(now).await {
+                Ok(state) => tool_ok(&QueueStatusView::from(state)),
+                Err(err) => Ok(tool_error_from_app(err)),
+            },
+            "pause" => {
+                let resume_at = if let Some(raw) = params
+                    .resume_at
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    match chrono::DateTime::parse_from_rfc3339(raw) {
+                        Ok(dt) => Some(dt.timestamp()),
+                        Err(err) => {
+                            return Ok(tool_error(
+                                "validation_error",
+                                format!("invalid resume_at '{raw}': {err}"),
+                            ));
+                        }
+                    }
+                } else {
+                    params
+                        .resume_in_minutes
+                        .map(|m| now.saturating_add(m.saturating_mul(60)))
+                };
+                if resume_at.is_some_and(|at| at <= now) {
+                    return Ok(tool_error(
+                        "validation_error",
+                        "resume time must be in the future",
+                    ));
+                }
+                let state = OutboxQueueState {
+                    paused: true,
+                    resume_at,
+                };
+                match db.set_outbox_queue_state(&state).await {
+                    Ok(()) => tool_ok(&QueueStatusView::from(state)),
+                    Err(err) => Ok(tool_error_from_app(err)),
+                }
+            }
+            "resume" => {
+                let state = OutboxQueueState::default();
+                match db.set_outbox_queue_state(&state).await {
+                    Ok(()) => {
+                        self.state.notify_outbox();
+                        tool_ok(&QueueStatusView::from(state))
+                    }
+                    Err(err) => Ok(tool_error_from_app(err)),
+                }
+            }
+            other => Ok(tool_error(
+                "validation_error",
+                format!(
+                    "invalid manage_outbox_queue action '{other}': expected status, pause, or resume"
+                ),
+            )),
+        }
+    }
+
+    /// Stateless debug push of one live feed item to a trusted channel (`admin` token scope required).
+    #[rmcp::tool(
+        name = "test_push_feed_entry",
+        description = "Requires 'admin' MCP token scope. Send one live feed item (latest, or a fingerprint from preview_feed_latest) to an existing trusted channel_id with a chosen Telegram mode and delivery language. Stateless: does not store fingerprints, create queue tasks, or consume quota.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn test_push_feed_entry(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<TestPushFeedEntryParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(res) = ensure_admin_scope(&ctx, "test_push_feed_entry") {
+            return Ok(res);
+        }
+        let Some(runtime) = self.state.runtime() else {
+            return Ok(tool_error(
+                "unavailable",
+                "debug push is not available: delivery runtime is not attached to this MCP server",
+            ));
+        };
+
+        let explicit_url = params
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let (url, fetch_full_content, use_proxy) = if let Some(feed_id) = params.feed_id {
+            match self.state.db().get_feed(feed_id).await {
+                Ok(Some(feed)) => (
+                    explicit_url.unwrap_or(feed.url),
+                    params.fetch_full_content.unwrap_or(feed.fetch_full_content),
+                    params.use_proxy.unwrap_or(feed.use_proxy),
+                ),
+                Ok(None) => {
+                    return Ok(tool_error("not_found", format!("feed {feed_id} not found")));
+                }
+                Err(err) => return Ok(tool_error_from_app(err)),
+            }
+        } else if let Some(url) = explicit_url {
+            (
+                url,
+                params.fetch_full_content.unwrap_or(false),
+                params.use_proxy.unwrap_or(false),
+            )
+        } else {
+            return Ok(tool_error(
+                "validation_error",
+                "either 'url' or 'feed_id' must be provided",
+            ));
+        };
+        if let Err(msg) = validate_http_url(&url) {
+            return Ok(tool_error("validation_error", msg));
+        }
+        let locale = match parse_locale_param(params.locale.as_deref()) {
+            Ok(l) => l,
+            Err(msg) => return Ok(tool_error("validation_error", msg)),
+        };
+
+        let options = RouteOptions {
+            telegram_mode: params.telegram_mode.unwrap_or_default(),
+            link_preview: params.link_preview.unwrap_or(true),
+            locale,
+            ..RouteOptions::default()
+        };
+        match runtime
+            .debug_push(DebugPushParams {
+                channel_id: params.channel_id,
+                url,
+                feed_id: params.feed_id,
+                fingerprint: params.fingerprint_sha256,
+                fetch_full_content,
+                use_proxy,
+                options,
+            })
+            .await
+        {
+            Ok(result) => tool_ok(&serde_json::json!({
+                "ok": result.ok,
+                "message": wrap_untrusted_feed_text("message", &result.message, MAX_UNTRUSTED_SHORT_CHARS),
+                "entry_title": wrap_untrusted_feed_text("entry_title", &result.entry_title, MAX_UNTRUSTED_SHORT_CHARS),
+                "entry_url": result.entry_url,
+            })),
+            Err(err) => Ok(tool_error_from_app(err)),
+        }
+    }
 }
 
 #[rmcp::tool_handler(router = self.tool_router)]
@@ -1344,6 +1679,15 @@ fn tool_error_from_app(err: AppError) -> CallToolResult {
         msg
     };
     tool_error(code, safe_msg)
+}
+
+fn parse_locale_param(raw: Option<&str>) -> Result<Option<AppLocale>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(value) => AppLocale::parse_lossy(value)
+            .map(Some)
+            .ok_or_else(|| format!("unsupported locale '{value}' (expected 'en' or 'zh-CN')")),
+    }
 }
 
 fn validate_http_url(raw: &str) -> Result<(), String> {

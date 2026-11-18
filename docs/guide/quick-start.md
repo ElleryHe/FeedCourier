@@ -1,5 +1,5 @@
 ---
-description: "Deploy FeedCourier with Docker Run, Docker Compose, prebuilt Linux and macOS binaries, or from source, and initialize the WebUI administrator password."
+description: "Deploy FeedCourier with Docker Run, Docker Compose, prebuilt Linux and macOS binaries, or from source, and initialize the WebUI administrator account, and enable optional TOTP two-factor authentication."
 ---
 
 # Quick Start
@@ -18,6 +18,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
+  -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
   # Or pin a specific release version:
   # elleryhe/feedcourier:0.1.5
@@ -26,7 +27,7 @@ docker run -d \
 Once the container starts:
 
 1. Open **`http://127.0.0.1:8080`** in your browser.
-2. On first launch, the WebUI prompts you to set an administrator password (unless you configured `ADMIN_PASSWORD` in the environment).
+2. On first launch, the WebUI prompts you to choose an administrator username (default `Courier`) and password (unless you configured `ADMIN_USERNAME` / `ADMIN_PASSWORD` in the environment).
 3. FeedCourier generates `/data/master.key` (`0600` file permissions) and initializes `/data/feedcourier.db` in SQLite `WAL` mode.
 
 ---
@@ -49,7 +50,9 @@ services:
       DATA_DIR: /data
       LISTEN_ADDR: 0.0.0.0:8080
       RETENTION_HOURS: "24"
+      TZ: America/Los_Angeles # system timezone for route delivery time windows
       # Optional presets (can also be configured in WebUI):
+      # ADMIN_USERNAME: "Courier"
       # ADMIN_PASSWORD: "change-me-strong-passphrase"
       # MASTER_KEY: "<64-char-hex-or-base64-32-byte-key>"
       # OUTBOUND_PROXY: "socks5h://127.0.0.1:1080"
@@ -154,5 +157,25 @@ After signing in to the WebUI at `http://127.0.0.1:8080`:
 
 1. **Create a Delivery Channel** — Go to **Channels** and configure [SMTP Email](/channels/smtp), [Telegram](/channels/telegram), or [Notion](/channels/notion). Click **Test** to send a verification message or page.
 2. **Add Feeds or Import OPML** — Go to **Feeds** to add an RSS, Atom, or JSON Feed URL (with **Silent Init** enabled by default so existing historical articles are not sent all at once), or import an OPML 2.0 file.
-3. **Create a Route** — Go to **Routes** and link specific feeds or tags (such as `rust` or `security`) to your target channel, optionally adding keyword or regex filters.
+3. **Create a Route** — Go to **Routes** and link specific feeds or tags (such as `rust` or `security`) to your target channel, optionally adding keyword or regex filters. Each route also has its own **delivery language** (defaults to your current WebUI language) and optional **delivery time windows** and **weekdays** (evaluated in the system timezone).
 4. **(Optional) Connect an MCP Client** — Go to **Settings → Native MCP Server (`/mcp`)** to generate a `readonly` or `admin` Bearer token for Claude Desktop, Cursor, or Windsurf. See [Client Setup & Security](/mcp/setup).
+
+---
+
+## Sign-In & Two-Factor Authentication
+
+FeedCourier has a single administrator account. Sign in with the **username** and **password** you chose on first launch (the username defaults to `Courier`). Password managers can autofill both fields.
+
+To add a second factor, go to **Settings → Account & Security**:
+
+1. Click **Enable 2FA** and confirm your current password.
+2. Scan the QR code with any TOTP authenticator app (or type the displayed secret manually) and enter the 6-digit code to activate it.
+3. Save the **10 recovery codes** (`XXXX-XXXX-XXXX`) shown once. Each code works a single time in place of an authenticator code.
+
+Afterwards, signing in is a two-step flow: username and password first, then a 6-digit code (submitted automatically on the sixth digit) or a recovery code. You can regenerate recovery codes (which invalidates the old ones) or disable 2FA from the same page. Changing the password with 2FA enabled requires a current code, and revokes all other sessions.
+
+If you lose both your authenticator and your recovery codes, see [Lost Authenticator (`RESET_2FA`)](/guide/operations#lost-authenticator-reset-2fa).
+
+::: info Interface Language vs. Delivery Language
+The WebUI language switcher (sidebar bottom-left, or the top bar on mobile) is a browser-only preference. The language used for pushed messages is set per route.
+:::

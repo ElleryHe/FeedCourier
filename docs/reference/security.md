@@ -1,5 +1,5 @@
 ---
-description: "Security design of FeedCourier: ChaCha20-Poly1305 credential encryption, Argon2id password hashing, MCP Destination Lock, prompt-injection isolation, and SSRF protection."
+description: "Security design of FeedCourier: ChaCha20-Poly1305 credential encryption, Argon2id password hashing, TOTP two-factor authentication with recovery codes, MCP Destination Lock, prompt-injection isolation, and SSRF protection."
 ---
 
 # Security & Isolation
@@ -26,11 +26,21 @@ Channel configurations (`ChannelConfig`, containing SMTP credentials and recipie
 
 ### 3. Password & Token Hashing
 Plaintext passwords, session cookies, and MCP tokens are never stored in SQLite:
-- **Administrator Password**: Hashed with **Argon2id** (v19, random CSPRNG salt) into a PHC string stored in `system_settings` (`key = 'admin_password_hash'`);
+- **Administrator Account**: The username is stored in `system_settings` (`key = 'admin_username'`, default `Courier`, never returned by unauthenticated endpoints) and the password is hashed with **Argon2id** (v19, random CSPRNG salt) into a PHC string (`key = 'admin_password_hash'`). `ADMIN_USERNAME` / `ADMIN_PASSWORD` environment variables override both at every startup;
 - **WebUI Sessions (`fc_session`)**: Issued as `HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000` cookies; `sessions.token_hash` stores only the 64-character hex SHA-256 digest;
 - **MCP Bearer Tokens (`fc_mcp_...`)**: Returned once in plaintext upon creation; `mcp_tokens` persists only the 64-character SHA-256 `token_hash` and a 15-character display prefix (`token_prefix`).
 
-### 4. Redaction Comparison: WebUI REST API vs. `/mcp`
+### 4. Two-Factor Authentication (TOTP) & Recovery Codes (`src/totp.rs`, `src/api/auth.rs`)
+Optional second factor for the WebUI administrator (managed under **Settings → Account & Security**, `/api/v1/account/*`):
+- **TOTP**: RFC 6238 (HMAC-SHA1, 6 digits, 30-second step) with a 20-byte random secret presented as Base32, an `otpauth://` URL, and an inline SVG QR code. Setting up 2FA requires the current password and stores a *pending* secret (`admin_totp_pending`) that only becomes active (`admin_totp_secret`) after a valid code is submitted. Active and pending secrets are encrypted at rest with the same ChaCha20-Poly1305 master key as channel credentials.
+- **Replay protection**: The last accepted time step is recorded (`admin_totp_last_step`), so a code cannot be reused.
+- **Recovery codes**: 10 single-use codes (`XXXX-XXXX-XXXX`) are generated when 2FA is enabled and shown **once**. Only their SHA-256 hashes are stored (`admin_recovery_hashes`); a used code is removed. Regenerating replaces all remaining codes.
+- **Two-step login**: With 2FA enabled, `POST /api/v1/auth/login` validates username and password, returns no cookie, and issues an `mfa_token` valid for 5 minutes. `POST /api/v1/auth/login/2fa` exchanges it plus a TOTP or recovery code for the `fc_session` cookie.
+- **Brute-force and enumeration resistance**: Failed logins return a generic `401` that does not reveal whether the username or password was wrong, and repeated failures are throttled with `429` and `Retry-After`.
+- **Sensitive changes**: Disabling 2FA, regenerating recovery codes, and changing the password or username require the current password; changing the password with 2FA enabled also requires a current code, and revokes all other sessions.
+- **Emergency recovery**: Starting the process once with `RESET_2FA=true` deletes the TOTP secret and all recovery codes and logs a `WARN`. This requires control of the host environment, which already implies access to `master.key` and the database. Remove the variable after the restart.
+
+### 5. Redaction Comparison: WebUI REST API vs. `/mcp`
 
 | Interface | Output Struct | Credential & Destination Exposure Policy |
 | :--- | :--- | :--- |
@@ -44,11 +54,11 @@ Plaintext passwords, session cookies, and MCP tokens are never stored in SQLite:
 When an AI agent inspects untrusted RSS feeds, a primary threat is **data exfiltration via prompt injection**: a malicious feed item could instruct the assistant to create a new delivery channel pointing to an attacker-controlled email address, Telegram chat, or Notion workspace.
 
 FeedCourier prevents this through the **Destination Lock** boundary:
-1. **No Channel Creation or Mutation Tools on `/mcp`**: The MCP server exposes zero tools for creating, updating, deleting, or testing channels. Channel lifecycle operations exist exclusively in the `fc_session`-authenticated WebUI REST API (`/api/v1/channels*`).
+1. **No Channel Creation or Mutation Tools on `/mcp`**: The MCP server exposes zero tools for creating, updating, or deleting channels, and no tool that accepts channel credentials or destination addresses. Channel lifecycle operations exist exclusively in the `fc_session`-authenticated WebUI REST API (`/api/v1/channels*`).
 2. **Integer `channel_id` Lookup in `configure_route`**: When an `admin`-scoped MCP client calls `configure_route`, the target destination parameter (`ConfigureRouteParams.channel_id: Option<i64>`) accepts only an integer ID. Before creating or updating a route, the handler queries `db.get_channel(channel_id)` to verify that the ID references an existing WebUI-created channel in `channels`.
 3. **Dual-Scope Bearer Token Separation (`readonly` vs. `admin`)**:
    - `readonly` tokens are restricted to `list_feeds_status`, `inspect_failed_deliveries`, and `preview_feed_latest`;
-   - `admin` tokens additionally permit `manage_feed`, `configure_route`, `reset_and_poll_feed`, and `retry_dead_tasks`, while remaining bound to existing `channel_id` rows.
+   - `admin` tokens additionally permit `manage_feed` (including `clear_cache`), `configure_route`, `reset_and_poll_feed`, `retry_dead_tasks`, `manage_outbox_queue`, and `test_push_feed_entry`, while remaining bound to existing `channel_id` rows. `test_push_feed_entry` only sends an entry to an existing channel; it cannot change the destination.
 
 ---
 

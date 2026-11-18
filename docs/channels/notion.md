@@ -60,3 +60,7 @@ If you already have a Notion database for reading or knowledge management:
 ## Technical Details
 
 For the target Notion API version, data source schema calls, Markdown conversion pipeline, and asynchronous page creation workflow, see [Channel Protocols & Delivery](/reference/channel-protocols).
+
+::: info Debug Pushes Use `test-` IDs
+Pages created by a [debug push](/channels/pacing-and-quotas#debug-push-from-the-feed-preview) from the Feed Preview store a `test-` prefixed `FC-ID` instead of the article's content hash, and no deduplication or retry reconciliation applies to them.
+:::

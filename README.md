@@ -23,9 +23,9 @@
 
 - **Article Deduplication & Automatic Cleanup** — Stores SHA-256 article fingerprints in SQLite to prevent duplicate deliveries while automatically cleaning up sanitized HTML bodies and media metadata after the retention window (24 hours by default). Anti-hotlink media is relayed in memory.
 - **Multi-Channel Delivery (SMTP Email / Telegram / Notion)** — Delivers matched articles to **SMTP Email** (inline-CSS email template with `Force-From` sender alignment), **Telegram** (Rich Message, Compact Card, and Media delivery modes, with Local Bot API support), and **Notion** (automatic data source property initialization, Markdown conversion, and asynchronous long-page creation).
-- **Rate Pacing & Crash Recovery** — Enqueues an independent delivery task for each matched article and route (`1 Task = 1 Entry × 1 Route`), supporting credential-shared minimum intervals, random jitter, and hourly/daily quotas, with task lease recovery across restarts.
+- **Rate Pacing & Crash Recovery** — Enqueues an independent delivery task for each matched article and route (`1 Task = 1 Entry × 1 Route`), supporting credential-shared minimum intervals, random jitter, and hourly/daily quotas, with task lease recovery across restarts. Routes have their own delivery language, time windows, and weekdays (outside a window tasks stay queued), the whole queue can be paused or resumed on a schedule, and backlogs and multiple feeds are delivered in chronological order.
 - **Connect-Time DNS SSRF Protection & Per-Resource Proxy** — Validates resolved IPs before TCP connection and re-validates every `30x` redirect hop; supports CIDR/host allowlists, response size caps, optional Readability full-text extraction, and per-feed or per-channel HTTP / SOCKS5 proxy routing.
-- **Embedded Web Console & `/mcp` Endpoint** — Ships the React management console and a Streamable HTTP `/mcp` server in a single binary, supporting `readonly` and `admin` Bearer tokens, encrypted channel credentials, and WebUI-managed delivery destinations.
+- **Embedded Web Console & `/mcp` Endpoint** — Ships the React management console and a Streamable HTTP `/mcp` server in a single binary, supporting `readonly` and `admin` Bearer tokens, encrypted channel credentials, and WebUI-managed delivery destinations. Sign in with username and password plus optional TOTP 2FA with recovery codes; the MCP server exposes 9 tools, including global queue control and a stateless debug push.
 
 ```mermaid
 flowchart LR
@@ -50,6 +50,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
+  -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
   # Or pin an exact release: elleryhe/feedcourier:0.1.5
 ```
@@ -70,9 +71,10 @@ services:
       DATA_DIR: /data
       LISTEN_ADDR: 0.0.0.0:8080
       RETENTION_HOURS: "24"
+      TZ: America/Los_Angeles # system timezone for route delivery time windows
 ```
 
-Open `http://127.0.0.1:8080` to initialize your administrator password. For **Prebuilt Binaries (`Linux` / `macOS`) & Building from Source**, see the [Quick Start Guide](https://feedcourier.ellery.me/guide/quick-start).
+Open `http://127.0.0.1:8080` to create your administrator account (username defaults to `Courier`; optional TOTP 2FA is available under **Settings**). Set `ADMIN_USERNAME`, `ADMIN_PASSWORD`, or `RESET_2FA=true` to manage or recover access; see [Configuration](https://feedcourier.ellery.me/guide/configuration). For **Prebuilt Binaries (`Linux` / `macOS`) & Building from Source**, see the [Quick Start Guide](https://feedcourier.ellery.me/guide/quick-start).
 
 ---
 
@@ -83,7 +85,7 @@ Full bilingual documentation is hosted at **[feedcourier.ellery.me](https://feed
 | Manual | Section | Core Topics |
 | :--- | :--- | :--- |
 | **User Guide** | **Getting Started** | [Project Overview](https://feedcourier.ellery.me/guide/introduction) · [Quick Start](https://feedcourier.ellery.me/guide/quick-start) · [Configuration & Proxy](https://feedcourier.ellery.me/guide/configuration) · [Backup & Maintenance](https://feedcourier.ellery.me/guide/operations) |
-| **User Guide** | **Delivery Channels** | [Send Rate, Quotas & Filters](https://feedcourier.ellery.me/channels/pacing-and-quotas) · [SMTP Email](https://feedcourier.ellery.me/channels/smtp) · [Telegram](https://feedcourier.ellery.me/channels/telegram) · [Notion](https://feedcourier.ellery.me/channels/notion) |
+| **User Guide** | **Delivery Channels** | [Send Rate, Quotas, Windows & Filters](https://feedcourier.ellery.me/channels/pacing-and-quotas) · [SMTP Email](https://feedcourier.ellery.me/channels/smtp) · [Telegram](https://feedcourier.ellery.me/channels/telegram) · [Notion](https://feedcourier.ellery.me/channels/notion) |
 | **User Guide** | **MCP Integration** | [Client Setup & Security](https://feedcourier.ellery.me/mcp/setup) · [Tools Overview](https://feedcourier.ellery.me/mcp/tools) |
 | **Architecture Manual** | **Architecture & Development** | [System Architecture](https://feedcourier.ellery.me/reference/architecture) · [Channel Protocols & Delivery](https://feedcourier.ellery.me/reference/channel-protocols) · [Security & Isolation](https://feedcourier.ellery.me/reference/security) · [Database Schema](https://feedcourier.ellery.me/reference/database-schema) · [REST API](https://feedcourier.ellery.me/reference/rest-api) · [Build & Release Pipeline](https://feedcourier.ellery.me/reference/releasing) |
 

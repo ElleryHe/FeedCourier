@@ -1,5 +1,5 @@
 ---
-description: "通过 Docker Run、Docker Compose、Linux/macOS 预编译二进制文件或源码编译快速部署 FeedCourier，并完成首次管理员密码初始化。"
+description: "通过 Docker Run、Docker Compose、Linux/macOS 预编译二进制文件或源码编译快速部署 FeedCourier，并完成首次管理员账号初始化与可选的 TOTP 两步验证。"
 ---
 
 # 快速开始
@@ -18,6 +18,7 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
+  -e TZ=Asia/Shanghai \
   elleryhe/feedcourier:latest
   # 也可指定具体版本号：
   # elleryhe/feedcourier:0.1.5
@@ -47,9 +48,11 @@ services:
       DATA_DIR: /data
       LISTEN_ADDR: 0.0.0.0:8080
       RETENTION_HOURS: "24"
+      TZ: Asia/Shanghai # 系统时区，用于路由投递时间窗口
       DB_READ_MAX_CONNECTIONS: "8"
       RUST_LOG: "feedcourier=info,tower_http=info"
       # 以下为可选配置项（也可在启动后通过 WebUI 设置并保存）：
+      # ADMIN_USERNAME: "Courier"
       # ADMIN_PASSWORD: "change-me-strong-passphrase"
       # MASTER_KEY: "<64位十六进制或Base64编码的32字节主密钥>"
       # OUTBOUND_PROXY: "socks5h://127.0.0.1:1080"
@@ -134,12 +137,12 @@ docker build -t feedcourier:local .
 
 ---
 
-## 首次启动与管理员口令初始化
+## 首次启动与管理员账号初始化
 
 1. **访问管理界面**：在浏览器中打开 `http://127.0.0.1:8080`。
-2. **初始化管理员口令**：
-   - 若启动时**未设置** `ADMIN_PASSWORD` 环境变量，WebUI 会展示首次初始化界面（要求口令长度至少为 **8 个字符**）。提交后，后端使用 Argon2id 算法将密码哈希保存至 SQLite 数据库，并签发有效期 30 天的 `fc_session` `HttpOnly` 会话 Cookie。
-   - 若启动时**已设置** `ADMIN_PASSWORD` 环境变量，系统会在启动阶段自动写入密码哈希，直接进入登录界面。
+2. **初始化管理员账号**：
+   - 若启动时**未设置** `ADMIN_PASSWORD` 环境变量，WebUI 会展示首次初始化界面：填写用户名（默认 `Courier`）与口令（至少 **8 个字符**）。提交后，后端使用 Argon2id 算法将密码哈希保存至 SQLite 数据库，并签发有效期 30 天的 `fc_session` `HttpOnly` 会话 Cookie。
+   - 若启动时**已设置** `ADMIN_PASSWORD`（以及可选的 `ADMIN_USERNAME`）环境变量，系统会在启动阶段自动写入，直接进入登录界面。
 3. **验证健康状态**：可以通过健康检查接口确认服务运行状态：
 
 ```bash
@@ -166,5 +169,24 @@ curl -s http://127.0.0.1:8080/api/v1/health
 
 1. **创建推送通道**：前往 **Channels** 页面，配置 [SMTP 邮件](/zh/channels/smtp)、[Telegram](/zh/channels/telegram) 或 [Notion](/zh/channels/notion)，并点击 **Test** 按钮发送测试消息。
 2. **添加订阅源或导入 OPML**：前往 **Feeds** 页面添加 RSS / Atom / JSON Feed（支持开启 `silent_init` 静默记录存量历史文章，或勾选 `push_latest_one` 立即试推最新 1 篇）。
-3. **配置路由规则**：前往 **Routes** 页面将指定订阅源或标签（`tags`）绑定到目标通道，按需设置关键词/正则过滤与投递模式。
+3. **配置路由规则**：前往 **Routes** 页面将指定订阅源或标签（`tags`）绑定到目标通道，按需设置关键词/正则过滤与投递模式。每条路由还有独立的**投递语言**（默认取当前 WebUI 界面语言），以及可选的**投递时间窗口**与**星期**（按系统时区判定）。
 4. **（可选）接入 MCP 客户端**：前往 **Settings → Native MCP Server (`/mcp`)** 签发令牌，参阅 [客户端接入与安全说明](/zh/mcp/setup)。
+
+---
+
+## 登录与两步验证（2FA）
+
+FeedCourier 只有一个管理员账号。使用首次启动时设置的**用户名**（默认 `Courier`）和**密码**登录，密码管理器可自动填充这两个字段。
+
+如需增加第二重验证，前往 **Settings → 账号与安全**：
+
+1. 点击**启用两步验证**，并输入当前密码确认；
+2. 使用任意 TOTP 验证器 App 扫描二维码（或手动输入页面显示的密钥），再输入 6 位验证码完成激活；
+3. 妥善保存仅显示**一次**的 **10 个恢复码**（格式 `XXXX-XXXX-XXXX`）。每个恢复码可代替验证器验证码使用一次。
+
+启用后，登录分两步：先输入用户名和密码，再输入 6 位验证码（输入第 6 位时自动提交）或恢复码。你可以在同一页面重新生成恢复码（旧恢复码立即失效）或关闭 2FA。启用 2FA 时修改密码需要提供当前验证码，并会使其他所有会话失效。
+
+如果验证器和恢复码都丢失，请参阅[丢失验证器（`RESET_2FA`）](/zh/guide/operations#lost-authenticator-reset-2fa)。
+
+> [!NOTE]
+> WebUI 语言切换器（桌面端位于侧边栏左下角，移动端位于顶部栏）只是浏览器本地偏好；推送消息使用的语言由各路由单独设置。

@@ -47,7 +47,7 @@ function parseHashSection(): NavSection {
 
 export function App() {
   useThemeMode();
-  const { locale, userChangedLocale, hydrateServerLocale, m } = useI18n();
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -94,42 +94,6 @@ export function App() {
     enabled: authenticated,
     refetchInterval: 20_000,
   });
-
-  const settingsLocaleQuery = useQuery({
-    queryKey: ["settings"],
-    queryFn: () => api.settings.get(),
-    enabled: authenticated,
-  });
-
-  useEffect(() => {
-    if (!authenticated || !settingsLocaleQuery.data) return;
-    const serverLocale = settingsLocaleQuery.data.locale;
-    if (serverLocale === locale) return;
-
-    // Server-saved locale takes precedence on initial load across devices unless
-    // the user explicitly clicked the language switcher on the login screen or
-    // the server has no locale saved yet (`null` on first-time setup).
-    if (serverLocale && !userChangedLocale) {
-      hydrateServerLocale(serverLocale);
-      return;
-    }
-
-    void api.settings
-      .update({ locale })
-      .then((updated) => {
-        queryClient.setQueryData(["settings"], updated);
-      })
-      .catch(() => {
-        // Ignore transient background locale sync errors
-      });
-  }, [
-    authenticated,
-    hydrateServerLocale,
-    locale,
-    queryClient,
-    settingsLocaleQuery.data,
-    userChangedLocale,
-  ]);
 
   const logoutMutation = useMutation({
     mutationFn: () => api.auth.logout(),

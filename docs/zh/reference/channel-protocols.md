@@ -89,7 +89,7 @@ flowchart TD
 - **三行精简 HTML 文案（`MAX_CAPTION_UTF16_UNITS = 1,024`，`parse_mode: "HTML"`）**：
   - 第 1 行：经 HTML 转义的文章作者（无作者时回退为订阅源名称）；
   - 第 2 行：入库阶段由 `unicode-segmentation`（`unicode_sentences`）提取并经 HTML 转义的正文首句 `entries.first_sentence`；
-  - 第 3 行：随 `system_settings.locale` 本地化的原文超链接（中文为 `<a href="...">链接</a>`，英文为 `<a href="...">Link</a>`）。
+  - 第 3 行：随路由 `options.locale`（缺省回退到旧版 `system_settings.locale`）本地化的原文超链接（中文为 `<a href="...">链接</a>`，英文为 `<a href="...">Link</a>`）。
   - 可见字符严格按 UTF-16 代码单元截断至 $\le 1,024$（当条目不含任何可用媒体时，发送相同三行格式的 HTML 消息）。
 - **按类型智能分流、文件头魔数嗅探与纯 Rust MP4 元数据提取**：
   - **阶段 1（图片、音频与明确后缀文档的 URL 直传）**：优先将原始 URL 提交给 Telegram 服务器（`sendPhoto` / `sendAudio` / `sendDocument` / `sendMediaGroup`），遇防盗链或拉取失败时自动转入阶段 2。

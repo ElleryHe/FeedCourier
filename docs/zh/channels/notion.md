@@ -70,3 +70,6 @@ Notion 通道可将订阅源的新文章自动同步到指定的 Notion 数据�
 ## 延伸阅读
 
 - 关于底层 Notion API 版本适配、HTML 转 Markdown 规范化处理、长文异步创建流程以及 `FC-ID` 防重对账的实现细节，请参阅架构手册中的 [通道协议与投递实现](/zh/reference/channel-protocols)。
+
+> [!NOTE]
+> 通过[调试推送](/zh/channels/pacing-and-quotas#debug-push-from-the-feed-preview)在 Notion 创建的页面，`FC-ID` 会写入带 `test-` 前缀的值，而不是文章内容哈希；这类页面不参与去重与重试对账。

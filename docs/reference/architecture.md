@@ -1,5 +1,5 @@
 ---
-description: "Internal architecture of FeedCourier: Rust module layout, SHA-256 deduplication, SQLite WAL pools, payload garbage collection, and lease-based outbox scheduling."
+description: "Internal architecture of FeedCourier: Rust module layout, SHA-256 deduplication, SQLite WAL pools, payload garbage collection, lease-based outbox scheduling with merged chronological claim ordering, route time windows, and global queue pause."
 ---
 
 # System Architecture
@@ -89,6 +89,9 @@ Before computing a Tier 2 fingerprint or storing `entries.canonical_url`, links 
 ### Silent Initialization (`silent_init`)
 When a feed is created (`silent_init = true` by default) or imported via OPML 2.0, the initial poll records the SHA-256 fingerprints of all existing entries in `entries` and flips `silent_init` to `0` without enqueuing historical `delivery_tasks` (unless `push_latest_one = true` is set, which enqueues only the single newest item to verify channel connectivity).
 
+### Chronological Backlog Insertion & Clear Cache
+When a poll finds several new entries (a first poll with `silent_init = false`, or a feed that published many items at once), they are inserted and enqueued **oldest → newest** by `published_at`, falling back to the reverse of the feed's own order when timestamps are absent. `POST /api/v1/feeds/{id}/clear-cache` (and MCP `manage_feed` `clear_cache`) deletes the feed's `entries` (cascading to `delivery_tasks`), clears `etag` / `last_modified` and failure state, and sets `silent_init = 0`, so the next poll (immediate by default) enqueues the full backlog in that order.
+
 ---
 
 ## 3. SQLite WAL Dual-Pool Concurrency & `NOT EXISTS` Payload GC
@@ -165,6 +168,8 @@ On every dispatch cycle, `claim_next_delivery_task` executes a single `UPDATE ..
 1. `status IN ('queued', 'retrying', 'deferred') AND next_attempt_at <= now`, or
 2. `status = 'delivering' AND lease_until <= now`.
 
+Candidates are ordered with expired leases first (`delivering` by `lease_until`), then by `COALESCE(entries.published_at, entries.discovered_at) ASC`, `entries.id ASC`, `delivery_tasks.id ASC`. Because the outbox is global, tasks of several feeds form **one merged chronological stream** rather than per-feed batches.
+
 If the process terminates mid-delivery (`SIGKILL`, container restart, or power loss), the task's `120`-second lease expires and the next worker tick claims it automatically. Before issuing a new network request, the channel adapter inspects `checkpoint_json` (`DeliveryCheckpoint`) to reconcile or resume partial progress (see [Channel Protocols & Delivery](/reference/channel-protocols)).
 
 ### 3. Shared-Credential Rate Limiting (`credential_group_key`) & Quotas
@@ -174,6 +179,19 @@ Multiple logical channels may share the same underlying sender credential (for e
 - **Pacing & Jitter**: `DeliveryDispatcher` tracks the next allowed send timestamp per `credential_group_key`. After each delivery, all channels sharing that key wait `min_interval_secs + uniform_random(0..=jitter_max_secs)` seconds;
 - **Group-Wide `429` Cooldown (`cooldown_until`)**: When an upstream API returns `429 Too Many Requests` (with a Telegram `retry_after` parameter or HTTP `Retry-After` header), `cooldown_until` is applied across all channels sharing the same `credential_group_key`;
 - **Rolling Quotas (`hourly_quota` / `daily_quota`)**: Before sending, the worker counts `status = 'delivered'` tasks for the channel over the trailing `3,600` and `86,400` seconds. When a quota is reached, the task is moved to `deferred` until the oldest delivered task exits the rolling window.
+
+### 4. Route Time Windows & Global Queue Pause
+
+Two gates sit in front of the claim loop:
+
+- **Route time windows**: `routes.options_json` may carry `active_windows` (`HH:MM` pairs) and `active_weekdays` (`1`=Mon … `7`=Sun). They are evaluated in the IANA timezone stored in `system_settings.timezone` (`src/schedule.rs`). A window whose `end` is earlier than `start` wraps midnight, `start == end` covers the whole day, and an empty list means always; for wrapped windows the weekday is that of the day the window starts. A task outside its window is **not dropped**: it keeps status `queued` / `deferred` and `next_attempt_at` is set to the next window start, so the regular claim query picks it up then.
+- **Global pause**: `system_settings.outbox_queue` stores the pause state and optional `resume_at`. While paused the dispatcher claims nothing, but feed polling and task enqueueing continue. An expired `resume_at` counts as resumed (`GET /api/v1/tasks/queue` returns `paused: false`). After resume, all due tasks drain in the chronological order above.
+
+Delivery language is resolved per task from `routes.options_json.locale`, falling back to the legacy `system_settings.locale`. The WebUI language is only a browser preference (`localStorage`) and is not stored on the server.
+
+### 5. Debug Push (`POST /api/v1/feeds/preview/push`, MCP `test_push_feed_entry`)
+
+A debug push fetches one entry live and calls the channel sender directly with an in-memory entry. It writes no `entries` fingerprint and no `delivery_tasks` row, and bypasses route filters, time windows, the global pause, pacing, and quotas. Notion pages use a `test-` prefixed `FC-ID`, and downstream errors are returned to the caller as `ok: false` diagnostics.
 
 ---
 

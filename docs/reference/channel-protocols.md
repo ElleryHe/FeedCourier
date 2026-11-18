@@ -89,7 +89,7 @@ flowchart TD
 - **3-Line HTML Caption (`MAX_CAPTION_UTF16_UNITS = 1,024`, `parse_mode: "HTML"`)**:
   - Line 1: HTML-escaped entry author (or feed title when author is absent);
   - Line 2: HTML-escaped first sentence extracted via `unicode-segmentation` (`unicode_sentences`) stored in `entries.first_sentence`;
-  - Line 3: Localized hyperlink (`<a href="...">Link</a>` in English / `<a href="...">链接</a>` in Simplified Chinese, following `system_settings.locale`).
+  - Line 3: Localized hyperlink (`<a href="...">Link</a>` in English / `<a href="...">链接</a>` in Simplified Chinese, following the route's `options.locale`, falling back to the legacy `system_settings.locale`).
   - Visible text is truncated on a character boundary to at most `1,024` UTF-16 code units (entries without valid media items send the same 3-line HTML message via `sendMessage`).
 - **Smart Per-Type Routing, Magic-Byte Sniffing & ISO-BMFF Metadata Extraction**:
   - **Stage 1 (Direct URL Pass for Images, Audio & Explicit Documents)**: Submits upstream image/audio URLs directly to Telegram (`sendPhoto`, `sendAudio`, `sendDocument`, or `sendMediaGroup`), falling back to Stage 2 on hotlink (`Referer`) or URL fetch failures.

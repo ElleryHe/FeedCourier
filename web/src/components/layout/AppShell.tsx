@@ -13,7 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { useI18n } from "@/i18n";
+import { LocaleSwitchButton, useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { ComplianceFooter } from "./ComplianceFooter";
 
@@ -342,6 +342,7 @@ export function AppShell({
 
       {/* Bottom Controls */}
       <div className="space-y-1.5 border-t border-zinc-200/80 p-3 dark:border-zinc-800/80">
+        <LocaleSwitchButton className="w-full" />
         <button
           type="button"
           onClick={toggleTheme}
@@ -422,6 +423,7 @@ export function AppShell({
             <span className="rounded bg-zinc-100 px-2 py-0.5 text-xs font-medium dark:bg-zinc-800">
               {m.shell.nav[activeSection].label}
             </span>
+            <LocaleSwitchButton />
           </div>
         </header>
 

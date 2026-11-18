@@ -1,8 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Clock,
   ExternalLink,
   FileSearch,
   Inbox,
+  Pause,
+  Play,
   RefreshCw,
   RotateCcw,
 } from "lucide-react";
@@ -11,7 +14,9 @@ import { api } from "@/api/client";
 import type {
   DeliveryCheckpoint,
   DeliveryTaskDto,
+  QueueStateDto,
   TaskStatus,
+  UpdateQueueRequest,
 } from "@/api/types";
 import {
   Badge,
@@ -20,6 +25,8 @@ import {
   Card,
   ConfirmDialog,
   EmptyState,
+  FieldError,
+  Input,
   Modal,
   Select,
 } from "@/components/ui/primitives";
@@ -84,6 +91,164 @@ function summarizeCheckpoint(
   }
 }
 
+const PAUSE_PRESETS = [
+  { id: "forever", secs: null },
+  { id: "15m", secs: 15 * 60 },
+  { id: "30m", secs: 30 * 60 },
+  { id: "1h", secs: 60 * 60 },
+  { id: "3h", secs: 3 * 60 * 60 },
+  { id: "6h", secs: 6 * 60 * 60 },
+  { id: "custom", secs: null },
+] as const;
+
+type PausePresetId = (typeof PAUSE_PRESETS)[number]["id"];
+
+function isFuture(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const t = Date.parse(value);
+  return Number.isFinite(t) && t > Date.now();
+}
+
+function QueueControlBar({ queue }: { queue: QueueStateDto | undefined }) {
+  const { m } = useI18n();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const [preset, setPreset] = useState<PausePresetId>("forever");
+  const [customAt, setCustomAt] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const paused = queue?.paused === true;
+
+  const mutation = useMutation({
+    mutationFn: (payload: UpdateQueueRequest) => api.tasks.updateQueue(payload),
+    onSuccess: (res) => {
+      queryClient.setQueryData(["task-queue"], res);
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      toast.success(
+        res.paused ? m.tasks.queue.toastPaused : m.tasks.queue.toastResumed,
+      );
+      setError(null);
+    },
+    onError: (err) => {
+      setError(errorMessage(err));
+    },
+  });
+
+  const handlePause = () => {
+    setError(null);
+    const chosen = PAUSE_PRESETS.find((p) => p.id === preset);
+    if (preset === "custom") {
+      const when = customAt ? new Date(customAt) : null;
+      if (!when || Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) {
+        setError(m.tasks.queue.errCustomPast);
+        return;
+      }
+      mutation.mutate({ action: "pause", resume_at: when.toISOString() });
+      return;
+    }
+    mutation.mutate(
+      chosen?.secs
+        ? { action: "pause", resume_in_secs: chosen.secs }
+        : { action: "pause" },
+    );
+  };
+
+  return (
+    <Card
+      className={`p-3.5 ${
+        paused
+          ? "border-amber-300 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/30"
+          : ""
+      }`}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          {paused ? (
+            <Pause className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          ) : (
+            <Play className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          )}
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-semibold">
+                {m.tasks.queue.title}
+              </span>
+              <Badge variant={paused ? "warning" : "success"}>
+                {paused ? m.tasks.queue.paused : m.tasks.queue.running}
+              </Badge>
+            </div>
+            <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+              {paused
+                ? queue?.resume_at
+                  ? m.tasks.queue.pausedUntil(
+                      formatDateTime(queue.resume_at),
+                      formatRelativeTime(queue.resume_at),
+                    )
+                  : m.tasks.queue.pausedIndefinitely
+                : m.tasks.queue.runningHint}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Select
+            value={preset}
+            onChange={(e) => {
+              setPreset(e.target.value as PausePresetId);
+              setError(null);
+            }}
+            aria-label={m.tasks.queue.durationLabel}
+            className="h-8 w-auto text-xs"
+          >
+            {PAUSE_PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>
+                {m.tasks.queue.presets[p.id]}
+              </option>
+            ))}
+          </Select>
+          {preset === "custom" && (
+            <Input
+              type="datetime-local"
+              value={customAt}
+              onChange={(e) => {
+                setCustomAt(e.target.value);
+                setError(null);
+              }}
+              aria-label={m.tasks.queue.customLabel}
+              className="h-8 w-auto text-xs"
+            />
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handlePause}
+            loading={mutation.isPending && mutation.variables?.action === "pause"}
+          >
+            <Pause className="h-3.5 w-3.5" />
+            {paused ? m.tasks.queue.updatePause : m.tasks.queue.pauseBtn}
+          </Button>
+          {paused && (
+            <Button
+              size="sm"
+              onClick={() => mutation.mutate({ action: "resume" })}
+              loading={
+                mutation.isPending && mutation.variables?.action === "resume"
+              }
+            >
+              <Play className="h-3.5 w-3.5" />
+              {m.tasks.queue.resumeBtn}
+            </Button>
+          )}
+        </div>
+      </div>
+      <FieldError message={error} />
+      <p className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+        {m.tasks.queue.orderHint}
+      </p>
+    </Card>
+  );
+}
+
 export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
   const { m } = useI18n();
   const toast = useToast();
@@ -107,6 +272,13 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
       }),
     refetchInterval: 10_000,
   });
+
+  const queueQuery = useQuery({
+    queryKey: ["task-queue"],
+    queryFn: () => api.tasks.queue(),
+    refetchInterval: 10_000,
+  });
+  const queuePaused = queueQuery.data?.paused === true;
 
   const retryMutation = useMutation({
     mutationFn: (payload: { task_ids?: number[]; all_dead_letter?: boolean }) =>
@@ -181,6 +353,9 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
           </Button>
         </div>
       </div>
+
+      {/* Global Queue Control */}
+      <QueueControlBar queue={queueQuery.data} />
 
       {/* Filter Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -345,7 +520,29 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                           {cpSummary && (
                             <Badge variant="mono">{cpSummary}</Badge>
                           )}
+                          {queuePaused &&
+                            (task.status === "queued" ||
+                              task.status === "retrying" ||
+                              task.status === "deferred") && (
+                              <Badge variant="warning">
+                                <Pause className="h-3 w-3" />
+                                {m.tasks.queue.heldBadge}
+                              </Badge>
+                            )}
                         </div>
+                        {(task.status === "queued" ||
+                          task.status === "deferred") &&
+                          isFuture(task.next_attempt_at) && (
+                            <div
+                              className="mt-1 inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-400"
+                              title={formatDateTime(task.next_attempt_at)}
+                            >
+                              <Clock className="h-3 w-3" />
+                              {m.tasks.scheduledPrefix(
+                                formatRelativeTime(task.next_attempt_at),
+                              )}
+                            </div>
+                          )}
                         {task.lease_until && task.status === "delivering" && (
                           <div
                             className="mt-1 font-mono text-[10px] text-sky-600 dark:text-sky-400"

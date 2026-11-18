@@ -50,7 +50,86 @@ export interface AuthStatusResponse {
 
 /** `POST /api/v1/auth/setup` & `POST /api/v1/auth/login` */
 export interface AuthPasswordRequest {
+  /** Admin username (setup defaults to `"Courier"` on the server when omitted). */
+  username?: string;
   password: string;
+}
+
+/** `POST /api/v1/auth/login` */
+export interface AuthLoginRequest {
+  username: string;
+  password: string;
+}
+
+/** `POST /api/v1/auth/login` response (2FA aware). */
+export interface AuthLoginResponse {
+  ok: boolean;
+  /** True when the credentials were valid but a TOTP / recovery code is still required. */
+  mfa_required: boolean;
+  /** Short-lived (5 min) challenge token for `POST /auth/login/2fa`. */
+  mfa_token?: string;
+}
+
+/** `POST /api/v1/auth/login/2fa` */
+export interface AuthLogin2faRequest {
+  mfa_token: string;
+  /** 6-digit TOTP or recovery code (`XXXX-XXXX-XXXX`). */
+  code: string;
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Account & Security (`/api/v1/account*`)
+// ---------------------------------------------------------------------------
+
+export interface AccountDto {
+  username: string;
+  /** True when `ADMIN_USERNAME` env overrides the stored username at every restart. */
+  username_env_managed: boolean;
+  totp_enabled: boolean;
+  recovery_codes_remaining: number;
+}
+
+/** `PATCH /api/v1/account` */
+export interface UpdateAccountRequest {
+  current_password: string;
+  new_username?: string;
+  new_password?: string;
+  /** TOTP / recovery code; required when changing the password with 2FA enabled. */
+  code?: string;
+}
+
+/** `POST /api/v1/account/2fa/setup` */
+export interface TotpSetupRequest {
+  current_password: string;
+}
+
+export interface TotpSetupResponse {
+  /** Base32 secret for manual entry. */
+  secret: string;
+  otpauth_url: string;
+  /** Inline `<svg>` markup rendered by the backend. */
+  qr_svg: string;
+}
+
+/** `POST /api/v1/account/2fa/enable` */
+export interface TotpEnableRequest {
+  code: string;
+}
+
+export interface RecoveryCodesResponse {
+  /** Shown ONCE. */
+  recovery_codes: string[];
+}
+
+/** `POST /api/v1/account/2fa/disable` */
+export interface TotpDisableRequest {
+  current_password: string;
+  code: string;
+}
+
+/** `POST /api/v1/account/2fa/recovery-codes` */
+export interface RegenerateRecoveryCodesRequest {
+  current_password: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +284,40 @@ export interface FeedPreviewItem {
   full_content_extracted: boolean;
   matched_filter: boolean;
   filter_reason: string | null;
+}
+
+/** `POST /api/v1/feeds/:id/clear-cache` */
+export interface ClearFeedCacheRequest {
+  /** Default `true`: re-fetch and enqueue the full backlog immediately. */
+  poll_now?: boolean;
+}
+
+export interface ClearFeedCacheResponse {
+  deleted_entries: number;
+  poll: PollFeedResponse | null;
+}
+
+/** `POST /api/v1/feeds/preview/push` (stateless debug push). */
+export interface FeedPreviewPushRequest {
+  url: string;
+  feed_id?: number;
+  /** Omit to push the latest item. */
+  fingerprint_sha256?: string;
+  fetch_full_content?: boolean;
+  use_proxy?: boolean;
+  channel_id: number;
+  options?: {
+    telegram_mode?: TelegramDeliveryMode;
+    link_preview?: boolean;
+    locale?: SystemLocale;
+  };
+}
+
+export interface FeedPreviewPushResponse {
+  ok: boolean;
+  message: string;
+  entry_title: string;
+  entry_url: string | null;
 }
 
 export interface FeedPreviewResponse {
@@ -421,6 +534,11 @@ export interface UpdateChannelRequest {
   enabled?: boolean;
 }
 
+/** `POST /api/v1/channels/:id/test` request body (optional). */
+export interface TestChannelRequest {
+  locale?: SystemLocale;
+}
+
 /** `POST /api/v1/channels/:id/test` */
 export interface TestChannelResponse {
   ok: boolean;
@@ -521,6 +639,19 @@ export interface RouteOptions {
   telegram_mode?: TelegramDeliveryMode;
   /** Toggle `LinkPreviewOptions` when `telegram_mode === "compact_card"` (default: `true`). */
   link_preview?: boolean;
+  /** Delivery language of this route. Legacy routes inherit `settings.locale`. */
+  locale?: SystemLocale;
+  /** Daily windows (system timezone). `end < start` wraps midnight; `start == end` = whole day; empty = always. */
+  active_windows?: ActiveWindow[];
+  /** 1=Mon..7=Sun; empty = every day. */
+  active_weekdays?: number[];
+}
+
+export interface ActiveWindow {
+  /** `HH:MM` */
+  start: string;
+  /** `HH:MM` */
+  end: string;
 }
 
 export interface RouteDto {
@@ -633,6 +764,17 @@ export interface RetryTasksResponse {
   requeued_count: number;
 }
 
+/** `GET/PUT /api/v1/tasks/queue` */
+export interface QueueStateDto {
+  paused: boolean;
+  /** RFC 3339 auto-resume time, or `null` for an indefinite pause. */
+  resume_at: string | null;
+}
+
+export type UpdateQueueRequest =
+  | { action: "pause"; resume_in_secs?: number; resume_at?: string }
+  | { action: "resume" };
+
 // ---------------------------------------------------------------------------
 // 7. System Settings & MCP Tokens (`/api/v1/settings`, `/api/v1/mcp-tokens*`)
 // ---------------------------------------------------------------------------
@@ -645,14 +787,17 @@ export interface SystemSettingsDto {
   outbound_proxy_url: string | null;
   /** CIDR ranges (e.g. `"10.0.0.0/8"`) or internal hostnames (e.g. `"rsshub.internal"`) allowed past SSRF private-IP block. */
   ssrf_allowlist: string[];
-  /** Active system locale for downstream push notification templates (`"en"` | `"zh-CN"`). */
+  /** IANA timezone used for route active windows (e.g. `"Asia/Shanghai"`). */
+  timezone: string;
+  /** LEGACY fallback delivery language for routes without `options.locale`. Never written by the WebUI. */
   locale?: SystemLocale | null;
 }
 
+/** Any subset; network fields are applied only when at least one is present. */
 export interface UpdateSystemSettingsRequest {
+  timezone?: string;
   outbound_proxy_url?: string | null;
   ssrf_allowlist?: string[];
-  locale?: SystemLocale;
 }
 
 export type McpTokenScope = "readonly" | "admin";

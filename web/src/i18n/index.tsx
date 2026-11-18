@@ -52,9 +52,7 @@ export function getMessages(locale: Locale = activeLocale): Messages {
 
 interface I18nContextValue {
   locale: Locale;
-  userChangedLocale: boolean;
   setLocale: (next: Locale) => void;
-  hydrateServerLocale: (serverLocale: Locale) => void;
   toggleLocale: () => void;
   m: Messages;
 }
@@ -63,14 +61,10 @@ const I18nContext = createContext<I18nContextValue | null>(null);
 
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(activeLocale);
-  const [userChangedLocale, setUserChangedLocale] = useState<boolean>(false);
 
-  const applyLocale = useCallback((next: Locale, markUserChanged: boolean) => {
+  const applyLocale = useCallback((next: Locale) => {
     activeLocale = next;
     setLocaleState(next);
-    if (markUserChanged) {
-      setUserChangedLocale(true);
-    }
     try {
       window.localStorage.setItem(STORAGE_KEY, next);
     } catch {
@@ -80,20 +74,13 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
   const setLocale = useCallback(
     (next: Locale) => {
-      applyLocale(next, true);
-    },
-    [applyLocale],
-  );
-
-  const hydrateServerLocale = useCallback(
-    (serverLocale: Locale) => {
-      applyLocale(serverLocale, false);
+      applyLocale(next);
     },
     [applyLocale],
   );
 
   const toggleLocale = useCallback(() => {
-    applyLocale(locale === "zh-CN" ? "en" : "zh-CN", true);
+    applyLocale(locale === "zh-CN" ? "en" : "zh-CN");
   }, [locale, applyLocale]);
 
   const m = locale === "zh-CN" ? zhCN : en;
@@ -107,13 +94,11 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   const value = useMemo<I18nContextValue>(
     () => ({
       locale,
-      userChangedLocale,
       setLocale,
-      hydrateServerLocale,
       toggleLocale,
       m,
     }),
-    [locale, userChangedLocale, setLocale, hydrateServerLocale, toggleLocale, m],
+    [locale, setLocale, toggleLocale, m],
   );
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;

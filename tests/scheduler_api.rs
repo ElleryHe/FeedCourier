@@ -278,7 +278,7 @@ async fn auth_lifecycle_and_session_guard() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "password": "wrong-password-999" })),
+            Some(json!({ "username": "Courier", "password": "wrong-password-999" })),
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -288,7 +288,7 @@ async fn auth_lifecycle_and_session_guard() {
             Method::POST,
             "/api/v1/auth/login",
             None,
-            Some(json!({ "password": "super-secret-admin-pw" })),
+            Some(json!({ "username": "Courier", "password": "super-secret-admin-pw" })),
         )
         .await;
     assert_eq!(status, StatusCode::OK);
@@ -954,6 +954,7 @@ async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
             options: RouteOptions {
                 telegram_mode: TelegramDeliveryMode::CompactCard,
                 link_preview: true,
+                ..RouteOptions::default()
             },
             enabled: true,
         })
@@ -1140,6 +1141,7 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
             options: RouteOptions {
                 telegram_mode: TelegramDeliveryMode::CompactCard,
                 link_preview: false,
+                ..RouteOptions::default()
             },
             enabled: true,
         })
@@ -1158,6 +1160,7 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
             options: RouteOptions {
                 telegram_mode: TelegramDeliveryMode::CompactCard,
                 link_preview: false,
+                ..RouteOptions::default()
             },
             enabled: true,
         })

@@ -17,8 +17,8 @@ It is designed as a delivery service rather than a local feed reader: reading, s
   - **[SMTP Email](/channels/smtp)**: Sends single-article HTML and plain-text emails with sender alignment (`Force-From`) and standard mailing-list headers.
   - **[Telegram](/channels/telegram)**: Supports private chats, groups, forum topics, and channels with three route-selectable modes: Rich Message, Compact Card, and Media Mode.
   - **[Notion](/channels/notion)**: Creates pages in a Notion database with mapped article properties and Markdown-converted body content, supporting one-click database initialization or binding to an existing database.
-- **Send Rate Control, Quotas & Route Filters**: Spaces out bursts using per-channel minimum intervals, random jitter, and optional hourly/daily quotas, and filters incoming entries by feed tags, keywords, or regular expressions ([Send Rate, Quotas & Filters](/channels/pacing-and-quotas)).
-- **WebUI & MCP Integration**: Ships with an embedded web console for managing channels, feeds, routes, and settings, alongside a Streamable HTTP Model Context Protocol endpoint (`/mcp`) for inspecting status, previewing feeds, and managing routes from AI clients ([Client Setup & Security](/mcp/setup)).
+- **Send Rate Control, Quotas & Route Filters**: Spaces out bursts using per-channel minimum intervals, random jitter, and optional hourly/daily quotas, filters incoming entries by feed tags, keywords, or regular expressions, restricts each route to delivery time windows and weekdays, and lets you pause the global queue ([Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas)). Backlogs and multiple feeds are delivered in chronological order.
+- **WebUI & MCP Integration**: Ships with an embedded web console for managing channels, feeds, routes, and settings (username and password sign-in with optional TOTP 2FA), alongside a Streamable HTTP Model Context Protocol endpoint (`/mcp`) for inspecting status, previewing feeds, and managing routes from AI clients ([Client Setup & Security](/mcp/setup)).
 
 ---
 
@@ -30,7 +30,7 @@ It is designed as a delivery service rather than a local feed reader: reading, s
 | **Storage** | SQLite (`WAL` mode) | Single-file persistent storage for configuration, feed state, content hashes, and delivery queues. |
 | **Feed & HTML Processing** | `feed-rs`, `dom_smoothie`, `ammonia` | RSS / Atom / JSON Feed parsing, Readability full-text extraction, and HTML sanitization. |
 | **Channel Adapters** | `lettre`, [`telegram-rich`](https://crates.io/crates/telegram-rich), Notion REST API | SMTP email delivery, Telegram message formatting and media upload, and Notion page synchronization. |
-| **MCP Server** | `rmcp` | Streamable HTTP `/mcp` server providing 7 structured tools with `readonly` and `admin` scopes. |
+| **MCP Server** | `rmcp` | Streamable HTTP `/mcp` server providing 9 structured tools with `readonly` and `admin` scopes. |
 | **Frontend** | React 19, TypeScript, Tailwind CSS v4, Vite | Single-page web console embedded directly into the server binary. |
 
 ---

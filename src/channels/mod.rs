@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::compute_credential_group_key;
-use crate::db::models::{Channel, DeliveryTask, Entry, Feed, Route};
+use crate::db::models::{AppLocale, Channel, DeliveryTask, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
 
 /// Supported trusted delivery channel types.
@@ -366,13 +366,30 @@ pub enum TelegramDeliveryMode {
     MediaMode,
 }
 
-/// Per-route presentation options stored in `routes.options_json`.
+/// Daily delivery window (`HH:MM`–`HH:MM`, system timezone). `end < start` wraps past midnight;
+/// `start == end` means the whole day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryTimeWindow {
+    pub start: String,
+    pub end: String,
+}
+
+/// Per-route presentation and scheduling options stored in `routes.options_json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteOptions {
     #[serde(default)]
     pub telegram_mode: TelegramDeliveryMode,
     #[serde(default = "default_true")]
     pub link_preview: bool,
+    /// Delivery template language of this route. `None` inherits the legacy system locale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<AppLocale>,
+    /// Daily windows in the system timezone during which this route may deliver (empty = always).
+    #[serde(default)]
+    pub active_windows: Vec<DeliveryTimeWindow>,
+    /// ISO weekdays (`1` = Monday … `7` = Sunday) on which windows start (empty = every day).
+    #[serde(default)]
+    pub active_weekdays: Vec<u8>,
 }
 
 const fn default_true() -> bool {
@@ -384,6 +401,9 @@ impl Default for RouteOptions {
         Self {
             telegram_mode: TelegramDeliveryMode::RichMessage,
             link_preview: true,
+            locale: None,
+            active_windows: Vec::new(),
+            active_weekdays: Vec::new(),
         }
     }
 }

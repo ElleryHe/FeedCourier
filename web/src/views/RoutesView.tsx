@@ -2,10 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowRight,
+  CalendarDays,
+  Clock,
   FileText,
   Filter,
   GitFork,
   Image,
+  Languages,
   MessageSquareText,
   Pencil,
   Plus,
@@ -16,8 +19,11 @@ import { api } from "@/api/client";
 import type {
   ChannelDto,
   CreateRouteRequest,
+  ActiveWindow,
   FeedDto,
   RouteDto,
+  RouteOptions,
+  SystemLocale,
   TelegramDeliveryMode,
   UpdateRouteRequest,
 } from "@/api/types";
@@ -37,7 +43,7 @@ import {
   TagInput,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
-import { useI18n } from "@/i18n";
+import { type Locale, useI18n } from "@/i18n";
 import type { Messages } from "@/i18n/en";
 import { errorMessage, validateRegex } from "@/lib/utils";
 
@@ -55,10 +61,28 @@ function telegramModeLabel(
   }
 }
 
+const WEEKDAYS = [1, 2, 3, 4, 5, 6, 7] as const;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function localeName(locale: SystemLocale): string {
+  return locale === "zh-CN" ? "简体中文" : "English";
+}
+
+function formatWindow(w: ActiveWindow, allDay: string): string {
+  return w.start === w.end ? allDay : `${w.start}–${w.end}`;
+}
+
 export function RoutesView() {
-  const { m } = useI18n();
+  const { m, locale: uiLocale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
+
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.settings.get(),
+  });
+  const timezone = settingsQuery.data?.timezone ?? null;
+  const legacyLocale: Locale | null = settingsQuery.data?.locale ?? null;
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingRoute, setEditingRoute] = useState<RouteDto | null>(null);
@@ -198,6 +222,33 @@ export function RoutesView() {
                               : m.routes.previewOn)}
                         </Badge>
                       )}
+                      <Badge variant="outline">
+                        <Languages className="h-3 w-3" />
+                        {localeName(
+                          route.options.locale ?? legacyLocale ?? uiLocale,
+                        )}
+                      </Badge>
+                      {(route.options.active_windows ?? []).length > 0 && (
+                        <Badge
+                          variant="warning"
+                          title={m.routes.windowBadgeTitle(timezone ?? "")}
+                        >
+                          <Clock className="h-3 w-3" />
+                          {(route.options.active_windows ?? [])
+                            .map((w) => formatWindow(w, m.routes.allDay))
+                            .join(", ")}
+                        </Badge>
+                      )}
+                      {(route.options.active_weekdays ?? []).length > 0 &&
+                        (route.options.active_weekdays ?? []).length < 7 && (
+                          <Badge variant="warning">
+                            <CalendarDays className="h-3 w-3" />
+                            {[...(route.options.active_weekdays ?? [])]
+                              .sort((a, b) => a - b)
+                              .map((d) => m.routes.weekdaysShort[d - 1] ?? d)
+                              .join(" ")}
+                          </Badge>
+                        )}
                     </div>
 
                     {/* Source -> Destination Flow */}
@@ -313,6 +364,8 @@ export function RoutesView() {
           feeds={feedsQuery.data ?? []}
           channels={channelsQuery.data ?? []}
           knownTags={allFeedTags}
+          timezone={timezone}
+          legacyLocale={legacyLocale}
         />
       )}
 
@@ -343,6 +396,8 @@ function RouteEditorModal({
   feeds,
   channels,
   knownTags,
+  timezone,
+  legacyLocale,
 }: {
   open: boolean;
   onClose: () => void;
@@ -350,8 +405,10 @@ function RouteEditorModal({
   feeds: FeedDto[];
   channels: ChannelDto[];
   knownTags: string[];
+  timezone: string | null;
+  legacyLocale: Locale | null;
 }) {
-  const { m } = useI18n();
+  const { m, locale: uiLocale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const isEdit = route !== null;
@@ -381,6 +438,15 @@ function RouteEditorModal({
   );
   const [linkPreview, setLinkPreview] = useState<boolean>(
     route?.options.link_preview ?? true,
+  );
+  const [deliveryLocale, setDeliveryLocale] = useState<SystemLocale>(
+    route ? (route.options.locale ?? legacyLocale ?? uiLocale) : uiLocale,
+  );
+  const [activeWindows, setActiveWindows] = useState<ActiveWindow[]>(
+    route?.options.active_windows?.map((w) => ({ ...w })) ?? [],
+  );
+  const [activeWeekdays, setActiveWeekdays] = useState<number[]>(
+    route?.options.active_weekdays ?? [],
   );
   const [enabled, setEnabled] = useState<boolean>(route?.enabled ?? true);
   const [formError, setFormError] = useState<string | null>(null);
@@ -421,14 +487,18 @@ function RouteEditorModal({
 
   const saveMutation = useMutation({
     mutationFn: async () => {
-      const options =
-        selectedChannel?.kind === "telegram"
+      const options: RouteOptions = {
+        ...(selectedChannel?.kind === "telegram"
           ? {
               telegram_mode: telegramMode,
               link_preview:
                 telegramMode === "compact_card" ? linkPreview : undefined,
             }
-          : {};
+          : {}),
+        locale: deliveryLocale,
+        active_windows: activeWindows,
+        active_weekdays: [...activeWeekdays].sort((a, b) => a - b),
+      };
 
       if (isEdit && route) {
         const payload: UpdateRouteRequest = {
@@ -484,6 +554,12 @@ function RouteEditorModal({
     }
     if (feedIds.length === 0 && matchTags.length === 0) {
       setFormError(m.routes.editor.errNoSource);
+      return;
+    }
+    if (
+      activeWindows.some((w) => !TIME_RE.test(w.start) || !TIME_RE.test(w.end))
+    ) {
+      setFormError(m.routes.editor.errWindowTime);
       return;
     }
     const incErr = validateRegex(includeRegex);
@@ -695,6 +771,180 @@ function RouteEditorModal({
             )}
           </div>
         )}
+
+        {/* Delivery Language */}
+        <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+            <Languages className="h-3.5 w-3.5" />
+            {m.routes.editor.languageHeading}
+          </h3>
+          <div className="grid gap-2.5 sm:grid-cols-2">
+            {(["zh-CN", "en"] as const).map((loc) => {
+              const active = deliveryLocale === loc;
+              return (
+                <button
+                  key={loc}
+                  type="button"
+                  onClick={() => setDeliveryLocale(loc)}
+                  className={`flex cursor-pointer items-center justify-between rounded-lg border px-3.5 py-2 text-left transition-colors ${
+                    active
+                      ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
+                      : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-800/70"
+                  }`}
+                >
+                  <span className="text-xs font-semibold">
+                    {localeName(loc)}
+                  </span>
+                  <span
+                    className={`font-mono text-[11px] ${
+                      active
+                        ? "text-zinc-300 dark:text-zinc-600"
+                        : "text-zinc-500"
+                    }`}
+                  >
+                    {loc}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <FieldHint>{m.routes.editor.languageHint}</FieldHint>
+        </div>
+
+        {/* Active Windows */}
+        <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="flex items-center gap-1.5 text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+              <Clock className="h-3.5 w-3.5" />
+              {m.routes.editor.windowsHeading}
+            </h3>
+            <Badge variant="mono">
+              {m.routes.editor.timezoneBadge(timezone ?? "—")}
+            </Badge>
+          </div>
+          <FieldHint className="mt-0">
+            {m.routes.editor.windowsHint(timezone ?? "—")}
+          </FieldHint>
+
+          {activeWindows.length === 0 ? (
+            <p className="rounded-lg border border-dashed border-zinc-200 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+              {m.routes.editor.windowsAlways}
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {activeWindows.map((w, idx) => (
+                <div
+                  // biome-ignore lint/suspicious/noArrayIndexKey: rows are positional and editable
+                  key={idx}
+                  className="flex flex-wrap items-center gap-2"
+                >
+                  <Input
+                    type="time"
+                    value={w.start}
+                    onChange={(e) =>
+                      setActiveWindows((prev) =>
+                        prev.map((x, i) =>
+                          i === idx ? { ...x, start: e.target.value } : x,
+                        ),
+                      )
+                    }
+                    aria-label={m.routes.editor.windowStart}
+                    className="w-32 font-mono"
+                  />
+                  <span className="text-xs text-zinc-400">–</span>
+                  <Input
+                    type="time"
+                    value={w.end}
+                    onChange={(e) =>
+                      setActiveWindows((prev) =>
+                        prev.map((x, i) =>
+                          i === idx ? { ...x, end: e.target.value } : x,
+                        ),
+                      )
+                    }
+                    aria-label={m.routes.editor.windowEnd}
+                    className="w-32 font-mono"
+                  />
+                  {w.start && w.start === w.end ? (
+                    <Badge variant="info">{m.routes.allDay}</Badge>
+                  ) : (
+                    w.start &&
+                    w.end &&
+                    w.end < w.start && (
+                      <Badge variant="info">
+                        {m.routes.editor.windowWraps}
+                      </Badge>
+                    )
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() =>
+                      setActiveWindows((prev) =>
+                        prev.filter((_, i) => i !== idx),
+                      )
+                    }
+                    title={m.routes.editor.removeWindow}
+                    aria-label={m.routes.editor.removeWindow}
+                    className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              setActiveWindows((prev) => [
+                ...prev,
+                { start: "09:00", end: "18:00" },
+              ])
+            }
+          >
+            <Plus className="h-3.5 w-3.5" />
+            {m.routes.editor.addWindow}
+          </Button>
+
+          <div className="space-y-1.5 border-t border-zinc-100 pt-3 dark:border-zinc-800">
+            <Label>{m.routes.editor.weekdaysLabel}</Label>
+            <div className="flex flex-wrap gap-1.5">
+              {WEEKDAYS.map((d) => {
+                const active = activeWeekdays.includes(d);
+                return (
+                  <button
+                    key={d}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() =>
+                      setActiveWeekdays((prev) =>
+                        prev.includes(d)
+                          ? prev.filter((x) => x !== d)
+                          : [...prev, d],
+                      )
+                    }
+                    className={`min-w-11 cursor-pointer rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
+                      active
+                        ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
+                        : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400 dark:hover:bg-zinc-800/70"
+                    }`}
+                  >
+                    {m.routes.weekdaysShort[d - 1]}
+                  </button>
+                );
+              })}
+            </div>
+            <FieldHint>
+              {activeWeekdays.length === 0
+                ? m.routes.editor.weekdaysEveryDay
+                : m.routes.editor.weekdaysHint}
+            </FieldHint>
+          </div>
+          <FieldHint>{m.routes.editor.queuedOutsideHint}</FieldHint>
+        </div>
 
         {/* Content Filter Rules */}
         <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">

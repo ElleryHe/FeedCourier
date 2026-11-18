@@ -1,10 +1,10 @@
 ---
-description: "Configure FeedCourier environment variables, HTTP and SOCKS5 outbound proxies, per-feed and per-channel proxy toggles, and private network SSRF allowlists."
+description: "Configure FeedCourier environment variables (admin username and password, 2FA reset, timezone), HTTP and SOCKS5 outbound proxies, per-feed and per-channel proxy toggles, and private network SSRF allowlists."
 ---
 
 # Configuration & Proxy
 
-FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment, both of which have default values. Outbound proxy settings and private network allowlists can be initialized via environment variables on first launch and updated at any time from the WebUI under **Settings**.
+FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment, both of which have default values. The system timezone, outbound proxy settings, and private network allowlists can be initialized via environment variables on first launch and updated at any time from the WebUI under **Settings**.
 
 ---
 
@@ -15,17 +15,25 @@ FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment
 | `DATA_DIR` | `./data` (`/data` in Docker) | Persistent directory storing `feedcourier.db` (SQLite WAL), `master.key`, and online database backups. |
 | `LISTEN_ADDR` | `0.0.0.0:8080` | Socket address (`IP:PORT`) for the WebUI, `/api/v1/*` REST API, and `/mcp` Streamable HTTP endpoint. |
 | `MASTER_KEY` | *(auto-generated)* | Explicit 32-byte encryption key encoded as 64-character hex or Base64. When omitted, `<DATA_DIR>/master.key` is generated automatically with `0600` file permissions. |
+| `ADMIN_USERNAME` | `Courier` | WebUI administrator username. When set, it overrides the stored username on **every startup**. |
 | `ADMIN_PASSWORD` | *(interactive setup)* | Sets or resets the WebUI administrator password on startup. |
+| `RESET_2FA` | *(unset)* | Set to `true` for a one-shot emergency removal of the TOTP secret and all recovery codes at startup (logs a `WARN`). Remove the variable afterwards. See [Lost Authenticator](/guide/operations#lost-authenticator-reset-2fa). |
+| `TIMEZONE` (or `TZ`) | `America/Los_Angeles` | IANA timezone (for example `Asia/Shanghai`) used to evaluate route delivery time windows and weekdays. Seeds the **system timezone** setting once; later changes in **Settings** take precedence. |
 | `OUTBOUND_PROXY` | *(unset)* | Initial global outbound proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`). Falls back to `ALL_PROXY`, `HTTPS_PROXY`, or `HTTP_PROXY` if unset. |
 | `SSRF_ALLOWLIST` | *(empty)* | Comma-separated internal CIDRs or hostnames permitted for outbound requests (e.g., `10.0.0.5/32,rsshub.internal,*.lan`). |
-| `LOCALE` | *(auto-synced)* | Initial language (`en` or `zh-CN`) for downstream Telegram and SMTP push notification templates. Automatically syncs with the WebUI language switcher once signed in. |
+| `LOCALE` | *(unset)* | Legacy fallback delivery language (`en` or `zh-CN`) for routes that have no delivery language of their own. New routes store their own language; the WebUI language is a browser preference and no longer syncs to the server. |
 | `RETENTION_HOURS` | `24` | Hours after discovery to retain article HTML and media metadata once all delivery tasks for that entry have finished. |
 | `DB_READ_MAX_CONNECTIONS` | `8` | Maximum concurrent connections in the read-only SQLite connection pool (minimum `1`). |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | Log level filter (supports `debug`, `warn`, `error`, or module targets such as `feedcourier::scheduler=debug`). |
 
-::: warning Resetting `ADMIN_PASSWORD` vs. Persisted Network Settings
-- If **`ADMIN_PASSWORD`** is set in the environment, FeedCourier updates the administrator password on **every startup**, which can also be used to recover access if you forget your password.
-- **`OUTBOUND_PROXY`** and **`SSRF_ALLOWLIST`** act as **initial defaults**: they populate the database only when no value has been saved yet. Once initialized, changes saved in the WebUI (**Settings**) take precedence across restarts.
+::: warning Environment Overrides vs. Persisted Settings
+- If **`ADMIN_PASSWORD`** is set in the environment, FeedCourier updates the administrator password on **every startup**, which can also be used to recover access if you forget your password. **`ADMIN_USERNAME`** behaves the same way for the username; while it is set, the WebUI shows a hint that the username is managed by the environment.
+- **`TIMEZONE`**/**`TZ`**, **`OUTBOUND_PROXY`**, and **`SSRF_ALLOWLIST`** act as **initial defaults**: they populate the database only when no value has been saved yet. Once initialized, changes saved in the WebUI (**Settings**) take precedence across restarts.
+- **`RESET_2FA=true`** is a one-time recovery switch. Remove it after the restart, otherwise it clears 2FA again on every start.
+:::
+
+::: tip Docker Timezone
+Pass the timezone to the container with `-e TZ=America/Los_Angeles` (or any IANA name). Route time windows are evaluated in this system timezone, not in the browser's timezone.
 :::
 
 ---

@@ -23,6 +23,30 @@ pub const SETTING_SSRF_ALLOWLIST: &str = "ssrf_allowlist";
 /// Well-known `system_settings.key` for the system UI and delivery template locale (`AppLocale`).
 pub const SETTING_LOCALE: &str = "locale";
 
+/// Well-known `system_settings.key` for the IANA system timezone used by route delivery windows.
+pub const SETTING_TIMEZONE: &str = "timezone";
+
+/// Well-known `system_settings.key` for the global outbox queue pause state.
+pub const SETTING_OUTBOX_QUEUE: &str = "outbox_queue";
+
+/// Well-known `system_settings.key` for the WebUI administrator username.
+pub const SETTING_ADMIN_USERNAME: &str = "admin_username";
+
+/// Fallback administrator username for new and legacy installations.
+pub const DEFAULT_ADMIN_USERNAME: &str = "Courier";
+
+/// `system_settings.key`: ChaCha20-Poly1305 encrypted (base64) active TOTP secret.
+pub const SETTING_ADMIN_TOTP_SECRET: &str = "admin_totp_secret";
+
+/// `system_settings.key`: encrypted (base64) TOTP secret awaiting first-code confirmation.
+pub const SETTING_ADMIN_TOTP_PENDING: &str = "admin_totp_pending";
+
+/// `system_settings.key`: last accepted TOTP time-step (replay protection).
+pub const SETTING_ADMIN_TOTP_LAST_STEP: &str = "admin_totp_last_step";
+
+/// `system_settings.key`: SHA-256 hashes of unused recovery codes.
+pub const SETTING_ADMIN_RECOVERY_HASHES: &str = "admin_recovery_hashes";
+
 /// Supported system UI and delivery template locales (`system_settings.locale`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AppLocale {

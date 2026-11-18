@@ -126,7 +126,7 @@ function kindMeta(kind: ChannelKind, m: Messages) {
 }
 
 export function ChannelsView() {
-  const { m } = useI18n();
+  const { m, locale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -145,7 +145,7 @@ export function ChannelsView() {
   const testMutation = useMutation({
     mutationFn: (id: number) => {
       setTestingId(id);
-      return api.channels.test(id);
+      return api.channels.test(id, { locale });
     },
     onSuccess: (res) => {
       if (res.ok) {

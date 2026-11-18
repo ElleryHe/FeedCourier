@@ -3,15 +3,15 @@ import {
   Bot,
   Check,
   Copy,
+  Clock,
   Globe,
   KeyRound,
-  Languages,
   Plus,
   Save,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { api } from "@/api/client";
 import type {
   CreateMcpTokenResponse,
@@ -36,7 +36,7 @@ import {
   TagInput,
 } from "@/components/ui/primitives";
 import { useToast } from "@/components/ui/toast";
-import { type Locale, useI18n } from "@/i18n";
+import { useI18n } from "@/i18n";
 import {
   copyToClipboard,
   errorMessage,
@@ -44,29 +44,18 @@ import {
   formatRelativeTime,
   isValidProxyUrl,
 } from "@/lib/utils";
+import {
+  browserTimeZone,
+  currentTimeIn,
+  listTimeZones,
+  utcOffsetLabel,
+} from "@/lib/timezone";
+import { AccountSecurityCard } from "@/views/AccountSecurityCard";
 
 export function SettingsView() {
-  const { locale, setLocale, m } = useI18n();
+  const { m } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
-
-  const handleSelectLocale = (next: Locale) => {
-    if (next === locale) return;
-    setLocale(next);
-    void api.settings
-      .update({ locale: next })
-      .then((updated) => {
-        queryClient.setQueryData(["settings"], updated);
-        toast.success(
-          next === "zh-CN"
-            ? "语言设置已更新"
-            : "Language updated",
-        );
-      })
-      .catch((err) => {
-        toast.error(errorMessage(err));
-      });
-  };
 
   // --- System Settings (`GET` & `PUT /api/v1/settings`) ---
   const settingsQuery = useQuery({
@@ -77,9 +66,14 @@ export function SettingsView() {
   const [proxyUrl, setProxyUrl] = useState("");
   const [ssrfAllowlist, setSsrfAllowlist] = useState<string[]>([]);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [timezone, setTimezone] = useState("");
+  const [timezoneError, setTimezoneError] = useState<string | null>(null);
+  const timeZones = useMemo(() => listTimeZones(), []);
+  const detectedZone = useMemo(() => browserTimeZone(), []);
 
   useEffect(() => {
     if (settingsQuery.data) {
+      setTimezone(settingsQuery.data.timezone ?? "");
       setProxyUrl(settingsQuery.data.outbound_proxy_url ?? "");
       setSsrfAllowlist(settingsQuery.data.ssrf_allowlist);
     }
@@ -99,6 +93,35 @@ export function SettingsView() {
       setSettingsError(errorMessage(err));
     },
   });
+
+  const saveTimezoneMutation = useMutation({
+    mutationFn: (tz: string) => api.settings.update({ timezone: tz }),
+    onSuccess: (updated) => {
+      toast.success(m.settings.toastTimezoneSaved);
+      queryClient.setQueryData(["settings"], updated);
+    },
+    onError: (err) => {
+      setTimezoneError(errorMessage(err));
+    },
+  });
+
+  const handleSaveTimezone = (e: FormEvent) => {
+    e.preventDefault();
+    setTimezoneError(null);
+    const tz = timezone.trim();
+    if (!tz || !timeZones.includes(tz)) {
+      setTimezoneError(m.settings.errInvalidTimezone);
+      return;
+    }
+    saveTimezoneMutation.mutate(tz);
+  };
+
+  const timezoneNow = timeZones.includes(timezone.trim())
+    ? currentTimeIn(timezone.trim())
+    : null;
+  const timezoneOffset = timeZones.includes(timezone.trim())
+    ? utcOffsetLabel(timezone.trim())
+    : null;
 
   const handleSaveSettings = (e: FormEvent) => {
     e.preventDefault();
@@ -207,68 +230,81 @@ export function SettingsView() {
         </p>
       </div>
 
-      {/* Section 0: Interface & Delivery Language */}
+      {/* Section 0: System Timezone */}
       <Card>
         <CardHeader>
           <div className="flex items-center gap-2">
-            <Languages className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-            <CardTitle>{m.settings.languageTitle}</CardTitle>
+            <Clock className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+            <CardTitle>{m.settings.timezoneTitle}</CardTitle>
           </div>
-          <CardDescription>{m.settings.languageDesc}</CardDescription>
+          <CardDescription>{m.settings.timezoneDesc}</CardDescription>
         </CardHeader>
-        <CardContent className="space-y-2.5">
-          <div className="grid gap-2.5 sm:grid-cols-2">
-            <button
-              type="button"
-              onClick={() => handleSelectLocale("zh-CN")}
-              className={`flex cursor-pointer items-center justify-between rounded-lg border px-3.5 py-2.5 text-left transition-colors ${
-                locale === "zh-CN"
-                  ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
-                  : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800/70"
-              }`}
-            >
-              <div>
-                <div className="text-xs font-semibold">简体中文</div>
-                <div
-                  className={`mt-0.5 font-mono text-[11px] ${
-                    locale === "zh-CN"
-                      ? "text-zinc-300 dark:text-zinc-600"
-                      : "text-zinc-500"
-                  }`}
-                >
-                  zh-CN
-                </div>
+        <CardContent>
+          <form onSubmit={handleSaveTimezone} className="space-y-3">
+            <div>
+              <Label htmlFor="system-timezone">
+                {m.settings.timezoneLabel}
+              </Label>
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                <Input
+                  id="system-timezone"
+                  list="fc-timezone-options"
+                  value={timezone}
+                  onChange={(e) => {
+                    setTimezone(e.target.value);
+                    setTimezoneError(null);
+                  }}
+                  placeholder={m.settings.timezonePlaceholder}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="max-w-xs font-mono text-xs"
+                />
+                <datalist id="fc-timezone-options">
+                  {timeZones.map((tz) => (
+                    <option key={tz} value={tz} />
+                  ))}
+                </datalist>
+                {detectedZone && detectedZone !== timezone && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setTimezone(detectedZone);
+                      setTimezoneError(null);
+                    }}
+                  >
+                    {m.settings.timezoneUseBrowser(detectedZone)}
+                  </Button>
+                )}
+                {timezoneNow && (
+                  <Badge variant="mono">
+                    {m.settings.timezoneNow(timezoneNow, timezoneOffset)}
+                  </Badge>
+                )}
               </div>
-              {locale === "zh-CN" && <Check className="h-4 w-4 shrink-0" />}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => handleSelectLocale("en")}
-              className={`flex cursor-pointer items-center justify-between rounded-lg border px-3.5 py-2.5 text-left transition-colors ${
-                locale === "en"
-                  ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
-                  : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800/70"
-              }`}
-            >
-              <div>
-                <div className="text-xs font-semibold">English</div>
-                <div
-                  className={`mt-0.5 font-mono text-[11px] ${
-                    locale === "en"
-                      ? "text-zinc-300 dark:text-zinc-600"
-                      : "text-zinc-500"
-                  }`}
-                >
-                  en
-                </div>
-              </div>
-              {locale === "en" && <Check className="h-4 w-4 shrink-0" />}
-            </button>
-          </div>
-          <FieldHint>{m.settings.languageDeliveryHint}</FieldHint>
+              <FieldHint>{m.settings.timezoneHint}</FieldHint>
+            </div>
+            <FieldError message={timezoneError} />
+            <div className="flex justify-end">
+              <Button
+                type="submit"
+                size="sm"
+                loading={saveTimezoneMutation.isPending}
+                disabled={
+                  !settingsQuery.data ||
+                  timezone.trim() === settingsQuery.data.timezone
+                }
+              >
+                <Save className="h-3.5 w-3.5" />
+                {m.settings.saveTimezone}
+              </Button>
+            </div>
+          </form>
         </CardContent>
       </Card>
+
+      {/* Section 0b: Account & Security */}
+      <AccountSecurityCard />
 
       {/* Section 1: Outbound Proxy & SSRF Guardrails */}
       <Card>
@@ -410,7 +446,7 @@ export function SettingsView() {
                           : "text-zinc-500"
                       }`}
                     >
-                      + manage_feed, configure_route, reset_and_poll_feed, retry_dead_tasks
+                      + manage_feed, configure_route, reset_and_poll_feed, retry_dead_tasks, manage_outbox_queue, test_push_feed_entry
                     </p>
                   </button>
                 </div>
