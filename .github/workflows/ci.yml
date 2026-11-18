@@ -127,6 +127,8 @@ jobs:
           pnpm --dir docs build
           test -s docs/.vitepress/dist/llms.txt
           test -s docs/.vitepress/dist/llms-full.txt
+          test -s docs/.vitepress/dist/feed.xml
+          test -s docs/.vitepress/dist/atom.xml
           test -s docs/.vitepress/dist/_headers
 
   docker-web-stage:

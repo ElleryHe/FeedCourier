@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-18
+
+### Added
+
+- **Release Changelog RSS 2.0 & Atom 1.0 Feeds (`docs/.vitepress/config.mts`, `CHANGELOG.md`)**:
+  - Added static build-time generation of `/feed.xml` (RSS 2.0) and `/atom.xml` (Atom 1.0) directly from `CHANGELOG.md`, complete with `<link rel="alternate" type="application/rss+xml">` and `application/atom+xml` auto-discovery headers, top-bar RSS social link, and README links so users can subscribe to FeedCourier's own release notes.
+- **Documentation Site SEO Hardening, IndexNow & `llms.txt` (`docs/`, `.github/workflows/indexnow.yml`)**:
+  - Added build-time generation of `/llms.txt` (structured English documentation index and page summaries) and `/llms-full.txt` (complete single-file plain-text Markdown documentation) with `<link rel="alternate" type="text/plain" href="https://feedcourier.ellery.me/llms.txt" />` discovery.
+  - Added Cloudflare Workers Static Assets `docs/public/_headers` (`X-Robots-Tag: noindex, nofollow` on `*.workers.dev/*`) and set `"workers_dev": false` in `docs/wrangler.jsonc` so preview/worker subdomains cannot compete with `https://feedcourier.ellery.me` in search rankings.
+  - Added legacy version route isolation (`noindex, follow`, canonical rewrite to the latest version path, and `sitemap.xml` exclusion for `/v<N>/*` or `version: legacy` frontmatter).
+  - Added optional IndexNow key-file emission (`/<INDEXNOW_KEY>.txt`) at build time and `.github/workflows/indexnow.yml` to automatically push modified documentation and feed URLs to `https://api.indexnow.org/indexnow` after merges to `main`.
+- **Automated Release Tagging on `main` (`.github/workflows/release.yml`)**:
+  - Updated the release workflow to trigger on `push` to `main` (alongside manual `v*` tag pushes): when `[package].version` in `Cargo.toml` does not yet have a corresponding `v<version>` Git tag, the workflow automatically creates and pushes the tag before building multi-platform binaries, multi-arch Docker images, and the GitHub Release.
+
+### Changed
+
+- **Unified Console & Delivery Language Setting in System Settings (`web/src/views/SettingsView.tsx`, `web/src/components/AppShell.tsx`, `web/src/App.tsx`)**:
+  - Relocated the console language selector (`English` / `简体中文`) from the sidebar footer and mobile top bar into **System Settings**, accompanied by an explicit helper notice explaining that switching the console language also updates the delivery template language for newly dispatched SMTP, Telegram, and Notion notifications (`AuthGateView` retains a login-screen language toggle prior to authentication).
+  - Hydrated the active WebUI locale from `/api/v1/settings` (`system_settings.locale`) upon authentication so new browser sessions reflect the server's configured language.
+- **GitHub Actions Runner Upgrades (`.github/workflows/release.yml`, `.github/workflows/ci.yml`)**:
+  - Upgraded the macOS release binary runner from `macos-latest` to `macos-26` (`aarch64-apple-darwin` + `x86_64-apple-darwin` cross-compilation), upgraded `actions/upload-artifact` to `@v7`, and pinned `ubuntu-24.04` across all Linux CI and release jobs.
+
+### Fixed
+
+- **Scheduled Feed Polling Stall & UTF-8 HTML Entity Slice Panic (`src/ingest/html.rs`, `src/scheduler/mod.rs`, `src/db/repo.rs`, `web/src/views/FeedsView.tsx`)**:
+  - Fixed a byte-index slice panic in `decode_basic_html_entities` (`&s[i..limit]` when `i + 12` landed inside a multi-byte UTF-8 character after an unescaped `&` in feed titles or author names) that terminated the background scheduler loop and left `next_poll_at` timestamps frozen in the past.
+  - Isolated each scheduled feed poll inside its own `tokio::spawn` task with a hard `90s` timeout and outer `catch_unwind` recovery so a slow or panicking feed can never stall the scheduler loop or block sibling feeds in the same batch.
+  - Clamped overdue `next_poll_at` timestamps to `now` when updating a feed's `poll_interval_minutes`, and added a `30s` `refetchInterval` on the WebUI **Feeds** view so background scheduler polls update relative timestamps live.
+- **WebUI Theme Mode Reactivity & Dark-Mode Text Selection Contrast (`web/src/components/AppShell.tsx`, `web/index.html`)**:
+  - Replaced per-component `useThemeMode` state with a shared `useSyncExternalStore` theme store and live `matchMedia('(prefers-color-scheme: dark)')` listener so desktop and mobile theme controls stay synchronized and `system` mode reacts immediately to OS appearance changes.
+  - Added explicit dark-mode text selection styling (`dark:selection:bg-emerald-500/30 dark:selection:text-emerald-50`) on `<body>` in `web/index.html` so highlighted text remains clearly legible on dark backgrounds.
+
 ## [0.1.4] - 2026-11-18
 
 ### Added
@@ -123,7 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Encrypted Credential Vault & Scoped Auth**: Channel credentials are encrypted at rest with `ChaCha20-Poly1305` AEAD (`master.key`, `0600`); WebUI administrator passwords use `Argon2id` PHC hashing with `HttpOnly` session cookies (`fc_session`); and `/mcp` Bearer tokens are stored exclusively as `SHA-256` hashes.
 - **MCP Trust Boundaries & Untrusted Content Framing**: Channel secrets and recipient targets (email addresses, `chat_id`, `data_source_id`) are strictly locked to the WebUI and opaque to `/mcp` tools, while untrusted external feed text surfaced to AI agents is sanitized, truncated, and isolated inside `<untrusted_feed_content>` XML boundary tags (`src/mcp/sanitize.rs`), complemented by `ammonia` HTML sanitization across ingest and delivery pipelines.
 
-[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.1...v0.1.2

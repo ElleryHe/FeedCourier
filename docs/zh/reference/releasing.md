@@ -54,7 +54,7 @@ flowchart LR
 ### 第二步：Docker Hub 原生双架构镜像并行构建与合并推送
 - `docker-build` 矩阵任务分别在原生 `ubuntu-24.04`（`linux/amd64`）与 `ubuntu-24.04-arm`（`linux/arm64`）运行器上并行编译镜像（无需 QEMU 指令模拟，按架构独立缓存 Cargo 外部依赖层），并按不可变摘要（`push-by-digest`）推送分片；随后由 `docker` 任务调用 `docker buildx imagetools create` 合并生成统一的多架构 Manifest 并发布至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
 - **镜像标签规则**：
-  - `<version>`（如 `0.1.4`）
+  - `<version>`（如 `0.1.5`）
   - `<major>.<minor>`（如 `0.1`）
   - `<major>`（自 `1.0.0` 正式版起启用）
   - `latest`（仅对不带 `-rc` / `-beta` / `-alpha` 后缀的正式版标签更新）

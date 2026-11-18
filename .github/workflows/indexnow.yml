@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "docs/**"
+      - "CHANGELOG.md"
   workflow_dispatch:
     inputs:
       scope:
@@ -65,7 +66,7 @@ jobs:
 
           CHANGED_FILES=""
           if [[ "${SUBMIT_ALL}" == "false" ]] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-            CHANGED_FILES="$(git diff --name-only "${BEFORE_SHA}" "${AFTER_SHA}" -- 'docs/**')"
+            CHANGED_FILES="$(git diff --name-only "${BEFORE_SHA}" "${AFTER_SHA}" -- 'docs/**' 'CHANGELOG.md')"
             if printf '%s\n' "${CHANGED_FILES}" | grep -Eq '^docs/(\.vitepress/|public/)'; then
               SUBMIT_ALL="true"
             fi
@@ -77,7 +78,10 @@ jobs:
           if [[ "${SUBMIT_ALL}" == "false" ]]; then
             while IFS= read -r file; do
               [[ -z "${file}" ]] && continue
-              if [[ "${file}" == docs/*.md ]]; then
+              if [[ "${file}" == "CHANGELOG.md" ]]; then
+                echo "${SITE_ORIGIN}/feed.xml" >> "${URLS_FILE}"
+                echo "${SITE_ORIGIN}/atom.xml" >> "${URLS_FILE}"
+              elif [[ "${file}" == docs/*.md ]]; then
                 rel="${file#docs/}"
                 rel="${rel%.md}"
                 if [[ "${rel}" == "404" || "${rel}" == "zh/404" ]]; then
@@ -116,6 +120,8 @@ jobs:
               >> "${URLS_FILE}" || true
             echo "${SITE_ORIGIN}/llms.txt" >> "${URLS_FILE}"
             echo "${SITE_ORIGIN}/llms-full.txt" >> "${URLS_FILE}"
+            echo "${SITE_ORIGIN}/feed.xml" >> "${URLS_FILE}"
+            echo "${SITE_ORIGIN}/atom.xml" >> "${URLS_FILE}"
           fi
 
           sort -u "${URLS_FILE}" -o "${URLS_FILE}"
