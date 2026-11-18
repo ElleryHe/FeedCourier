@@ -147,6 +147,16 @@ impl SmtpSender {
         self.locale.read().map(|g| *g).unwrap_or(AppLocale::En)
     }
 
+    /// Clone sharing the pooled transports but with an independent default `locale`
+    /// (used for per-request localized channel test messages).
+    pub fn for_locale(&self, locale: AppLocale) -> Self {
+        Self {
+            timeout: self.timeout,
+            transports: Arc::clone(&self.transports),
+            locale: Arc::new(RwLock::new(locale)),
+        }
+    }
+
     /// Obtain or create a pooled `AsyncSmtpTransport` matching `cfg`.
     fn transport_for(
         &self,
@@ -329,7 +339,7 @@ impl ChannelSender for SmtpSender {
             ctx.entry,
             ctx.route.id,
             prior_msg_id,
-            self.locale(),
+            ctx.route_options.locale.unwrap_or_else(|| self.locale()),
         ) {
             Ok(built) => built,
             Err(err) => {

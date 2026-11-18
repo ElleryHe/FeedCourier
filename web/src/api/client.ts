@@ -1,7 +1,25 @@
 import type {
+  AccountDto,
   ActionAckResponse,
   ApiErrorBody,
+  AuthLogin2faRequest,
+  AuthLoginRequest,
+  AuthLoginResponse,
   AuthPasswordRequest,
+  ClearFeedCacheRequest,
+  ClearFeedCacheResponse,
+  FeedPreviewPushRequest,
+  FeedPreviewPushResponse,
+  QueueStateDto,
+  RecoveryCodesResponse,
+  RegenerateRecoveryCodesRequest,
+  TestChannelRequest,
+  TotpDisableRequest,
+  TotpEnableRequest,
+  TotpSetupRequest,
+  TotpSetupResponse,
+  UpdateAccountRequest,
+  UpdateQueueRequest,
   AuthStatusResponse,
   ChannelDto,
   CreateChannelRequest,
@@ -184,8 +202,14 @@ export const api = {
         body: payload,
         skipUnauthorizedHook: true,
       }),
-    login: (payload: AuthPasswordRequest) =>
-      request<ActionAckResponse | undefined>("/auth/login", {
+    login: (payload: AuthLoginRequest) =>
+      request<AuthLoginResponse | undefined>("/auth/login", {
+        method: "POST",
+        body: payload,
+        skipUnauthorizedHook: true,
+      }),
+    login2fa: (payload: AuthLogin2faRequest) =>
+      request<ActionAckResponse | undefined>("/auth/login/2fa", {
         method: "POST",
         body: payload,
         skipUnauthorizedHook: true,
@@ -194,6 +218,35 @@ export const api = {
       request<ActionAckResponse | undefined>("/auth/logout", {
         method: "POST",
         skipUnauthorizedHook: true,
+      }),
+  },
+
+  // -------------------------------------------------------------------------
+  // Account & Security
+  // -------------------------------------------------------------------------
+  account: {
+    get: () => request<AccountDto>("/account", { method: "GET" }),
+    update: (payload: UpdateAccountRequest) =>
+      request<AccountDto>("/account", { method: "PATCH", body: payload }),
+    totpSetup: (payload: TotpSetupRequest) =>
+      request<TotpSetupResponse>("/account/2fa/setup", {
+        method: "POST",
+        body: payload,
+      }),
+    totpEnable: (payload: TotpEnableRequest) =>
+      request<RecoveryCodesResponse>("/account/2fa/enable", {
+        method: "POST",
+        body: payload,
+      }),
+    totpDisable: (payload: TotpDisableRequest) =>
+      request<AccountDto>("/account/2fa/disable", {
+        method: "POST",
+        body: payload,
+      }),
+    regenerateRecoveryCodes: (payload: RegenerateRecoveryCodesRequest) =>
+      request<RecoveryCodesResponse>("/account/2fa/recovery-codes", {
+        method: "POST",
+        body: payload,
       }),
   },
 
@@ -241,6 +294,16 @@ export const api = {
       request<PollFeedResponse>(`/feeds/${id}/poll`, { method: "POST" }),
     preview: (payload: FeedPreviewRequest) =>
       request<FeedPreviewResponse>("/feeds/preview", {
+        method: "POST",
+        body: payload,
+      }),
+    clearCache: (id: number, payload: ClearFeedCacheRequest = {}) =>
+      request<ClearFeedCacheResponse>(`/feeds/${id}/clear-cache`, {
+        method: "POST",
+        body: payload,
+      }),
+    previewPush: (payload: FeedPreviewPushRequest) =>
+      request<FeedPreviewPushResponse>("/feeds/preview/push", {
         method: "POST",
         body: payload,
       }),
@@ -293,8 +356,11 @@ export const api = {
       request<ActionAckResponse | undefined>(`/channels/${id}`, {
         method: "DELETE",
       }),
-    test: (id: number) =>
-      request<TestChannelResponse>(`/channels/${id}/test`, { method: "POST" }),
+    test: (id: number, payload?: TestChannelRequest) =>
+      request<TestChannelResponse>(`/channels/${id}/test`, {
+        method: "POST",
+        body: payload,
+      }),
     notionInitDb: (payload: NotionInitDbRequest) =>
       request<NotionInitDbResponse>("/channels/notion/init-db", {
         method: "POST",
@@ -335,6 +401,9 @@ export const api = {
         method: "GET",
       });
     },
+    queue: () => request<QueueStateDto>("/tasks/queue", { method: "GET" }),
+    updateQueue: (payload: UpdateQueueRequest) =>
+      request<QueueStateDto>("/tasks/queue", { method: "PUT", body: payload }),
     retry: (payload: RetryTasksRequest) =>
       request<RetryTasksResponse>("/tasks/retry", {
         method: "POST",

@@ -869,7 +869,7 @@ async fn env_preset_bootstrap_activates_before_dispatcher_initialization() {
     // `POST /api/v1/auth/login` succeeds using the bootstrapped password.
     let login_resp = http
         .post(format!("{}/api/v1/auth/login", server.base_url))
-        .json(&json!({ "password": "bootstrapped-env-secret" }))
+        .json(&json!({ "username": "Courier", "password": "bootstrapped-env-secret" }))
         .send()
         .await
         .expect("login must succeed");

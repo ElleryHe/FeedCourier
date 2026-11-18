@@ -112,7 +112,7 @@ export const en = {
     initDesc:
       "First-time setup: your password is hashed with Argon2id, and channel credentials are encrypted at rest with ChaCha20-Poly1305.",
     loginDesc:
-      "Enter your administrator password to manage feeds, delivery channels, routing rules, and MCP tokens.",
+      "Enter your administrator username and password to manage feeds, delivery channels, routing rules, and MCP tokens.",
     newPasswordLabel: "New Admin Password",
     passwordLabel: "Password",
     minCharsPlaceholder: "Minimum 8 characters…",
@@ -127,6 +127,25 @@ export const en = {
     errMinLength: "Administrator password must be at least 8 characters.",
     errMismatch: "Password confirmation does not match.",
     errEmpty: "Please enter your administrator password.",
+    usernameLabel: "Username",
+    usernameHint:
+      "Defaults to Courier. You can change it later under System → Account & Security.",
+    errUsername: "Username must be 1–64 characters.",
+    errEmptyUsername: "Please enter your administrator username.",
+    mfaTitle: "Two-Factor Verification",
+    mfaDesc:
+      "Enter the 6-digit code from your authenticator app to finish signing in.",
+    mfaRecoveryDesc:
+      "Enter one of your one-time recovery codes. Each code can only be used once.",
+    mfaCodeLabel: "Authentication Code",
+    mfaCodeHint: "Submits automatically once all 6 digits are entered.",
+    mfaRecoveryLabel: "Recovery Code",
+    mfaRecoveryHint: "Format XXXX-XXXX-XXXX (case-insensitive, dashes optional).",
+    mfaVerify: "Verify & Sign In",
+    mfaUseRecovery: "Use a recovery code instead",
+    mfaUseTotp: "Use authenticator code",
+    mfaBack: "Back to password",
+    mfaExpired: "The verification session expired. Please sign in again.",
   },
 
   overview: {
@@ -166,6 +185,12 @@ export const en = {
     backupDoneTitle: "SQLite snapshot downloaded",
     backupDoneDesc: (filename: string) => `Saved ${filename}`,
     backupFailedTitle: "Snapshot backup failed",
+    queuePausedTitle: "Delivery queue is paused",
+    queuePausedUntil: (at: string, rel: string) =>
+      `Feeds are still polled and new tasks keep queuing, but nothing is sent until ${at} (${rel}) or until you resume.`,
+    queuePausedIndefinitely:
+      "Feeds are still polled and new tasks keep queuing, but nothing is sent until you resume the queue.",
+    queueManage: "Queue controls",
   },
 
   feeds: {
@@ -219,6 +244,22 @@ export const en = {
     deleteModalDesc: (name: string) =>
       `Remove "${name}"? Stored entry fingerprints and delivery tasks for this feed will also be deleted.`,
     deleteModalConfirm: "Delete Feed",
+    clearCache: {
+      buttonTitle: "Clear cache (entries, fingerprints, HTTP cache)",
+      title: "Clear Feed Cache",
+      desc: (name: string) =>
+        `Delete all stored entries, deduplication fingerprints, and queued delivery tasks of "${name}" and reset its ETag / Last-Modified and failure state? Already delivered messages are not recalled.`,
+      pollNowLabel: "Re-fetch and queue the full backlog now",
+      pollNowDesc:
+        "Poll immediately after clearing; every item currently in the feed is enqueued oldest-first (silent initialization is turned off).",
+      confirm: "Clear Cache",
+      toastDoneTitle: "Feed cache cleared",
+      toastDoneDesc: (deleted: number) =>
+        `Deleted ${deleted} cached ${deleted === 1 ? "entry" : "entries"}; the backlog will be queued on the next poll.`,
+      toastDoneDescPolled: (deleted: number, entries: number, tasks: number) =>
+        `Deleted ${deleted} cached ${deleted === 1 ? "entry" : "entries"}; re-fetched ${entries} and enqueued ${tasks} ${tasks === 1 ? "task" : "tasks"}.`,
+      toastFailed: "Failed to clear feed cache",
+    },
     editor: {
       editTitle: "Edit Subscription",
       addTitle: "Add Subscription",
@@ -275,6 +316,17 @@ export const en = {
       firstSentenceTag: "[1st sentence] ",
       collapse: "Collapse",
       body: "Body",
+      debugTitle: "Debug Push",
+      debugHint:
+        "Sends straight to the channel without touching fingerprints, quotas, or the queue.",
+      debugChannel: "Channel",
+      debugLanguage: "Delivery language",
+      debugTelegramMode: "Telegram mode",
+      debugNoChannel: "Create a delivery channel first to use debug push.",
+      pushLatest: "Push Latest",
+      pushThisItem: "Push This Item",
+      debugPushedTitle: "Debug push delivered",
+      debugFailedTitle: "Debug push failed",
     },
     opml: {
       title: "Import OPML Subscriptions",
@@ -497,6 +549,10 @@ export const en = {
     deleteModalDesc: (name: string) =>
       `Delete route "${name}"? Pending delivery tasks for this route will also be removed.`,
     deleteModalConfirm: "Delete Route",
+    allDay: "All day",
+    weekdaysShort: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    windowBadgeTitle: (tz: string) =>
+      `Daily active window${tz ? ` (${tz})` : ""} — tasks outside it stay queued until the next window opens`,
     modes: {
       rich_message: {
         label: "Rich Message",
@@ -555,6 +611,26 @@ export const en = {
         "Select at least one explicit feed or enter at least one #tag.",
       errIncludeRegex: (msg: string) => `Include regex syntax error: ${msg}`,
       errExcludeRegex: (msg: string) => `Exclude regex syntax error: ${msg}`,
+      languageHeading: "Delivery Language",
+      languageHint:
+        "Language of the fixed push text (e.g. “Read original” buttons, link captions, truncation notices). New routes default to the current interface language.",
+      windowsHeading: "Daily Active Windows",
+      timezoneBadge: (tz: string) => `Timezone: ${tz}`,
+      windowsHint: (tz: string) =>
+        `Times use the system timezone (${tz}). A window whose end is earlier than its start wraps past midnight; identical start and end means all day.`,
+      windowsAlways: "No windows configured — this route delivers at any time.",
+      windowStart: "Window start",
+      windowEnd: "Window end",
+      windowWraps: "Wraps midnight",
+      addWindow: "Add Window",
+      removeWindow: "Remove window",
+      weekdaysLabel: "Active Weekdays",
+      weekdaysEveryDay: "No day selected — delivers every day.",
+      weekdaysHint:
+        "A window belongs to the weekday on which it starts (a Monday 22:00–06:00 window ends Tuesday morning).",
+      queuedOutsideHint:
+        "Tasks outside the active window are not dropped: they stay queued and are sent when the next window opens.",
+      errWindowTime: "Each active window needs a valid start and end time (HH:MM).",
     },
   },
 
@@ -614,18 +690,58 @@ export const en = {
     toastRequeuedDesc: (count: number) =>
       `Requeued ${count} ${count === 1 ? "task" : "tasks"} into the outbox queue.`,
     toastRetryFailed: "Retry failed",
+    scheduledPrefix: (rel: string) => `Scheduled ${rel}`,
+    queue: {
+      title: "Global delivery queue",
+      running: "Running",
+      paused: "Paused",
+      runningHint:
+        "Due tasks across all feeds are delivered oldest-first as one merged stream.",
+      pausedUntil: (at: string, rel: string) =>
+        `Paused — auto-resumes ${at} (${rel}). Feeds keep polling and tasks keep queuing.`,
+      pausedIndefinitely:
+        "Paused until you resume. Feeds keep polling and tasks keep queuing.",
+      durationLabel: "Pause duration",
+      customLabel: "Resume at",
+      presets: {
+        forever: "Until resumed",
+        "15m": "For 15 minutes",
+        "30m": "For 30 minutes",
+        "1h": "For 1 hour",
+        "3h": "For 3 hours",
+        "6h": "For 6 hours",
+        custom: "Until a custom time…",
+      },
+      pauseBtn: "Pause Queue",
+      updatePause: "Update Pause",
+      resumeBtn: "Resume Now",
+      heldBadge: "Held",
+      errCustomPast: "Choose a resume time in the future.",
+      orderHint:
+        "On resume, every due task is delivered in chronological order of the article's publish time.",
+      toastPaused: "Delivery queue paused",
+      toastResumed: "Delivery queue resumed",
+      toastResumeFailed: "Failed to resume the delivery queue",
+    },
   },
 
   settings: {
-    title: "System, Language & MCP Server",
+    title: "System, Account & MCP Server",
     subtitle:
-      "Configure console and push notification language, outbound HTTP/SOCKS5 proxy settings, private-network SSRF allowlists, and scoped MCP Bearer tokens.",
-    languageTitle: "Interface & Delivery Language",
-    languageDesc:
-      "Select the display language for the management console.",
-    languageDeliveryHint:
-      "Note: Changing the console language also updates the template language used for downstream Telegram and SMTP email deliveries (such as 'Read original' buttons and 'Link' captions).",
-    toastLanguageSaved: "Language updated",
+      "Configure the system timezone, administrator account and two-factor authentication, outbound HTTP/SOCKS5 proxy settings, private-network SSRF allowlists, and scoped MCP Bearer tokens.",
+    timezoneTitle: "System Timezone",
+    timezoneDesc:
+      "Used for route active windows and weekday rules. Choose the IANA timezone of the place you want “9:00 to 18:00” to mean.",
+    timezoneLabel: "IANA Timezone",
+    timezonePlaceholder: "e.g. Asia/Shanghai or America/Los_Angeles",
+    timezoneHint:
+      "Start typing to search. Existing windows keep their wall-clock times and shift to the new timezone.",
+    timezoneUseBrowser: (zone: string) => `Use browser timezone (${zone})`,
+    timezoneNow: (time: string, offset: string | null) =>
+      `Now ${time}${offset ? ` · ${offset}` : ""}`,
+    saveTimezone: "Save Timezone",
+    errInvalidTimezone: "Select a valid IANA timezone from the list.",
+    toastTimezoneSaved: "System timezone saved",
     networkTitle: "Outbound Proxy & SSRF Allowlist",
     networkDesc:
       "FeedCourier blocks loopback, link-local, cloud metadata, and private IPs at DNS connect time across every redirect hop. Add internal CIDRs or hostnames below only for trusted self-hosted services (such as FreshRSS, RSSHub, or a Local Bot API Server).",
@@ -681,6 +797,73 @@ export const en = {
     revokeModalDesc: (name: string, prefix: string) =>
       `Immediately revoke "${name}" (${prefix}…)? Connected MCP clients using this token will receive 401 Unauthorized.`,
     revokeModalConfirm: "Revoke Token",
+    account: {
+      title: "Account & Security",
+      desc: "Change the administrator username and password, and protect sign-in with TOTP two-factor authentication.",
+      loading: "Loading account…",
+      usernameLabel: "Username",
+      usernameEnvPrefix: "Managed by the",
+      usernameEnvSuffix:
+        "environment variable, which overrides the stored username on every restart; change it there.",
+      newPasswordLabel: "New Password (optional)",
+      newPasswordPlaceholder: "Leave blank to keep the current password",
+      confirmPasswordLabel: "Confirm New Password",
+      currentPasswordLabel: "Current Password",
+      sessionsHint:
+        "Required for every change. Changing the password signs out all other browsers.",
+      codeLabel: "Authenticator or recovery code",
+      codeHint: "6-digit code from your app, or a recovery code (XXXX-XXXX-XXXX).",
+      saveBtn: "Save Account Changes",
+      errNothingChanged: "Change the username or enter a new password first.",
+      errCurrentPassword: "Enter your current password.",
+      errUsername: "Username must be 1–64 characters.",
+      errMinLength: "New password must be at least 8 characters.",
+      errMismatch: "New password confirmation does not match.",
+      errCodeRequired: "Enter an authenticator code or a recovery code.",
+      toastUpdated: "Account updated",
+      toastPasswordChanged: "Password changed; other sessions were signed out",
+      twoFaTitle: "Two-Factor Authentication (TOTP)",
+      twoFaEnabled: "Enabled",
+      twoFaDisabled: "Disabled",
+      twoFaDesc:
+        "Works with any RFC 6238 authenticator app (1Password, Bitwarden, Google Authenticator, Authy…). Ten one-time recovery codes are issued when you enable it.",
+      recoveryRemaining: (n: number) =>
+        `${n} recovery ${n === 1 ? "code" : "codes"} left`,
+      enable: "Enable 2FA",
+      disable: "Disable 2FA",
+      regenerate: "Regenerate Recovery Codes",
+      continueBtn: "Continue",
+      enableTitle: "Enable Two-Factor Authentication",
+      enablePasswordDesc: "Confirm your current password to generate a new secret.",
+      enableScanDesc:
+        "Scan the QR code with your authenticator app, then enter the 6-digit code to confirm.",
+      qrAlt: "TOTP setup QR code",
+      manualSecret: "Can't scan? Enter this key manually",
+      manualSecretHint: "Time-based (TOTP), 6 digits, 30-second period, SHA-1.",
+      copySecret: "Copy secret",
+      confirmCodeLabel: "6-digit code",
+      verifyEnable: "Verify & Enable",
+      toastEnabled: "Two-factor authentication enabled",
+      codesTitle: "Save Your Recovery Codes",
+      codesDesc:
+        "Use a recovery code if you lose your authenticator. Each code works once.",
+      codesWarning:
+        "These codes are shown only once. Store them somewhere safe (a password manager is ideal).",
+      codesCopy: "Copy all",
+      codesDownload: "Download .txt",
+      codesCopied: "Recovery codes copied",
+      codesSaved: "I've Saved These Codes",
+      regenTitle: "Regenerate Recovery Codes",
+      regenDesc:
+        "Issues 10 new codes and permanently invalidates all existing ones.",
+      regenConfirm: "Regenerate",
+      toastRegenerated: "New recovery codes issued",
+      disableTitle: "Disable Two-Factor Authentication",
+      disableDesc:
+        "Sign-in will only require your password again. Confirm with your password and a current authenticator or recovery code.",
+      disableConfirm: "Disable 2FA",
+      toastDisabled: "Two-factor authentication disabled",
+    },
   },
 };
 

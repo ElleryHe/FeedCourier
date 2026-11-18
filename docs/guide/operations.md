@@ -1,5 +1,5 @@
 ---
-description: "Back up and restore the FeedCourier SQLite WAL database and master.key, configure payload retention cleanup, and set up reverse proxies and monitoring."
+description: "Back up and restore the FeedCourier SQLite WAL database and master.key, pause and resume the delivery queue, clear a feed's cache, recover a lost 2FA authenticator, configure payload retention cleanup, and set up reverse proxies."
 ---
 
 # Backup & Maintenance
@@ -66,8 +66,13 @@ You can also download a database snapshot from the command line using an authent
 # 1. Sign in and save the HttpOnly fc_session cookie
 curl -s -c cookies.txt \
   -H "Content-Type: application/json" \
-  -d '{"password":"your-admin-password"}' \
+  -d '{"username":"Courier","password":"your-admin-password"}' \
   http://127.0.0.1:8080/api/v1/auth/login
+# With 2FA enabled, the response contains "mfa_required": true and an "mfa_token".
+# Complete the sign-in with:
+#   curl -s -c cookies.txt -H "Content-Type: application/json" \
+#     -d '{"mfa_token":"<mfa_token>","code":"123456"}' \
+#     http://127.0.0.1:8080/api/v1/auth/login/2fa
 
 # 2. Download a consistent SQLite snapshot
 curl -s -b cookies.txt -OJ \
@@ -79,6 +84,48 @@ curl -s -b cookies.txt -OJ \
 2. Remove the existing `feedcourier.db`, `feedcourier.db-wal`, and `feedcourier.db-shm` files in `/data`.
 3. Copy your backup file to `/data/feedcourier.db` alongside your original `/data/master.key`.
 4. Start FeedCourier.
+
+---
+
+## Pausing & Resuming the Delivery Queue {#pausing-resuming-the-delivery-queue}
+
+All routes share one global outbox. To hold back every delivery (for example during maintenance of a downstream service), use the control bar on the **Tasks** page:
+
+- **Pause now**, **pause for 15 min / 30 min / 1 h / 3 h / 6 h**, or **pause until** a custom date and time.
+- **Resume now** to lift the pause early.
+
+While the queue is paused, feeds keep being polled and new tasks keep accumulating; nothing is sent. A banner on **Overview** shows the paused state. When the pause ends (scheduled resume or manual resume), all due tasks across every feed are delivered oldest-first by article publish time (falling back to discovery time), as one merged chronological stream. The same control is available through [`PUT /api/v1/tasks/queue`](/reference/rest-api) and the MCP [`manage_outbox_queue`](/mcp/tools) tool.
+
+::: tip Routes with Time Windows
+A route's own delivery time windows work independently: tasks outside the window are still queued and are delivered at the next window start. See [Pacing & Quotas](/channels/pacing-and-quotas#route-delivery-time-windows).
+:::
+
+---
+
+## Clearing a Feed's Cache
+
+If you want a feed to behave as freshly subscribed, use **Clear cache** on the feed (confirm dialog). It deletes all stored entries, content fingerprints, and delivery tasks of that feed, clears its `ETag` / `Last-Modified` validators and failure state, and disables silent init. With the switch **Re-fetch and queue the full backlog now** on (default), the feed is polled immediately and the whole backlog is queued oldest-first.
+
+::: warning Articles May Be Delivered Again
+Because fingerprints are deleted, articles that were already delivered are treated as new. Pause the queue first, or turn off the re-fetch switch, if you want to review before anything is sent.
+:::
+
+REST: `POST /api/v1/feeds/{id}/clear-cache`; MCP: `manage_feed` with `action: "clear_cache"`.
+
+---
+
+## Lost Authenticator (`RESET_2FA`) {#lost-authenticator-reset-2fa}
+
+If you lose both the authenticator device and the recovery codes, sign-in is blocked by 2FA. Restart FeedCourier once with the environment variable `RESET_2FA=true`:
+
+```bash
+docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
+  -e TZ=America/Los_Angeles \
+  -e RESET_2FA=true \
+  elleryhe/feedcourier:latest
+```
+
+At startup FeedCourier removes the TOTP secret and all recovery codes and logs a `WARN` line. Sign in with username and password, then **remove `RESET_2FA` and restart**; otherwise 2FA is cleared on every start. Re-enable 2FA in **Settings → Account & Security**. If you also forgot the password or username, set `ADMIN_PASSWORD` / `ADMIN_USERNAME` the same way.
 
 ---
 

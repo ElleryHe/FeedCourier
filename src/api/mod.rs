@@ -1,6 +1,7 @@
 //! REST API (`/api/v1/*`), HttpOnly session authentication, and `rust-embed` static WebUI router
 //! (`feedcourier.md` Sections 二.2 & 六.2).
 
+pub mod account;
 pub mod auth;
 pub mod dto;
 pub mod handlers;
@@ -18,12 +19,14 @@ use crate::config::AppConfig;
 use crate::crypto::{MasterKey, hash_password};
 use crate::db::Database;
 use crate::db::models::{
-    SETTING_ADMIN_PASSWORD_HASH, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST,
+    SETTING_ADMIN_PASSWORD_HASH, SETTING_ADMIN_USERNAME, SETTING_LOCALE,
+    SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE,
 };
 use crate::error::AppResult;
 use crate::ingest::IngestEngine;
 use crate::mcp::{McpState, build_mcp_router_with_state};
 use crate::net::ProtectedHttpClient;
+use crate::schedule::DEFAULT_TIMEZONE;
 use crate::scheduler::DeliveryDispatcher;
 
 /// Shared Axum application state (`Clone` via `DeliveryDispatcher`'s internal `Arc`).
@@ -85,6 +88,7 @@ pub fn build_api_only_router(state: AppState) -> Router {
         .route("/api/v1/auth/status", get(auth::auth_status))
         .route("/api/v1/auth/setup", post(auth::auth_setup))
         .route("/api/v1/auth/login", post(auth::auth_login))
+        .route("/api/v1/auth/login/2fa", post(auth::auth_login_2fa))
         .route("/api/v1/auth/logout", post(auth::auth_logout));
 
     let protected_routes = Router::new()
@@ -98,6 +102,10 @@ pub fn build_api_only_router(state: AppState) -> Router {
             get(handlers::list_feeds).post(handlers::create_feed),
         )
         .route("/api/v1/feeds/preview", post(handlers::preview_feed))
+        .route(
+            "/api/v1/feeds/preview/push",
+            post(handlers::debug_push_feed),
+        )
         .route("/api/v1/feeds/opml/import", post(handlers::import_opml))
         .route("/api/v1/feeds/opml/export", get(handlers::export_opml))
         .route(
@@ -105,6 +113,10 @@ pub fn build_api_only_router(state: AppState) -> Router {
             patch(handlers::update_feed).delete(handlers::delete_feed),
         )
         .route("/api/v1/feeds/{id}/poll", post(handlers::poll_feed_now))
+        .route(
+            "/api/v1/feeds/{id}/clear-cache",
+            post(handlers::clear_feed_cache),
+        )
         // Trusted Channels & Notion Onboarding
         .route(
             "/api/v1/channels",
@@ -135,6 +147,22 @@ pub fn build_api_only_router(state: AppState) -> Router {
         // Outbox & Dead-Letter Tasks
         .route("/api/v1/tasks", get(handlers::list_tasks))
         .route("/api/v1/tasks/retry", post(handlers::retry_tasks))
+        .route(
+            "/api/v1/tasks/queue",
+            get(handlers::get_queue_state).put(handlers::update_queue_state),
+        )
+        // Account & Security
+        .route(
+            "/api/v1/account",
+            get(account::get_account).patch(account::update_account),
+        )
+        .route("/api/v1/account/2fa/setup", post(account::totp_setup))
+        .route("/api/v1/account/2fa/enable", post(account::totp_enable))
+        .route("/api/v1/account/2fa/disable", post(account::totp_disable))
+        .route(
+            "/api/v1/account/2fa/recovery-codes",
+            post(account::regenerate_recovery_codes),
+        )
         // System Settings & MCP Bearer Tokens
         .route(
             "/api/v1/settings",
@@ -188,6 +216,24 @@ pub async fn bootstrap_env_settings(config: &AppConfig, db: &Database) -> AppRes
     {
         db.set_setting_typed(SETTING_LOCALE, &locale.as_str())
             .await?;
+    }
+    if let Some(ref username) = config.admin_username {
+        db.set_setting_typed(SETTING_ADMIN_USERNAME, &username.trim().to_string())
+            .await?;
+    }
+    if db.get_setting(SETTING_TIMEZONE).await?.is_none() {
+        let tz = config
+            .timezone
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TIMEZONE.to_string());
+        db.set_setting_typed(SETTING_TIMEZONE, &tz).await?;
+    }
+    if config.reset_2fa {
+        account::clear_totp_state_db(db).await?;
+        tracing::warn!(
+            "RESET_2FA is set: the administrator TOTP secret and recovery codes were removed; \
+             unset RESET_2FA after this start and re-enable 2FA in Settings"
+        );
     }
     Ok(())
 }

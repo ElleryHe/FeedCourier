@@ -8,7 +8,6 @@ pub mod html;
 pub mod opml;
 pub mod readability;
 
-use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::io::Cursor;
 
@@ -18,13 +17,15 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
 
+use crate::channels::RouteOptions;
 use crate::db::Database;
 use crate::db::models::{
-    EntryInsertOutcome, Feed, FeedHealthStatus, MediaAttachment, MediaAttachmentKind, NewEntry,
-    Route, now_unix, unix_to_rfc3339,
+    Entry, EntryInsertOutcome, Feed, FeedHealthStatus, MediaAttachment, MediaAttachmentKind,
+    NewEntry, Route, now_unix, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
 use crate::net::{DEFAULT_MAX_FEED_BYTES, OutboundRequest, ProtectedHttpClient};
+use crate::schedule::next_allowed_at;
 
 pub use self::filter::{
     CompiledContentFilter, ContentFilterRules, route_matches_entry, route_matches_feed,
@@ -70,6 +71,14 @@ pub struct PollFeedOutcome {
     pub not_modified: bool,
 }
 
+/// Result of [`IngestEngine::clear_feed_cache`].
+#[derive(Debug, Clone)]
+pub struct ClearFeedCacheOutcome {
+    pub deleted_entries: u64,
+    pub poll: Option<PollFeedOutcome>,
+    pub poll_error: Option<String>,
+}
+
 /// Single previewed entry returned by [`IngestEngine::preview_feed`] (matches `FeedPreviewItem` in `web/src/api/types.ts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedPreviewItem {
@@ -98,6 +107,15 @@ pub struct FeedPreviewResponse {
 
 /// Alias matching [`FeedPreviewResponse`] for callers referring to `PreviewResult`.
 pub type PreviewResult = FeedPreviewResponse;
+
+/// Transient entry produced by [`IngestEngine::build_debug_entry`] for stateless debug pushes.
+#[derive(Debug, Clone)]
+pub struct DebugEntry {
+    pub entry: Entry,
+    pub feed_title: Option<String>,
+    pub site_url: Option<String>,
+    pub favicon_url: Option<String>,
+}
 
 /// Unified feed ingestion engine coordinating SSRF-guarded feed polling, 4-tier deduplication,
 /// optional Readability extraction, route filtering, outbox task enqueueing, and OPML import/export.
@@ -255,6 +273,7 @@ impl IngestEngine {
 
         // Prepare candidate entries (4-tier fingerprint + native HTML sanitization + enclosures).
         let mut candidates = prepare_candidates(&parsed_feed, &resp.final_url, &meta);
+        order_candidates_oldest_first(&mut candidates);
 
         // Check which fingerprints already exist on this feed so we never waste Readability HTTP
         // fetches on already-ingested historical items.
@@ -271,13 +290,14 @@ impl IngestEngine {
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| !c.already_exists)
-                .max_by_key(|(idx, c)| (c.published_at.unwrap_or(i64::MIN), Reverse(*idx)))
+                .max_by_key(|(idx, c)| (c.published_at.unwrap_or(i64::MIN), *idx))
                 .map(|(idx, _)| idx)
         } else {
             None
         };
 
         let matching_routes = self.load_compiled_routes_for_feed(&feed).await?;
+        let timezone = self.db.get_timezone().await;
         let now = now_unix();
         let mut new_entries = 0usize;
         let mut enqueued_tasks = 0usize;
@@ -337,7 +357,7 @@ impl IngestEngine {
                                         compiled_route.route.id,
                                         compiled_route.route.channel_id,
                                         inserted.id,
-                                        now,
+                                        next_allowed_at(&compiled_route.options, now, timezone),
                                     )
                                     .await?
                                     .is_some()
@@ -468,6 +488,129 @@ impl IngestEngine {
         })
     }
 
+    /// Build a transient, never-persisted [`Entry`] from a live feed fetch for stateless debug
+    /// pushes. Selects the item with `fingerprint_sha256` or, when `None`, the latest item
+    /// (highest `published_at`, otherwise the top of the feed). Runs Readability on that single
+    /// item when `fetch_full_content` is set. The returned entry carries a `test-` prefixed unique
+    /// fingerprint so Notion `FC-ID` / SMTP `Message-ID` never collide with real deliveries.
+    pub async fn build_debug_entry(
+        &self,
+        url: &str,
+        fetch_full_content: bool,
+        use_proxy: bool,
+        fingerprint: Option<&str>,
+    ) -> AppResult<DebugEntry> {
+        let req = OutboundRequest::new(url.trim())
+            .max_bytes(DEFAULT_MAX_FEED_BYTES)
+            .use_proxy(use_proxy)
+            .header(ACCEPT, HeaderValue::from_static(FEED_ACCEPT_HEADER));
+
+        let resp = self.http.get_bytes(req).await?;
+        if !resp.status.is_success() {
+            return Err(AppError::Upstream(format!(
+                "feed '{}' returned HTTP {}",
+                resp.final_url, resp.status
+            )));
+        }
+
+        let parsed_feed = parse_feed_bytes(&resp.bytes, &resp.final_url)?;
+        let meta = extract_feed_metadata(&parsed_feed, &resp.final_url, None);
+        let mut discovered_favicon = meta.favicon_url.clone();
+        let candidates = prepare_candidates(&parsed_feed, &resp.final_url, &meta);
+
+        let picked = match fingerprint.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(fp) => candidates
+                .into_iter()
+                .find(|c| c.fingerprint_sha256 == fp)
+                .ok_or_else(|| {
+                    AppError::NotFound(
+                        "requested item is no longer present in the live feed".to_string(),
+                    )
+                })?,
+            None => candidates
+                .into_iter()
+                .enumerate()
+                .max_by_key(|(idx, c)| {
+                    (
+                        c.published_at.unwrap_or(i64::MIN),
+                        i64::MAX - i64::try_from(*idx).unwrap_or(0),
+                    )
+                })
+                .map(|(_, c)| c)
+                .ok_or_else(|| AppError::NotFound("feed contains no items".to_string()))?,
+        };
+
+        let mut cand = picked;
+        if fetch_full_content
+            && let Some(canon_url) = cand.canonical_url.clone()
+            && let Some(extracted) = self
+                .readability
+                .fetch_and_extract(&self.http, &canon_url, use_proxy)
+                .await
+        {
+            apply_extracted_article(&mut cand, extracted, &mut discovered_favicon);
+        }
+
+        let now = now_unix();
+        let media_json = if cand.media.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&cand.media)?)
+        };
+        let fp_prefix: String = cand.fingerprint_sha256.chars().take(16).collect();
+        let entry = Entry {
+            id: 0,
+            feed_id: 0,
+            fingerprint_sha256: format!("test-{now}-{fp_prefix}"),
+            published_at: cand.published_at,
+            discovered_at: now,
+            payload_purged_at: None,
+            title: cand.title.clone(),
+            canonical_url: cand.canonical_url.clone(),
+            author: cand.author.clone(),
+            content_html: non_empty_string(&cand.sanitized.content_html),
+            first_sentence: cand.sanitized.first_sentence.clone(),
+            summary_text: cand.sanitized.summary_text.clone(),
+            media_json,
+        };
+
+        Ok(DebugEntry {
+            entry,
+            feed_title: meta.title,
+            site_url: meta.site_url,
+            favicon_url: discovered_favicon,
+        })
+    }
+
+    /// Clear a feed's cached entries/fingerprints/tasks/HTTP validators and optionally poll it
+    /// immediately so the whole backlog is re-ingested oldest → newest.
+    pub async fn clear_feed_cache(
+        &self,
+        feed_id: i64,
+        poll_now: bool,
+    ) -> AppResult<ClearFeedCacheOutcome> {
+        let deleted_entries = self.db.clear_feed_cache(feed_id).await?;
+        if !poll_now {
+            return Ok(ClearFeedCacheOutcome {
+                deleted_entries,
+                poll: None,
+                poll_error: None,
+            });
+        }
+        match self.poll_feed(feed_id, true, false).await {
+            Ok(poll) => Ok(ClearFeedCacheOutcome {
+                deleted_entries,
+                poll: Some(poll),
+                poll_error: None,
+            }),
+            Err(err) => Ok(ClearFeedCacheOutcome {
+                deleted_entries,
+                poll: None,
+                poll_error: Some(err.to_string()),
+            }),
+        }
+    }
+
     /// Import an OPML 2.0 XML document into SQLite, skipping already-subscribed URLs.
     pub async fn import_opml(
         &self,
@@ -554,7 +697,14 @@ impl IngestEngine {
             }
             let rules = ContentFilterRules::from_route(&route);
             match rules.compile() {
-                Ok(filter) => out.push(CompiledRoute { route, filter }),
+                Ok(filter) => {
+                    let options = route.options();
+                    out.push(CompiledRoute {
+                        route,
+                        filter,
+                        options,
+                    });
+                }
                 Err(err) => {
                     warn!(
                         route_id = route.id,
@@ -573,6 +723,17 @@ impl IngestEngine {
 struct CompiledRoute {
     route: Route,
     filter: CompiledContentFilter,
+    options: RouteOptions,
+}
+
+/// Reorder candidates so the backlog is processed (stored, enqueued, delivered) oldest → newest:
+/// feeds list newest-first, so reverse feed order, then stable-sort by explicit `published_at`
+/// when every candidate carries one.
+fn order_candidates_oldest_first(candidates: &mut [CandidateEntry]) {
+    candidates.reverse();
+    if candidates.iter().all(|c| c.published_at.is_some()) {
+        candidates.sort_by_key(|c| c.published_at);
+    }
 }
 
 #[derive(Debug, Clone, Default)]

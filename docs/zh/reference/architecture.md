@@ -1,5 +1,5 @@
 ---
-description: "FeedCourier 系统架构总览：模块划分、四级 SHA-256 指纹去重、SQLite WAL 读写双连接池、正文垃圾回收与发件箱租约调度状态机。"
+description: "FeedCourier 系统架构总览：模块划分、四级 SHA-256 指纹去重、SQLite WAL 读写双连接池、正文垃圾回收、发件箱租约调度状态机、合并时间顺序领取、路由时间窗口与全局队列暂停。"
 ---
 
 # 系统架构总览
@@ -89,6 +89,10 @@ flowchart TD
 ### 首次静默初始化（`silent_init`）
 新增订阅源或通过 OPML 批量导入时，`silent_init` 默认设为 `true`：首次拉取将存量条目的 `fingerprint_sha256` 写入 `entries` 表并把 `silent_init` 置为 `0`，不向 `delivery_tasks` 派发历史文章任务（若同时指定 `push_latest_one = true`，则仅将最新 1 篇条目入队以验证通道连通性）。
 
+
+### 积压按时间顺序入队与清除缓存
+当一次拉取发现多篇新文章（首次拉取且 `silent_init = false`，或订阅源一次性发布大量文章）时，系统按 `published_at` 从旧到新依次写入并入队；缺少发布时间时，按订阅源自身顺序的倒序处理。`POST /api/v1/feeds/{id}/clear-cache`（以及 MCP `manage_feed` 的 `clear_cache`）会删除该订阅源的 `entries`（级联删除 `delivery_tasks`）、清除 `etag` / `last_modified` 与失败状态，并将 `silent_init` 置为 `0`，使下一次拉取（默认立即）按上述顺序将全部积压入队。
+
 ---
 
 ## 3. SQLite WAL 读写双池与 `NOT EXISTS` 载荷回收
@@ -165,6 +169,8 @@ stateDiagram-v2
 1. `status IN ('queued', 'retrying', 'deferred') AND next_attempt_at <= now`
 2. `status = 'delivering' AND lease_until <= now`
 
+候选任务的排序为：先处理已过期租约（`delivering`，按 `lease_until`），其余按 `COALESCE(entries.published_at, entries.discovered_at) ASC`、`entries.id ASC`、`delivery_tasks.id ASC`。由于发件箱是全局的，多个订阅源的任务会合并成**一条按时间排列的投递流**，而不是按订阅源分批。
+
 若进程在投递中途因容器重启或断电退出，正在执行的任务在 `120` 秒租约到期后会被后续调度周期自动重新领取。Worker 在发起网络请求前会先读取任务上的 `checkpoint_json`（`DeliveryCheckpoint`），按通道协议执行幂等对账或断点续传（详见[通道协议与投递实现](/zh/reference/channel-protocols)）。
 
 ### 3. 共享凭据组流控（`credential_group_key`）与配额护栏
@@ -174,6 +180,19 @@ stateDiagram-v2
 - **步进间隔与随机抖动（Pacing & Jitter）**：`DeliveryDispatcher` 按 `credential_group_key` 维护下次允许发送时间戳。每次投递完成后，同组通道共同延迟 `min_interval_secs + uniform_random(0..=jitter_max_secs)` 秒；
 - **上游 `429` 组级冷却（`cooldown_until`）**：当任一通道收到下游 `429 Too Many Requests`（含 Telegram `parameters.retry_after` 或 HTTP `Retry-After` 响应头）时，系统按 `credential_group_key` 批量更新同组所有通道的 `cooldown_until`；
 - **滚动配额窗口（`hourly_quota` / `daily_quota`）**：发送前统计当前通道过去 `3,600` 秒与 `86,400` 秒内 `status = 'delivered'` 的任务数；若达到上限，任务转入 `deferred` 状态并推迟至最早一笔已完成任务滑出窗口的时间点。
+
+### 4. 路由时间窗口与全局队列暂停
+
+领取循环之前有两道闸门：
+
+- **路由时间窗口**：`routes.options_json` 可包含 `active_windows`（`HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日），按 `system_settings.timezone` 中保存的 IANA 时区判定（`src/schedule.rs`）。`end` 早于 `start` 的窗口跨午夜，`start == end` 表示全天，空列表表示不限制；跨午夜窗口按窗口开始那一天的星期判定。窗口外的任务**不会被丢弃**：保持 `queued` / `deferred` 状态，`next_attempt_at` 被设为下一个窗口开始时间，之后由常规领取查询接管。
+- **全局暂停**：`system_settings.outbox_queue` 保存暂停状态与可选的 `resume_at`。暂停期间调度器不领取任何任务，但订阅源轮询与任务入队照常进行。已过期的 `resume_at` 视为已恢复（`GET /api/v1/tasks/queue` 返回 `paused: false`）。恢复后，所有到期任务按上述时间顺序依次发出。
+
+每个任务的投递语言按 `routes.options_json.locale` 解析，缺省时回退到旧版 `system_settings.locale`。WebUI 界面语言只是浏览器本地偏好（`localStorage`），不保存到服务端。
+
+### 5. 调试推送（`POST /api/v1/feeds/preview/push`、MCP `test_push_feed_entry`）
+
+调试推送会实时抓取一条文章，并以内存中的条目直接调用通道发送器。它不写入 `entries` 指纹，也不创建 `delivery_tasks` 行，并绕过路由过滤、时间窗口、全局暂停、步进间隔与配额。Notion 页面的 `FC-ID` 带 `test-` 前缀，下游错误会以 `ok: false` 诊断信息返回给调用方。
 
 ---
 

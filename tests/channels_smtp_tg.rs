@@ -701,6 +701,7 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
     let route_opts = RouteOptions {
         telegram_mode: TelegramDeliveryMode::RichMessage,
         link_preview: false,
+        ..RouteOptions::default()
     };
     let route = sample_route(3, route_opts.clone());
     let task = sample_task(route.id);
@@ -1058,6 +1059,7 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
     let media_opts = RouteOptions {
         telegram_mode: TelegramDeliveryMode::MediaMode,
         link_preview: true,
+        ..RouteOptions::default()
     };
     let route = sample_route(8, media_opts.clone());
     let task = sample_task(route.id);
@@ -1330,6 +1332,7 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
     let media_opts = RouteOptions {
         telegram_mode: TelegramDeliveryMode::MediaMode,
         link_preview: true,
+        ..RouteOptions::default()
     };
     let route = sample_route(12, media_opts.clone());
     let task = sample_task(route.id);
@@ -1592,6 +1595,7 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             route_options: RouteOptions {
                 telegram_mode: TelegramDeliveryMode::CompactCard,
                 link_preview: true,
+                ..RouteOptions::default()
             },
             channel: &channel,
             channel_config: &cfg,
@@ -1713,6 +1717,7 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
     let media_opts = RouteOptions {
         telegram_mode: TelegramDeliveryMode::MediaMode,
         link_preview: true,
+        ..RouteOptions::default()
     };
     let route = sample_route(21, media_opts.clone());
     let task = sample_task(route.id);

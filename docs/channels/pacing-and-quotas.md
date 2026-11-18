@@ -1,8 +1,8 @@
 ---
-description: "Configure send intervals, random jitter, hourly and daily delivery quotas, shared credential rate limits, and keyword or regex route filters."
+description: "Configure send intervals, random jitter, hourly and daily delivery quotas, shared credential rate limits, route delivery time windows, global queue pause, delivery ordering, and keyword or regex route filters."
 ---
 
-# Send Rate, Quotas & Filters
+# Send Rate, Quotas, Windows & Filters
 
 When a feed publishes multiple articles at once—or when several feeds update at the same time—sending all of them immediately can trigger downstream rate limits (such as SMTP temporary deferrals or HTTP `429 Too Many Requests` on Telegram and Notion).
 
@@ -85,6 +85,43 @@ For matched feeds, the route evaluates filters against the article's **title and
 ::: tip Previewing Filters Before Saving
 You can test keyword and regex rules against live feed entries without creating delivery tasks by using the **Feed Preview** drawer in the WebUI or the [`preview_feed_latest` MCP tool](/mcp/tools#3-preview-feed-latest). Each preview item shows whether it matched (`matched_filter`) and which rule accepted or rejected it (`filter_reason`).
 :::
+
+---
+
+## 6. Route Delivery Time Windows {#route-delivery-time-windows}
+
+Each route can restrict **when** it delivers, so notifications do not arrive at night or on days you do not want them. In the WebUI under **Routes** (or via `configure_route`), set:
+
+| Option | Description |
+| :--- | :--- |
+| **`active_windows`** | Daily windows as `{ "start": "HH:MM", "end": "HH:MM" }` pairs, evaluated in the **system timezone**. An `end` earlier than `start` wraps past midnight (`22:00`–`06:00`); `start` equal to `end` means the whole day; an empty list means always. |
+| **`active_weekdays`** | Weekdays as numbers `1` (Monday) to `7` (Sunday). An empty list means every day. For a window that wraps midnight, the weekday is the day the window **starts**. |
+
+The system timezone defaults to `America/Los_Angeles` (from the `TIMEZONE` / `TZ` environment variable on first start) and can be changed in **Settings**. See [Configuration](/guide/configuration).
+
+::: info Outside the Window Tasks Are Still Queued
+Tasks are not dropped when the route is outside its window. They stay in the queue (`queued` / `deferred`) with their next attempt scheduled for the **next window start**, and are then delivered in chronological order, still subject to channel intervals and quotas.
+:::
+
+### Route Delivery Language
+
+Each route has its own delivery language (`en` or `zh-CN`) used for the localized parts of pushed messages (such as the Telegram Media Mode link label and SMTP/Notion template text). The WebUI pre-fills it with your current interface language when you create a route. The interface language itself is only a browser preference and does not change what is delivered. Routes created before this option existed fall back to the legacy system-wide language.
+
+---
+
+## 7. Delivery Order & Global Queue Pause {#delivery-order-and-queue-pause}
+
+- **Chronological backlog**: When a feed is polled for the first time (or after **Clear cache**), its backlog is queued oldest → newest by publish time (falling back to the reverse feed order).
+- **Merged multi-feed order**: The global outbox claims due tasks by article publish time (falling back to discovery time), oldest first. When several feeds have pending tasks, they are delivered as one merged chronological stream, subject to channel intervals and quotas.
+- **Global pause**: On the **Tasks** page you can pause the whole queue (now, for 15 min – 6 h, or until a chosen time) and resume it manually. While paused, feeds are still polled and tasks accumulate; on resume everything due is delivered oldest-first. See [Backup & Maintenance](/guide/operations#pausing-resuming-the-delivery-queue).
+
+---
+
+## 8. Debug Push from the Feed Preview {#debug-push-from-the-feed-preview}
+
+To check how an article will look in a channel without subscribing or touching the queue, open the **Feed Preview** for a URL (or for an existing feed) and use the **Debug push** bar: choose a channel, (for Telegram) the delivery mode and link preview, and the delivery language, then click **Push latest** or **Push this item** on a specific preview item.
+
+A debug push is **stateless**: it does not create fingerprints, does not enter the queue, ignores route filters, time windows, and quotas, and does not count against channel limits. Notion pages created this way use a `test-` prefixed `FC-ID`, so they never collide with real deliveries. Failures are reported in the result message. The MCP equivalent is [`test_push_feed_entry`](/mcp/tools#9-test-push-feed-entry).
 
 ---
 

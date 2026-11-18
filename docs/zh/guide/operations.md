@@ -1,5 +1,5 @@
 ---
-description: "FeedCourier 在线备份与快照恢复 SQLite WAL 数据库及 master.key 主密钥、正文保留期清理、反向代理配置与健康检查说明。"
+description: "FeedCourier 在线备份与快照恢复 SQLite WAL 数据库及 master.key 主密钥、全局投递队列暂停与恢复、清除订阅源缓存、丢失 2FA 验证器的恢复、正文保留期清理与反向代理配置说明。"
 ---
 
 # 数据备份与维护
@@ -46,8 +46,12 @@ FeedCourier 内置了基于 SQLite `VACUUM INTO` 的在线备份功能，无需�
 # 1. 登录并保存 fc_session Cookie
 curl -s -c cookies.txt \
   -H "Content-Type: application/json" \
-  -d '{"password":"your-admin-password"}' \
+  -d '{"username":"Courier","password":"your-admin-password"}' \
   http://127.0.0.1:8080/api/v1/auth/login
+# 启用 2FA 后，响应包含 "mfa_required": true 与 "mfa_token"，需再完成：
+#   curl -s -c cookies.txt -H "Content-Type: application/json" \
+#     -d '{"mfa_token":"<mfa_token>","code":"123456"}' \
+#     http://127.0.0.1:8080/api/v1/auth/login/2fa
 
 # 2. 导出并下载单文件备份
 curl -fL -b cookies.txt \
@@ -61,6 +65,46 @@ curl -fL -b cookies.txt \
 2. 删除目标 `/data/` 下的旧 `feedcourier.db`、`feedcourier.db-wal`、`feedcourier.db-shm`；
 3. 将备份的 `.db` 快照文件复制到 `/data/feedcourier.db`，并确保原实例的 `/data/master.key`（权限 `0600`）已放置在 `/data/` 下；
 4. 启动 FeedCourier 服务，即可恢复全部订阅源、去重指纹、推送通道、路由规则与 MCP 令牌。
+
+---
+
+## 暂停与恢复全局投递队列 {#pausing-resuming-the-delivery-queue}
+
+所有路由共用一个全局发件箱。需要暂时停止全部投递时（例如维护下游服务），可使用 **Tasks** 页面顶部的控制栏：
+
+- **立即暂停**、**暂停 15 分钟 / 30 分钟 / 1 小时 / 3 小时 / 6 小时**，或**暂停至**自定义日期时间；
+- **立即恢复**可提前结束暂停。
+
+队列暂停期间，订阅源仍会继续轮询，新任务持续累积，但不会发送任何消息；**Overview** 页面会显示暂停横幅。暂停结束（到点自动恢复或手动恢复）后，所有订阅源中已到期的任务会按文章发布时间（缺失时按发现时间）从旧到新依次投递，形成一条统一的时间顺序流。该功能也可通过 [`PUT /api/v1/tasks/queue`](/zh/reference/rest-api) 与 MCP 工具 [`manage_outbox_queue`](/zh/mcp/tools) 使用。
+
+> [!TIP]
+> 路由自身的投递时间窗口独立生效：窗口外的任务仍会入队，并在下一个窗口开始时投递。参见[发送频率、配额与时间窗口](/zh/channels/pacing-and-quotas#route-delivery-time-windows)。
+
+---
+
+## 清除订阅源缓存
+
+希望某个订阅源像全新订阅一样重新开始时，可在订阅源上点击 **Clear cache**（需确认）。它会删除该订阅源的全部文章记录、内容指纹与投递任务，清除 `ETag` / `Last-Modified` 与失败状态，并关闭静默初始化。开启开关**立即重新抓取并将全部积压入队**（默认开启）时，会立即轮询并按从旧到新的顺序将全部积压文章入队。
+
+> [!WARNING]
+> 由于指纹已被删除，曾经投递过的文章会被视为新文章而再次投递。如需先检查再发送，请先暂停队列，或关闭立即重新抓取开关。
+
+REST：`POST /api/v1/feeds/{id}/clear-cache`；MCP：`manage_feed` 的 `action: "clear_cache"`。
+
+---
+
+## 丢失验证器（`RESET_2FA`） {#lost-authenticator-reset-2fa}
+
+如果验证器设备与恢复码都已丢失，登录会被 2FA 拦住。请带环境变量 `RESET_2FA=true` 重启一次 FeedCourier：
+
+```bash
+docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
+  -e TZ=Asia/Shanghai \
+  -e RESET_2FA=true \
+  elleryhe/feedcourier:latest
+```
+
+启动时 FeedCourier 会删除 TOTP 密钥与全部恢复码，并输出一条 `WARN` 日志。随后使用用户名和密码登录，并**移除 `RESET_2FA` 后再重启一次**，否则每次启动都会清除 2FA。之后可在 **Settings → 账号与安全** 中重新启用。若同时忘记了密码或用户名，可用同样方式设置 `ADMIN_PASSWORD` / `ADMIN_USERNAME`。
 
 ---
 
@@ -137,8 +181,8 @@ server {
   - 若目标是你自建的内网服务（如 `RSSHub`），前往 WebUI **Settings** 将其 IP/CIDR 或内部主机名加入 **SSRF Allowlist**；
   - 若宿主机运行了透明代理（Fake-IP 模式）导致本地 DNS 返回 `198.18.x.x`，建议配置 `OUTBOUND_PROXY="socks5h://..."` 并为该源勾选 `use_proxy`，使域名由远端代理直接解析。
 
-### 2. 忘记 WebUI 管理员密码如何重置？
-- **解决**：在启动容器或进程时设置环境变量 `ADMIN_PASSWORD="your-new-strong-password"` 并重启一次服务。系统会在启动时用新密码的哈希覆盖数据库中的旧记录，随后即可移除该环境变量。
+### 2. 忘记 WebUI 管理员用户名、密码或丢失 2FA 验证器如何找回？
+- **解决**：在启动容器或进程时设置环境变量 `ADMIN_PASSWORD="your-new-strong-password"`（需要时同时设置 `ADMIN_USERNAME`）并重启一次服务。系统会在启动时用新值覆盖数据库中的旧记录，随后即可移除这些环境变量。若验证器与恢复码都已丢失，请按[丢失验证器](#lost-authenticator-reset-2fa)一节使用一次性的 `RESET_2FA=true`。
 
 ### 3. 失败任务（`dead_letter`）报错 `Entry payload already garbage-collected before delivery`
 - **原因**：任务因通道故障停留在死信队列的时间已超过 `RETENTION_HOURS`（默认 24 小时），且在清理过程中文章正文已被回收。

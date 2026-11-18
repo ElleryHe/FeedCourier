@@ -122,7 +122,7 @@ Binds feed IDs or tags to a target `channel_id`.
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of case-insensitive excluded keywords. |
 | `include_regex` | `TEXT` | `NULL` | Optional regular expression that must match. |
 | `exclude_regex` | `TEXT` | `NULL` | Optional regular expression that rejects matching entries. |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions` (`telegram_mode`, `link_preview`). |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `active_windows` (`[{start, end}]`, `HH:MM` in the system timezone), and `active_weekdays` (`1` = Mon … `7` = Sun). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when disabled. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
@@ -151,7 +151,7 @@ Tracks every `Entry × Route` delivery lifecycle.
 
 **Indexes:**
 - `UNIQUE (route_id, entry_id)`
-- `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)`
+- `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)` *(The outbox claim then orders due tasks by `COALESCE(entries.published_at, entries.discovered_at)` via a join on `entries`, producing a merged chronological stream across feeds)*
 - `idx_delivery_tasks_status_lease ON delivery_tasks (status, lease_until)`
 - `idx_delivery_tasks_entry_status ON delivery_tasks (entry_id, status)` *(Supports `NOT EXISTS` GC subquery)*
 - `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` *(Supports rolling hourly/daily quota window counts)*
@@ -160,6 +160,20 @@ Tracks every `Entry × Route` delivery lifecycle.
 
 ### 6. `system_settings`, `mcp_tokens` & `sessions`
 
-- **`system_settings`** (`key TEXT PRIMARY KEY`, `value_json TEXT`, `updated_at INTEGER`): Persists `admin_password_hash` (Argon2id PHC string), `outbound_proxy_url`, and `ssrf_allowlist`.
+- **`system_settings`** (`key TEXT PRIMARY KEY`, `value_json TEXT`, `updated_at INTEGER`): Key-value store for instance-wide settings:
+
+  | Key | Value |
+  | :--- | :--- |
+  | `admin_username` | Administrator username (default `Courier`; overridden by `ADMIN_USERNAME` at every start). |
+  | `admin_password_hash` | Argon2id PHC string. |
+  | `admin_totp_secret` | Active TOTP secret, ChaCha20-Poly1305 encrypted (base64). Removed when 2FA is disabled or `RESET_2FA=true`. |
+  | `admin_totp_pending` | Encrypted TOTP secret awaiting its first confirmed code during 2FA setup. |
+  | `admin_totp_last_step` | Last accepted TOTP time step (replay protection). |
+  | `admin_recovery_hashes` | SHA-256 hashes of the unused single-use recovery codes. |
+  | `timezone` | IANA system timezone for route time windows (seeded from `TIMEZONE` / `TZ`, default `America/Los_Angeles`). |
+  | `outbox_queue` | Global queue pause state (`paused`, optional `resume_at`). |
+  | `locale` | **Legacy** fallback delivery language for routes without `options.locale`. |
+  | `outbound_proxy_url` | Global outbound proxy URL. |
+  | `ssrf_allowlist` | SSRF CIDR / hostname allowlist entries. |
 - **`mcp_tokens`** (`id`, `name`, `token_hash UNIQUE`, `token_prefix`, `scope CHECK (scope IN ('readonly', 'admin'))`, `last_used_at`, `created_at`): Stores SHA-256 digests of issued MCP Bearer tokens.
 - **`sessions`** (`token_hash TEXT PRIMARY KEY`, `expires_at INTEGER`, `created_at INTEGER`): Stores SHA-256 digests of active WebUI `fc_session` cookies (`30`-day TTL, `2,592,000` seconds).

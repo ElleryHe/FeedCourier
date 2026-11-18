@@ -1,10 +1,10 @@
 ---
-description: "FeedCourier 7 个 MCP 工具参数与返回结构说明：涵盖状态查询、失败任务诊断、文章预览、订阅源管理、路由编排与死信重投。"
+description: "FeedCourier 9 个 MCP 工具参数与返回结构说明：涵盖状态查询、失败任务诊断、文章预览、订阅源管理、路由编排、死信重投、全局队列控制与调试推送。"
 ---
 
 # 工具说明
 
-FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读查询/预览工具（`readonly` 与 `admin` 令牌均可调用）和配置管理/运维工具（仅限 `admin` 令牌调用）。
+FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读查询/预览工具（`readonly` 与 `admin` 令牌均可调用）和配置管理/运维工具（仅限 `admin` 令牌调用）。
 
 ---
 
@@ -15,10 +15,12 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 | [`list_feeds_status`](#1-list-feeds-status) | `readonly` | 只读 | 查看全局统计概览、通道列表（仅含 ID、名称和类型）、路由列表及订阅源健康状态。 |
 | [`inspect_failed_deliveries`](#2-inspect-failed-deliveries) | `readonly` | 只读 | 查看投递失败（`dead_letter`）、等待重试（`retrying`）、顺延（`deferred`）或排队中的任务与诊断日志。 |
 | [`preview_feed_latest`](#3-preview-feed-latest) | `readonly` | 只读 | 实时试抓指定订阅源 URL 或已有 `feed_id` 的最新 10 篇文章，支持测试全文提取与过滤规则。 |
-| [`manage_feed`](#4-manage-feed) | **`admin`** | 写操作 | 新增、修改、暂停（`pause`）、恢复（`resume`）或删除订阅源，设置标签、轮询间隔、全文提取与代理开关。 |
+| [`manage_feed`](#4-manage-feed) | **`admin`** | 写操作 | 新增、修改、暂停（`pause`）、恢复（`resume`）、清除缓存（`clear_cache`）或删除订阅源，设置标签、轮询间隔、全文提取与代理开关。 |
 | [`configure_route`](#5-configure-route) | **`admin`** | 写操作 | 创建、更新或删除路由规则，将订阅源/标签及关键词/正则过滤规则绑定至已有的 `channel_id`。 |
 | [`reset_and_poll_feed`](#6-reset-and-poll-feed) | **`admin`** | 写操作 | 重置指定订阅源的失败计数与退避/熔断状态，并立即执行一次拉取。 |
 | [`retry_dead_tasks`](#7-retry-dead-tasks) | **`admin`** | 写操作 | 按任务 ID 列表或一键将全部死信任务（`all_dead_letter: true`）重新加入发送队列。 |
+| [`manage_outbox_queue`](#8-manage-outbox-queue) | **`admin`** | 写操作 | 查看、暂停或恢复全局投递队列（可设定自动恢复时间）。 |
+| [`test_push_feed_entry`](#9-test-push-feed-entry) | **`admin`** | 无状态 | 将一条订阅源文章调试推送到指定通道，不写入指纹、不入队、不占用配额。 |
 
 ---
 
@@ -34,6 +36,8 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 | :--- | :--- | :---: | :--- | :--- |
 | `health_status` | `string` | 否 | `null` | 按健康状态筛选订阅源：`"active"`、`"backoff"`、`"circuit_open"` 或 `"paused"`。 |
 | `tag` | `string` | 否 | `null` | 按标签（不区分大小写）筛选包含该标签的订阅源。 |
+
+返回内容中，每条路由还包含其投递语言 `locale`、投递时间窗口 `active_windows` 与允许的星期 `active_weekdays`；响应另含全局队列状态 `queue: { paused, resume_at }` 以及用于判定时间窗口的系统时区 `timezone`。
 
 #### 返回示例
 
@@ -147,18 +151,18 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 ## 配置管理与运维工具（仅限 `admin` 令牌）
 
 > [!WARNING]
-> 若使用 `readonly` 令牌调用以下 4 个工具，服务端会拒绝执行并返回权限不足（`insufficient_scope`）错误。
+> 若使用 `readonly` 令牌调用以下 6 个工具，服务端会拒绝执行并返回权限不足（`insufficient_scope`）错误。
 
 ### 4. `manage_feed` {#4-manage-feed}
 
-新增、修改、暂停、恢复或删除订阅源。当执行 `"add"` 新增订阅源时，创建后会立即触发一次首次拉取（默认启用 `silent_init: true` 静默记录存量历史文章，可通过设置 `push_latest_one: true` 立即推送最新 1 篇）。
+新增、修改、暂停、恢复、清除缓存或删除订阅源。当执行 `"add"` 新增订阅源时，创建后会立即触发一次首次拉取（默认启用 `silent_init: true` 静默记录存量历史文章，可通过设置 `push_latest_one: true` 立即推送最新 1 篇）。
 
 #### 参数说明
 
 | 参数名 | 类型 | 必填 | 默认值 | 说明 |
 | :--- | :--- | :---: | :--- | :--- |
-| `action` | `string` | **是** | — | 操作类型：`"add"`、`"update"`、`"pause"`、`"resume"` 或 `"delete"`。 |
-| `feed_id` | `integer` | 条件必填 | `null` | 目标订阅源 ID（在 `"update"`、`"pause"`、`"resume"`、`"delete"` 时必填）。 |
+| `action` | `string` | **是** | — | 操作类型：`"add"`、`"update"`、`"pause"`、`"resume"`、`"clear_cache"` 或 `"delete"`。 |
+| `feed_id` | `integer` | 条件必填 | `null` | 目标订阅源 ID（在 `"update"`、`"pause"`、`"resume"`、`"clear_cache"`、`"delete"` 时必填）。 |
 | `url` | `string` | 条件必填 | `null` | 订阅源 URL（在 `"add"` 时必填，`"update"` 时可选修改）。 |
 | `title` | `string` | 否 | `""` | 自定义订阅源标题（留空则在首次抓取时使用订阅源自带标题）。 |
 | `tags` | `string[]` | 否 | `[]` | 自定义标签列表（用于路由按标签匹配及同步至 Notion `Tag` 列）。 |
@@ -167,6 +171,16 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 | `use_proxy` | `bool` | 否 | `false` | 是否通过全局出站代理拉取该源及其全文网页。 |
 | `silent_init` | `bool` | 否 | `true` | 新增源首次拉取时是否静默记录历史文章而不发送。 |
 | `push_latest_one` | `bool` | 否 | `false` | 在 `"add"` 且 `silent_init: true` 时，是否将最新 1 篇文章加入发送队列。 |
+| `poll_now` | `bool` | 否 | `true` | 在 `"clear_cache"` 时，清除后是否立即重新拉取。 |
+
+`clear_cache` 会删除该订阅源的全部文章记录、指纹与投递任务，清除 `ETag` / `Last-Modified` 与失败状态并关闭静默初始化，因此下一次拉取会按从旧到新的顺序将全部积压文章入队；已投递过的文章可能被再次投递。
+
+```json
+{
+  "name": "manage_feed",
+  "arguments": { "action": "clear_cache", "feed_id": 4, "poll_now": true }
+}
+```
 
 ---
 
@@ -193,7 +207,12 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 | `exclude_regex` | `string` | 否 | `null` | 匹配即跳过的正则表达式（在 `"update"` 时传入 `""` 可清空）。 |
 | `telegram_mode` | `string` | 否 | `"rich_message"` | Telegram 投递模式：`"rich_message"`、`"compact_card"` 或 `"media_mode"`。 |
 | `link_preview` | `bool` | 否 | `true` | Telegram 快讯模式下是否开启网页链接预览。 |
+| `locale` | `string` | 否 | `null` | 该路由的投递语言：`"en"` 或 `"zh-CN"`。 |
+| `active_windows` | `{start, end}[]` | 否 | `[]` | 系统时区下的每日投递窗口，如 `[{"start":"08:00","end":"22:00"}]`。`end` 早于 `start` 表示跨午夜，`start == end` 表示全天，`[]` 表示不限制。 |
+| `active_weekdays` | `integer[]` | 否 | `[]` | 允许投递的星期，`1`（周一）到 `7`（周日），`[]` 表示每天。 |
 | `enabled` | `bool` | 否 | `true` | 是否启用该路由规则。 |
+
+窗口或星期之外产生的任务仍会入队，并在下一个窗口开始时投递。
 
 ---
 
@@ -242,6 +261,56 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 
 ---
 
+### 8. `manage_outbox_queue` {#8-manage-outbox-queue}
+
+查看或修改全局投递队列状态。暂停期间订阅源仍会轮询、任务持续累积；恢复后所有订阅源中到期的任务按文章发布时间（缺失时按发现时间）从旧到新投递。
+
+#### 参数说明
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+| :--- | :--- | :---: | :--- | :--- |
+| `action` | `string` | **是** | — | 操作类型：`"status"`、`"pause"` 或 `"resume"`。 |
+| `resume_in_minutes` | `integer` | 否 | `null` | 配合 `"pause"`：经过指定分钟数后自动恢复。 |
+| `resume_at` | `string` | 否 | `null` | 配合 `"pause"`：在指定的 RFC 3339 时间自动恢复。 |
+
+未提供 `resume_in_minutes` 或 `resume_at` 时，暂停会一直持续到调用 `"resume"`。
+
+```json
+{
+  "name": "manage_outbox_queue",
+  "arguments": { "action": "pause", "resume_in_minutes": 60 }
+}
+```
+
+---
+
+### 9. `test_push_feed_entry` {#9-test-push-feed-entry}
+
+调试推送：实时抓取一条订阅源文章并向指定通道投递一次。它是**无状态**的：不写入指纹、不进入队列，也不使用路由过滤、时间窗口或配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。下游投递失败时返回诊断结果，而不是抛出错误。
+
+#### 参数说明
+
+| 参数名 | 类型 | 必填 | 默认值 | 说明 |
+| :--- | :--- | :---: | :--- | :--- |
+| `channel_id` | `integer` | **是** | — | 要推送到的已有推送通道 ID。 |
+| `feed_id` | `integer` | 二选一 | `null` | 读取文章的已有订阅源（`feed_id` 与 `url` 二选一）。 |
+| `url` | `string` | 二选一 | `null` | 订阅源 URL。 |
+| `fingerprint_sha256` | `string` | 否 | `null` | 要推送的文章指纹；留空则推送最新一篇。 |
+| `fetch_full_content` | `bool` | 否 | `false` | 推送前是否提取全文。 |
+| `use_proxy` | `bool` | 否 | `false` | 抓取时是否使用全局出站代理。 |
+| `telegram_mode` | `string` | 否 | `null` | Telegram 通道的投递模式：`"rich_message"`、`"compact_card"` 或 `"media_mode"`。 |
+| `link_preview` | `bool` | 否 | `null` | Telegram 网页链接预览开关。 |
+| `locale` | `string` | 否 | `null` | 投递语言：`"en"` 或 `"zh-CN"`。 |
+
+```json
+{
+  "name": "test_push_feed_entry",
+  "arguments": { "channel_id": 2, "feed_id": 4, "telegram_mode": "media_mode", "locale": "zh-CN" }
+}
+```
+
+---
+
 ## 常用自然语言提示词示例
 
 完成客户端接入后，你可以直接用自然语言向 AI 助手发出以下指令：
@@ -251,3 +320,4 @@ FeedCourier 的 `/mcp` 接口共提供 **7 个工具（Tools）**，分为只读
 - **添加订阅源并配置路由**：“*把上面那个 Rust 官方博客添加到订阅源里，打上 `rust` 和 `programming` 标签，开启全文提取并立即试推最新 1 篇；然后检查是否已有匹配 `rust` 标签发往 Telegram 通道的路由。*”
 - **模拟并调整过滤规则**：“*用 `preview_feed_latest` 测试一下如果给 `feed_id = 3` 加上排除关键词 `["招聘", "周报"]`，最近 10 篇文章会有哪几篇被过滤掉？确认没问题后帮我更新到路由 #1。*”
 - **排查并重投失败任务**：“*查看一下当前有没有处于 `dead_letter` 状态的失败投递任务，告诉我报错原因，然后把它们全部重新加入队列投递。*”
+- **控制队列与调试推送**：“*把投递队列暂停 1 小时；然后把 `feed_id = 4` 的最新一篇用媒体模式调试推送到 Telegram 通道 #2。*”

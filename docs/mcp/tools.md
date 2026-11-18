@@ -1,10 +1,10 @@
 ---
-description: "Reference for FeedCourier's 7 MCP tools covering feed status inspection, article preview, failed delivery diagnostics, feed management, and route configuration."
+description: "Reference for FeedCourier's 9 MCP tools covering feed status inspection, article preview, failed delivery diagnostics, feed management, route configuration, global queue control, and debug push."
 ---
 
 # Tools Overview
 
-FeedCourier exposes **7 structured MCP tools** across two permission scopes (`readonly` and `admin`). All tools return structured JSON responses.
+FeedCourier exposes **9 structured MCP tools** across two permission scopes (`readonly` and `admin`). All tools return structured JSON responses.
 
 ---
 
@@ -19,6 +19,8 @@ FeedCourier exposes **7 structured MCP tools** across two permission scopes (`re
 | [`configure_route`](#5-configure-route) | `admin` | Yes | Create, update, or delete a delivery route linked to an existing `channel_id`. |
 | [`reset_and_poll_feed`](#6-reset-and-poll-feed) | `admin` | Yes | Reset failure counters on a feed and trigger an immediate poll. |
 | [`retry_dead_tasks`](#7-retry-dead-tasks) | `admin` | Yes | Requeue failed delivery tasks by `task_ids` or `all_dead_letter: true`. |
+| [`manage_outbox_queue`](#8-manage-outbox-queue) | `admin` | Yes | Check, pause, or resume the global delivery queue (optionally with a scheduled resume). |
+| [`test_push_feed_entry`](#9-test-push-feed-entry) | `admin` | No (stateless) | Debug push of one feed entry to a channel without fingerprints, queue, or quota. |
 
 ---
 
@@ -26,7 +28,7 @@ FeedCourier exposes **7 structured MCP tools** across two permission scopes (`re
 
 ### 1. `list_feeds_status` {#1-list-feeds-status}
 
-Returns system-wide counters (`overview`), channel summaries (`id`, `name`, `kind`, `enabled`, `cooldown_until`—without secrets or recipient addresses), configured routes, and subscribed feeds.
+Returns system-wide counters (`overview`), channel summaries (`id`, `name`, `kind`, `enabled`, `cooldown_until`—without secrets or recipient addresses), configured routes, and subscribed feeds. Each route also carries its delivery `locale`, `active_windows`, and `active_weekdays`. The response additionally includes the global outbox state `queue: { paused, resume_at }` and the system `timezone` used to evaluate route time windows.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
@@ -113,18 +115,18 @@ Fetches and parses a feed live without writing to the database. Returns up to `1
 ## Configuration & Operational Tools (`admin` Scope Only)
 
 ::: warning Requires `admin` Token Scope
-Calling any of the four tools below with a `readonly` token returns an `"insufficient_scope"` error without making changes.
+Calling any of the six tools below with a `readonly` token returns an `"insufficient_scope"` error without making changes.
 :::
 
 ### 4. `manage_feed` {#4-manage-feed}
 
-Adds, updates, pauses, resumes, or deletes a feed subscription. On `"add"`, FeedCourier performs an initial poll right away (with `silent_init: true` enabled by default so existing historical articles are recorded without flooding your channels). If the initial request is blocked by private network protection, the new feed record is rolled back automatically.
+Adds, updates, pauses, resumes, clears the cache of, or deletes a feed subscription. On `"add"`, FeedCourier performs an initial poll right away (with `silent_init: true` enabled by default so existing historical articles are recorded without flooding your channels). If the initial request is blocked by private network protection, the new feed record is rolled back automatically.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `action` | `string` | **Yes** | `"add"`, `"update"`, `"pause"`, `"resume"`, or `"delete"`. |
-| `feed_id` | `i64?` | For non-`add` | Target feed ID (required for `"update"`, `"pause"`, `"resume"`, `"delete"`). |
+| `action` | `string` | **Yes** | `"add"`, `"update"`, `"pause"`, `"resume"`, `"clear_cache"`, or `"delete"`. |
+| `feed_id` | `i64?` | For non-`add` | Target feed ID (required for `"update"`, `"pause"`, `"resume"`, `"clear_cache"`, `"delete"`). |
 | `url` | `string?` | For `add` | Feed URL (`http://` or `https://`). |
 | `title` | `string?` | Optional | Custom feed title override. |
 | `tags` | `string[]?` | Optional | Custom tags for route matching and Notion `Tag` property sync. |
@@ -133,6 +135,7 @@ Adds, updates, pauses, resumes, or deletes a feed subscription. On `"add"`, Feed
 | `use_proxy` | `bool?` | Optional | Route feed and article requests through the global outbound proxy (`false` by default). |
 | `silent_init` | `bool?` | Optional | On `"add"`, record existing historical articles silently (`true` by default). |
 | `push_latest_one` | `bool?` | Optional | On `"add"` when `silent_init` is `true`, still enqueue the single newest entry (`false` by default). |
+| `poll_now` | `bool?` | Optional | On `"clear_cache"`, poll the feed immediately after clearing (`true` by default). |
 
 #### Example Call (`add`)
 ```json
@@ -149,6 +152,20 @@ Adds, updates, pauses, resumes, or deletes a feed subscription. On `"add"`, Feed
   }
 }
 ```
+
+#### Example Call (`clear_cache`)
+```json
+{
+  "name": "manage_feed",
+  "arguments": {
+    "action": "clear_cache",
+    "feed_id": 4,
+    "poll_now": true
+  }
+}
+```
+
+`clear_cache` deletes all entries, fingerprints, and delivery tasks of the feed, clears its `ETag` / `Last-Modified` and failure state, and disables silent init, so the next poll queues the full backlog oldest-first. Already delivered articles can be delivered again.
 
 #### Example Prompt
 > *"Add `https://tokio.rs/blog/index.xml` with tags `rust` and `async`, enable full-text extraction, and push the latest 1 article."*
@@ -174,6 +191,9 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 | `exclude_regex` | `string?` | Optional | Regular expression that excludes matching entries (`""` clears on `"update"`). |
 | `telegram_mode` | `string?` | Optional | Telegram mode: `"rich_message"` (default), `"compact_card"`, or `"media_mode"`. |
 | `link_preview` | `bool?` | Optional | Enable link preview in compact/text Telegram messages (`true` by default). |
+| `locale` | `string?` | Optional | Delivery language of this route: `"en"` or `"zh-CN"`. |
+| `active_windows` | `{start, end}[]?` | Optional | Daily delivery windows in the system timezone, e.g. `[{"start":"08:00","end":"22:00"}]`. `end` earlier than `start` wraps midnight; `start == end` means all day; `[]` means always. |
+| `active_weekdays` | `u8[]?` | Optional | Allowed weekdays `1` (Mon) – `7` (Sun); `[]` means every day. |
 | `enabled` | `bool?` | Optional | Whether this route is active (`true` by default). |
 
 #### Example Call (`create`)
@@ -186,13 +206,18 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
     "channel_id": 2,
     "match_tags": ["rust"],
     "telegram_mode": "rich_message",
-    "link_preview": true
+    "link_preview": true,
+    "locale": "en",
+    "active_windows": [{ "start": "08:00", "end": "22:00" }],
+    "active_weekdays": [1, 2, 3, 4, 5]
   }
 }
 ```
 
+Tasks outside a route's window or weekdays are still queued and are delivered at the next window start.
+
 #### Example Prompt
-> *"Create a route sending all feeds with the `rust` tag to Telegram channel #2 in `rich_message` mode."*
+> *"Create a route sending all feeds with the `rust` tag to Telegram channel #2 in `rich_message` mode, only on weekdays between 08:00 and 22:00."*
 
 ---
 
@@ -242,3 +267,67 @@ Requeues specific failed tasks (`task_ids`) or all `dead_letter` tasks whose art
 
 #### Example Prompt
 > *"Retry all dead-letter delivery tasks."*
+
+---
+
+### 8. `manage_outbox_queue` {#8-manage-outbox-queue}
+
+Reads or changes the global delivery queue state. While paused, feeds are still polled and tasks accumulate; on resume all due tasks across feeds are delivered oldest-first by article publish time (falling back to discovery time).
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `action` | `string` | **Yes** | `"status"`, `"pause"`, or `"resume"`. |
+| `resume_in_minutes` | `u32?` | Optional | With `"pause"`: automatically resume after this many minutes. |
+| `resume_at` | `string?` | Optional | With `"pause"`: automatically resume at this RFC 3339 timestamp. |
+
+Without `resume_in_minutes` or `resume_at`, a pause lasts until `"resume"` is called.
+
+#### Example Call
+```json
+{
+  "name": "manage_outbox_queue",
+  "arguments": {
+    "action": "pause",
+    "resume_in_minutes": 60
+  }
+}
+```
+
+#### Example Prompt
+> *"Pause the delivery queue for one hour."*
+
+---
+
+### 9. `test_push_feed_entry` {#9-test-push-feed-entry}
+
+Debug push: fetches a feed entry live and delivers it to a channel once. It is **stateless**: it creates no fingerprints, does not enter the queue, and does not use route filters, time windows, or quotas. Notion pages use a `test-` prefixed `FC-ID`. Downstream failures are returned as a diagnostic result instead of an error.
+
+#### Input Parameters
+| Parameter | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `channel_id` | `i64` | **Yes** | Existing delivery channel to push to. |
+| `feed_id` | `i64?` | Conditional | Existing feed to read from (provide `feed_id` or `url`). |
+| `url` | `string?` | Conditional | Direct feed URL. |
+| `fingerprint_sha256` | `string?` | Optional | Entry to push; omit to push the latest item. |
+| `fetch_full_content` | `bool?` | Optional | Extract the full article before pushing. |
+| `use_proxy` | `bool?` | Optional | Use the configured outbound proxy when fetching. |
+| `telegram_mode` | `string?` | Optional | `"rich_message"`, `"compact_card"`, or `"media_mode"` (Telegram channels). |
+| `link_preview` | `bool?` | Optional | Telegram link preview toggle. |
+| `locale` | `string?` | Optional | Delivery language: `"en"` or `"zh-CN"`. |
+
+#### Example Call
+```json
+{
+  "name": "test_push_feed_entry",
+  "arguments": {
+    "channel_id": 2,
+    "feed_id": 4,
+    "telegram_mode": "media_mode",
+    "locale": "en"
+  }
+}
+```
+
+#### Example Prompt
+> *"Push the latest item of feed #4 to Telegram channel #2 in media mode as a test."*

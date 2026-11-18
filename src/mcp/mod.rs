@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::Database;
 use crate::ingest::IngestEngine;
+use crate::scheduler::DeliveryDispatcher;
 
 pub use self::auth::{
     AuthenticatedMcpToken, CURRENT_MCP_TOKEN, MCP_WWW_AUTHENTICATE, mcp_bearer_auth_middleware,
@@ -36,6 +37,7 @@ pub struct McpState {
     db: Database,
     ingest: IngestEngine,
     outbox_notify: Option<Arc<Notify>>,
+    runtime: Option<DeliveryDispatcher>,
     cancellation_token: CancellationToken,
 }
 
@@ -46,6 +48,7 @@ impl McpState {
             db,
             ingest,
             outbox_notify: None,
+            runtime: None,
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -55,6 +58,16 @@ impl McpState {
     pub fn with_outbox_notify(mut self, notify: Arc<Notify>) -> Self {
         self.outbox_notify = Some(notify);
         self
+    }
+
+    /// Attach the delivery runtime so admin tools can issue stateless debug pushes.
+    pub fn with_runtime(mut self, runtime: DeliveryDispatcher) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    pub fn runtime(&self) -> Option<&DeliveryDispatcher> {
+        self.runtime.as_ref()
     }
 
     /// Attach an optional outbox dispatcher wakeup handle.

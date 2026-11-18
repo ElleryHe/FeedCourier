@@ -18,7 +18,7 @@ FeedCourier 在同一个 HTTP 监听端口（默认 `0.0.0.0:8080`）上提供�
 | 权限范围（Scope） | 可调用的工具 | 适用场景 |
 | :--- | :--- | :--- |
 | **`readonly`（只读权限）** | `list_feeds_status`<br>`inspect_failed_deliveries`<br>`preview_feed_latest` | 仅用于查看订阅源状态、查看投递失败诊断日志以及试抓预览新订阅源，无法修改任何配置或数据。 |
-| **`admin`（管理权限）** | 全部 `readonly` 工具 **+** <br>`manage_feed`<br>`configure_route`<br>`reset_and_poll_feed`<br>`retry_dead_tasks` | 除查看与预览外，还可通过自然语言添加/修改/暂停/删除订阅源、配置路由过滤规则、立即触发拉取以及重投失败任务。 |
+| **`admin`（管理权限）** | 全部 `readonly` 工具 **+** <br>`manage_feed`<br>`configure_route`<br>`reset_and_poll_feed`<br>`retry_dead_tasks`<br>`manage_outbox_queue`<br>`test_push_feed_entry` | 除查看与预览外，还可通过自然语言添加/修改/暂停/清除缓存/删除订阅源、配置路由规则（投递语言、时间窗口）、立即触发拉取、重投失败任务、暂停或恢复全局队列，以及向通道调试推送一条文章。 |
 
 3. 点击生成后，界面会显示以 `fc_mcp_` 开头的明文令牌，以及自动填好当前服务地址的客户端配置 JSON。
 
@@ -99,9 +99,10 @@ curl -i -X POST http://127.0.0.1:8080/mcp \
 
 1. **权限分级（`readonly` 与 `admin`）**：
    - `readonly` 令牌仅可调用状态查询、失败任务诊断和试抓预览三个只读工具，任何写操作调用均会被服务端直接拒绝。
-   - `admin` 令牌可额外执行订阅源增删改、路由规则配置、重置拉取与重投失败任务。日常如果只需要让 AI 帮忙检查运行情况，建议优先使用 `readonly` 令牌。
+   - `admin` 令牌可额外执行订阅源增删改与清除缓存、路由规则配置、重置拉取、重投失败任务、暂停/恢复全局投递队列以及调试推送。日常如果只需要让 AI 帮忙检查运行情况，建议优先使用 `readonly` 令牌。
 2. **通道与收件地址隔离**：
    - 推送通道的密钥（SMTP 密码、Telegram `bot_token`、Notion `integration_secret`）和收件地址（邮箱地址、`chat_id`、Notion 数据库 ID）**只能在 WebUI 中由管理员创建和修改**。
+   - `test_push_feed_entry` 只能向已有的 `channel_id` 推送，不接受任何凭据或收件地址；它是无状态的（不写指纹、不入队、不占用配额），仅限 `admin` 令牌调用，其目标 URL 同样经过 SSRF 检查。
    - MCP 接口不提供任何创建或修改推送通道的工具，也不会向 AI 客户端返回任何密钥或收件地址（AI 只能看到通道的数字 `id`、名称和类型，并通过数字 `channel_id` 将路由绑定到已有通道），从而避免数据被导向未知的外部收件地址。
 3. **防提示词注入与内网隔离**：
    - 外部订阅源的标题、作者、摘要和上游报错信息在通过 MCP 返回给 AI 前，都会移除控制字符、限制长度并包裹在 `<untrusted_feed_content>` 标签内，同时不包含原始 HTML，防止网页或文章中的恶意文本诱导 AI 执行非预期操作。

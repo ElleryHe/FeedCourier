@@ -1215,12 +1215,22 @@ impl ChannelSender for TelegramSender {
             )));
         };
 
-        match ctx.route_options.telegram_mode {
-            TelegramDeliveryMode::RichMessage => self.send_rich_mode(ctx, cfg).await,
-            TelegramDeliveryMode::CompactCard => {
-                self.send_compact_mode(ctx, cfg, false, None).await
+        // Per-route delivery language overrides the sender-wide (legacy system) default.
+        let scoped;
+        let this: &Self = match ctx.route_options.locale {
+            Some(locale) if locale != self.locale => {
+                scoped = self.clone().with_locale(locale);
+                &scoped
             }
-            TelegramDeliveryMode::MediaMode => self.send_media_mode(ctx, cfg).await,
+            _ => self,
+        };
+
+        match ctx.route_options.telegram_mode {
+            TelegramDeliveryMode::RichMessage => this.send_rich_mode(ctx, cfg).await,
+            TelegramDeliveryMode::CompactCard => {
+                this.send_compact_mode(ctx, cfg, false, None).await
+            }
+            TelegramDeliveryMode::MediaMode => this.send_media_mode(ctx, cfg).await,
         }
     }
 

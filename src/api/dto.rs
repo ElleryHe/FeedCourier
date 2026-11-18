@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::channels::notion::normalize_notion_id;
 use crate::channels::{
     ChannelConfig, ChannelKind, DeliveryCheckpoint, NotionChannelConfig, NotionColumnMapping,
-    RouteOptions, SmtpChannelConfig, SmtpSecurity, TelegramChannelConfig,
+    RouteOptions, SmtpChannelConfig, SmtpSecurity, TelegramChannelConfig, TelegramDeliveryMode,
 };
 use crate::config::{LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::MasterKey;
@@ -70,8 +70,83 @@ impl AuthStatusResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AuthPasswordRequest {
+pub struct AuthSetupRequest {
+    #[serde(default)]
+    pub username: Option<String>,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthLoginRequest {
+    #[serde(default)]
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthLogin2faRequest {
+    pub mfa_token: String,
+    pub code: String,
+}
+
+/// `POST /api/v1/auth/login` response (two-step when 2FA is enabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginResponse {
+    pub ok: bool,
+    pub mfa_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mfa_token: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Account & Security (`/api/v1/account*`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountDto {
+    pub username: String,
+    pub username_env_managed: bool,
+    pub totp_enabled: bool,
+    pub recovery_codes_remaining: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAccountRequest {
+    pub current_password: String,
+    #[serde(default)]
+    pub new_username: Option<String>,
+    #[serde(default)]
+    pub new_password: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PasswordConfirmRequest {
+    pub current_password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TotpEnableRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TotpDisableRequest {
+    pub current_password: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotpSetupResponse {
+    pub secret: String,
+    pub otpauth_url: String,
+    pub qr_svg: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryCodesResponse {
+    pub recovery_codes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +331,55 @@ pub struct FeedPreviewRequest {
     pub use_proxy: bool,
     #[serde(default)]
     pub filter: Option<ContentFilterRules>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ClearFeedCacheRequest {
+    #[serde(default = "default_true")]
+    pub poll_now: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearFeedCacheResponse {
+    pub deleted_entries: u64,
+    pub poll: Option<PollFeedResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_error: Option<String>,
+}
+
+/// Debug-push route option overrides (`POST /api/v1/feeds/preview/push`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DebugPushOptions {
+    #[serde(default)]
+    pub telegram_mode: Option<TelegramDeliveryMode>,
+    #[serde(default)]
+    pub link_preview: Option<bool>,
+    #[serde(default)]
+    pub locale: Option<AppLocale>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DebugPushRequest {
+    pub url: String,
+    #[serde(default)]
+    pub feed_id: Option<i64>,
+    #[serde(default)]
+    pub fingerprint_sha256: Option<String>,
+    #[serde(default)]
+    pub fetch_full_content: bool,
+    #[serde(default)]
+    pub use_proxy: bool,
+    pub channel_id: i64,
+    #[serde(default)]
+    pub options: DebugPushOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugPushResponse {
+    pub ok: bool,
+    pub message: String,
+    pub entry_title: String,
+    pub entry_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -556,6 +680,12 @@ pub struct UpdateChannelRequest {
     pub enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TestChannelRequest {
+    #[serde(default)]
+    pub locale: Option<AppLocale>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestChannelResponse {
     pub ok: bool,
@@ -745,6 +875,36 @@ pub struct RetryTasksResponse {
     pub requeued_count: u64,
 }
 
+/// Global outbox queue state (`GET`/`PUT /api/v1/tasks/queue`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueStateDto {
+    pub paused: bool,
+    pub resume_at: Option<String>,
+}
+
+impl QueueStateDto {
+    pub fn from_state(state: crate::schedule::OutboxQueueState) -> Self {
+        Self {
+            paused: state.paused,
+            resume_at: if state.paused {
+                state.resume_at.map(unix_to_rfc3339)
+            } else {
+                None
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateQueueRequest {
+    /// `"pause"` or `"resume"`.
+    pub action: String,
+    #[serde(default)]
+    pub resume_in_secs: Option<i64>,
+    #[serde(default)]
+    pub resume_at: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // 7. System Settings & MCP Tokens (`/api/v1/settings`, `/api/v1/mcp-tokens*`)
 // ---------------------------------------------------------------------------
@@ -753,6 +913,7 @@ pub struct RetryTasksResponse {
 pub struct SystemSettingsDto {
     pub outbound_proxy_url: Option<String>,
     pub ssrf_allowlist: Vec<String>,
+    pub timezone: String,
     #[serde(default)]
     pub locale: Option<AppLocale>,
 }
@@ -763,6 +924,8 @@ pub struct UpdateSystemSettingsRequest {
     pub outbound_proxy_url: Option<Option<String>>,
     #[serde(default)]
     pub ssrf_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub locale: Option<AppLocale>,
 }

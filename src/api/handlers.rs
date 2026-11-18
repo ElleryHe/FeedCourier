@@ -17,11 +17,13 @@ use url::Url;
 
 use crate::api::AppState;
 use crate::api::dto::{
-    ActionAckResponse, ChannelCooldownSummary, ChannelDto, CreateChannelRequest, CreateFeedRequest,
-    CreateMcpTokenRequest, CreateMcpTokenResponse, CreateRouteRequest, DeliveryTaskDto, FeedDto,
-    FeedPreviewRequest, GcResponse, ListTasksQuery, McpTokenDto, OpmlImportRequest,
-    OpmlImportResponse, OverviewResponse, PollFeedResponse, RetryTasksRequest, RetryTasksResponse,
-    RouteDto, SystemSettingsDto, TestChannelResponse, UpdateChannelRequest, UpdateFeedRequest,
+    ActionAckResponse, ChannelCooldownSummary, ChannelDto, ClearFeedCacheRequest,
+    ClearFeedCacheResponse, CreateChannelRequest, CreateFeedRequest, CreateMcpTokenRequest,
+    CreateMcpTokenResponse, CreateRouteRequest, DebugPushRequest, DebugPushResponse,
+    DeliveryTaskDto, FeedDto, FeedPreviewRequest, GcResponse, ListTasksQuery, McpTokenDto,
+    OpmlImportRequest, OpmlImportResponse, OverviewResponse, PollFeedResponse, QueueStateDto,
+    RetryTasksRequest, RetryTasksResponse, RouteDto, SystemSettingsDto, TestChannelRequest,
+    TestChannelResponse, UpdateChannelRequest, UpdateFeedRequest, UpdateQueueRequest,
     UpdateRouteRequest, UpdateSystemSettingsRequest, normalize_channel_config_on_create,
     normalize_opt_string, normalize_string_vec,
 };
@@ -29,18 +31,19 @@ use crate::channels::notion::{
     NotionInitDbRequest, NotionInitDbResponse, NotionInspectSchemaRequest,
     NotionInspectSchemaResponse,
 };
-use crate::channels::{ChannelConfig, ChannelKind, ChannelSender};
+use crate::channels::{ChannelConfig, ChannelKind, ChannelSender, RouteOptions};
 use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::hash_token;
 use crate::db::models::{
-    DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewFeed, NewRoute, SETTING_LOCALE,
-    SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, UpdateChannel, UpdateFeed, UpdateRoute,
-    now_unix, unix_to_rfc3339,
+    AppLocale, DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewFeed, NewRoute, SETTING_LOCALE,
+    SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE, UpdateChannel,
+    UpdateFeed, UpdateRoute, now_unix, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::{ContentFilterRules, FeedPreviewResponse};
 use crate::net::NetSettings;
-use crate::scheduler::{load_persisted_locale, normalize_net_settings};
+use crate::schedule::{OutboxQueueState, parse_timezone, validate_schedule};
+use crate::scheduler::{DebugPushParams, load_persisted_locale, normalize_net_settings};
 
 // ===========================================================================
 // Public Health Check
@@ -284,6 +287,61 @@ pub async fn preview_feed(
     Ok(Json(preview))
 }
 
+/// `POST /api/v1/feeds/{id}/clear-cache`
+pub async fn clear_feed_cache(
+    State(state): State<AppState>,
+    Path(feed_id): Path<i64>,
+    body: Option<Json<ClearFeedCacheRequest>>,
+) -> AppResult<Json<ClearFeedCacheResponse>> {
+    let poll_now = body.map(|Json(req)| req.poll_now).unwrap_or(true);
+    let outcome = state.ingest().clear_feed_cache(feed_id, poll_now).await?;
+    if outcome.poll.as_ref().is_some_and(|p| p.enqueued_tasks > 0) {
+        state.runtime().notify_outbox();
+    }
+    Ok(Json(ClearFeedCacheResponse {
+        deleted_entries: outcome.deleted_entries,
+        poll: outcome.poll.map(|p| PollFeedResponse {
+            feed: FeedDto::from_model(p.feed),
+            new_entries: p.new_entries,
+            enqueued_tasks: p.enqueued_tasks,
+            not_modified: p.not_modified,
+        }),
+        poll_error: outcome.poll_error,
+    }))
+}
+
+/// `POST /api/v1/feeds/preview/push` — stateless debug push of a single live feed item.
+pub async fn debug_push_feed(
+    State(state): State<AppState>,
+    Json(req): Json<DebugPushRequest>,
+) -> AppResult<Json<DebugPushResponse>> {
+    let url = validate_http_url(&req.url)?;
+    let options = RouteOptions {
+        telegram_mode: req.options.telegram_mode.unwrap_or_default(),
+        link_preview: req.options.link_preview.unwrap_or(true),
+        locale: req.options.locale,
+        ..RouteOptions::default()
+    };
+    let result = state
+        .runtime()
+        .debug_push(DebugPushParams {
+            channel_id: req.channel_id,
+            url,
+            feed_id: req.feed_id,
+            fingerprint: req.fingerprint_sha256,
+            fetch_full_content: req.fetch_full_content,
+            use_proxy: req.use_proxy,
+            options,
+        })
+        .await?;
+    Ok(Json(DebugPushResponse {
+        ok: result.ok,
+        message: result.message,
+        entry_title: result.entry_title,
+        entry_url: result.entry_url,
+    }))
+}
+
 /// `POST /api/v1/feeds/opml/import`
 pub async fn import_opml(
     State(state): State<AppState>,
@@ -497,7 +555,9 @@ pub async fn delete_channel(
 pub async fn test_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<i64>,
+    body: Option<Json<TestChannelRequest>>,
 ) -> AppResult<Json<TestChannelResponse>> {
+    let test_locale: Option<AppLocale> = body.and_then(|Json(req)| req.locale);
     let channel = state
         .db()
         .get_channel(channel_id)
@@ -507,11 +567,11 @@ pub async fn test_channel(
 
     match channel.kind {
         ChannelKind::Smtp => {
-            let message = state
-                .runtime()
-                .smtp_sender()
-                .send_test(&cfg, channel.use_proxy)
-                .await?;
+            let sender = match test_locale {
+                Some(loc) => state.runtime().smtp_sender().for_locale(loc),
+                None => state.runtime().smtp_sender().clone(),
+            };
+            let message = sender.send_test(&cfg, channel.use_proxy).await?;
             Ok(Json(TestChannelResponse {
                 ok: true,
                 message,
@@ -524,7 +584,10 @@ pub async fn test_channel(
                     "decrypted config kind mismatch for telegram channel {channel_id}"
                 )));
             };
-            let sender = state.runtime().telegram_sender();
+            let mut sender = state.runtime().telegram_sender();
+            if let Some(loc) = test_locale {
+                sender.set_locale(loc);
+            }
             let caps = sender.probe_capabilities(tg_cfg, channel.use_proxy).await?;
             let caps_val = serde_json::to_value(&caps)?;
             state
@@ -637,6 +700,9 @@ pub async fn create_route(
     }
     .compile()?;
 
+    let mut options = req.options;
+    validate_schedule(&mut options)?;
+
     let created = state
         .db()
         .create_route(&NewRoute {
@@ -648,7 +714,7 @@ pub async fn create_route(
             exclude_keywords,
             include_regex,
             exclude_regex,
-            options: req.options,
+            options,
             enabled: req.enabled,
         })
         .await?;
@@ -705,6 +771,14 @@ pub async fn update_route(
     }
     .compile()?;
 
+    let options = match req.options {
+        Some(mut opts) => {
+            validate_schedule(&mut opts)?;
+            Some(opts)
+        }
+        None => None,
+    };
+
     let patch = UpdateRoute {
         name: req.name.map(|s| s.trim().to_string()),
         feed_ids: req.feed_ids.map(deduplicate_ids),
@@ -714,7 +788,7 @@ pub async fn update_route(
         exclude_keywords,
         include_regex,
         exclude_regex,
-        options: req.options,
+        options,
         enabled: req.enabled,
     };
 
@@ -796,6 +870,59 @@ pub async fn retry_tasks(
     Ok(Json(RetryTasksResponse { requeued_count }))
 }
 
+/// `GET /api/v1/tasks/queue`
+pub async fn get_queue_state(State(state): State<AppState>) -> AppResult<Json<QueueStateDto>> {
+    let queue = state.db().effective_outbox_queue_state(now_unix()).await?;
+    Ok(Json(QueueStateDto::from_state(queue)))
+}
+
+/// `PUT /api/v1/tasks/queue`
+pub async fn update_queue_state(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateQueueRequest>,
+) -> AppResult<Json<QueueStateDto>> {
+    let now = now_unix();
+    let next = match req.action.trim().to_ascii_lowercase().as_str() {
+        "pause" => {
+            let resume_at = if let Some(raw) = req
+                .resume_at
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let parsed = chrono::DateTime::parse_from_rfc3339(raw).map_err(|err| {
+                    AppError::Validation(format!("invalid resume_at '{raw}': {err}"))
+                })?;
+                Some(parsed.timestamp())
+            } else {
+                req.resume_in_secs.map(|secs| now.saturating_add(secs))
+            };
+            if let Some(at) = resume_at
+                && at <= now
+            {
+                return Err(AppError::Validation(
+                    "resume time must be in the future".to_string(),
+                ));
+            }
+            OutboxQueueState {
+                paused: true,
+                resume_at,
+            }
+        }
+        "resume" => OutboxQueueState::default(),
+        other => {
+            return Err(AppError::Validation(format!(
+                "invalid queue action '{other}' (expected 'pause' or 'resume')"
+            )));
+        }
+    };
+    state.db().set_outbox_queue_state(&next).await?;
+    if !next.paused {
+        state.runtime().notify_outbox();
+    }
+    Ok(Json(QueueStateDto::from_state(next)))
+}
+
 // ===========================================================================
 // System Settings & MCP Bearer Tokens (`/api/v1/settings`, `/api/v1/mcp-tokens*`)
 // ===========================================================================
@@ -807,6 +934,7 @@ pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<Syste
     Ok(Json(SystemSettingsDto {
         outbound_proxy_url: settings.outbound_proxy_url,
         ssrf_allowlist: settings.ssrf_allowlist,
+        timezone: state.db().get_timezone().await.name().to_string(),
         locale,
     }))
 }
@@ -817,10 +945,9 @@ pub async fn update_settings(
     Json(req): Json<UpdateSystemSettingsRequest>,
 ) -> AppResult<Json<SystemSettingsDto>> {
     let current_net = state.http().settings();
-    let has_only_locale =
-        req.locale.is_some() && req.outbound_proxy_url.is_none() && req.ssrf_allowlist.is_none();
+    let has_net_update = req.outbound_proxy_url.is_some() || req.ssrf_allowlist.is_some();
 
-    let next_net = if has_only_locale {
+    let next_net = if !has_net_update {
         current_net
     } else {
         let normalized = normalize_net_settings(NetSettings {
@@ -845,6 +972,14 @@ pub async fn update_settings(
         normalized
     };
 
+    if let Some(raw_tz) = req.timezone.as_deref() {
+        let tz = parse_timezone(raw_tz)?;
+        state
+            .db()
+            .set_setting_typed(SETTING_TIMEZONE, &tz.name().to_string())
+            .await?;
+    }
+
     if let Some(locale) = req.locale {
         state.runtime().set_locale(locale);
         state
@@ -858,6 +993,7 @@ pub async fn update_settings(
     Ok(Json(SystemSettingsDto {
         outbound_proxy_url: next_net.outbound_proxy_url,
         ssrf_allowlist: next_net.ssrf_allowlist,
+        timezone: state.db().get_timezone().await.name().to_string(),
         locale: persisted_locale,
     }))
 }

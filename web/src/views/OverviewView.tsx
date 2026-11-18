@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Send,
   ShieldAlert,
+  Play,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -54,6 +55,26 @@ export function OverviewView({
     queryKey: ["overview"],
     queryFn: () => api.overview.get(),
     refetchInterval: 15_000,
+  });
+
+  const queueQuery = useQuery({
+    queryKey: ["task-queue"],
+    queryFn: () => api.tasks.queue(),
+    refetchInterval: 15_000,
+  });
+  const queue = queueQuery.data;
+
+  const resumeMutation = useMutation({
+    mutationFn: () => api.tasks.updateQueue({ action: "resume" }),
+    onSuccess: (res) => {
+      queryClient.setQueryData(["task-queue"], res);
+      toast.success(m.tasks.queue.toastResumed);
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: (err) => {
+      toast.error(m.tasks.queue.toastResumeFailed, errorMessage(err));
+    },
   });
 
   const gcMutation = useMutation({
@@ -188,6 +209,46 @@ export function OverviewView({
           {m.common.refresh}
         </Button>
       </div>
+
+      {queue?.paused && (
+        <Card className="border-amber-300 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/30">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-5">
+            <div className="flex items-start gap-2.5 text-xs text-amber-800 dark:text-amber-200">
+              <PauseCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <div className="font-semibold">
+                  {m.overview.queuePausedTitle}
+                </div>
+                <p className="mt-0.5 text-amber-700 dark:text-amber-300/90">
+                  {queue.resume_at
+                    ? m.overview.queuePausedUntil(
+                        formatDateTime(queue.resume_at),
+                        formatRelativeTime(queue.resume_at),
+                      )
+                    : m.overview.queuePausedIndefinitely}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onNavigateSection("tasks")}
+              >
+                {m.overview.queueManage}
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => resumeMutation.mutate()}
+                loading={resumeMutation.isPending}
+              >
+                <Play className="h-3.5 w-3.5" />
+                {m.tasks.queue.resumeBtn}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {overviewQuery.isError && (
         <Card className="border-rose-200 bg-rose-50/50 dark:border-rose-900/60 dark:bg-rose-950/20">

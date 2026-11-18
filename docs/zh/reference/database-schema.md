@@ -179,7 +179,7 @@ erDiagram
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | 排除关键词数组 JSON（命中任意一词即排除）。 |
 | `include_regex` | `TEXT` | `NULL` | 包含正则表达式（非空时必须匹配）。 |
 | `exclude_regex` | `TEXT` | `NULL` | 排除正则表达式（匹配即排除）。 |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 通道展现选项 JSON（`RouteOptions`：`telegram_mode` 与 `link_preview`）。 |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 路由选项 JSON（`RouteOptions`）：`telegram_mode`、`link_preview`、`locale`（路由投递语言）、`active_windows`（`[{start, end}]`，系统时区下的 `HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日）。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 路由启用开关。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
@@ -206,7 +206,7 @@ erDiagram
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 任务入队时间戳。 |
 
 - **复合索引**：
-  - `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)` —— 用于 Worker 按到期时间领取待发任务。
+  - `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)` —— 用于 Worker 按到期时间领取待发任务（领取时再通过 `entries` 关联，按 `COALESCE(entries.published_at, entries.discovered_at)` 排序，从而让多个订阅源形成统一的时间顺序流）。
   - `idx_delivery_tasks_status_lease ON delivery_tasks (status, lease_until)` —— 用于发现并接管过期租约任务。
   - `idx_delivery_tasks_entry_status ON delivery_tasks (entry_id, status)` —— 支撑 `entries` 正文 GC 的 `NOT EXISTS` 子查询。
   - `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` —— 支撑滚动小时/每日配额（`hourly_quota` / `daily_quota`）统计。
@@ -219,7 +219,7 @@ erDiagram
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `key` | `TEXT` | `PRIMARY KEY NOT NULL` | 配置项键名：<br>• `'admin_password_hash'`：Argon2id PHC 管理员密码哈希<br>• `'outbound_proxy_url'`：全局出站代理地址<br>• `'ssrf_allowlist'`：内网 SSRF 白名单字符串数组 |
+| `key` | `TEXT` | `PRIMARY KEY NOT NULL` | 配置项键名：<br>• `'admin_username'`：管理员用户名（默认 `Courier`，每次启动时被 `ADMIN_USERNAME` 覆盖）<br>• `'admin_password_hash'`：Argon2id PHC 管理员密码哈希<br>• `'admin_totp_secret'`：已生效的 TOTP 密钥（ChaCha20-Poly1305 加密后 Base64 存储；关闭 2FA 或 `RESET_2FA=true` 时删除）<br>• `'admin_totp_pending'`：启用 2FA 过程中等待首次验证码确认的加密密钥<br>• `'admin_totp_last_step'`：最近一次已接受的 TOTP 时间步（重放防护）<br>• `'admin_recovery_hashes'`：未使用恢复码的 SHA-256 哈希<br>• `'timezone'`：路由时间窗口使用的 IANA 系统时区（首次由 `TIMEZONE` / `TZ` 写入，默认 `America/Los_Angeles`）<br>• `'outbox_queue'`：全局队列暂停状态（`paused`、可选 `resume_at`）<br>• `'locale'`：**旧版**兼容回退投递语言（仅用于未设置 `options.locale` 的路由）<br>• `'outbound_proxy_url'`：全局出站代理地址<br>• `'ssrf_allowlist'`：内网 SSRF 白名单字符串数组 |
 | `value_json` | `TEXT` | `NOT NULL` | JSON 序列化后的配置值。 |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 最后修改时间戳。 |
 

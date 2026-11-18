@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::Path;
 
+use chrono_tz::Tz;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -12,10 +13,11 @@ use crate::db::Database;
 use crate::db::models::{
     Channel, DeliveryTask, DeliveryTaskDetail, DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed,
     FeedHealthStatus, McpToken, McpTokenScope, NewChannel, NewEntry, NewFeed, NewRoute,
-    OverviewSnapshot, QuotaUsage, Route, Session, SystemSetting, UpdateChannel, UpdateFeed,
-    UpdateRoute, now_unix,
+    OverviewSnapshot, QuotaUsage, Route, SETTING_OUTBOX_QUEUE, SETTING_TIMEZONE, Session,
+    SystemSetting, UpdateChannel, UpdateFeed, UpdateRoute, now_unix,
 };
 use crate::error::{AppError, AppResult};
+use crate::schedule::{DEFAULT_TIMEZONE, OutboxQueueState};
 
 impl Database {
     // =========================================================================
@@ -308,6 +310,46 @@ impl Database {
             .execute(&self.write_pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// Remove all cached state of a feed so the next poll re-ingests (and re-delivers) its full
+    /// backlog: deletes every `entries` row (cascading `delivery_tasks`), clears HTTP validators
+    /// and failure state, and disables `silent_init`. Returns the number of deleted entries.
+    pub async fn clear_feed_cache(&self, feed_id: i64) -> AppResult<u64> {
+        let mut tx = self.write_pool.begin().await?;
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM feeds WHERE id = ?1")
+            .bind(feed_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::NotFound(format!("feed {feed_id} not found")));
+        }
+        let deleted = sqlx::query("DELETE FROM entries WHERE feed_id = ?1")
+            .bind(feed_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let now = now_unix();
+        sqlx::query(
+            r#"
+            UPDATE feeds
+            SET etag = NULL,
+                last_modified = NULL,
+                consecutive_failures = 0,
+                last_error = NULL,
+                silent_init = 0,
+                health_status = CASE WHEN health_status = 'paused' THEN 'paused' ELSE 'active' END,
+                next_poll_at = CASE WHEN health_status = 'paused' THEN next_poll_at ELSE ?1 END,
+                updated_at = ?1
+            WHERE id = ?2
+            "#,
+        )
+        .bind(now)
+        .bind(feed_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     // =========================================================================
@@ -817,6 +859,7 @@ impl Database {
                 SELECT dt.id
                 FROM delivery_tasks dt
                 JOIN channels c ON c.id = dt.channel_id
+                JOIN entries e ON e.id = dt.entry_id
                 WHERE c.enabled = 1
                   AND (c.cooldown_until IS NULL OR c.cooldown_until <= ?2)
                   AND (
@@ -827,8 +870,9 @@ impl Database {
                     CASE WHEN dt.status = 'delivering' THEN 0 ELSE 1 END ASC,
                     CASE
                         WHEN dt.status = 'delivering' THEN COALESCE(dt.lease_until, dt.next_attempt_at)
-                        ELSE dt.next_attempt_at
+                        ELSE COALESCE(e.published_at, e.discovered_at)
                     END ASC,
+                    e.id ASC,
                     dt.id ASC
                 LIMIT 1
             )
@@ -1547,5 +1591,52 @@ impl Database {
             .execute(&self.write_pool)
             .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Revoke every session except `keep_token_hash` (used after password changes).
+    pub async fn delete_sessions_except(&self, keep_token_hash: Option<&str>) -> AppResult<u64> {
+        let res = sqlx::query("DELETE FROM sessions WHERE token_hash != ?1")
+            .bind(keep_token_hash.unwrap_or(""))
+            .execute(&self.write_pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Resolve the configured IANA system timezone (falls back to [`DEFAULT_TIMEZONE`]).
+    pub async fn get_timezone(&self) -> Tz {
+        let stored = self
+            .get_setting_typed::<String>(SETTING_TIMEZONE)
+            .await
+            .ok()
+            .flatten();
+        stored
+            .and_then(|raw| raw.trim().parse::<Tz>().ok())
+            .or_else(|| DEFAULT_TIMEZONE.parse::<Tz>().ok())
+            .unwrap_or(chrono_tz::UTC)
+    }
+
+    /// Read the raw persisted outbox queue state.
+    pub async fn get_outbox_queue_state(&self) -> AppResult<OutboxQueueState> {
+        Ok(self
+            .get_setting_typed::<OutboxQueueState>(SETTING_OUTBOX_QUEUE)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Persist the outbox queue state.
+    pub async fn set_outbox_queue_state(&self, state: &OutboxQueueState) -> AppResult<()> {
+        self.set_setting_typed(SETTING_OUTBOX_QUEUE, state).await?;
+        Ok(())
+    }
+
+    /// Outbox queue state at `now`, lazily clearing an expired timed pause.
+    pub async fn effective_outbox_queue_state(&self, now: i64) -> AppResult<OutboxQueueState> {
+        let state = self.get_outbox_queue_state().await?;
+        if state.paused && !state.is_blocking(now) {
+            let resumed = OutboxQueueState::default();
+            self.set_outbox_queue_state(&resumed).await?;
+            return Ok(resumed);
+        }
+        Ok(state)
     }
 }

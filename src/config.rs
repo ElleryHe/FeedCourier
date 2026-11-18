@@ -52,6 +52,12 @@ pub struct AppConfig {
     pub read_pool_max_connections: u32,
     /// Optional initial locale for delivery templates (`LOCALE`, e.g. `en` or `zh-CN`).
     pub locale: Option<AppLocale>,
+    /// Optional WebUI administrator username that overrides the stored one at startup (`ADMIN_USERNAME`).
+    pub admin_username: Option<String>,
+    /// Optional initial IANA system timezone (`TIMEZONE`, falling back to a valid `TZ`).
+    pub timezone: Option<String>,
+    /// One-shot emergency removal of the administrator TOTP secret and recovery codes (`RESET_2FA`).
+    pub reset_2fa: bool,
 }
 
 impl Default for AppConfig {
@@ -68,6 +74,9 @@ impl Default for AppConfig {
             retention_hours: DEFAULT_RETENTION_HOURS,
             read_pool_max_connections: DEFAULT_READ_POOL_MAX_CONNECTIONS,
             locale: None,
+            admin_username: None,
+            timezone: None,
+            reset_2fa: false,
         }
     }
 }
@@ -146,6 +155,29 @@ impl AppConfig {
             None => None,
         };
 
+        let admin_username = non_empty("ADMIN_USERNAME");
+        if let Some(name) = admin_username.as_deref() {
+            validate_admin_username(name)?;
+        }
+
+        let timezone = match non_empty("TIMEZONE") {
+            Some(raw) => {
+                crate::schedule::parse_timezone(&raw).map_err(|_| {
+                    AppError::Config(format!("invalid TIMEZONE '{raw}' (expected an IANA name)"))
+                })?;
+                Some(raw)
+            }
+            // A container-level `TZ` may be unset or non-IANA (e.g. `:/etc/localtime`); ignore then.
+            None => non_empty("TZ").filter(|raw| crate::schedule::parse_timezone(raw).is_ok()),
+        };
+
+        let reset_2fa = non_empty("RESET_2FA").is_some_and(|raw| {
+            matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+
         Ok(Self {
             data_dir,
             listen_addr,
@@ -156,6 +188,9 @@ impl AppConfig {
             retention_hours,
             read_pool_max_connections,
             locale,
+            admin_username,
+            timezone,
+            reset_2fa,
         })
     }
 
@@ -181,4 +216,20 @@ impl AppConfig {
     pub fn retention_secs(&self) -> i64 {
         i64::try_from(self.retention_hours.saturating_mul(3600)).unwrap_or(i64::MAX)
     }
+}
+
+/// Validate an administrator username (1–64 chars, no control characters, trimmed).
+pub fn validate_admin_username(raw: &str) -> AppResult<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 64 {
+        return Err(AppError::Validation(
+            "username must be between 1 and 64 characters".to_string(),
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(AppError::Validation(
+            "username must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
 }

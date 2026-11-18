@@ -38,6 +38,7 @@ async fn main() -> AppResult<()> {
     let mcp_cancel = scheduler_handle.cancel_token().child_token();
     let mcp_state = McpState::new(db.clone(), runtime.ingest().clone())
         .with_outbox_notify(runtime.outbox_notify())
+        .with_runtime(runtime.clone())
         .with_cancellation_token(mcp_cancel.clone());
     let app_state = AppState::new(runtime);
     let app = build_full_router(app_state, mcp_state);
