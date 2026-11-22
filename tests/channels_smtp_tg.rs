@@ -18,9 +18,10 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use feedcourier::channels::smtp::{MAX_EMAIL_HTML_BYTES, SmtpSender, deterministic_message_id};
 use feedcourier::channels::telegram::{
     DefaultMediaStreamFetcher, FetchedMedia, MAX_CAPTION_UTF16_UNITS, MAX_MESSAGE_UTF16_UNITS,
-    MAX_PHOTO_BYTES, MediaStreamFetcher, TelegramSender, format_compact_card_html,
-    format_compact_card_html_with_locale, format_media_mode_caption,
-    format_media_mode_caption_with_locale, parse_mp4_metadata,
+    MAX_PHOTO_BYTES, MediaStreamFetcher, TelegramSender, build_compact_card_reply_markup,
+    format_compact_card_html, format_compact_card_html_with_locale,
+    format_compact_card_html_with_options, format_media_mode_caption,
+    format_media_mode_caption_with_locale, parse_mp4_metadata, suppress_telegram_auto_entities,
 };
 use feedcourier::channels::{
     ChannelConfig, ChannelKind, ChannelSender, CheckpointSink, DeliveryCheckpoint, DeliveryContext,
@@ -834,8 +835,12 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             .as_str()
             .expect("rich_message.html");
         assert!(
-            rich_html.contains("<h2><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h2>"),
-            "missing linked <h2> header in rich_html: {rich_html}"
+            rich_html.contains("<h3>Zero-Copy Streaming Gateways in Rust</h3>"),
+            "missing plain foreground <h3> header in rich_html: {rich_html}"
+        );
+        assert!(
+            !rich_html.contains("<h1>") && !rich_html.contains("<h2>"),
+            "rich_html must not emit oversized <h1>/<h2> article title: {rich_html}"
         );
         assert!(
             rich_html.contains("<footer>Rust Insider · Alice Chen · "),
@@ -954,11 +959,20 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             "https://blog.example.com/posts/zero-copy-rust"
         );
         let text = compact_req["text"].as_str().expect("text");
-        assert!(text.contains("<b>Zero-Copy Streaming Gateways in Rust</b>"));
-        assert!(text.contains("<i>Rust Insider · Alice Chen</i>"));
-        assert!(text.contains(
-            "<a href=\"https://blog.example.com/posts/zero-copy-rust\">Read original</a>"
-        ));
+        assert!(text.starts_with("<b>Zero-Copy Streaming Gateways in Rust</b>"));
+        assert!(text.contains("<blockquote>") && text.contains("</blockquote>"));
+        assert!(
+            text.contains("<i>Rust Insider · Alice Chen · "),
+            "compact card must render bottom italic source/author/time footer: {text}"
+        );
+        assert_eq!(
+            compact_req["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Read original"
+        );
+        assert_eq!(
+            compact_req["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://blog.example.com/posts/zero-copy-rust"
+        );
     }
 
     // 3) Pre-probed `supports_rich_message == false` skips `sendRichMessage` directly + `send_test`
@@ -1045,7 +1059,7 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         assert!(test_msg.contains("@cached_bot"));
     }
 
-    // 4) CompactCard <= 4096 UTF-16 code unit strict bound (including surrogate-pair emojis & HTML escaping)
+    // 4) CompactCard <= 4096 UTF-16 code unit strict bound + expandable blockquote on long summaries
     let mut long_entry = entry.clone();
     long_entry.summary_text = Some("🦀 <Rust & Async> ".repeat(500));
     let compact_html = format_compact_card_html(&feed, &long_entry);
@@ -1055,9 +1069,12 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         compact_html.encode_utf16().count()
     );
     assert!(
-        compact_html.ends_with(
-            "<a href=\"https://blog.example.com/posts/zero-copy-rust\">Read original</a>"
-        )
+        compact_html.contains("<blockquote expandable>") && compact_html.contains("</blockquote>"),
+        "long CompactCard summary (>300 UTF-16 units) must use <blockquote expandable>: {compact_html}"
+    );
+    assert!(
+        compact_html.ends_with("</i>"),
+        "CompactCard must place italic source/author/time metadata at bottom: {compact_html}"
     );
 }
 
@@ -2005,12 +2022,24 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         "extensionless Document containing MP4 bytes must be promoted to sendVideo"
     );
 
-    // 4) Chinese CompactCard template (`阅读原文`)
+    // 4) Chinese CompactCard template (`阅读原文` inline button + editorial blockquote layout)
     let compact_zh = format_compact_card_html_with_locale(&feed, &video_entry, AppLocale::ZhCn);
     assert!(
-        compact_zh
-            .contains("<a href=\"https://blog.example.com/posts/zero-copy-rust\">阅读原文</a>"),
-        "CompactCard under ZhCn must render 阅读原文: {compact_zh}"
+        compact_zh.contains("<b>Zero-Copy Streaming Gateways in Rust</b>")
+            && compact_zh.contains("<blockquote>")
+            && compact_zh.contains("<i>Video Feed · Alice Chen · "),
+        "CompactCard under ZhCn must render editorial blockquote + bottom metadata: {compact_zh}"
+    );
+    let markup_zh = build_compact_card_reply_markup(
+        &video_entry,
+        AppLocale::ZhCn,
+        &feedcourier::plugins::RenderOverrides::default(),
+    )
+    .expect("inline button markup");
+    assert_eq!(markup_zh["inline_keyboard"][0][0]["text"], "阅读原文");
+    assert_eq!(
+        markup_zh["inline_keyboard"][0][0]["url"],
+        "https://blog.example.com/posts/zero-copy-rust"
     );
 }
 
@@ -2262,25 +2291,24 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
     let rich_html = payload["rich_message"]["html"].as_str().expect("html");
 
     assert!(
-        rich_html.contains("<h2><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h2>"),
-        "article title must use <h2>:\n{rich_html}"
+        rich_html.contains("<h3>Zero-Copy Streaming Gateways in Rust</h3>"),
+        "article title must use plain foreground <h3> without hyperlink blue:\n{rich_html}"
     );
     assert!(
-        !rich_html.contains("<h1>"),
-        "article title and body must not emit oversized <h1>:\n{rich_html}"
+        !rich_html.contains("<h1>") && !rich_html.contains("<h2>"),
+        "article title and body must not emit oversized <h1> or <h2>:\n{rich_html}"
     );
     assert!(
-        rich_html
-            .contains("<footer>Visual Digest · Alice Chen · 2026-01-15 08:30 (UTC+08:00)</footer>"),
-        "metadata + localized route timestamp must live inside native <footer>:\n{rich_html}"
+        rich_html.contains("<footer>Visual Digest · Alice Chen · 2026-01-15 08:30</footer>"),
+        "metadata + compact localized route timestamp must live inside native <footer>:\n{rich_html}"
     );
     assert!(
         rich_html.contains("<hr/>"),
         "divider must separate header and body:\n{rich_html}"
     );
     assert!(
-        rich_html.contains("<h3>Section One</h3>") && rich_html.contains("<h4>Subsection</h4>"),
-        "body headings must shift by heading_offset=2 (h1->h3, h2->h4):\n{rich_html}"
+        rich_html.contains("<h4>Section One</h4>") && rich_html.contains("<h5>Subsection</h5>"),
+        "body headings must shift by heading_offset=3 (h1->h4, h2->h5):\n{rich_html}"
     );
     assert!(
         rich_html.contains("<tg-collage>") && rich_html.contains("</tg-collage>"),
@@ -2290,6 +2318,106 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
         rich_html.contains("<tg-slideshow>") && rich_html.contains("</tg-slideshow>"),
         "11 consecutive images must group into <tg-slideshow>:\n{rich_html}"
     );
+}
+
+#[test]
+fn telegram_v030_compact_card_editorial_layout_expandable_and_auto_entity_suppression() {
+    let feed = sample_feed(42, "OVH Nexus Changelog");
+    let la: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
+    let overrides = feedcourier::plugins::RenderOverrides::default();
+
+    // 1. Auto-entity suppression neutralizes `/cmd`, `@pkg`, and multi-dot code/doc filenames
+    //    while keeping real `https://` URLs and email addresses untouched.
+    let raw = "Firewall (/ip/{ip}/firewall) & (/vps), docs/README.fr.md, README.zh-CN.md, @astrojs/starlight, server/internal/sku.go, see (https://ovh-nexus.ellery.me) or mail alice@example.com.";
+    let suppressed = suppress_telegram_auto_entities(raw);
+    assert!(suppressed.contains("/\u{200C}firewall"), "{suppressed}");
+    assert!(suppressed.contains("/\u{200C}vps"), "{suppressed}");
+    assert!(
+        suppressed.contains("README.\u{200C}fr.\u{200C}md"),
+        "multi-dot filenames must break every dot so .fr is not linked: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("README.\u{200C}zh-CN.\u{200C}md"),
+        "{suppressed}"
+    );
+    assert!(
+        suppressed.contains("@\u{200C}astrojs/\u{200C}starlight"),
+        "{suppressed}"
+    );
+    assert!(suppressed.contains("sku.\u{200C}go"), "{suppressed}");
+    assert!(
+        suppressed.contains("(https://ovh-nexus.ellery.me)"),
+        "real https URL must remain verbatim: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("alice@example.com"),
+        "email address must not trigger @mention suppression: {suppressed}"
+    );
+
+    // 2. Short summary (<= 300 UTF-16) uses plain `<blockquote>`, compact route timezone footer.
+    let mut short_entry = sample_entry("compact-short", Vec::new());
+    short_entry.author = None;
+    short_entry.published_at = Some(1_768_437_000); // 2026-01-14 16:30 America/Los_Angeles
+    short_entry.summary_text =
+        Some("Added firewall (/ip/{ip}/firewall) and README.md guide.".to_owned());
+    let short_html =
+        format_compact_card_html_with_options(&feed, &short_entry, AppLocale::En, la, &overrides);
+    assert!(short_html.starts_with("<b>Zero-Copy Streaming Gateways in Rust</b>\n\n<blockquote>"));
+    assert!(!short_html.contains("<blockquote expandable>"));
+    assert!(short_html.contains("README.\u{200C}md"));
+    assert!(
+        short_html.ends_with("\n\n<i>OVH Nexus Changelog · 2026-01-14 16:30</i>"),
+        "expected compact LA timestamp in bottom footer: {short_html}"
+    );
+
+    // 3. Long summary (> 300 UTF-16, > 800 cap) uses `<blockquote expandable>` and avoids mid-word chop.
+    let mut long_entry = short_entry.clone();
+    long_entry.summary_text = Some(
+        "Dedicated server monitoring and infrastructure automation improvements across clusters. "
+            .repeat(20),
+    );
+    let long_html =
+        format_compact_card_html_with_options(&feed, &long_entry, AppLocale::En, la, &overrides);
+    assert!(long_html.contains("<blockquote expandable>"));
+    assert!(long_html.contains("…</blockquote>"));
+    // Verify clean word boundary: char immediately before `…` should not cut mid-word from `clusters`/`monitoring`
+    let before_ell = long_html
+        .split("…</blockquote>")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap();
+    assert!(
+        [
+            "Dedicated",
+            "server",
+            "monitoring",
+            "and",
+            "infrastructure",
+            "automation",
+            "improvements",
+            "across",
+            "clusters."
+        ]
+        .contains(&before_ell),
+        "expected clean whole-word boundary before ellipsis, got '{before_ell}'"
+    );
+
+    // 4. Duplicate summary equal to title omits redundant blockquote.
+    let mut dup_entry = short_entry.clone();
+    dup_entry.summary_text = dup_entry.title.clone();
+    let dup_html =
+        format_compact_card_html_with_options(&feed, &dup_entry, AppLocale::En, la, &overrides);
+    assert!(
+        !dup_html.contains("<blockquote"),
+        "duplicate summary matching title must omit blockquote: {dup_html}"
+    );
+
+    // 5. No canonical URL yields None reply_markup.
+    let mut no_url_entry = short_entry;
+    no_url_entry.canonical_url = None;
+    assert!(build_compact_card_reply_markup(&no_url_entry, AppLocale::En, &overrides).is_none());
 }
 
 #[tokio::test]

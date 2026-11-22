@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Telegram Rich Message & Compact Card Typography Polish (`src/channels/telegram.rs`)**:
+  - **Rich Message**: Demoted article titles one notch further to plain-foreground `<h3>` (removing full-title hyperlink blue in favor of the bottom **"Read original"** pill button), raised body heading offset to `heading_offset = 3` (`h1→h4`, `h2→h5`, `h3+→h6`), and compacted `<footer>` timestamps to `YYYY-MM-DD HH:MM` in the route timezone (SMTP emails retain explicit `(UTC±HH:MM)` offsets).
+  - **Compact Card**: Redesigned into an editorial card layout — bold title at top, `<blockquote>` summary (auto-upgrading to collapsible `<blockquote expandable>` above `300` UTF-16 units, cleanly word/sentence-boundary truncated at `<= 800` units, omitting duplicate title summaries, and inserting invisible zero-width non-joiners to stop false-positive blue highlights on `/commands`, `@scoped/packages`, and filenames like `README.md` / `sku.go`), bottom italic `Source · Author · YYYY-MM-DD HH:MM` metadata, and a native inline URL button (`reply_markup`) matching Rich Message while keeping `link_preview_options.url` on the original canonical URL.
 - **Destination Delete Reference Guard (`DELETE /api/v1/destinations/{id}`)**: Deleting a destination still referenced by one or more routes now returns **`409 Conflict`** listing `referencing_routes`, requiring explicit `?cascade=true` to cascade-delete the destination together with its routes.
 - **Notion 8-Column Standard Schema (`Short URL`)**: `POST /api/v1/channels/notion/init-db` now provisions an optional `Short URL` (`url`) property alongside the 7 existing columns so Notion destinations preserve the original article permalink in `Link` while recording shortened URLs from route plugins in `Short URL` when mapped (`inspect-schema` detects and optionally patches it).
 

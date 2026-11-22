@@ -35,7 +35,7 @@ use crate::channels::{
 use crate::db::models::{AppLocale, Entry, Feed, MediaAttachment, MediaAttachmentKind, now_unix};
 use crate::error::{AppError, AppResult};
 use crate::net::ssrf::{SsrfDnsResolver, SsrfPolicy, find_ssrf_blocked_in_error};
-use crate::schedule::format_local_timestamp;
+use crate::schedule::format_local_timestamp_compact;
 
 /// Default official Telegram Bot API base URL.
 pub const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
@@ -827,10 +827,11 @@ impl TelegramSender {
                 ctx.channel.use_proxy,
             )
             .await?;
-        let html_text = format_compact_card_html_with_overrides(
+        let html_text = format_compact_card_html_with_options(
             ctx.feed,
             ctx.entry,
             self.locale,
+            ctx.timezone,
             &ctx.overrides,
         );
         // Link preview intentionally targets the original canonical URL (v0.3.0 Q6) so Telegram
@@ -855,6 +856,11 @@ impl TelegramSender {
             "parse_mode": "HTML",
             "link_preview_options": link_preview_options,
         });
+        if let Some(reply_markup) =
+            build_compact_card_reply_markup(ctx.entry, self.locale, &ctx.overrides)
+        {
+            payload["reply_markup"] = reply_markup;
+        }
         if let Some(thread_id) = dest.message_thread_id {
             payload["message_thread_id"] = json!(thread_id);
         }
@@ -1623,10 +1629,10 @@ pub fn build_rich_message_payload_with_locale(
 }
 
 /// Build a Bot API 10.4 [`InputRichMessage`] localized to `locale` and route timezone `tz`:
-/// - Article title rendered as `<h2>` (linked when `canonical_url` exists)
-/// - Source · Author · Localized publish time rendered in native Telegram `<footer>`
+/// - Article title rendered as plain foreground `<h3>` (no hyperlink blue; bottom button links out)
+/// - Source · Author · Compact localized publish time rendered in native Telegram `<footer>`
 /// - `<hr/>` divider separating header from body
-/// - Body HTML parsed via `telegram-rich` with `heading_offset = 2` (`h1`→`h3`, `h2`→`h4`, …)
+/// - Body HTML parsed via `telegram-rich` with `heading_offset = 3` (`h1`→`h4`, `h2`→`h5`, `h3+`→`h6`)
 ///   and `group_consecutive_media = true` (auto `<tg-collage>` / `<tg-slideshow>`).
 pub fn build_rich_message_payload_with_options(
     feed: &Feed,
@@ -1682,42 +1688,25 @@ pub fn build_rich_message_payload_with_overrides(
 
     let mut blocks: Vec<Block> = Vec::new();
 
-    // 1. Demoted `<h2>` title header (avoids oversized `<h1>` on mobile Telegram clients).
-    let title_inlines = match primary_url {
-        Some(url) => vec![Inline::Link {
-            href: url.to_owned(),
-            content: vec![Inline::Text(title)],
-        }],
-        None => vec![Inline::Text(title)],
-    };
+    // 1. Calm editorial `<h3>` title header in native foreground text (bottom pill button links out).
     blocks.push(Block::Heading {
-        level: 2,
-        content: title_inlines,
+        level: 3,
+        content: vec![Inline::Text(title)],
     });
 
-    // 2. Native Telegram `<footer>` metadata line: Source · Author · Localized Time.
-    let mut meta_parts = Vec::new();
-    let source_author = format_source_author_line(feed, entry);
-    if !source_author.is_empty() {
-        meta_parts.push(source_author);
-    }
-    if let Some(local_ts) = entry
-        .published_at
-        .and_then(|ts| format_local_timestamp(ts, tz))
-    {
-        meta_parts.push(local_ts);
-    }
-    if !meta_parts.is_empty() {
-        blocks.push(Block::Footer(vec![Inline::Text(meta_parts.join(" · "))]));
+    // 2. Native Telegram `<footer>` metadata line: Source · Author · Compact Localized Time.
+    let meta_line = format_telegram_meta_line(feed, entry, tz);
+    if !meta_line.is_empty() {
+        blocks.push(Block::Footer(vec![Inline::Text(meta_line)]));
     }
 
-    // 3. Body parsed with heading demotion (`h1`->`h3`..`h6`) and consecutive media grouping.
+    // 3. Body parsed with heading demotion (`h1`->`h4`, `h2`->`h5`, `h3+`->`h6`) and media grouping.
     let parse_opts = ParseOptions {
         base_url: original_url
             .or(fallback_url)
             .and_then(|u| Url::parse(u).ok()),
         keep_tracking_pixels: false,
-        heading_offset: 2,
+        heading_offset: 3,
         group_consecutive_media: true,
     };
 
@@ -1774,21 +1763,57 @@ pub fn build_rich_message_payload_with_overrides(
     doc.to_input_rich_message()
 }
 
-/// Format `TelegramDeliveryMode::CompactCard` HTML strictly bounded to `<= 4096` UTF-16 code units.
-pub fn format_compact_card_html(feed: &Feed, entry: &Entry) -> String {
-    format_compact_card_html_with_locale(feed, entry, AppLocale::En)
+/// UTF-16 threshold above which Compact Card summaries automatically upgrade from
+/// `<blockquote>` to Telegram's native collapsible `<blockquote expandable>`.
+pub const COMPACT_SUMMARY_EXPANDABLE_UNITS: usize = 300;
+
+/// Maximum UTF-16 length for Compact Card summaries before word/sentence-boundary truncation.
+pub const COMPACT_SUMMARY_MAX_UNITS: usize = 800;
+
+/// Build the optional `reply_markup` inline keyboard URL button for `CompactCard` messages.
+pub fn build_compact_card_reply_markup(
+    entry: &Entry,
+    locale: AppLocale,
+    overrides: &crate::plugins::RenderOverrides,
+) -> Option<Value> {
+    let url = overrides
+        .effective_primary_link(entry)
+        .map(str::trim)
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))?;
+    let label = if locale.is_zh() {
+        "阅读原文"
+    } else {
+        "Read original"
+    };
+    Some(json!({
+        "inline_keyboard": [[
+            { "text": label, "url": url }
+        ]]
+    }))
 }
 
-/// Format `TelegramDeliveryMode::CompactCard` HTML localized to `locale`.
+/// Format `TelegramDeliveryMode::CompactCard` HTML strictly bounded to `<= 4096` UTF-16 code units.
+pub fn format_compact_card_html(feed: &Feed, entry: &Entry) -> String {
+    format_compact_card_html_with_options(
+        feed,
+        entry,
+        AppLocale::En,
+        chrono_tz::UTC,
+        &crate::plugins::RenderOverrides::default(),
+    )
+}
+
+/// Format `TelegramDeliveryMode::CompactCard` HTML localized to `locale` (UTC default).
 pub fn format_compact_card_html_with_locale(
     feed: &Feed,
     entry: &Entry,
     locale: AppLocale,
 ) -> String {
-    format_compact_card_html_with_overrides(
+    format_compact_card_html_with_options(
         feed,
         entry,
         locale,
+        chrono_tz::UTC,
         &crate::plugins::RenderOverrides::default(),
     )
 }
@@ -1799,6 +1824,24 @@ pub fn format_compact_card_html_with_overrides(
     entry: &Entry,
     locale: AppLocale,
     overrides: &crate::plugins::RenderOverrides,
+) -> String {
+    format_compact_card_html_with_options(feed, entry, locale, chrono_tz::UTC, overrides)
+}
+
+/// Format `TelegramDeliveryMode::CompactCard` HTML localized to `locale` and route timezone `tz`:
+/// - Bold article title at top (`<b>...</b>`)
+/// - Optional summary in `<blockquote>` (`<blockquote expandable>` when `> 300` UTF-16 units,
+///   word/sentence-boundary truncated at `<= 800` units, with zero-width suppression against
+///   false-positive `/cmd`, `@pkg`, and filename-TLD highlights)
+/// - Bottom italic metadata line (`<i>Source · Author · YYYY-MM-DD HH:MM</i>`)
+///
+/// The original article link is attached separately via [`build_compact_card_reply_markup`].
+pub fn format_compact_card_html_with_options(
+    feed: &Feed,
+    entry: &Entry,
+    locale: AppLocale,
+    tz: Tz,
+    _overrides: &crate::plugins::RenderOverrides,
 ) -> String {
     let default_title = if locale.is_zh() {
         "无标题"
@@ -1811,54 +1854,50 @@ pub fn format_compact_card_html_with_overrides(
         .map(collapse_single_line)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_title.to_owned());
-    let title = truncate_utf16(&raw_title, 300, "…");
+    let title = truncate_utf16_word_boundary(&raw_title, 300, "…");
+    let header = format!("<b>{}</b>", escape_html(&title));
 
-    let raw_meta = format_source_author_line(feed, entry);
+    let raw_meta = format_telegram_meta_line(feed, entry, tz);
     let meta = truncate_utf16(&raw_meta, 200, "…");
-
-    let canonical_url = overrides.effective_primary_link(entry);
-
-    let mut header = format!("<b>{}</b>", escape_html(&title));
-    if !meta.is_empty() {
-        header.push('\n');
-        header.push_str("<i>");
-        header.push_str(&escape_html(&meta));
-        header.push_str("</i>");
-    }
-
-    let read_original_label = if locale.is_zh() {
-        "阅读原文"
+    let meta_footer = if meta.is_empty() {
+        String::new()
     } else {
-        "Read original"
-    };
-
-    let footer = match canonical_url {
-        Some(url) => format!(
-            "\n\n<a href=\"{}\">{read_original_label}</a>",
-            escape_html_attr(url)
-        ),
-        None => String::new(),
+        format!("\n\n<i>{}</i>", escape_html(&meta))
     };
 
     let raw_summary = extract_plain_summary(entry);
-    if raw_summary.is_empty() {
-        let combined = format!("{header}{footer}");
+    let summary_is_duplicate = !raw_summary.is_empty()
+        && collapse_single_line(&raw_summary).eq_ignore_ascii_case(&raw_title);
+    if raw_summary.is_empty() || summary_is_duplicate {
+        let combined = format!("{header}{meta_footer}");
         if utf16_len(&combined) <= MAX_MESSAGE_UTF16_UNITS {
             return combined;
         }
         return format!("<b>{}</b>", escape_html(&truncate_utf16(&title, 256, "…")));
     }
 
-    let fixed_units = utf16_len(&header) + 2 + utf16_len(&footer);
-    let mut summary_budget = MAX_MESSAGE_UTF16_UNITS.saturating_sub(fixed_units + 16);
+    // Reserve wrapper budget (`\n\n<blockquote expandable>...</blockquote>`).
+    let wrapper_units = utf16_len("\n\n<blockquote expandable></blockquote>");
+    let fixed_units = utf16_len(&header) + wrapper_units + utf16_len(&meta_footer);
+    let max_fit_budget = MAX_MESSAGE_UTF16_UNITS.saturating_sub(fixed_units + 16);
+    let mut summary_budget = COMPACT_SUMMARY_MAX_UNITS.min(max_fit_budget);
 
     for _ in 0..8 {
-        let clipped_summary = truncate_utf16(&raw_summary, summary_budget, "…");
-        let escaped_summary = escape_html(&clipped_summary);
+        if summary_budget == 0 {
+            break;
+        }
+        let clipped_summary = truncate_utf16_word_boundary(&raw_summary, summary_budget, "…");
+        let is_expandable = utf16_len(&clipped_summary) > COMPACT_SUMMARY_EXPANDABLE_UNITS;
+        let suppressed = suppress_telegram_auto_entities(&clipped_summary);
+        let escaped_summary = escape_html(&suppressed);
         let candidate = if escaped_summary.is_empty() {
-            format!("{header}{footer}")
+            format!("{header}{meta_footer}")
+        } else if is_expandable {
+            format!(
+                "{header}\n\n<blockquote expandable>{escaped_summary}</blockquote>{meta_footer}"
+            )
         } else {
-            format!("{header}\n\n{escaped_summary}{footer}")
+            format!("{header}\n\n<blockquote>{escaped_summary}</blockquote>{meta_footer}")
         };
         if utf16_len(&candidate) <= MAX_MESSAGE_UTF16_UNITS
             && candidate.chars().count() <= MAX_MESSAGE_UTF16_UNITS
@@ -1867,12 +1906,9 @@ pub fn format_compact_card_html_with_overrides(
         }
         let over = utf16_len(&candidate).saturating_sub(MAX_MESSAGE_UTF16_UNITS);
         summary_budget = summary_budget.saturating_sub(over + 32);
-        if summary_budget == 0 {
-            break;
-        }
     }
 
-    format!("{header}{footer}")
+    format!("{header}{meta_footer}")
 }
 
 /// Format `TelegramDeliveryMode::MediaMode` strict 3-line minimalist HTML caption (`AppLocale::En` default):
@@ -3045,6 +3081,113 @@ fn format_source_author_line(feed: &Feed, entry: &Entry) -> String {
     }
 }
 
+fn format_telegram_meta_line(feed: &Feed, entry: &Entry, tz: Tz) -> String {
+    let mut parts = Vec::with_capacity(2);
+    let source_author = format_source_author_line(feed, entry);
+    if !source_author.is_empty() {
+        parts.push(source_author);
+    }
+    if let Some(local_ts) = entry
+        .published_at
+        .and_then(|ts| format_local_timestamp_compact(ts, tz))
+    {
+        parts.push(local_ts);
+    }
+    parts.join(" · ")
+}
+
+/// File extensions commonly colliding with ICANN ccTLDs/gTLDs (such as `.md`, `.go`, `.rs`,
+/// `.sh`, `.py`, `.ts`, `.js`, `.zip`, `.mov`) that Telegram's `sendMessage` auto-linker
+/// mistakenly turns into clickable domain hyperlinks.
+const FILENAME_TLD_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "go", "rs", "sh", "bash", "zsh", "py", "pl", "rb", "php", "so", "cc", "cpp",
+    "hpp", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "css", "html", "xml",
+    "yml", "yaml", "json", "jsonc", "toml", "sql", "lock", "mod", "sum", "txt", "log", "cfg",
+    "ini", "env", "zip", "mov", "tar", "gz", "png", "jpg", "jpeg", "svg", "pdf", "ml", "tf", "re",
+    "pm", "am", "is", "it", "in", "im", "java", "kt", "swift", "dart",
+];
+
+/// Suppress false-positive Telegram `sendMessage` auto-detected entities in plain-text summaries
+/// (`/command`, `@mention`, and code/doc filenames like `README.md`, `README.fr.md`, `sku.go`)
+/// by inserting an invisible ZERO WIDTH NON-JOINER (`\u{200C}`) while leaving real `http://` and
+/// `https://` URLs untouched.
+pub fn suppress_telegram_auto_entities(text: &str) -> String {
+    const ZWNJ: char = '\u{200C}';
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    let bytes = text.as_bytes();
+
+    while i < bytes.len() {
+        let ch = text[i..].chars().next().expect("valid char boundary");
+        if ch.is_whitespace() {
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        // Capture one contiguous non-whitespace token.
+        let start = i;
+        while i < bytes.len() {
+            let c = text[i..].chars().next().expect("valid char boundary");
+            if c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
+        }
+        let token = &text[start..i];
+        let trimmed_leading =
+            token.trim_start_matches(['(', '[', '{', '<', '"', '\'', '“', '‘', '「', '『', '（']);
+        let lower_leading = trimmed_leading.to_ascii_lowercase();
+
+        // Never alter genuine http(s):// URLs.
+        if lower_leading.starts_with("http://") || lower_leading.starts_with("https://") {
+            out.push_str(token);
+            continue;
+        }
+
+        // Detect whether this token ends with a filename-like extension (e.g. `README.fr.md`, `sku.go`).
+        let core = trimmed_leading.trim_end_matches([
+            '.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"', '\'', '”', '’', '」', '』', '）',
+        ]);
+        let is_filename_like = core.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && stem
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && FILENAME_TLD_EXTENSIONS
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known))
+        });
+
+        let chars: Vec<char> = token.chars().collect();
+        for (idx, &c) in chars.iter().enumerate() {
+            out.push(c);
+            let next = chars.get(idx + 1).copied();
+            let prev = idx.checked_sub(1).and_then(|p| chars.get(p).copied());
+            match c {
+                // Suppress `/cmd` false-positive bot commands (e.g. `/firewall`, `/vps`, `/api/v1`).
+                '/' if next.is_some_and(|n| n.is_ascii_alphabetic()) => {
+                    out.push(ZWNJ);
+                }
+                // Suppress `@mention` false-positive handles (e.g. `@astrojs/starlight`, `@types/node`).
+                '@' if prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_')
+                    && next.is_some_and(|n| n.is_ascii_alphabetic() || n == '_') =>
+                {
+                    out.push(ZWNJ);
+                }
+                // Suppress filename ccTLD collisions across multi-dot names (`README.fr.md`, `sku.go`).
+                '.' if is_filename_like && next.is_some_and(|n| n.is_ascii_alphabetic()) => {
+                    out.push(ZWNJ);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    out
+}
+
 fn extract_plain_summary(entry: &Entry) -> String {
     if let Some(summary) = entry
         .summary_text
@@ -3166,6 +3309,68 @@ fn truncate_utf16(s: &str, max_units: usize, ellipsis: &str) -> String {
     }
     let trimmed = out.trim_end();
     format!("{trimmed}{ellipsis}")
+}
+
+/// Truncate `s` to at most `max_units` UTF-16 code units, preferring to step back cleanly to a
+/// nearby sentence/word boundary instead of chopping an ASCII word mid-token (e.g. `ad…`).
+fn truncate_utf16_word_boundary(s: &str, max_units: usize, ellipsis: &str) -> String {
+    if utf16_len(s) <= max_units {
+        return s.to_owned();
+    }
+    let ell_units = utf16_len(ellipsis);
+    if max_units <= ell_units {
+        return truncate_utf16(s, max_units, ellipsis);
+    }
+
+    let target = max_units - ell_units;
+    let mut byte_end = 0;
+    let mut used = 0;
+    for (idx, ch) in s.char_indices() {
+        let w = ch.len_utf16();
+        if used + w > target {
+            break;
+        }
+        byte_end = idx + ch.len_utf8();
+        used += w;
+    }
+
+    let mut cut = &s[..byte_end];
+    let next_char = s[byte_end..].chars().next();
+    let mid_ascii_word = next_char.is_some_and(|c| c.is_ascii_alphanumeric())
+        && cut
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+
+    if mid_ascii_word {
+        // Prefer stepping back to the last whitespace or clean punctuation boundary while keeping
+        // at least 60% of the allocated length.
+        let min_bytes = (byte_end * 3) / 5;
+        if let Some((b_idx, b_ch)) = cut.char_indices().rev().find(|&(idx, ch)| {
+            idx >= min_bytes
+                && (ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '.' | '!' | '?' | ';' | ',' | ')' | ']' | '。' | '，' | '；'
+                    ))
+        }) {
+            cut = if b_ch.is_whitespace() {
+                &cut[..b_idx]
+            } else {
+                &cut[..b_idx + b_ch.len_utf8()]
+            };
+        }
+    }
+
+    let cleaned = cut.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '—' | '(' | '[' | '/')
+    });
+    let final_slice = if cleaned.is_empty() {
+        cut.trim_end()
+    } else {
+        cleaned
+    };
+    format!("{final_slice}{ellipsis}")
 }
 
 fn derive_filename(url: &Url, content_type: Option<&str>) -> String {

@@ -840,7 +840,7 @@ async fn plugin_framework_and_link_rewrite_yourls_end_to_end() {
         "only non-excluded HTTP(S) <a href> + primary link should hit YOURLS (not media/mailto/excluded/self)"
     );
 
-    // Check Telegram payload: `<a href>` uses rewritten short link, while `link_preview_options.url` keeps original!
+    // Check Telegram payload: inline URL button uses rewritten short link, while `link_preview_options.url` keeps original!
     let tg_reqs = tg_srv.received_requests().await.unwrap();
     assert_eq!(tg_reqs.len(), 1);
     let tg_json: Value = serde_json::from_slice(&tg_reqs[0].body).unwrap();
@@ -848,10 +848,12 @@ async fn plugin_framework_and_link_rewrite_yourls_end_to_end() {
         tg_json["link_preview_options"]["url"], "https://origin.example.com/post-1",
         "Telegram link_preview_options.url MUST keep original canonical URL"
     );
-    let tg_text = tg_json["text"].as_str().unwrap();
+    let btn_url = tg_json["reply_markup"]["inline_keyboard"][0][0]["url"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        tg_text.contains("https://sho.rt/"),
-        "Telegram CompactCard anchor should carry shortened link: {tg_text}"
+        btn_url.starts_with("https://sho.rt/"),
+        "Telegram CompactCard inline button should carry shortened link: {tg_json}"
     );
 
     // Process Notion task second -> cached URLs MUST NOT hit YOURLS again (only the failed URL retries)!

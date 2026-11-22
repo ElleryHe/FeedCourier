@@ -77,8 +77,8 @@ flowchart TD
 
 ### 1. `RichMessage` 模式与 `telegram-rich 0.0.2` 结构化转换
 - 路由设为 `rich_message` 时，`build_rich_message_payload_with_options` 基于 [`telegram-rich 0.0.2`](https://crates.io/crates/telegram-rich) 构建 Bot API 10.4 富文本消息：
-  1. **头部块结构**：文章标题使用降级后的 **`<h2>`**（`Block::Heading { level: 2 }`，带原文超链接），下方以 Telegram 原生小号灰字 **`<footer>`**（`Block::Footer`）展示按**路由时区**格式化的「来源 · 作者 · `YYYY-MM-DD HH:MM (UTC±HH:MM)`」，并以水平分隔线（`Block::Divider` / `<hr>`）分隔头部与正文；
-  2. **HTML 结构解析（`parse_rich_html` + `ParseOptions`）**：传入 `heading_offset: 2`（原文标题统一降级为 `h1→h3`、`h2→h4` …，最低至 `h6`）与 `group_consecutive_media: true`（连续 2 张及以上内嵌图片自动合并为 `<tg-collage>`，超过 collage 上限时自动改用 `<tg-slideshow>`），同时保留紧凑表格（`<table compact>`）、可展开引用块（`<blockquote expandable>`）、带语法高亮标识的代码块（`<pre><code class="language-...">`）以及底部直达按钮行（`<tg-button-row>` / `Block::link_button`）；
+  1. **头部块结构**：文章标题使用无超链接的纯白 **`<h3>`**（`Block::Heading { level: 3 }`，由底部胶囊按钮统一承载外链跳转），下方以 Telegram 原生小号灰字 **`<footer>`**（`Block::Footer`）展示按**路由时区**格式化的紧凑「来源 · 作者 · `YYYY-MM-DD HH:MM`」，并以水平分隔线（`Block::Divider` / `<hr>`）分隔头部与正文；
+  2. **HTML 结构解析（`parse_rich_html` + `ParseOptions`）**：传入 `heading_offset: 3`（原文标题统一降级为 `h1→h4`、`h2→h5`、`h3+→h6`）与 `group_consecutive_media: true`（连续 2 张及以上内嵌图片自动合并为 `<tg-collage>`，超过 collage 上限时自动改用 `<tg-slideshow>`），同时保留紧凑表格（`<table compact>`）、可展开引用块（`<blockquote expandable>`）、带语法高亮标识的代码块（`<pre><code class="language-...">`）以及底部直达按钮行（`<tg-button-row>` / `Block::link_button`）；
   3. **配额自适应裁剪（`Document::fit` / `FitOptions`）**：在序列化为 `InputRichMessage` 前，自动将文档裁剪至 Bot API 10.4 的四项硬性限制以内：
      - 正文总字符数 $\le 32,768$；
      - 结构块（`Block`）总数 $\le 500$；
