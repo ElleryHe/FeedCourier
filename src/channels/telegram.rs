@@ -467,7 +467,7 @@ impl TelegramSender {
                     AppError::Config(format!("invalid Telegram proxy URL '{raw_proxy}': {err}"))
                 })?;
                 match parsed_proxy.scheme() {
-                    "http" | "https" | "socks5h" => true,
+                    "http" | "https" | "socks5h" | "socks4a" => true,
                     "socks5" | "socks4" => false,
                     other => {
                         return Err(AppError::Config(format!(
@@ -493,10 +493,16 @@ impl TelegramSender {
             }
             let proxy = reqwest::Proxy::all(raw_proxy)
                 .map_err(|err| AppError::Config(format!("invalid Telegram proxy URL: {err}")))?;
+            // Do NOT attach `self.ssrf_resolver` here: when a proxy is configured, `reqwest`
+            // runs its custom DNS resolver against the *proxy hostname* itself (e.g. local
+            // sidecar `http://clash:7890`, `http://localhost:7890`, or `http://host.docker.internal:7890`),
+            // which would falsely trip SSRF on the trusted operator-configured proxy. The target
+            // Bot API URL was already validated above via `policy.validate_url_hop` and (for
+            // local-DNS proxies) `self.ssrf_resolver.resolve_and_validate`, matching
+            // `ProtectedHttpClient::ssrf_proxied`.
             return reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(Arc::new(self.ssrf_resolver.clone()))
                 .timeout(DEFAULT_HTTP_TIMEOUT)
                 .connect_timeout(Duration::from_secs(15))
                 .proxy(proxy)

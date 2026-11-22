@@ -2437,3 +2437,115 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         built.html_body
     );
 }
+
+#[tokio::test]
+async fn telegram_proxied_client_allows_local_proxy_host_while_blocking_ssrf_target() {
+    // Spawn a minimal local HTTP forward-proxy listener on loopback (NOT in SSRF allowlist!).
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local mock HTTP proxy");
+    let proxy_port = listener.local_addr().expect("proxy addr").port();
+
+    let proxy_handle = tokio::spawn(async move {
+        // Handle 2 sequential requests from `probe_capabilities`: `getMe` + `sendRichMessage`.
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut reader = BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await.unwrap_or(0);
+                if n == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_length = v.trim().parse::<usize>().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                let _ = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await;
+            }
+
+            let (status_line, json_body) = if request_line.contains("/getMe") {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"ok":true,"result":{"id":77,"is_bot":true,"first_name":"ProxyBot","username":"proxy_ok_bot"}}"#,
+                )
+            } else {
+                (
+                    "HTTP/1.1 400 Bad Request",
+                    r#"{"ok":false,"error_code":400,"description":"Bad Request: chat_id is empty"}"#,
+                )
+            };
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
+                json_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    // Strict default SSRF policy (NO loopback allowlist!) + local `http://localhost:<port>` proxy.
+    // Prior to R2-01, attaching `self.ssrf_resolver` to the proxied client blocked `localhost`
+    // with `403 ssrf_blocked`.
+    let sender = TelegramSender::with_proxy_and_fetcher(
+        Some(format!("http://localhost:{proxy_port}")),
+        Arc::new(DefaultMediaStreamFetcher::new()),
+    );
+
+    // 1. Public-looking target URL succeeds through the local proxy without tripping SSRF.
+    let public_cfg = TelegramChannelConfig {
+        bot_token: "PROXY_TOK".to_owned(),
+        api_base_url: Some("http://tg-upstream.example.com".to_owned()),
+    };
+    let caps = sender
+        .probe_capabilities(&public_cfg, true)
+        .await
+        .expect("proxied Telegram Bot API request via local proxy hostname must succeed");
+    assert!(caps.supports_rich_message);
+    assert_eq!(caps.bot_username.as_deref(), Some("proxy_ok_bot"));
+
+    // 2. Private/loopback & metadata target URLs are STILL rejected with `AppError::SsrfBlocked`
+    //    even when routing through a proxy.
+    for blocked_base in ["http://127.0.0.1:9999", "http://169.254.169.254"] {
+        let blocked_cfg = TelegramChannelConfig {
+            bot_token: "PROXY_TOK".to_owned(),
+            api_base_url: Some(blocked_base.to_owned()),
+        };
+        assert!(
+            matches!(
+                sender.probe_capabilities(&blocked_cfg, true).await,
+                Err(AppError::SsrfBlocked(_))
+            ),
+            "proxied Telegram target '{blocked_base}' must still be blocked by SSRF policy"
+        );
+    }
+
+    // 3. `socks4a://` proxy scheme is accepted as a remote-DNS proxy (and still blocks private targets).
+    let socks4a_sender = TelegramSender::with_proxy_and_fetcher(
+        Some("socks4a://127.0.0.1:1080".to_owned()),
+        Arc::new(DefaultMediaStreamFetcher::new()),
+    );
+    let blocked_socks4a_cfg = TelegramChannelConfig {
+        bot_token: "PROXY_TOK".to_owned(),
+        api_base_url: Some("http://127.0.0.1:9999".to_owned()),
+    };
+    assert!(matches!(
+        socks4a_sender
+            .probe_capabilities(&blocked_socks4a_cfg, true)
+            .await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    let _ = proxy_handle.await;
+}

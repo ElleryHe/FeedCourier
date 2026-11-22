@@ -611,7 +611,11 @@ pub async fn update_channel(
                 Ok(caps) => {
                     patch.capabilities_json = Some(serde_json::to_string(&caps)?);
                 }
-                Err(err @ AppError::SsrfBlocked(_)) => return Err(err),
+                Err(
+                    err @ (AppError::SsrfBlocked(_)
+                    | AppError::Unauthorized(_)
+                    | AppError::NotFound(_)),
+                ) => return Err(err),
                 Err(err) => {
                     warn!(
                         channel_id,
@@ -1422,11 +1426,19 @@ pub async fn update_settings(
     };
 
     if let Some(raw_tz) = req.timezone.as_deref() {
+        let prev_tz = state.db().get_timezone().await;
         let tz = parse_timezone(raw_tz)?;
         state
             .db()
             .set_setting_typed(SETTING_TIMEZONE, &tz.name().to_string())
             .await?;
+        if tz != prev_tz {
+            state
+                .db()
+                .release_system_timezone_scheduled_tasks(now_unix())
+                .await?;
+            state.runtime().notify_outbox();
+        }
     }
 
     if let Some(locale) = req.locale {

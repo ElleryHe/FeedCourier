@@ -1475,13 +1475,53 @@ impl Database {
             UPDATE delivery_tasks
             SET status = 'delivering',
                 lease_until = ?1,
-                attempt_count = attempt_count + 1
+                channel_id = COALESCE(
+                    (SELECT r.channel_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    channel_id
+                ),
+                destination_id = COALESCE(
+                    (SELECT r.destination_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    destination_id
+                ),
+                checkpoint_json = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE checkpoint_json
+                END,
+                last_status_code = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE last_status_code
+                END,
+                attempt_count = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN 1
+                    ELSE attempt_count + 1
+                END
             WHERE id = (
                 SELECT dt.id
                 FROM delivery_tasks dt
                 JOIN routes r ON r.id = dt.route_id
-                JOIN channels c ON c.id = dt.channel_id
-                JOIN channel_destinations cd ON cd.id = dt.destination_id
+                JOIN channels c ON c.id = r.channel_id
+                JOIN channel_destinations cd ON cd.id = r.destination_id
                 JOIN entries e ON e.id = dt.entry_id
                 WHERE r.enabled = 1
                   AND c.enabled = 1
@@ -1600,6 +1640,10 @@ impl Database {
     }
 
     /// Transition an in-flight task to `retrying` with updated `next_attempt_at` and checkpoint.
+    ///
+    /// If the parent route switched `(channel_id, destination_id)` while this task was `delivering`,
+    /// the task is atomically realigned to the route's current target with cleared destination
+    /// checkpoint, retry counter, and status code.
     pub async fn mark_task_retrying(
         &self,
         task_id: i64,
@@ -1614,9 +1658,48 @@ impl Database {
             UPDATE delivery_tasks
             SET status = 'retrying',
                 lease_until = NULL,
+                channel_id = COALESCE(
+                    (SELECT r.channel_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    channel_id
+                ),
+                destination_id = COALESCE(
+                    (SELECT r.destination_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    destination_id
+                ),
                 next_attempt_at = ?1,
-                checkpoint_json = COALESCE(?2, checkpoint_json),
-                last_status_code = ?3,
+                attempt_count = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN 0
+                    ELSE attempt_count
+                END,
+                checkpoint_json = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE COALESCE(?2, checkpoint_json)
+                END,
+                last_status_code = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE ?3
+                END,
                 diagnostic_log = ?4
             WHERE id = ?5
             RETURNING *
@@ -1636,6 +1719,10 @@ impl Database {
 
     /// Transition a task to `deferred` (e.g. quota, pacing, delivery window, or Notion `202` async poll).
     /// Decrements `attempt_count` back by 1 so non-error deferral never consumes retry attempts.
+    ///
+    /// If the parent route switched `(channel_id, destination_id)` while this task was `delivering`,
+    /// the task is atomically realigned to the route's current target with cleared destination
+    /// checkpoint, retry counter, and status code.
     pub async fn mark_task_deferred(
         &self,
         task_id: i64,
@@ -1650,10 +1737,48 @@ impl Database {
             UPDATE delivery_tasks
             SET status = 'deferred',
                 lease_until = NULL,
-                attempt_count = MAX(attempt_count - 1, 0),
+                channel_id = COALESCE(
+                    (SELECT r.channel_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    channel_id
+                ),
+                destination_id = COALESCE(
+                    (SELECT r.destination_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    destination_id
+                ),
+                attempt_count = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN 0
+                    ELSE MAX(attempt_count - 1, 0)
+                END,
                 next_attempt_at = ?1,
-                last_status_code = COALESCE(?2, last_status_code),
-                checkpoint_json = COALESCE(?3, checkpoint_json),
+                last_status_code = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE COALESCE(?2, last_status_code)
+                END,
+                checkpoint_json = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE COALESCE(?3, checkpoint_json)
+                END,
                 diagnostic_log = ?4
             WHERE id = ?5
             RETURNING *
@@ -1802,7 +1927,9 @@ impl Database {
         Ok(rows)
     }
 
-    /// Requeue specific dead-letter/failed tasks by ID (provided their entry payload has not been purged).
+    /// Requeue specific dead-letter/failed tasks by ID (provided their entry payload has not been purged),
+    /// realigning `(channel_id, destination_id)` to the parent route's current target and clearing
+    /// stale checkpoints/status codes when the route target changed.
     pub async fn requeue_tasks_by_ids(&self, task_ids: &[i64], now: i64) -> AppResult<u64> {
         if task_ids.is_empty() {
             return Ok(0);
@@ -1814,6 +1941,36 @@ impl Database {
                 UPDATE delivery_tasks
                 SET status = 'queued',
                     lease_until = NULL,
+                    channel_id = COALESCE(
+                        (SELECT r.channel_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                        channel_id
+                    ),
+                    destination_id = COALESCE(
+                        (SELECT r.destination_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                        destination_id
+                    ),
+                    checkpoint_json = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM routes r
+                            WHERE r.id = delivery_tasks.route_id
+                              AND (
+                                  r.channel_id != delivery_tasks.channel_id
+                                  OR r.destination_id != delivery_tasks.destination_id
+                              )
+                        ) THEN NULL
+                        ELSE checkpoint_json
+                    END,
+                    last_status_code = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM routes r
+                            WHERE r.id = delivery_tasks.route_id
+                              AND (
+                                  r.channel_id != delivery_tasks.channel_id
+                                  OR r.destination_id != delivery_tasks.destination_id
+                              )
+                        ) THEN NULL
+                        ELSE last_status_code
+                    END,
                     attempt_count = 0,
                     next_attempt_at = ?1,
                     completed_at = NULL
@@ -1835,13 +1992,45 @@ impl Database {
         Ok(total)
     }
 
-    /// Requeue all `dead_letter` tasks whose entry payloads are still within retention.
+    /// Requeue all `dead_letter` tasks whose entry payloads are still within retention, realigning
+    /// `(channel_id, destination_id)` to the parent route's current target and clearing stale
+    /// checkpoints/status codes when the route target changed.
     pub async fn requeue_all_dead_letter_tasks(&self, now: i64) -> AppResult<u64> {
         let res = sqlx::query(
             r#"
             UPDATE delivery_tasks
             SET status = 'queued',
                 lease_until = NULL,
+                channel_id = COALESCE(
+                    (SELECT r.channel_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    channel_id
+                ),
+                destination_id = COALESCE(
+                    (SELECT r.destination_id FROM routes r WHERE r.id = delivery_tasks.route_id),
+                    destination_id
+                ),
+                checkpoint_json = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE checkpoint_json
+                END,
+                last_status_code = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM routes r
+                        WHERE r.id = delivery_tasks.route_id
+                          AND (
+                              r.channel_id != delivery_tasks.channel_id
+                              OR r.destination_id != delivery_tasks.destination_id
+                          )
+                    ) THEN NULL
+                    ELSE last_status_code
+                END,
                 attempt_count = 0,
                 next_attempt_at = ?1,
                 completed_at = NULL
@@ -1850,6 +2039,35 @@ impl Database {
                   SELECT 1 FROM entries e
                   WHERE e.id = delivery_tasks.entry_id
                     AND e.payload_purged_at IS NULL
+              )
+            "#,
+        )
+        .bind(now)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Pull forward `queued`/`deferred` outbox tasks belonging to scheduled routes that inherit
+    /// the global system timezone (`options.timezone` is absent/null/blank) so changing
+    /// `system_settings.timezone` re-evaluates their delivery windows immediately.
+    pub async fn release_system_timezone_scheduled_tasks(&self, now: i64) -> AppResult<u64> {
+        let res = sqlx::query(
+            r#"
+            UPDATE delivery_tasks
+            SET next_attempt_at = ?1
+            WHERE status IN ('queued', 'deferred')
+              AND next_attempt_at > ?1
+              AND route_id IN (
+                  SELECT id FROM routes
+                  WHERE (
+                      json_extract(options_json, '$.timezone') IS NULL
+                      OR TRIM(CAST(json_extract(options_json, '$.timezone') AS TEXT)) = ''
+                  )
+                    AND (
+                        COALESCE(json_array_length(options_json, '$.active_windows'), 0) > 0
+                        OR COALESCE(json_array_length(options_json, '$.active_weekdays'), 0) > 0
+                    )
               )
             "#,
         )

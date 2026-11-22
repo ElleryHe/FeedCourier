@@ -188,7 +188,7 @@ fn effective_windows(windows: &[DeliveryTimeWindow]) -> Vec<(u32, u32)> {
 }
 
 /// Earliest instant `>= now` (unix seconds) at which the route may deliver. Returns `now` when
-/// delivery is currently allowed, no schedule is configured, or no slot exists within 8 days.
+/// delivery is currently allowed, no schedule is configured, or no slot exists within 15 days.
 pub fn next_allowed_at(options: &RouteOptions, now: i64, tz: Tz) -> i64 {
     if !has_schedule(options) {
         return now;
@@ -203,7 +203,7 @@ pub fn next_allowed_at(options: &RouteOptions, now: i64, tz: Tz) -> i64 {
     let today = now_dt.with_timezone(&tz).date_naive();
 
     let mut best: Option<i64> = None;
-    for offset in -1i64..=8 {
+    for offset in -1i64..=15 {
         let Some(date) = today.checked_add_signed(Duration::days(offset)) else {
             continue;
         };
@@ -414,6 +414,26 @@ mod tests {
         assert_eq!(
             next_allowed_at(&fallback_win, second_0130_pst, la),
             next_day_0030
+        );
+
+        // 4. Single-weekday route (`Sunday [7]`) with a window entirely inside the 2026-03-08
+        //    spring-forward DST gap (`02:10–02:40`): on Sunday 2026-03-01 at 03:00 PST, the
+        //    2026-03-08 occurrence collapses to an empty interval, so `next_allowed_at` must scan
+        //    14 days ahead to Sunday 2026-03-15 02:10 PDT rather than falling back to `now`.
+        let sun_gap_only = opts(&[("02:10", "02:40")], &[7]);
+        let sun_mar1_0300 = la
+            .with_ymd_and_hms(2026, 3, 1, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let sun_mar15_0210 = la
+            .with_ymd_and_hms(2026, 3, 15, 2, 10, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            next_allowed_at(&sun_gap_only, sun_mar1_0300, la),
+            sun_mar15_0210
         );
     }
 

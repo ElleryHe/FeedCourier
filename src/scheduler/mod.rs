@@ -758,6 +758,12 @@ impl DeliveryDispatcher {
         };
 
         if !route.enabled || !channel.enabled || !destination.enabled {
+            let diag = format_deferral_diagnostic(
+                "Route, channel, or destination currently disabled",
+                task.attempt_count,
+                task.last_status_code,
+                task.diagnostic_log.as_deref(),
+            );
             self.inner
                 .db
                 .mark_task_deferred(
@@ -765,7 +771,7 @@ impl DeliveryDispatcher {
                     now.saturating_add(300),
                     None,
                     existing_checkpoint.as_ref(),
-                    "Route, channel, or destination currently disabled",
+                    &diag,
                 )
                 .await?;
             return Ok(true);
@@ -779,6 +785,12 @@ impl DeliveryDispatcher {
         if has_schedule(&route_options) {
             let next_window = next_allowed_at(&route_options, now, route_tz);
             if next_window > now {
+                let diag = format_deferral_diagnostic(
+                    "Route delivery window closed; deferred to the next allowed window",
+                    task.attempt_count,
+                    task.last_status_code,
+                    task.diagnostic_log.as_deref(),
+                );
                 self.inner
                     .db
                     .mark_task_deferred(
@@ -786,7 +798,7 @@ impl DeliveryDispatcher {
                         next_window,
                         None,
                         existing_checkpoint.as_ref(),
-                        "Route delivery window closed; deferred to the next allowed window",
+                        &diag,
                     )
                     .await?;
                 return Ok(true);
@@ -842,6 +854,7 @@ impl DeliveryDispatcher {
                 &format!(
                     "Channel hourly quota reached ({used_last_hour}/{hourly_quota}); deferred to next window"
                 ),
+                task.attempt_count,
                 task.last_status_code,
                 task.diagnostic_log.as_deref(),
             );
@@ -865,6 +878,7 @@ impl DeliveryDispatcher {
                 &format!(
                     "Channel daily quota reached ({used_last_day}/{daily_quota}); deferred to next window"
                 ),
+                task.attempt_count,
                 task.last_status_code,
                 task.diagnostic_log.as_deref(),
             );
@@ -890,6 +904,7 @@ impl DeliveryDispatcher {
         {
             let diag = format_deferral_diagnostic(
                 "Channel anti-spam pacing window active",
+                task.attempt_count,
                 task.last_status_code,
                 task.diagnostic_log.as_deref(),
             );
@@ -1421,15 +1436,15 @@ impl DeliveryDispatcher {
                 diagnostic,
             } => {
                 let target_window = next_window_at.max(completed_now.saturating_add(1));
+                let diag = format_deferral_diagnostic(
+                    &diagnostic,
+                    task.attempt_count,
+                    task.last_status_code,
+                    task.diagnostic_log.as_deref(),
+                );
                 self.inner
                     .db
-                    .mark_task_deferred(
-                        task.id,
-                        target_window,
-                        None,
-                        checkpoint.as_ref(),
-                        &diagnostic,
-                    )
+                    .mark_task_deferred(task.id, target_window, None, checkpoint.as_ref(), &diag)
                     .await?;
             }
             DeliveryOutcome::PermanentFailure {
@@ -1674,21 +1689,38 @@ pub fn compute_delivery_retry_delay_secs(attempt_count: i64, retry_after_secs: O
     exp.saturating_add(jitter)
 }
 
+fn is_benign_deferral_diagnostic(msg: &str) -> bool {
+    msg.starts_with("Route, channel, or destination currently disabled")
+        || msg.starts_with("Route delivery window closed")
+        || msg.starts_with("Channel hourly quota reached")
+        || msg.starts_with("Channel daily quota reached")
+        || msg.starts_with("Channel anti-spam pacing window active")
+}
+
 fn format_deferral_diagnostic(
     reason: &str,
+    prior_attempts: i64,
     prior_status: Option<i32>,
     prior_log: Option<&str>,
 ) -> String {
     let Some(prior) = prior_log.map(str::trim).filter(|s| !s.is_empty()) else {
         return reason.to_owned();
     };
-    if !prior_status.is_some_and(|c| c >= 400) {
+    let (preserved, had_wrapped_previous) = match prior.rsplit_once(" (previous: ") {
+        Some((_, tail)) => (tail.strip_suffix(')').unwrap_or(tail).trim(), true),
+        None => (prior, false),
+    };
+    if preserved.is_empty() {
         return reason.to_owned();
     }
-    let preserved = prior
-        .rsplit_once(" (previous: ")
-        .map(|(_, tail)| tail.trim_end_matches(')'))
-        .unwrap_or(prior);
+    let has_prior_failure = had_wrapped_previous
+        || prior_status.is_some_and(|c| c >= 400)
+        || (prior_status.is_none()
+            && prior_attempts > 1
+            && !is_benign_deferral_diagnostic(preserved));
+    if !has_prior_failure {
+        return reason.to_owned();
+    }
     let snippet: String = preserved.chars().take(240).collect();
     format!("{reason} (previous: {snippet})")
 }
