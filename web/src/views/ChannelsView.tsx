@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Database,
   Globe,
   Lock,
@@ -11,14 +13,17 @@ import {
   Plus,
   Radio,
   RefreshCw,
+  RotateCcw,
   Send,
   ShieldCheck,
   Sparkles,
   Trash2,
+  UserX,
+  Users,
   Wrench,
 } from "lucide-react";
 import { type FormEvent, useMemo, useState } from "react";
-import { api } from "@/api/client";
+import { api, getReferencingRoutesConflict } from "@/api/client";
 import {
   type ChannelAccountCreate,
   type ChannelAccountPatch,
@@ -33,12 +38,17 @@ import {
   type NotionColumnMapping,
   type NotionInspectSchemaResponse,
   type NotionStandardFieldKey,
+  type RouteReferenceDto,
+  type SmtpRecipientDto,
+  type SmtpRecipientStatus,
+  type SmtpRecipientSummary,
   type SmtpSecurity,
   type UpdateChannelRequest,
   type UpdateDestinationRequest,
 } from "@/api/types";
 import {
   Badge,
+  type BadgeVariant,
   Button,
   Card,
   ConfirmDialog,
@@ -87,6 +97,12 @@ const NOTION_STANDARD_COLUMNS: Array<{
     required: false,
   },
   {
+    key: "short_url",
+    standardName: "Short URL",
+    expectedType: "url",
+    required: false,
+  },
+  {
     key: "source",
     standardName: "Source",
     expectedType: "select",
@@ -131,6 +147,59 @@ function kindMeta(kind: ChannelKind, m: Messages) {
   };
 }
 
+function smtpSummaryVariant(summary: SmtpRecipientSummary): BadgeVariant {
+  if (summary.total > 0 && summary.verified === summary.total) {
+    return "success";
+  }
+  if (
+    summary.verified === 0 &&
+    (summary.unsubscribed > 0 || summary.bounced > 0)
+  ) {
+    return "danger";
+  }
+  return "warning";
+}
+
+function recipientStatusVariant(status: SmtpRecipientStatus): BadgeVariant {
+  switch (status) {
+    case "verified":
+      return "success";
+    case "pending":
+      return "warning";
+    case "unsubscribed":
+    case "bounced":
+      return "danger";
+    case "unverified":
+      return "default";
+  }
+}
+
+function consentMethodLabel(method: string, m: Messages): string {
+  switch (method) {
+    case "legacy":
+      return m.channels.smtpCompliance.consentMethod.legacy;
+    case "code":
+      return m.channels.smtpCompliance.consentMethod.code;
+    case "link":
+      return m.channels.smtpCompliance.consentMethod.link;
+    default:
+      return m.channels.smtpCompliance.consentMethod.other(method);
+  }
+}
+
+function revokedMethodLabel(method: string, m: Messages): string {
+  switch (method) {
+    case "one_click":
+      return m.channels.smtpCompliance.revokedMethod.one_click;
+    case "hard_bounce":
+      return m.channels.smtpCompliance.revokedMethod.hard_bounce;
+    case "admin":
+      return m.channels.smtpCompliance.revokedMethod.admin;
+    default:
+      return m.channels.smtpCompliance.revokedMethod.other(method);
+  }
+}
+
 export function ChannelsView() {
   const { m, locale } = useI18n();
   const toast = useToast();
@@ -150,12 +219,31 @@ export function ChannelsView() {
   } | null>(null);
   const [deletingDest, setDeletingDest] =
     useState<ChannelDestinationDto | null>(null);
+  const [destConflict, setDestConflict] = useState<{
+    dest: ChannelDestinationDto;
+    routes: RouteReferenceDto[];
+  } | null>(null);
+  const [expandedSmtpDests, setExpandedSmtpDests] = useState<
+    Record<number, boolean>
+  >({});
   const [testingDestId, setTestingDestId] = useState<number | null>(null);
 
   const channelsQuery = useQuery({
     queryKey: ["channels"],
     queryFn: () => api.channels.list(),
   });
+
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.settings.get(),
+  });
+
+  const toggleSmtpRecipients = (destId: number) => {
+    setExpandedSmtpDests((prev) => ({
+      ...prev,
+      [destId]: !prev[destId],
+    }));
+  };
 
   const allChannels = channelsQuery.data ?? [];
   const filteredChannels = useMemo(
@@ -242,16 +330,31 @@ export function ChannelsView() {
   });
 
   const deleteDestMutation = useMutation({
-    mutationFn: (id: number) => api.destinations.remove(id),
+    mutationFn: ({
+      dest,
+      cascade,
+    }: {
+      dest: ChannelDestinationDto;
+      cascade: boolean;
+    }) => api.destinations.remove(dest.id, cascade),
     onSuccess: () => {
       toast.success(m.channels.toastDestDeleted);
       setDeletingDest(null);
+      setDestConflict(null);
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
-    onError: (err) => {
+    onError: (err, variables) => {
+      if (!variables.cascade) {
+        const refs = getReferencingRoutesConflict(err);
+        if (refs) {
+          setDeletingDest(null);
+          setDestConflict({ dest: variables.dest, routes: refs });
+          return;
+        }
+      }
       toast.error(m.channels.toastDestDeleteFailed, errorMessage(err));
     },
   });
@@ -478,6 +581,16 @@ export function ChannelsView() {
                               : m.channels.card.noPassword}
                           </span>
                         </div>
+                        {ch.config.sender_identity && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-zinc-500">
+                              {m.channels.card.senderIdentity}
+                            </span>
+                            <span className="text-zinc-700 dark:text-zinc-300">
+                              {ch.config.sender_identity}
+                            </span>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -531,6 +644,17 @@ export function ChannelsView() {
                       </Badge>
                     </div>
                   )}
+
+                  {ch.kind === "smtp" &&
+                    settingsQuery.data &&
+                    !settingsQuery.data.public_url && (
+                      <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                        <span className="leading-relaxed">
+                          {m.channels.publicUrlMissingBanner}
+                        </span>
+                      </div>
+                    )}
                 </div>
 
                 {/* Layer 2: Nested Destinations List */}
@@ -557,123 +681,166 @@ export function ChannelsView() {
                     </div>
                   ) : (
                     <div className="space-y-2">
-                      {ch.destinations.map((dest) => (
-                        <div
-                          key={dest.id}
-                          className="flex flex-col justify-between gap-2.5 rounded-lg border border-zinc-200/80 bg-white px-3.5 py-2.5 sm:flex-row sm:items-center dark:border-zinc-800 dark:bg-zinc-900"
-                        >
-                          <div className="min-w-0 flex-1 space-y-1">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
-                                {dest.name}
-                              </span>
-                              {!dest.enabled && (
-                                <Badge variant="default">
-                                  {m.common.disabled}
-                                </Badge>
-                              )}
-                            </div>
+                      {ch.destinations.map((dest) => {
+                        const isSmtp = dest.kind === "smtp";
+                        const isExpanded = Boolean(expandedSmtpDests[dest.id]);
+                        return (
+                          <div
+                            key={dest.id}
+                            className="overflow-hidden rounded-lg border border-zinc-200/80 bg-white dark:border-zinc-800 dark:bg-zinc-900"
+                          >
+                            <div className="flex flex-col justify-between gap-2.5 px-3.5 py-2.5 sm:flex-row sm:items-center">
+                              <div className="min-w-0 flex-1 space-y-1">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                                    {dest.name}
+                                  </span>
+                                  {!dest.enabled && (
+                                    <Badge variant="default">
+                                      {m.common.disabled}
+                                    </Badge>
+                                  )}
+                                  {isSmtp && dest.smtp_summary && (
+                                    <Badge
+                                      variant={smtpSummaryVariant(
+                                        dest.smtp_summary,
+                                      )}
+                                    >
+                                      {m.channels.smtpCompliance.verifiedCountBadge(
+                                        dest.smtp_summary.verified,
+                                        dest.smtp_summary.total,
+                                      )}
+                                    </Badge>
+                                  )}
+                                </div>
 
-                            <div className="flex flex-wrap items-center gap-x-4 gap-y-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
-                              {dest.config.kind === "telegram" && (
-                                <span className="font-mono">
-                                  <span className="font-sans text-zinc-400">
-                                    {m.channels.card.destChat}{" "}
-                                  </span>
-                                  {dest.config.chat_id}
-                                  {dest.config.message_thread_id !== null
-                                    ? m.channels.card.topicSuffix(
-                                        dest.config.message_thread_id,
-                                      )
-                                    : ""}
-                                </span>
-                              )}
-                              {dest.config.kind === "smtp" && (
-                                <>
-                                  <span className="truncate font-mono">
-                                    <span className="font-sans text-zinc-400">
-                                      {m.channels.card.destTo}{" "}
-                                    </span>
-                                    {dest.config.to_addresses.join(", ")}
-                                  </span>
-                                  {dest.config.reply_to && (
-                                    <span className="truncate font-mono">
+                                <div className="flex flex-wrap items-center gap-x-4 gap-y-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                  {dest.config.kind === "telegram" && (
+                                    <span className="font-mono">
                                       <span className="font-sans text-zinc-400">
-                                        {m.channels.card.destReplyTo}{" "}
+                                        {m.channels.card.destChat}{" "}
                                       </span>
-                                      {dest.config.reply_to}
+                                      {dest.config.chat_id}
+                                      {dest.config.message_thread_id !== null
+                                        ? m.channels.card.topicSuffix(
+                                            dest.config.message_thread_id,
+                                          )
+                                        : ""}
                                     </span>
                                   )}
-                                </>
-                              )}
-                              {dest.config.kind === "notion" && (
-                                <>
-                                  <span className="truncate font-mono">
-                                    <span className="font-sans text-zinc-400">
-                                      {m.channels.card.destDataSource}{" "}
-                                    </span>
-                                    {dest.config.data_source_id}
-                                  </span>
-                                  <span className="font-mono">
-                                    <span className="font-sans text-zinc-400">
-                                      {m.channels.card.requiredKeys}{" "}
-                                    </span>
-                                    {dest.config.column_mapping.title} ·{" "}
-                                    {dest.config.column_mapping.fc_id}
-                                  </span>
-                                </>
-                              )}
-                            </div>
-                          </div>
+                                  {dest.config.kind === "smtp" && (
+                                    <>
+                                      <span className="truncate font-mono">
+                                        <span className="font-sans text-zinc-400">
+                                          {m.channels.card.destTo}{" "}
+                                        </span>
+                                        {dest.config.to_addresses.join(", ")}
+                                      </span>
+                                      {dest.config.reply_to && (
+                                        <span className="truncate font-mono">
+                                          <span className="font-sans text-zinc-400">
+                                            {m.channels.card.destReplyTo}{" "}
+                                          </span>
+                                          {dest.config.reply_to}
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                  {dest.config.kind === "notion" && (
+                                    <>
+                                      <span className="truncate font-mono">
+                                        <span className="font-sans text-zinc-400">
+                                          {m.channels.card.destDataSource}{" "}
+                                        </span>
+                                        {dest.config.data_source_id}
+                                      </span>
+                                      <span className="font-mono">
+                                        <span className="font-sans text-zinc-400">
+                                          {m.channels.card.requiredKeys}{" "}
+                                        </span>
+                                        {dest.config.column_mapping.title} ·{" "}
+                                        {dest.config.column_mapping.fc_id}
+                                      </span>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
 
-                          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                            <Switch
-                              checked={dest.enabled}
-                              onCheckedChange={(enabled) =>
-                                toggleDestMutation.mutate({
-                                  id: dest.id,
-                                  enabled,
-                                })
-                              }
-                            />
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => testDestMutation.mutate(dest.id)}
-                              loading={testingDestId === dest.id}
-                            >
-                              <Send className="h-3 w-3" />
-                              {m.channels.card.testDestination}
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() =>
-                                setDestModalState({
-                                  channel: ch,
-                                  destination: dest,
-                                })
-                              }
-                              title={m.channels.card.editDestinationTitle}
-                              aria-label={m.channels.card.editDestinationTitle}
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              onClick={() => setDeletingDest(dest)}
-                              className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                              title={m.channels.card.deleteDestinationTitle}
-                              aria-label={
-                                m.channels.card.deleteDestinationTitle
-                              }
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </Button>
+                              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                                {isSmtp && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() =>
+                                      toggleSmtpRecipients(dest.id)
+                                    }
+                                  >
+                                    <Users className="h-3.5 w-3.5" />
+                                    {m.channels.smtpCompliance.recipientsToggle}
+                                    {isExpanded ? (
+                                      <ChevronUp className="h-3.5 w-3.5" />
+                                    ) : (
+                                      <ChevronDown className="h-3.5 w-3.5" />
+                                    )}
+                                  </Button>
+                                )}
+                                <Switch
+                                  checked={dest.enabled}
+                                  onCheckedChange={(enabled) =>
+                                    toggleDestMutation.mutate({
+                                      id: dest.id,
+                                      enabled,
+                                    })
+                                  }
+                                />
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() =>
+                                    testDestMutation.mutate(dest.id)
+                                  }
+                                  loading={testingDestId === dest.id}
+                                >
+                                  <Send className="h-3 w-3" />
+                                  {m.channels.card.testDestination}
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() =>
+                                    setDestModalState({
+                                      channel: ch,
+                                      destination: dest,
+                                    })
+                                  }
+                                  title={m.channels.card.editDestinationTitle}
+                                  aria-label={
+                                    m.channels.card.editDestinationTitle
+                                  }
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => setDeletingDest(dest)}
+                                  className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                                  title={m.channels.card.deleteDestinationTitle}
+                                  aria-label={
+                                    m.channels.card.deleteDestinationTitle
+                                  }
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </Button>
+                              </div>
+                            </div>
+
+                            {isSmtp && isExpanded && (
+                              <SmtpRecipientsPanel destinationId={dest.id} />
+                            )}
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -720,13 +887,373 @@ export function ChannelsView() {
         open={deletingDest !== null}
         onClose={() => setDeletingDest(null)}
         onConfirm={() => {
-          if (deletingDest) deleteDestMutation.mutate(deletingDest.id);
+          if (deletingDest) {
+            deleteDestMutation.mutate({ dest: deletingDest, cascade: false });
+          }
         }}
         title={m.channels.deleteDestModalTitle}
         description={m.channels.deleteDestModalDesc(deletingDest?.name ?? "")}
         confirmLabel={m.channels.deleteDestModalConfirm}
         loading={deleteDestMutation.isPending}
       />
+
+      {/* Delete Destination 409 Cascade Conflict Modal */}
+      <Modal
+        open={destConflict !== null}
+        onClose={() => setDestConflict(null)}
+        title={m.channels.deleteConflict.title}
+        size="sm"
+        footer={
+          <>
+            <Button
+              variant="outline"
+              onClick={() => setDestConflict(null)}
+              disabled={deleteDestMutation.isPending}
+            >
+              {m.common.cancel}
+            </Button>
+            <Button
+              variant="destructive"
+              loading={deleteDestMutation.isPending}
+              onClick={() => {
+                if (destConflict) {
+                  deleteDestMutation.mutate({
+                    dest: destConflict.dest,
+                    cascade: true,
+                  });
+                }
+              }}
+            >
+              {m.channels.deleteConflict.confirmCascade(
+                destConflict?.routes.length ?? 0,
+              )}
+            </Button>
+          </>
+        }
+      >
+        {destConflict && (
+          <div className="space-y-3 text-xs">
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50/80 p-3 text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+              <p className="leading-relaxed">
+                {m.channels.deleteConflict.desc(
+                  destConflict.dest.name,
+                  destConflict.routes.length,
+                )}
+              </p>
+            </div>
+            <div>
+              <div className="mb-1.5 font-semibold text-zinc-700 dark:text-zinc-300">
+                {m.channels.deleteConflict.affectedRoutesLabel}
+              </div>
+              <ul className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 bg-zinc-50/50 dark:divide-zinc-800 dark:border-zinc-800 dark:bg-zinc-950/60">
+                {destConflict.routes.map((r) => (
+                  <li
+                    key={r.id}
+                    className="flex items-center justify-between px-3 py-2"
+                  >
+                    <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                      {r.name}
+                    </span>
+                    <Badge variant="mono">#{r.id}</Badge>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Expandable SMTP Recipients & Compliance Panel
+// ---------------------------------------------------------------------------
+
+function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
+  const { m } = useI18n();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+
+  const [codeInputs, setCodeInputs] = useState<Record<number, string>>({});
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  const recipientsQuery = useQuery({
+    queryKey: ["destination-recipients", destinationId],
+    queryFn: () => api.destinations.listRecipients(destinationId),
+  });
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({
+      queryKey: ["destination-recipients", destinationId],
+    });
+    void queryClient.invalidateQueries({ queryKey: ["channels"] });
+  };
+
+  const sendCodeMutation = useMutation({
+    mutationFn: (recipient: SmtpRecipientDto) => {
+      setBusyKey(`send-${recipient.id}`);
+      return api.destinations.sendRecipientVerification(
+        destinationId,
+        recipient.id,
+      );
+    },
+    onSuccess: (res) => {
+      toast.success(
+        m.channels.smtpCompliance.toastVerificationSentTitle,
+        res.message,
+      );
+      invalidate();
+    },
+    onError: (err) => {
+      toast.error(m.channels.smtpCompliance.toastActionFailed, errorMessage(err));
+    },
+    onSettled: () => setBusyKey(null),
+  });
+
+  const verifyCodeMutation = useMutation({
+    mutationFn: ({
+      recipient,
+      code,
+    }: {
+      recipient: SmtpRecipientDto;
+      code: string;
+    }) => {
+      setBusyKey(`verify-${recipient.id}`);
+      return api.destinations.verifyRecipientCode(
+        destinationId,
+        recipient.id,
+        code,
+      );
+    },
+    onSuccess: (updated) => {
+      setCodeInputs((prev) => {
+        const next = { ...prev };
+        delete next[updated.id];
+        return next;
+      });
+      toast.success(
+        m.channels.smtpCompliance.toastVerifiedTitle,
+        m.channels.smtpCompliance.toastVerifiedDesc(updated.email),
+      );
+      invalidate();
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: (err) => {
+      toast.error(m.channels.smtpCompliance.toastActionFailed, errorMessage(err));
+    },
+    onSettled: () => setBusyKey(null),
+  });
+
+  const unsubscribeMutation = useMutation({
+    mutationFn: (recipient: SmtpRecipientDto) => {
+      setBusyKey(`unsub-${recipient.id}`);
+      return api.destinations.unsubscribeRecipientAdmin(
+        destinationId,
+        recipient.id,
+      );
+    },
+    onSuccess: (updated) => {
+      toast.success(
+        m.channels.smtpCompliance.toastUnsubscribedTitle,
+        m.channels.smtpCompliance.toastUnsubscribedDesc(updated.email),
+      );
+      invalidate();
+    },
+    onError: (err) => {
+      toast.error(m.channels.smtpCompliance.toastActionFailed, errorMessage(err));
+    },
+    onSettled: () => setBusyKey(null),
+  });
+
+  const reactivateMutation = useMutation({
+    mutationFn: (recipient: SmtpRecipientDto) => {
+      setBusyKey(`reactivate-${recipient.id}`);
+      return api.destinations.reactivateRecipient(destinationId, recipient.id);
+    },
+    onSuccess: (updated) => {
+      toast.success(
+        m.channels.smtpCompliance.toastReactivatedTitle,
+        m.channels.smtpCompliance.toastReactivatedDesc(updated.email),
+      );
+      invalidate();
+    },
+    onError: (err) => {
+      toast.error(m.channels.smtpCompliance.toastActionFailed, errorMessage(err));
+    },
+    onSettled: () => setBusyKey(null),
+  });
+
+  const handleVerifySubmit = (recipient: SmtpRecipientDto) => {
+    const code = (codeInputs[recipient.id] ?? "").trim();
+    if (!/^\d{6}$/.test(code)) {
+      toast.error(
+        m.channels.smtpCompliance.toastActionFailed,
+        m.channels.smtpCompliance.errCodeInvalid,
+      );
+      return;
+    }
+    verifyCodeMutation.mutate({ recipient, code });
+  };
+
+  const recipients = recipientsQuery.data ?? [];
+
+  return (
+    <div className="border-t border-zinc-100 bg-zinc-50/60 px-3.5 py-3 dark:border-zinc-800 dark:bg-zinc-950/40">
+      {recipientsQuery.isLoading ? (
+        <div className="py-2 text-xs text-zinc-500">
+          {m.channels.smtpCompliance.loading}
+        </div>
+      ) : recipients.length === 0 ? (
+        <div className="py-2 text-xs text-zinc-500">
+          {m.channels.smtpCompliance.empty}
+        </div>
+      ) : (
+        <div className="divide-y divide-zinc-200/70 rounded-lg border border-zinc-200/80 bg-white dark:divide-zinc-800/80 dark:border-zinc-800 dark:bg-zinc-900">
+          {recipients.map((r) => {
+            const canSendVerification =
+              r.status === "unverified" || r.status === "pending";
+            const isPending = r.status === "pending";
+            const canUnsubscribe =
+              r.status === "verified" ||
+              r.status === "pending" ||
+              r.status === "unverified";
+            const canReactivate =
+              r.status === "unsubscribed" || r.status === "bounced";
+
+            return (
+              <div
+                key={r.id}
+                className="flex flex-col justify-between gap-2.5 px-3 py-2.5 lg:flex-row lg:items-center"
+              >
+                <div className="min-w-0 flex-1 space-y-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="truncate font-mono text-xs font-medium text-zinc-900 dark:text-zinc-100">
+                      {r.email}
+                    </span>
+                    <Badge variant={recipientStatusVariant(r.status)}>
+                      {m.channels.smtpCompliance.status[r.status]}
+                    </Badge>
+                    {r.status === "bounced" && r.bounce_diagnostic && (
+                      <Badge
+                        variant="danger"
+                        title={`${m.channels.smtpCompliance.bounceTooltipPrefix}${r.bounce_diagnostic}`}
+                        className="max-w-[260px] truncate font-mono text-[10px]"
+                      >
+                        <AlertTriangle className="h-3 w-3 shrink-0" />
+                        <span className="truncate">{r.bounce_diagnostic}</span>
+                      </Badge>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    {r.consent_method && r.consented_at && (
+                      <span title={formatDateTime(r.consented_at)}>
+                        {m.channels.smtpCompliance.auditWithTime(
+                          consentMethodLabel(r.consent_method, m),
+                          formatRelativeTime(r.consented_at),
+                        )}
+                      </span>
+                    )}
+                    {r.revoked_method && r.revoked_at && (
+                      <span title={formatDateTime(r.revoked_at)}>
+                        {m.channels.smtpCompliance.auditWithTime(
+                          revokedMethodLabel(r.revoked_method, m),
+                          formatRelativeTime(r.revoked_at),
+                        )}
+                      </span>
+                    )}
+                    {isPending && r.code_expires_at && (
+                      <span title={formatDateTime(r.code_expires_at)}>
+                        {m.channels.smtpCompliance.codeExpires(
+                          formatRelativeTime(r.code_expires_at),
+                        )}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                  {isPending && (
+                    <div className="flex items-center gap-1">
+                      <Input
+                        value={codeInputs[r.id] ?? ""}
+                        onChange={(e) => {
+                          const digits = e.target.value
+                            .replace(/\D/g, "")
+                            .slice(0, 6);
+                          setCodeInputs((prev) => ({ ...prev, [r.id]: digits }));
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            handleVerifySubmit(r);
+                          }
+                        }}
+                        inputMode="numeric"
+                        maxLength={6}
+                        placeholder={m.channels.smtpCompliance.codePlaceholder}
+                        className="h-7 w-24 px-2 font-mono text-xs"
+                      />
+                      <Button
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        loading={busyKey === `verify-${r.id}`}
+                        onClick={() => handleVerifySubmit(r)}
+                      >
+                        <CheckCircle2 className="h-3 w-3" />
+                        {m.channels.smtpCompliance.verifyBtn}
+                      </Button>
+                    </div>
+                  )}
+
+                  {canSendVerification && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      loading={busyKey === `send-${r.id}`}
+                      onClick={() => sendCodeMutation.mutate(r)}
+                    >
+                      <Mail className="h-3 w-3" />
+                      {isPending
+                        ? m.channels.smtpCompliance.resendVerification
+                        : m.channels.smtpCompliance.sendVerification}
+                    </Button>
+                  )}
+
+                  {canUnsubscribe && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                      loading={busyKey === `unsub-${r.id}`}
+                      onClick={() => unsubscribeMutation.mutate(r)}
+                    >
+                      <UserX className="h-3 w-3" />
+                      {m.channels.smtpCompliance.unsubscribeBtn}
+                    </Button>
+                  )}
+
+                  {canReactivate && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      loading={busyKey === `reactivate-${r.id}`}
+                      onClick={() => reactivateMutation.mutate(r)}
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      {m.channels.smtpCompliance.reactivateBtn}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -1230,6 +1757,9 @@ function ChannelAccountModal({
   const [smtpFromAddress, setSmtpFromAddress] = useState(
     initialSmtp?.from_address ?? "",
   );
+  const [smtpSenderIdentity, setSmtpSenderIdentity] = useState(
+    initialSmtp?.sender_identity ?? "",
+  );
 
   const initialTg =
     channel?.config.kind === "telegram" ? channel.config : undefined;
@@ -1291,6 +1821,7 @@ function ChannelAccountModal({
                 ? { password: smtpPassword }
                 : {}),
             from_address: smtpFromAddress.trim(),
+            sender_identity: smtpSenderIdentity.trim() || null,
           };
         } else if (kind === "telegram") {
           configPatch = {
@@ -1330,6 +1861,7 @@ function ChannelAccountModal({
           username: smtpUsername.trim() || null,
           password: smtpPassword || null,
           from_address: smtpFromAddress.trim(),
+          sender_identity: smtpSenderIdentity.trim() || null,
         };
       } else if (kind === "telegram") {
         configCreate = {
@@ -1644,6 +2176,19 @@ function ChannelAccountModal({
               />
               <FieldHint>{m.channels.wizard.smtp.fromHint}</FieldHint>
             </div>
+
+            <div>
+              <Label>{m.channels.wizard.smtp.senderIdentityLabel}</Label>
+              <Input
+                value={smtpSenderIdentity}
+                onChange={(e) => setSmtpSenderIdentity(e.target.value)}
+                placeholder={m.channels.wizard.smtp.senderIdentityPlaceholder}
+                className="mt-1 text-xs"
+              />
+              <FieldHint>
+                {m.channels.wizard.smtp.senderIdentityHint}
+              </FieldHint>
+            </div>
           </div>
         )}
 
@@ -1823,6 +2368,9 @@ function ChannelAccountModal({
                           placeholder="me@example.com"
                         />
                       </div>
+                      <FieldHint>
+                        {m.channels.wizard.smtp.newRecipientsHint}
+                      </FieldHint>
                     </div>
                     <div>
                       <Label>{m.channels.wizard.smtp.replyToLabel}</Label>
@@ -1932,9 +2480,15 @@ function DestinationModal({
     targetInput: initialNotion?.data_source_id ?? "",
     dataSourceId: initialNotion?.data_source_id ?? "",
     databaseId: initialNotion?.database_id ?? null,
-    columnMapping: initialNotion?.column_mapping ?? {
-      ...DEFAULT_NOTION_COLUMN_MAPPING,
-    },
+    columnMapping: initialNotion?.column_mapping
+      ? {
+          ...DEFAULT_NOTION_COLUMN_MAPPING,
+          ...initialNotion.column_mapping,
+          short_url: initialNotion.column_mapping.short_url ?? null,
+        }
+      : {
+          ...DEFAULT_NOTION_COLUMN_MAPPING,
+        },
   });
 
   const [formError, setFormError] = useState<string | null>(null);
@@ -2014,6 +2568,11 @@ function DestinationModal({
         isEdit ? m.channels.toastDestUpdated : m.channels.toastDestCreated,
       );
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
+      if (isEdit && destination) {
+        void queryClient.invalidateQueries({
+          queryKey: ["destination-recipients", destination.id],
+        });
+      }
       onClose();
     },
     onError: (err) => {
@@ -2120,6 +2679,7 @@ function DestinationModal({
                   placeholder="me@example.com"
                 />
               </div>
+              <FieldHint>{m.channels.wizard.smtp.newRecipientsHint}</FieldHint>
             </div>
             <div>
               <Label>{m.channels.wizard.smtp.replyToLabel}</Label>

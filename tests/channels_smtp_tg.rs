@@ -191,6 +191,7 @@ fn smtp_headers_force_from_multipart_and_95kib_truncation() {
         password: Some("secret".to_owned()),
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+        sender_identity: None,
     };
     let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec![
@@ -431,6 +432,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
@@ -450,13 +452,15 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("send 250");
         match outcome {
             DeliveryOutcome::Delivered {
                 status_code,
-                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id }),
+                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id, .. }),
                 ..
             } => {
                 assert_eq!(status_code, Some(250));
@@ -493,7 +497,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
         assert!(
             sessions[0]
                 .raw_data
-                .contains("List-Id: <feed-7.verified.example.com>")
+                .contains("List-Id: <dest-101.verified.example.com>"),
+            "missing destination-scoped List-Id header:\n{}",
+            sessions[0].raw_data
         );
     }
 
@@ -508,6 +514,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
@@ -535,6 +542,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
@@ -554,6 +562,8 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("send 421");
@@ -561,7 +571,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             DeliveryOutcome::Retry {
                 retry_after_secs,
                 status_code,
-                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id }),
+                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id, .. }),
                 cooldown_credential_group,
                 ..
             } => {
@@ -592,6 +602,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["bad@dest.example.org".to_owned()],
@@ -611,13 +622,15 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("send 550");
         match outcome {
             DeliveryOutcome::PermanentFailure {
                 status_code,
-                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id }),
+                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id, .. }),
                 diagnostic,
             } => {
                 assert_eq!(status_code, Some(550));
@@ -786,6 +799,8 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: Some(&sink),
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("sendRichMessage");
@@ -895,6 +910,8 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("runtime fallback");
@@ -999,6 +1016,8 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         let outcome = sender.send(&ctx).await.expect("cached degrade");
         assert!(matches!(
@@ -1168,6 +1187,8 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         let outcome = sender.send(&ctx).await.expect("0-media send");
         assert!(matches!(outcome, DeliveryOutcome::Delivered { .. }));
@@ -1228,6 +1249,8 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&sink_attempt1),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome1 = sender.send(&ctx1).await.expect("attempt 1");
@@ -1276,6 +1299,8 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         timezone: chrono_tz::UTC,
         checkpoint: Some(retry_checkpoint),
         checkpoint_sink: Some(&sink_attempt2),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome2 = sender.send(&ctx2).await.expect("attempt 2 resume");
@@ -1498,6 +1523,8 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("multipart fallback");
@@ -1591,6 +1618,8 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender
@@ -1706,6 +1735,8 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         let outcome = sender.send(&ctx).await.expect("403 outcome");
         assert!(matches!(
@@ -1863,6 +1894,8 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("send video");
@@ -1956,6 +1989,8 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     let doc_outcome = sender
         .send(&doc_ctx)
@@ -1992,6 +2027,7 @@ fn smtp_responsive_image_table_pre_rewriting_and_route_timezone() {
         password: None,
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+        sender_identity: None,
     };
     let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec!["reader@example.org".to_owned()],
@@ -2210,6 +2246,8 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
         timezone: shanghai,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("sendRichMessage v0.2.0");
@@ -2374,6 +2412,8 @@ async fn telegram_ssrf_guard_blocks_loopback_metadata_redirects_and_invalid_base
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     assert!(matches!(
         allowed_sender.send(&ctx).await,
@@ -2383,15 +2423,24 @@ async fn telegram_ssrf_guard_blocks_loopback_metadata_redirects_and_invalid_base
 
 #[test]
 fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
-    // 1. HTML sanitizer must decode entities before re-escaping attributes (never `&amp;amp;` or `&amp;#39;`).
-    let raw_html = r#"<p><img src="https://cdn.example.com/pic.jpg?a=1&amp;b=2" alt="Tom&#39;s R&amp;D &quot;Lab&quot;" width="50%"></p>"#;
+    // 1. HTML sanitizer must decode full HTML5 named entities (`&euro;`, `&mdash;`, `&copy;`)
+    //    before re-escaping attributes (never `&amp;amp;` or `&amp;#39;`).
+    let raw_html = r#"<p>Price: 49&euro; &mdash; &copy; 2026</p><p><img src="https://cdn.example.com/pic.jpg?a=1&amp;b=2" alt="Tom&#39;s R&amp;D &quot;Lab&quot; &euro;" width="50%"><img src="https://cdn.example.com/third.jpg" width="33.3%"></p>"#;
     let base_url = url::Url::parse("https://cdn.example.com").expect("valid base url");
     let cleaned = feedcourier::ingest::html::sanitize_and_extract_html(raw_html, Some(&base_url));
     assert!(
         !cleaned.content_html.contains("&amp;amp;")
             && !cleaned.content_html.contains("&amp;#39;")
-            && !cleaned.content_html.contains("&amp;quot;"),
+            && !cleaned.content_html.contains("&amp;quot;")
+            && !cleaned.content_html.contains("&amp;euro;"),
         "sanitized HTML must not double-escape entities: {}",
+        cleaned.content_html
+    );
+    assert!(
+        cleaned.content_html.contains('€')
+            && cleaned.content_html.contains('—')
+            && cleaned.content_html.contains('©'),
+        "R2-08: full HTML5 named entities must decode cleanly: {}",
         cleaned.content_html
     );
     assert!(
@@ -2402,7 +2451,8 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         cleaned.content_html
     );
 
-    // 2. SMTP responsive image rewriter preserves relative percentage widths (`width="50%"`) instead of forcing 592px.
+    // 2. SMTP responsive image rewriter preserves integer AND fractional percentage widths
+    //    (`width="50%"`, `width="33.3%"`) instead of forcing 592px.
     let smtp_cfg = SmtpChannelConfig {
         host: "smtp.verified.example.com".to_owned(),
         port: 587,
@@ -2410,6 +2460,7 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         password: None,
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+        sender_identity: None,
     };
     let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec!["reader@example.org".to_owned()],
@@ -2427,8 +2478,13 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         built.html_body
     );
     assert!(
+        built.html_body.contains("width=\"33.3%\""),
+        "R2-08: fractional percentage width (33.3%) must be preserved in email HTML:\n{}",
+        built.html_body
+    );
+    assert!(
         !built.html_body.contains("width=\"592\""),
-        "percentage width must not be overwritten with 592px:\n{}",
+        "percentage widths must not be overwritten with 592px:\n{}",
         built.html_body
     );
     assert!(

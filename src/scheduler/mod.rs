@@ -23,18 +23,20 @@ use crate::channels::smtp::SmtpSender;
 use crate::channels::telegram::{FetchedMedia, MediaStreamFetcher, TelegramSender};
 use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, DestinationConfig, RouteOptions,
+    DeliveryOutcome, DestinationConfig, RouteOptions, SmtpDeliveryPlan, SmtpDeliveryRecipient,
 };
 use crate::config::AppConfig;
 use crate::crypto::MasterKey;
 use crate::db::Database;
 use crate::db::models::{
     AppLocale, Channel, DeliveryTask, DeliveryTaskStatus, Feed, FeedHealthStatus, Route,
-    SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, now_unix,
+    SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SmtpRecipientStatus,
+    UpdateDestination, now_unix,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
+use crate::plugins::{MarketIndexCache, PluginRegistry};
 use crate::schedule::{has_schedule, next_allowed_at, resolve_route_timezone};
 
 /// Default lease duration in seconds granted when a worker claims a `delivery_tasks` row.
@@ -226,6 +228,9 @@ struct DispatcherInner {
     telegram_sender: RwLock<TelegramSender>,
     notion_sender: Arc<NotionSender>,
     media_fetcher: Arc<ProtectedMediaFetcher>,
+    plugins: PluginRegistry,
+    market_cache: MarketIndexCache,
+    smtp_per_recipient_delay: Duration,
     /// In-memory per-`credential_group_key` next allowed send timestamp (`min_interval_secs + jitter`).
     pacing_next_allowed_at: Mutex<HashMap<String, i64>>,
     poller_wakeup: Arc<Notify>,
@@ -262,6 +267,9 @@ impl Clone for DispatcherInner {
             telegram_sender: RwLock::new(tg),
             notion_sender: Arc::clone(&self.notion_sender),
             media_fetcher: Arc::clone(&self.media_fetcher),
+            plugins: self.plugins.clone(),
+            market_cache: self.market_cache.clone(),
+            smtp_per_recipient_delay: self.smtp_per_recipient_delay,
             pacing_next_allowed_at: Mutex::new(pacing),
             poller_wakeup: Arc::clone(&self.poller_wakeup),
             outbox_wakeup: Arc::clone(&self.outbox_wakeup),
@@ -324,6 +332,8 @@ impl DeliveryDispatcher {
         )
         .with_locale(initial_locale);
         let notion_sender = Arc::new(NotionSender::new(net_settings.outbound_proxy_url)?);
+        let plugins = PluginRegistry::with_builtins();
+        let market_cache = MarketIndexCache::new(config.plugin_index_url.clone());
 
         Ok(Self {
             inner: Arc::new(DispatcherInner {
@@ -336,6 +346,9 @@ impl DeliveryDispatcher {
                 telegram_sender: RwLock::new(telegram_sender),
                 notion_sender,
                 media_fetcher,
+                plugins,
+                market_cache,
+                smtp_per_recipient_delay: Duration::from_secs(1),
                 pacing_next_allowed_at: Mutex::new(HashMap::new()),
                 poller_wakeup: Arc::new(Notify::new()),
                 outbox_wakeup: Arc::new(Notify::new()),
@@ -358,10 +371,16 @@ impl DeliveryDispatcher {
         master_key: MasterKey,
     ) -> AppResult<Self> {
         db.migrate_channels_to_v2(&master_key).await?;
+        db.backfill_legacy_smtp_recipients(&master_key).await?;
         let net_settings = load_persisted_net_settings(&config, &db).await?;
         let persisted_locale = load_persisted_locale(&config, &db).await?;
         let http = ProtectedHttpClient::new(net_settings)?;
         let dispatcher = Self::new(config, db, master_key, http)?;
+        dispatcher
+            .inner
+            .plugins
+            .sync_builtin_rows(&dispatcher.inner.db)
+            .await?;
         if let Some(locale) = persisted_locale {
             dispatcher.set_locale(locale);
         }
@@ -454,8 +473,23 @@ impl DeliveryDispatcher {
         self
     }
 
+    /// Override inter-recipient delay for multi-recipient SMTP deliveries (default `1s`).
+    pub fn with_smtp_per_recipient_delay(mut self, delay: Duration) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.smtp_per_recipient_delay = delay;
+        self
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.inner.config
+    }
+
+    pub fn plugins(&self) -> &PluginRegistry {
+        &self.inner.plugins
+    }
+
+    pub fn market_cache(&self) -> &MarketIndexCache {
+        &self.inner.market_cache
     }
 
     pub fn db(&self) -> &Database {
@@ -963,7 +997,178 @@ impl DeliveryDispatcher {
             }
         };
 
-        let checkpoint_sink = self.inner.db.checkpoint_sink(task.id);
+        // 3b. SMTP per-recipient compliance gate: only deliver to `verified` addresses, defer
+        //     while awaiting recipient verification, or auto-pause when all recipients revoked/bounced.
+        let smtp_delivery = if let DestinationConfig::Smtp(ref smtp_dest) = destination_config {
+            let mut hmacs: Vec<String> = Vec::new();
+            let mut hmac_to_email: HashMap<String, String> = HashMap::new();
+            for raw in &smtp_dest.to_addresses {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let h = self.inner.master_key.smtp_recipient_hmac(trimmed);
+                if hmac_to_email
+                    .entry(h.clone())
+                    .or_insert_with(|| trimmed.to_string())
+                    == trimmed
+                    && !hmacs.contains(&h)
+                {
+                    hmacs.push(h);
+                }
+            }
+
+            let rows = self
+                .inner
+                .db
+                .sync_smtp_recipients_for_destination(
+                    destination.id,
+                    &hmacs,
+                    SmtpRecipientStatus::Unverified,
+                    None,
+                )
+                .await?;
+
+            let (public_url, _) = self
+                .inner
+                .db
+                .get_effective_public_url(&self.inner.config)
+                .await?;
+
+            let mut verified_recipients = Vec::new();
+            let mut awaiting_verification = false;
+            for row in rows {
+                match row.status {
+                    SmtpRecipientStatus::Verified => {
+                        if let Some(email) = hmac_to_email.get(&row.address_hmac) {
+                            let unsubscribe_url = public_url.as_deref().map(|base| {
+                                let tok = self
+                                    .inner
+                                    .master_key
+                                    .sign_unsubscribe_token(destination.id, row.id);
+                                format!("{base}/u/{tok}")
+                            });
+                            verified_recipients.push(SmtpDeliveryRecipient {
+                                recipient_id: row.id,
+                                email: email.clone(),
+                                address_hmac: row.address_hmac,
+                                unsubscribe_url,
+                            });
+                        }
+                    }
+                    SmtpRecipientStatus::Unverified | SmtpRecipientStatus::Pending => {
+                        awaiting_verification = true;
+                    }
+                    SmtpRecipientStatus::Unsubscribed | SmtpRecipientStatus::Bounced => {}
+                }
+            }
+
+            if verified_recipients.is_empty() {
+                if awaiting_verification {
+                    let diag = format_deferral_diagnostic(
+                        "Awaiting SMTP recipient verification",
+                        task.attempt_count,
+                        task.last_status_code,
+                        task.diagnostic_log.as_deref(),
+                    );
+                    self.inner
+                        .db
+                        .mark_task_deferred(
+                            task.id,
+                            now.saturating_add(3600),
+                            None,
+                            existing_checkpoint.as_ref(),
+                            &diag,
+                        )
+                        .await?;
+                    return Ok(true);
+                } else {
+                    let _ = self
+                        .inner
+                        .db
+                        .update_destination(
+                            destination.id,
+                            &UpdateDestination {
+                                enabled: Some(false),
+                                ..UpdateDestination::default()
+                            },
+                        )
+                        .await;
+                    let diag = format_deferral_diagnostic(
+                        "All SMTP recipients are unsubscribed or bounced; destination paused",
+                        task.attempt_count,
+                        task.last_status_code,
+                        task.diagnostic_log.as_deref(),
+                    );
+                    self.inner
+                        .db
+                        .mark_task_deferred(
+                            task.id,
+                            now.saturating_add(3600),
+                            None,
+                            existing_checkpoint.as_ref(),
+                            &diag,
+                        )
+                        .await?;
+                    return Ok(true);
+                }
+            }
+
+            Some(SmtpDeliveryPlan {
+                recipients: verified_recipients,
+                per_recipient_delay: self.inner.smtp_per_recipient_delay,
+            })
+        } else {
+            None
+        };
+
+        // 3c. Run enabled `on_render` plugins (e.g. Link Rewrite) before channel rendering.
+        let (overrides, plugin_retry) = match self
+            .inner
+            .plugins
+            .run_on_render(
+                &self.inner.db,
+                &self.inner.master_key,
+                &self.inner.http,
+                &entry,
+                &feed,
+                &route,
+                &route_options,
+                &channel,
+                &destination,
+                true,
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                self.apply_unexpected_send_error(&task, &channel, now_unix(), err)
+                    .await?;
+                return Ok(true);
+            }
+        };
+
+        if let Some(retry) = plugin_retry {
+            self.handle_transient_retry(
+                &task,
+                &channel,
+                now_unix(),
+                retry.retry_after_secs,
+                None,
+                existing_checkpoint.as_ref(),
+                &retry.diagnostic,
+                false,
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let checkpoint_sink = self.inner.db.rich_checkpoint_sink(
+            task.id,
+            destination.id,
+            self.inner.master_key.clone(),
+            self.inner.task_lease_secs,
+        );
         let ctx = DeliveryContext {
             task: &task,
             entry: &entry,
@@ -977,6 +1182,8 @@ impl DeliveryDispatcher {
             timezone: route_tz,
             checkpoint: existing_checkpoint.clone(),
             checkpoint_sink: Some(&checkpoint_sink),
+            overrides,
+            smtp_delivery,
         };
 
         let send_result = match channel.kind {
@@ -1108,6 +1315,36 @@ impl DeliveryDispatcher {
             completed_at: None,
             created_at: now,
         };
+        let (overrides, plugin_retry) = self
+            .inner
+            .plugins
+            .run_on_render(
+                &self.inner.db,
+                &self.inner.master_key,
+                &self.inner.http,
+                &entry,
+                &feed,
+                &route,
+                &params.options,
+                &channel,
+                &destination,
+                false,
+            )
+            .await?;
+        if let Some(retry) = plugin_retry {
+            let entry_title = entry
+                .title
+                .clone()
+                .or_else(|| entry.first_sentence.clone())
+                .unwrap_or_else(|| "(Untitled)".to_string());
+            return Ok(DebugPushResult {
+                ok: false,
+                message: retry.diagnostic,
+                entry_title,
+                entry_url: entry.canonical_url.clone(),
+            });
+        }
+
         let ctx = DeliveryContext {
             task: &task,
             entry: &entry,
@@ -1121,6 +1358,8 @@ impl DeliveryDispatcher {
             timezone: route_tz,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides,
+            smtp_delivery: None,
         };
 
         let send_result = match channel.kind {
@@ -1179,6 +1418,7 @@ impl DeliveryDispatcher {
             .await?;
         let purged_sessions = self.inner.db.purge_expired_sessions(now).await?;
         let purged_ledger = self.inner.db.purge_expired_quota_ledger(now).await?;
+        let purged_link_cache = self.inner.db.purge_stale_plugin_link_cache(now).await?;
         self.inner.db.run_pragma_optimize().await?;
 
         {
@@ -1192,7 +1432,10 @@ impl DeliveryDispatcher {
 
         debug!(
             purged_entries,
-            purged_sessions, purged_ledger, "completed scheduled database maintenance cycle"
+            purged_sessions,
+            purged_ledger,
+            purged_link_cache,
+            "completed scheduled database maintenance cycle"
         );
         Ok(purged_entries)
     }
@@ -1695,6 +1938,8 @@ fn is_benign_deferral_diagnostic(msg: &str) -> bool {
         || msg.starts_with("Channel hourly quota reached")
         || msg.starts_with("Channel daily quota reached")
         || msg.starts_with("Channel anti-spam pacing window active")
+        || msg.starts_with("Awaiting SMTP recipient verification")
+        || msg.starts_with("All SMTP recipients are unsubscribed or bounced")
 }
 
 fn format_deferral_diagnostic(

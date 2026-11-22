@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
-use crate::channels::{CheckpointSink, DeliveryCheckpoint};
+use crate::channels::{CheckpointSink, DeliveryCheckpoint, DestinationConfig};
 use crate::config::AppConfig;
+use crate::crypto::MasterKey;
 use crate::error::AppResult;
 
 /// Embedded SQLx migrations compiled directly into the single static binary.
@@ -30,39 +31,70 @@ pub struct Database {
     /// Path to a true pre-v0.2.0 DDL backup captured via `VACUUM INTO` before applying
     /// `0002_channel_destinations.sql` on an existing v0.1.x database.
     pre_v2_backup_path: Option<PathBuf>,
+    /// Path to a true pre-v0.3.0 DDL backup captured via `VACUUM INTO` before applying
+    /// `0003_plugins_and_smtp_compliance.sql` on an existing v0.2.x database.
+    pre_v3_backup_path: Option<PathBuf>,
 }
 
-/// Choose a non-overwriting backup path beside `db_path` for pre-v0.2.0 upgrades.
-///
-/// Uses `pre-v0.2.0-backup.db` when absent; if a file or symlink already exists at that path,
-/// falls back to a UTC timestamped filename so an earlier clean backup is never clobbered.
-pub(crate) fn choose_pre_v2_backup_path(db_path: &Path) -> PathBuf {
+/// Return `true` only when `candidate` AND its SQLite WAL/SHM sidecar paths (`-wal`, `-shm`)
+/// do not exist on disk, preventing `VACUUM INTO` from picking up stale sidecars.
+pub(crate) fn path_and_sidecars_absent(candidate: &Path) -> bool {
+    if fs::symlink_metadata(candidate).is_ok() {
+        return false;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut os = candidate.as_os_str().to_os_string();
+        os.push(suffix);
+        if fs::symlink_metadata(Path::new(&os)).is_ok() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Best-effort cleanup of companion `-wal` and `-shm` sidecar files beside a backup database file.
+pub(crate) fn remove_sqlite_sidecars(path: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(suffix);
+        let sidecar = PathBuf::from(os);
+        if fs::symlink_metadata(&sidecar).is_ok() {
+            let _ = fs::remove_file(&sidecar);
+        }
+    }
+}
+
+/// Choose a non-overwriting backup path beside `db_path` whose main file and `-wal`/`-shm`
+/// sidecars are all absent.
+pub(crate) fn choose_pre_ddl_backup_path(db_path: &Path, stem: &str) -> PathBuf {
     let backup_dir = db_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let base = backup_dir.join("pre-v0.2.0-backup.db");
-    if fs::symlink_metadata(&base).is_err() {
+    let base = backup_dir.join(format!("{stem}.db"));
+    if path_and_sidecars_absent(&base) {
         return base;
     }
 
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let dated = backup_dir.join(format!("pre-v0.2.0-backup-{stamp}.db"));
-    if fs::symlink_metadata(&dated).is_err() {
+    let dated = backup_dir.join(format!("{stem}-{stamp}.db"));
+    if path_and_sidecars_absent(&dated) {
         return dated;
     }
 
     for idx in 1u32..=1000 {
-        let candidate = backup_dir.join(format!("pre-v0.2.0-backup-{stamp}-{idx}.db"));
-        if fs::symlink_metadata(&candidate).is_err() {
+        let candidate = backup_dir.join(format!("{stem}-{stamp}-{idx}.db"));
+        if path_and_sidecars_absent(&candidate) {
             return candidate;
         }
     }
 
-    backup_dir.join(format!(
-        "pre-v0.2.0-backup-{stamp}-{:08x}.db",
-        rand::random::<u32>()
-    ))
+    backup_dir.join(format!("{stem}-{stamp}-{:08x}.db", rand::random::<u32>()))
+}
+
+/// Choose a non-overwriting backup path beside `db_path` for pre-v0.2.0 upgrades.
+pub(crate) fn choose_pre_v2_backup_path(db_path: &Path) -> PathBuf {
+    choose_pre_ddl_backup_path(db_path, "pre-v0.2.0-backup")
 }
 
 async fn needs_pre_v2_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
@@ -100,6 +132,43 @@ async fn needs_pre_v2_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
         .fetch_one(write_pool)
         .await?;
     Ok(channel_count > 0)
+}
+
+async fn needs_pre_v3_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
+    let (has_migrations_table,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(write_pool)
+    .await?;
+    if has_migrations_table == 0 {
+        return Ok(false);
+    }
+
+    let (has_v2,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 2")
+            .fetch_one(write_pool)
+            .await?;
+    let (has_v3,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 3")
+            .fetch_one(write_pool)
+            .await?;
+    if has_v2 == 0 || has_v3 > 0 {
+        return Ok(false);
+    }
+
+    let (has_dests,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channel_destinations'",
+    )
+    .fetch_one(write_pool)
+    .await?;
+    if has_dests == 0 {
+        return Ok(false);
+    }
+
+    let (dest_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channel_destinations")
+        .fetch_one(write_pool)
+        .await?;
+    Ok(dest_count > 0)
 }
 
 impl Database {
@@ -146,6 +215,7 @@ impl Database {
                 .bind(backup_str)
                 .execute(&write_pool)
                 .await?;
+            remove_sqlite_sidecars(&backup_path);
             tracing::info!(
                 backup_path = %backup_path.display(),
                 "captured pre-v0.2.0 SQLite backup prior to applying 0002 schema migration"
@@ -154,6 +224,29 @@ impl Database {
         } else {
             None
         };
+
+        // Snapshot a genuine pre-v0.3.0 database BEFORE applying `0003_plugins_and_smtp_compliance.sql`.
+        let pre_v3_backup_path =
+            if pre_v2_backup_path.is_none() && needs_pre_v3_ddl_backup(&write_pool).await? {
+                let backup_path = choose_pre_ddl_backup_path(db_path, "pre-v0.3.0-backup");
+                let backup_str = backup_path.to_str().ok_or_else(|| {
+                    crate::error::AppError::Validation(
+                        "pre-v0.3.0 backup path must be valid UTF-8".to_string(),
+                    )
+                })?;
+                sqlx::query("VACUUM INTO ?1")
+                    .bind(backup_str)
+                    .execute(&write_pool)
+                    .await?;
+                remove_sqlite_sidecars(&backup_path);
+                tracing::info!(
+                    backup_path = %backup_path.display(),
+                    "captured pre-v0.3.0 SQLite backup prior to applying 0003 schema migration"
+                );
+                Some(backup_path)
+            } else {
+                None
+            };
 
         MIGRATOR.run(&write_pool).await?;
 
@@ -173,6 +266,7 @@ impl Database {
             read_pool,
             write_pool,
             pre_v2_backup_path,
+            pre_v3_backup_path,
         })
     }
 
@@ -186,6 +280,11 @@ impl Database {
         self.pre_v2_backup_path.as_deref()
     }
 
+    /// Path to the pre-DDL v0.2.x backup created during [`Database::connect`], if any.
+    pub fn pre_v3_backup_path(&self) -> Option<&Path> {
+        self.pre_v3_backup_path.as_deref()
+    }
+
     /// Concurrent read-only pool (`PRAGMA query_only = ON`).
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
@@ -196,11 +295,32 @@ impl Database {
         &self.write_pool
     }
 
-    /// Create a `CheckpointSink` bound to `task_id` for mid-flight checkpoint persistence.
+    /// Create a basic `CheckpointSink` bound to `task_id` for mid-flight checkpoint persistence.
     pub fn checkpoint_sink(&self, task_id: i64) -> DbCheckpointSink {
         DbCheckpointSink {
             db: self.clone(),
             task_id,
+            destination_id: None,
+            master_key: None,
+            lease_duration_secs: 120,
+        }
+    }
+
+    /// Create a full-featured `CheckpointSink` supporting checkpoint flushes, destination config
+    /// writeback (e.g. Notion `data_source_id`), lease renewal, and SMTP hard-bounce recording.
+    pub fn rich_checkpoint_sink(
+        &self,
+        task_id: i64,
+        destination_id: i64,
+        master_key: MasterKey,
+        lease_duration_secs: i64,
+    ) -> DbCheckpointSink {
+        DbCheckpointSink {
+            db: self.clone(),
+            task_id,
+            destination_id: Some(destination_id),
+            master_key: Some(master_key),
+            lease_duration_secs,
         }
     }
 
@@ -211,11 +331,15 @@ impl Database {
     }
 }
 
-/// SQLite-backed implementation of [`CheckpointSink`] persisting intermediate checkpoints to `write_pool`.
+/// SQLite-backed implementation of [`CheckpointSink`] persisting intermediate checkpoints,
+/// destination config writebacks, lease renewals, and SMTP hard bounces to `write_pool`.
 #[derive(Debug, Clone)]
 pub struct DbCheckpointSink {
     db: Database,
     task_id: i64,
+    destination_id: Option<i64>,
+    master_key: Option<MasterKey>,
+    lease_duration_secs: i64,
 }
 
 #[async_trait]
@@ -224,5 +348,29 @@ impl CheckpointSink for DbCheckpointSink {
         self.db
             .save_task_checkpoint_typed(self.task_id, checkpoint)
             .await
+    }
+
+    async fn update_destination_config(&self, config: &DestinationConfig) -> AppResult<()> {
+        if let (Some(dest_id), Some(key)) = (self.destination_id, self.master_key.as_ref()) {
+            let encrypted = key.encrypt_json(config)?;
+            self.db
+                .update_destination_encrypted_config(dest_id, &encrypted)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn renew_lease(&self) -> AppResult<()> {
+        let new_until = models::now_unix().saturating_add(self.lease_duration_secs.max(30));
+        let _ = self.db.renew_task_lease(self.task_id, new_until).await?;
+        Ok(())
+    }
+
+    async fn record_smtp_hard_bounce(&self, recipient_id: i64, diagnostic: &str) -> AppResult<()> {
+        let _ = self
+            .db
+            .mark_smtp_recipient_bounced(recipient_id, diagnostic, models::now_unix())
+            .await?;
+        Ok(())
     }
 }

@@ -26,6 +26,7 @@ use crate::channels::{
 use crate::crypto::sha256_hex;
 use crate::db::models::{AppLocale, Entry, Feed};
 use crate::error::{AppError, AppResult};
+use crate::plugins::RenderOverrides;
 use crate::schedule::format_local_timestamp;
 
 /// Maximum UTF-8 byte budget for the rendered HTML email part (`95 KiB`), keeping the
@@ -83,15 +84,38 @@ pre { max-width: 100% !important; overflow-x: auto !important; white-space: pre-
     {% endif %}
     <div style="margin-top:28px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:14px;color:#6b7280;">
       {% if original_url %}
-      <p style="margin:0 0 8px 0;">
+      <p style="margin:0 0 10px 0;">
         <a href="{{ original_url }}" style="color:#2563eb;font-weight:600;text-decoration:none;">{{ read_original_label }}</a>
       </p>
       {% endif %}
       <p style="margin:0;font-size:12px;color:#9ca3af;">{{ delivered_by_text }}</p>
+      {% if subscription_reason %}
+      <p style="margin:6px 0 0 0;font-size:12px;color:#9ca3af;">{{ subscription_reason }}</p>
+      {% endif %}
+      {% if unsubscribe_url %}
+      <p style="margin:10px 0 0 0;font-size:12px;">
+        <a href="{{ unsubscribe_url }}" style="display:inline-block;padding:5px 12px;border:1px solid #d1d5db;border-radius:4px;color:#4b5563;text-decoration:none;font-weight:500;">{{ unsubscribe_label }}</a>
+      </p>
+      {% elif unsubscribe_hint %}
+      <p style="margin:6px 0 0 0;font-size:12px;color:#9ca3af;">{{ unsubscribe_hint }}</p>
+      {% endif %}
+      {% if sender_identity %}
+      <p style="margin:6px 0 0 0;font-size:11px;color:#9ca3af;">{{ sender_identity }}</p>
+      {% endif %}
     </div>
   </div>
 </body>
 </html>"#;
+
+/// Optional per-recipient compliance metadata injected into rendered SMTP emails.
+#[derive(Debug, Clone, Default)]
+pub struct SmtpComplianceFooter<'a> {
+    pub destination_id: Option<i64>,
+    pub route_name: Option<&'a str>,
+    pub unsubscribe_url: Option<&'a str>,
+    pub sender_identity: Option<&'a str>,
+    pub include_compliance_headers: bool,
+}
 
 /// Built RFC 5322 email message and metadata ready for SMTP transmission or inspection.
 #[derive(Debug)]
@@ -306,6 +330,42 @@ impl SmtpSender {
         locale: AppLocale,
         tz: Tz,
     ) -> AppResult<BuiltEmail> {
+        let overrides = RenderOverrides::default();
+        let compliance = SmtpComplianceFooter {
+            sender_identity: cfg.sender_identity.as_deref(),
+            ..SmtpComplianceFooter::default()
+        };
+        Self::build_entry_email_full(
+            cfg,
+            &dest.to_addresses,
+            dest.reply_to.as_deref(),
+            feed,
+            entry,
+            route_id,
+            existing_message_id,
+            locale,
+            tz,
+            &overrides,
+            &compliance,
+        )
+    }
+
+    /// Full email builder supporting `RenderOverrides`, per-recipient single-`To` envelopes,
+    /// RFC 8058 `List-Unsubscribe` / `List-Unsubscribe-Post` headers, and CAN-SPAM footers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_entry_email_full(
+        cfg: &SmtpChannelConfig,
+        to_addresses: &[String],
+        reply_to: Option<&str>,
+        feed: &Feed,
+        entry: &Entry,
+        route_id: i64,
+        existing_message_id: Option<&str>,
+        locale: AppLocale,
+        tz: Tz,
+        overrides: &RenderOverrides,
+        compliance: &SmtpComplianceFooter<'_>,
+    ) -> AppResult<BuiltEmail> {
         let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
             AppError::Validation(format!(
                 "invalid SMTP from_address '{}': {err}",
@@ -318,8 +378,8 @@ impl SmtpSender {
         let display_name = format!("{sanitized_feed} via FeedCourier");
         let from_mailbox = Mailbox::new(Some(display_name), from_addr);
 
-        let to_mailboxes = parse_recipient_mailboxes(&dest.to_addresses)?;
-        let reply_to_mailbox = parse_optional_mailbox(dest.reply_to.as_deref(), "reply_to")?;
+        let to_mailboxes = parse_recipient_mailboxes(to_addresses)?;
+        let reply_to_mailbox = parse_optional_mailbox(reply_to, "reply_to")?;
 
         let entry_title = entry
             .title
@@ -342,9 +402,14 @@ impl SmtpSender {
                 deterministic_message_id(&entry.fingerprint_sha256, route_id, &from_domain)
             });
 
-        let list_id = list_id_value(feed.id, &from_domain);
-        let (html_body, html_truncated) = render_entry_html(feed, entry, &entry_title, locale, tz)?;
-        let plain_body = render_plain_fallback(&html_body, feed, entry, &entry_title, locale);
+        let list_id = match compliance.destination_id {
+            Some(dest_id) => format!("<dest-{dest_id}.{from_domain}>"),
+            None => list_id_value(feed.id, &from_domain),
+        };
+        let (html_body, html_truncated) =
+            render_entry_html(feed, entry, &entry_title, locale, tz, overrides, compliance)?;
+        let plain_body =
+            render_plain_fallback(&html_body, feed, entry, &entry_title, locale, overrides);
 
         let mut builder = Message::builder()
             .from(from_mailbox)
@@ -358,6 +423,30 @@ impl SmtpSender {
                 HeaderName::new_from_ascii_str("List-Id"),
                 list_id,
             ));
+
+        if compliance.include_compliance_headers || compliance.unsubscribe_url.is_some() {
+            let mailto = format!("<mailto:{}?subject=unsubscribe>", cfg.from_address.trim());
+            if let Some(unsub_url) = compliance
+                .unsubscribe_url
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                builder = builder
+                    .raw_header(HeaderValue::new(
+                        HeaderName::new_from_ascii_str("List-Unsubscribe"),
+                        format!("<{unsub_url}>, {mailto}"),
+                    ))
+                    .raw_header(HeaderValue::new(
+                        HeaderName::new_from_ascii_str("List-Unsubscribe-Post"),
+                        "List-Unsubscribe=One-Click".to_owned(),
+                    ));
+            } else {
+                builder = builder.raw_header(HeaderValue::new(
+                    HeaderName::new_from_ascii_str("List-Unsubscribe"),
+                    mailto,
+                ));
+            }
+        }
 
         for mbox in to_mailboxes {
             builder = builder.to(mbox);
@@ -381,6 +470,154 @@ impl SmtpSender {
             html_truncated,
         })
     }
+
+    /// Immediately send a double-opt-in verification email containing a 6-digit code and an
+    /// optional one-click confirmation page link (`/v/{token}` when `PUBLIC_URL` is configured).
+    /// Bypasses the outbox queue and channel quotas.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_verification_email(
+        &self,
+        cfg: &SmtpChannelConfig,
+        recipient_email: &str,
+        destination_name: &str,
+        code: &str,
+        verify_url: Option<&str>,
+        locale: AppLocale,
+    ) -> AppResult<String> {
+        let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
+            AppError::Validation(format!(
+                "invalid SMTP from_address '{}': {err}",
+                cfg.from_address
+            ))
+        })?;
+        let from_domain = sanitize_domain_ascii(from_addr.domain());
+        let from_mailbox = Mailbox::new(Some("FeedCourier".to_owned()), from_addr);
+        let to_mbox: Mailbox = recipient_email.trim().parse().map_err(|err| {
+            AppError::Validation(format!("invalid SMTP recipient '{recipient_email}': {err}"))
+        })?;
+
+        let probe_nonce = sha256_hex(
+            format!(
+                "verify:{recipient_email}:{code}:{}",
+                crate::db::models::now_unix()
+            )
+            .as_bytes(),
+        );
+        let message_id = format!("<fc-verify-{}@{from_domain}>", &probe_nonce[..16]);
+
+        let safe_dest = html_escape_text(destination_name);
+        let safe_code = html_escape_text(code);
+        let (subject, body_html, delivered_by_text) = if locale.is_zh() {
+            let link_block = match verify_url {
+                Some(u) => format!(
+                    "<p style=\"margin:20px 0;\"><a href=\"{}\" style=\"display:inline-block;padding:10px 20px;background-color:#2563eb;color:#ffffff;font-weight:600;text-decoration:none;border-radius:6px;\">确认订阅</a></p><p style=\"font-size:13px;color:#6b7280;\">或将下方 6 位验证码告知管理员在后台完成验证（30 分钟内有效）：</p>",
+                    html_escape_attr_simple(u)
+                ),
+                None => "<p style=\"font-size:14px;color:#374151;\">请将下方 6 位验证码告知管理员在 FeedCourier 后台完成验证（30 分钟内有效）：</p>".to_string(),
+            };
+            (
+                format!("请确认接收 FeedCourier 订阅邮件 ({destination_name})"),
+                format!(
+                    "<p>管理员正在将你的邮箱添加为 <strong>{safe_dest}</strong> 的 RSS 邮件投递收件人。</p>{link_block}<div style=\"margin:16px 0;padding:16px;background-color:#f3f4f6;border-radius:8px;text-align:center;font-size:28px;font-weight:700;letter-spacing:0.25em;color:#111827;font-family:monospace;\">{safe_code}</div><p style=\"font-size:12px;color:#6b7280;\">如果你并未请求接收此类邮件，直接忽略本邮件即可，系统不会向你投递任何订阅内容。</p>"
+                ),
+                "由 FeedCourier 发送 · 收件人验证",
+            )
+        } else {
+            let link_block = match verify_url {
+                Some(u) => format!(
+                    "<p style=\"margin:20px 0;\"><a href=\"{}\" style=\"display:inline-block;padding:10px 20px;background-color:#2563eb;color:#ffffff;font-weight:600;text-decoration:none;border-radius:6px;\">Confirm Subscription</a></p><p style=\"font-size:13px;color:#6b7280;\">Or share this 6-digit verification code with your administrator (valid for 30 minutes):</p>",
+                    html_escape_attr_simple(u)
+                ),
+                None => "<p style=\"font-size:14px;color:#374151;\">Please share this 6-digit verification code with your FeedCourier administrator to confirm delivery (valid for 30 minutes):</p>".to_string(),
+            };
+            (
+                format!("Confirm your FeedCourier email subscription ({destination_name})"),
+                format!(
+                    "<p>An administrator added this address as a recipient for <strong>{safe_dest}</strong>.</p>{link_block}<div style=\"margin:16px 0;padding:16px;background-color:#f3f4f6;border-radius:8px;text-align:center;font-size:28px;font-weight:700;letter-spacing:0.25em;color:#111827;font-family:monospace;\">{safe_code}</div><p style=\"font-size:12px;color:#6b7280;\">If you did not expect this email, you can safely ignore it — no feed deliveries will be sent until verified.</p>"
+                ),
+                "Sent by FeedCourier · Recipient Verification",
+            )
+        };
+
+        let env = template_env();
+        let html_body = env
+            .get_template("email")
+            .and_then(|tmpl| {
+                tmpl.render(context! {
+                    html_lang => locale.as_str(),
+                    subject => &subject,
+                    feed_title => "FeedCourier",
+                    entry_title => &subject,
+                    meta_line => Option::<String>::None,
+                    body_html => &body_html,
+                    truncated => false,
+                    truncation_notice => "",
+                    continue_label => "",
+                    read_original_label => "",
+                    delivered_by_text => delivered_by_text,
+                    continue_url => Option::<String>::None,
+                    original_url => Option::<String>::None,
+                    subscription_reason => Option::<String>::None,
+                    unsubscribe_url => Option::<String>::None,
+                    unsubscribe_label => "",
+                    unsubscribe_hint => Option::<String>::None,
+                    sender_identity => cfg.sender_identity.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                })
+            })
+            .map_err(|err| AppError::Internal(anyhow::anyhow!("template render error: {err}")))?;
+
+        let plain_body = if locale.is_zh() {
+            let mut text = format!(
+                "{subject}\n\n管理员正在将你的邮箱添加为 {destination_name} 的 RSS 邮件投递收件人。\n\n验证码（30 分钟内有效）：{code}\n"
+            );
+            if let Some(u) = verify_url {
+                text.push_str(&format!("\n确认订阅链接：{u}\n"));
+            }
+            text.push_str("\n如果你并未请求接收此类邮件，请忽略本邮件。\n");
+            text
+        } else {
+            let mut text = format!(
+                "{subject}\n\nAn administrator added this address as a recipient for {destination_name}.\n\nVerification code (valid for 30 minutes): {code}\n"
+            );
+            if let Some(u) = verify_url {
+                text.push_str(&format!("\nConfirm subscription link: {u}\n"));
+            }
+            text.push_str("\nIf you did not expect this email, you can safely ignore it.\n");
+            text
+        };
+
+        let email = Message::builder()
+            .from(from_mailbox)
+            .to(to_mbox)
+            .subject(&subject)
+            .message_id(Some(message_id))
+            .raw_header(HeaderValue::new(
+                HeaderName::new_from_ascii_str("Auto-Submitted"),
+                "auto-generated".to_owned(),
+            ))
+            .multipart(MultiPart::alternative_plain_html(plain_body, html_body))
+            .map_err(|err| {
+                AppError::Validation(format!("failed to build verification email: {err}"))
+            })?;
+
+        let transport = self
+            .transport_for(cfg)
+            .map_err(|err| AppError::Upstream(format!("SMTP transport setup failed: {err}")))?;
+        let resp = transport.send(email).await.map_err(|err| {
+            let status = err.status().map(u16::from);
+            if status == Some(535) {
+                AppError::Unauthorized(format!("SMTP authentication failed (535): {err}"))
+            } else {
+                AppError::Upstream(format!("SMTP verification email failed: {err}"))
+            }
+        })?;
+
+        Ok(format!(
+            "Verification email accepted ({}) for {}",
+            u16::from(resp.code()),
+            recipient_email.trim()
+        ))
+    }
 }
 
 #[async_trait]
@@ -403,20 +640,213 @@ impl ChannelSender for SmtpSender {
             )));
         };
 
+        let locale = ctx.route_options.locale.unwrap_or_else(|| self.locale());
+
+        // Compliant per-recipient delivery path (invoked by the outbox scheduler).
+        if let Some(plan) = ctx.smtp_delivery.as_ref() {
+            let (base_msg_id, mut sent_recipients) = match &ctx.checkpoint {
+                Some(DeliveryCheckpoint::Smtp {
+                    message_id,
+                    sent_recipients,
+                }) => (message_id.clone(), sent_recipients.clone()),
+                _ => {
+                    let from_domain = cfg
+                        .from_address
+                        .trim()
+                        .split('@')
+                        .nth(1)
+                        .map(sanitize_domain_ascii)
+                        .unwrap_or_else(|| "feedcourier.local".to_owned());
+                    (
+                        deterministic_message_id(
+                            &ctx.entry.fingerprint_sha256,
+                            ctx.route.id,
+                            &from_domain,
+                        ),
+                        Vec::new(),
+                    )
+                }
+            };
+
+            let transport = match self.transport_for(cfg) {
+                Ok(t) => t,
+                Err(err) => {
+                    return Ok(classify_smtp_error(
+                        err,
+                        DeliveryCheckpoint::Smtp {
+                            message_id: base_msg_id,
+                            sent_recipients,
+                        },
+                    ));
+                }
+            };
+
+            let from_domain = cfg
+                .from_address
+                .trim()
+                .split('@')
+                .nth(1)
+                .map(sanitize_domain_ascii)
+                .unwrap_or_else(|| "feedcourier.local".to_owned());
+
+            let mut delivered_this_run = 0usize;
+            let mut last_code: Option<i32> = None;
+            let mut bounced_notes: Vec<String> = Vec::new();
+
+            for recipient in &plan.recipients {
+                if sent_recipients.contains(&recipient.address_hmac) {
+                    continue;
+                }
+
+                if delivered_this_run > 0 && !plan.per_recipient_delay.is_zero() {
+                    tokio::time::sleep(plan.per_recipient_delay).await;
+                    if let Some(sink) = ctx.checkpoint_sink {
+                        let _ = sink.renew_lease().await;
+                    }
+                }
+
+                let recip_msg_id = deterministic_recipient_message_id(
+                    &ctx.entry.fingerprint_sha256,
+                    ctx.route.id,
+                    &recipient.address_hmac,
+                    &from_domain,
+                );
+                let compliance = SmtpComplianceFooter {
+                    destination_id: Some(ctx.destination.id),
+                    route_name: Some(ctx.route.name.as_str()),
+                    unsubscribe_url: recipient.unsubscribe_url.as_deref(),
+                    sender_identity: cfg.sender_identity.as_deref(),
+                    include_compliance_headers: true,
+                };
+                let single_to = [recipient.email.clone()];
+                let built = match Self::build_entry_email_full(
+                    cfg,
+                    &single_to,
+                    dest.reply_to.as_deref(),
+                    ctx.feed,
+                    ctx.entry,
+                    ctx.route.id,
+                    Some(&recip_msg_id),
+                    locale,
+                    ctx.timezone,
+                    &ctx.overrides,
+                    &compliance,
+                ) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        let diag = err.to_string();
+                        if let Some(sink) = ctx.checkpoint_sink {
+                            let _ = sink
+                                .record_smtp_hard_bounce(recipient.recipient_id, &diag)
+                                .await;
+                        }
+                        bounced_notes.push(format!("{}: {diag}", recipient.email));
+                        continue;
+                    }
+                };
+
+                match transport.send(built.message).await {
+                    Ok(resp) => {
+                        let code = i32::from(u16::from(resp.code()));
+                        last_code = Some(code);
+                        delivered_this_run += 1;
+                        sent_recipients.push(recipient.address_hmac.clone());
+                        let cp = DeliveryCheckpoint::Smtp {
+                            message_id: base_msg_id.clone(),
+                            sent_recipients: sent_recipients.clone(),
+                        };
+                        if let Some(sink) = ctx.checkpoint_sink {
+                            sink.save_checkpoint(&cp).await?;
+                        }
+                    }
+                    Err(err) => {
+                        let status_code = err.status().map(|c| i32::from(u16::from(c)));
+                        let is_perm = err.is_permanent() || matches!(status_code, Some(500..=599));
+                        if is_perm {
+                            let diag = err.to_string();
+                            if let Some(sink) = ctx.checkpoint_sink {
+                                let _ = sink
+                                    .record_smtp_hard_bounce(recipient.recipient_id, &diag)
+                                    .await;
+                            }
+                            bounced_notes.push(format!(
+                                "{} (HTTP/SMTP {}): {diag}",
+                                recipient.email,
+                                status_code.unwrap_or(550)
+                            ));
+                        } else {
+                            let cp = DeliveryCheckpoint::Smtp {
+                                message_id: base_msg_id,
+                                sent_recipients,
+                            };
+                            return Ok(classify_smtp_error(err, cp));
+                        }
+                    }
+                }
+            }
+
+            let final_cp = DeliveryCheckpoint::Smtp {
+                message_id: base_msg_id.clone(),
+                sent_recipients: sent_recipients.clone(),
+            };
+
+            if sent_recipients.is_empty() && !bounced_notes.is_empty() {
+                return Ok(DeliveryOutcome::PermanentFailure {
+                    status_code: Some(550),
+                    checkpoint: Some(final_cp),
+                    diagnostic: format!(
+                        "All SMTP recipients hard-bounced: {}",
+                        bounced_notes.join("; ")
+                    ),
+                });
+            }
+
+            let mut diag_parts = vec![format!(
+                "SMTP {} OK ({}/{} recipient(s) delivered)",
+                last_code.unwrap_or(250),
+                sent_recipients.len(),
+                plan.recipients.len()
+            )];
+            if !bounced_notes.is_empty() {
+                diag_parts.push(format!("hard-bounced: {}", bounced_notes.join("; ")));
+            }
+            for w in &ctx.overrides.warnings {
+                diag_parts.push(w.clone());
+            }
+
+            return Ok(DeliveryOutcome::Delivered {
+                status_code: last_code.or(Some(250)),
+                checkpoint: Some(final_cp),
+                diagnostic: Some(diag_parts.join(" | ")),
+                updated_capabilities: None,
+            });
+        }
+
+        // Legacy / standalone unit-test / Debug Push single-message path.
         let prior_msg_id = match &ctx.checkpoint {
-            Some(DeliveryCheckpoint::Smtp { message_id }) => Some(message_id.as_str()),
+            Some(DeliveryCheckpoint::Smtp { message_id, .. }) => Some(message_id.as_str()),
             _ => None,
         };
+        let compliance = SmtpComplianceFooter {
+            destination_id: (ctx.destination.id > 0).then_some(ctx.destination.id),
+            route_name: (!ctx.route.name.is_empty()).then_some(ctx.route.name.as_str()),
+            unsubscribe_url: None,
+            sender_identity: cfg.sender_identity.as_deref(),
+            include_compliance_headers: false,
+        };
 
-        let built = match Self::build_entry_email_with_options(
+        let built = match Self::build_entry_email_full(
             cfg,
-            dest,
+            &dest.to_addresses,
+            dest.reply_to.as_deref(),
             ctx.feed,
             ctx.entry,
             ctx.route.id,
             prior_msg_id,
-            ctx.route_options.locale.unwrap_or_else(|| self.locale()),
+            locale,
             ctx.timezone,
+            &ctx.overrides,
+            &compliance,
         ) {
             Ok(built) => built,
             Err(err) => {
@@ -424,6 +854,7 @@ impl ChannelSender for SmtpSender {
                     status_code: None,
                     checkpoint: prior_msg_id.map(|id| DeliveryCheckpoint::Smtp {
                         message_id: id.to_owned(),
+                        sent_recipients: Vec::new(),
                     }),
                     diagnostic: err.to_string(),
                 });
@@ -432,6 +863,7 @@ impl ChannelSender for SmtpSender {
 
         let checkpoint = DeliveryCheckpoint::Smtp {
             message_id: built.message_id.clone(),
+            sent_recipients: Vec::new(),
         };
 
         let transport = match self.transport_for(cfg) {
@@ -445,15 +877,19 @@ impl ChannelSender for SmtpSender {
             Ok(resp) => {
                 let code = i32::from(u16::from(resp.code()));
                 let msg = resp.message().collect::<Vec<_>>().join(" ");
-                let diagnostic = if msg.is_empty() {
-                    Some(format!("SMTP {code} OK (Message-ID {})", built.message_id))
+                let mut diagnostic = if msg.is_empty() {
+                    format!("SMTP {code} OK (Message-ID {})", built.message_id)
                 } else {
-                    Some(format!("SMTP {code}: {msg}"))
+                    format!("SMTP {code}: {msg}")
                 };
+                if !ctx.overrides.warnings.is_empty() {
+                    diagnostic.push_str(" | ");
+                    diagnostic.push_str(&ctx.overrides.warnings.join(" | "));
+                }
                 Ok(DeliveryOutcome::Delivered {
                     status_code: Some(code),
                     checkpoint: Some(checkpoint),
-                    diagnostic,
+                    diagnostic: Some(diagnostic),
                     updated_capabilities: None,
                 })
             }
@@ -538,6 +974,11 @@ impl ChannelSender for SmtpSender {
                     delivered_by_text => delivered_by_text,
                     continue_url => Option::<String>::None,
                     original_url => Some(crate::config::REPO_URL),
+                    subscription_reason => Option::<String>::None,
+                    unsubscribe_url => Option::<String>::None,
+                    unsubscribe_label => "",
+                    unsubscribe_hint => Option::<String>::None,
+                    sender_identity => cfg.sender_identity.as_deref().map(str::trim).filter(|s| !s.is_empty()),
                 })
             })
             .map_err(|err| AppError::Internal(anyhow::anyhow!("template render error: {err}")))?;
@@ -597,6 +1038,33 @@ impl ChannelSender for SmtpSender {
             dest.to_addresses.join(", ")
         ))
     }
+}
+
+/// Generate a deterministic per-recipient RFC 5322 `Message-ID`
+/// (`<fc-{fp[..24]}-r{route_id}-{hmac[..8]}@{from_domain}>`).
+pub fn deterministic_recipient_message_id(
+    fingerprint_sha256: &str,
+    route_id: i64,
+    address_hmac: &str,
+    from_domain: &str,
+) -> String {
+    let fp_prefix: String = fingerprint_sha256
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect();
+    let fp = if fp_prefix.is_empty() {
+        "000000000000000000000000"
+    } else {
+        fp_prefix.as_str()
+    };
+    let recip_tag: String = address_hmac
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let domain = sanitize_domain_ascii(from_domain);
+    format!("<fc-{fp}-r{route_id}-{recip_tag}@{domain}>")
 }
 
 /// Generate a deterministic RFC 5322 `Message-ID` (`<fc-{fp[..24]}-r{route_id}@{from_domain}>`).
@@ -765,6 +1233,8 @@ fn render_entry_html(
     entry_title: &str,
     locale: AppLocale,
     tz: Tz,
+    overrides: &RenderOverrides,
+    compliance: &SmtpComplianceFooter<'_>,
 ) -> AppResult<(String, bool)> {
     let env = template_env();
     let tmpl = env
@@ -772,11 +1242,7 @@ fn render_entry_html(
         .map_err(|err| AppError::Internal(anyhow::anyhow!("minijinja error: {err}")))?;
 
     let feed_title = sanitize_feed_title(&feed.title);
-    let original_url = entry
-        .canonical_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let original_url = overrides.effective_primary_link(entry);
     let continue_url = original_url.or_else(|| {
         feed.site_url
             .as_deref()
@@ -805,24 +1271,63 @@ fn render_entry_html(
         Some(meta_parts.join(" · "))
     };
 
-    let (truncation_notice, continue_label, read_original_label, delivered_by_text) =
-        if locale.is_zh() {
-            (
-                "为避免邮件客户端折叠截断，正文预览已精简。",
-                "继续阅读原文 →",
-                "阅读原文 →",
-                format!("由 FeedCourier 投递 · {feed_title}"),
-            )
-        } else {
-            (
-                "Article preview was shortened to prevent email client clipping.",
-                "Continue reading original article →",
-                "Read original →",
-                format!("Delivered by FeedCourier · {feed_title}"),
-            )
-        };
+    let (
+        truncation_notice,
+        continue_label,
+        read_original_label,
+        delivered_by_text,
+        unsubscribe_label,
+    ) = if locale.is_zh() {
+        (
+            "为避免邮件客户端折叠截断，正文预览已精简。",
+            "继续阅读原文 →",
+            "阅读原文 →",
+            format!("由 FeedCourier 投递 · {feed_title}"),
+            "退订此类邮件",
+        )
+    } else {
+        (
+            "Article preview was shortened to prevent email client clipping.",
+            "Continue reading original article →",
+            "Read original →",
+            format!("Delivered by FeedCourier · {feed_title}"),
+            "Unsubscribe",
+        )
+    };
 
-    let raw_body_html = rewrite_body_html_for_email(&build_body_html(entry, locale));
+    let sub_label = compliance
+        .route_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&feed_title);
+    let subscription_reason = if compliance.include_compliance_headers {
+        Some(if locale.is_zh() {
+            format!("你收到本邮件是因为订阅了 {sub_label}。")
+        } else {
+            format!("You are receiving this email because you subscribed to {sub_label}.")
+        })
+    } else {
+        None
+    };
+    let unsubscribe_url = compliance
+        .unsubscribe_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let unsubscribe_hint = if compliance.include_compliance_headers && unsubscribe_url.is_none() {
+        Some(if locale.is_zh() {
+            "如需退订，请直接回复本邮件。"
+        } else {
+            "Reply to this email to unsubscribe."
+        })
+    } else {
+        None
+    };
+    let sender_identity = compliance
+        .sender_identity
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let raw_body_html = rewrite_body_html_for_email(&build_body_html(entry, overrides, locale));
 
     let full_html = tmpl
         .render(context! {
@@ -839,6 +1344,11 @@ fn render_entry_html(
             delivered_by_text => &delivered_by_text,
             continue_url => continue_url,
             original_url => original_url,
+            subscription_reason => &subscription_reason,
+            unsubscribe_url => unsubscribe_url,
+            unsubscribe_label => unsubscribe_label,
+            unsubscribe_hint => unsubscribe_hint,
+            sender_identity => sender_identity,
         })
         .map_err(|err| AppError::Internal(anyhow::anyhow!("minijinja render error: {err}")))?;
 
@@ -862,6 +1372,11 @@ fn render_entry_html(
             delivered_by_text => &delivered_by_text,
             continue_url => continue_url,
             original_url => original_url,
+            subscription_reason => &subscription_reason,
+            unsubscribe_url => unsubscribe_url,
+            unsubscribe_label => unsubscribe_label,
+            unsubscribe_hint => unsubscribe_hint,
+            sender_identity => sender_identity,
         })
         .map_err(|err| AppError::Internal(anyhow::anyhow!("minijinja render error: {err}")))?;
 
@@ -883,6 +1398,11 @@ fn render_entry_html(
                 delivered_by_text => &delivered_by_text,
                 continue_url => continue_url,
                 original_url => original_url,
+                subscription_reason => &subscription_reason,
+                unsubscribe_url => unsubscribe_url,
+                unsubscribe_label => unsubscribe_label,
+                unsubscribe_hint => unsubscribe_hint,
+                sender_identity => sender_identity,
             })
             .map_err(|err| AppError::Internal(anyhow::anyhow!("minijinja render error: {err}")))?;
 
@@ -899,10 +1419,9 @@ fn render_entry_html(
     Ok((shell_html, true))
 }
 
-fn build_body_html(entry: &Entry, locale: AppLocale) -> String {
-    if let Some(html) = entry
-        .content_html
-        .as_deref()
+fn build_body_html(entry: &Entry, overrides: &RenderOverrides, locale: AppLocale) -> String {
+    if let Some(html) = overrides
+        .effective_content_html(entry)
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
@@ -1208,11 +1727,28 @@ fn parse_px_dimension(raw: &str) -> Option<u32> {
     numeric.parse::<u32>().ok()
 }
 
-fn parse_percent_dimension(raw: &str) -> Option<u32> {
+fn parse_percent_dimension(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let numeric = trimmed.strip_suffix('%')?.trim();
-    let pct = numeric.parse::<u32>().ok()?;
-    (1..=100).contains(&pct).then_some(pct)
+    if numeric.is_empty()
+        || numeric.starts_with('+')
+        || numeric.starts_with('-')
+        || !numeric.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    {
+        return None;
+    }
+    let pct: f64 = numeric.parse().ok()?;
+    if !pct.is_finite() || pct <= 0.0 || pct > 100.0 {
+        return None;
+    }
+    // Preserve clean integer or fractional percentage strings (e.g. "50" or "33.3").
+    let formatted = if (pct.fract()).abs() < 1e-6 {
+        format!("{}", pct.round() as u32)
+    } else {
+        let s = format!("{pct:.2}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    Some(formatted)
 }
 
 fn set_or_replace_attr(attrs: &mut Vec<EmailTagAttr>, name: &str, value: String) {
@@ -1258,6 +1794,7 @@ fn render_plain_fallback(
     entry: &Entry,
     entry_title: &str,
     locale: AppLocale,
+    overrides: &RenderOverrides,
 ) -> String {
     if let Ok(text) = html2text::from_read(rendered_html.as_bytes(), PLAIN_TEXT_WRAP_WIDTH)
         && !text.trim().is_empty()
@@ -1274,11 +1811,7 @@ fn render_plain_fallback(
         fallback.push_str(summary.trim());
         fallback.push_str("\n\n");
     }
-    if let Some(url) = entry
-        .canonical_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
+    if let Some(url) = overrides.effective_primary_link(entry) {
         if locale.is_zh() {
             fallback.push_str("阅读原文: ");
         } else {
@@ -1288,6 +1821,25 @@ fn render_plain_fallback(
         fallback.push('\n');
     }
     fallback
+}
+
+fn html_escape_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn html_escape_attr_simple(input: &str) -> String {
+    html_escape_text(input)
 }
 
 fn escape_html_into(out: &mut String, text: &str) {

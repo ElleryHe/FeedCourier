@@ -53,6 +53,15 @@ pub const SETTING_CHANNEL_MODEL_VERSION: &str = "channel_model_version";
 /// Current delivery channel data model version (v0.2.0 two-layer Channel Account + Destinations).
 pub const CHANNEL_MODEL_VERSION_V2: i64 = 2;
 
+/// `system_settings.key`: optional public base URL (`PUBLIC_URL`) for `/u/{token}` and `/v/{token}`.
+pub const SETTING_PUBLIC_URL: &str = "public_url";
+
+/// `system_settings.key`: schema/data version of the per-recipient SMTP compliance model (`1` = backfilled).
+pub const SETTING_SMTP_RECIPIENT_MODEL_VERSION: &str = "smtp_recipient_model_version";
+
+/// Current SMTP recipient compliance data model version (v0.3.0).
+pub const SMTP_RECIPIENT_MODEL_VERSION_V1: i64 = 1;
+
 /// Supported system UI and delivery template locales (`system_settings.locale`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AppLocale {
@@ -715,4 +724,100 @@ pub struct Session {
     pub token_hash: String,
     pub expires_at: i64,
     pub created_at: i64,
+}
+
+// =============================================================================
+// Plugins & Link Cache Models (v0.3.0)
+// =============================================================================
+
+/// Row from `plugins`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PluginRow {
+    pub id: String,
+    pub enabled: bool,
+    pub installed_version: String,
+    pub settings_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Row from `plugin_instances` (encrypted provider credentials/config).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PluginInstanceRow {
+    pub id: i64,
+    pub plugin_id: String,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub encrypted_config: Vec<u8>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// =============================================================================
+// SMTP Per-Recipient Compliance Models (v0.3.0)
+// =============================================================================
+
+/// Verification & consent lifecycle state for one SMTP recipient address (`smtp_recipients.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum SmtpRecipientStatus {
+    Unverified,
+    Pending,
+    Verified,
+    Unsubscribed,
+    Bounced,
+}
+
+impl SmtpRecipientStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::Unsubscribed => "unsubscribed",
+            Self::Bounced => "bounced",
+        }
+    }
+}
+
+impl fmt::Display for SmtpRecipientStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Row from `smtp_recipients` (stores only `address_hmac`, never plaintext email).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SmtpRecipientRow {
+    pub id: i64,
+    pub destination_id: i64,
+    pub address_hmac: String,
+    pub status: SmtpRecipientStatus,
+    #[serde(skip_serializing)]
+    pub code_sha256: Option<String>,
+    pub code_expires_at: Option<i64>,
+    pub code_attempts: i64,
+    pub last_code_sent_at: Option<i64>,
+    pub codes_sent_window_start: Option<i64>,
+    pub codes_sent_in_window: i64,
+    pub consent_method: Option<String>,
+    pub consented_at: Option<i64>,
+    pub revoked_method: Option<String>,
+    pub revoked_at: Option<i64>,
+    pub bounce_diagnostic: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Aggregate recipient verification status counts attached to SMTP destination DTOs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmtpRecipientSummary {
+    pub total: i64,
+    pub verified: i64,
+    pub pending: i64,
+    pub unverified: i64,
+    pub unsubscribed: i64,
+    pub bounced: i64,
 }

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   Clock,
   ExternalLink,
   FileSearch,
@@ -44,14 +45,36 @@ export interface TasksViewProps {
   initialStatusFilter?: TaskStatus | "all";
 }
 
+const DELIVERED_WARNING_MARKERS = [
+  "Link Rewrite partial",
+  "hard-bounced",
+  "is disabled; kept original",
+  "capped at",
+] as const;
+
+function hasDeliveredWarning(task: DeliveryTaskDto): boolean {
+  if (task.status !== "delivered" || !task.diagnostic_log) return false;
+  return DELIVERED_WARNING_MARKERS.some((marker) =>
+    task.diagnostic_log?.includes(marker),
+  );
+}
+
 function statusBadge(
-  status: TaskStatus,
+  task: DeliveryTaskDto,
   m: Messages,
 ): {
   label: string;
   variant: BadgeVariant;
+  warning?: boolean;
 } {
-  switch (status) {
+  if (hasDeliveredWarning(task)) {
+    return {
+      label: m.status.task.deliveredWarning,
+      variant: "warning",
+      warning: true,
+    };
+  }
+  switch (task.status) {
     case "queued":
       return { label: m.status.task.queued, variant: "default" };
     case "delivering":
@@ -99,8 +122,11 @@ function attemptCountVariant(attempts: number): BadgeVariant {
   return "default";
 }
 
-/** Diagnostic log preview color in table rows matching task status (never red for delivered). */
-function diagnosticRowTextClass(status: TaskStatus): string {
+/** Diagnostic log preview color in table rows matching task status (amber for delivered with warnings). */
+function diagnosticRowTextClass(status: TaskStatus, isWarning = false): string {
+  if (isWarning) {
+    return "text-amber-700 dark:text-amber-400";
+  }
   switch (status) {
     case "delivered":
       return "text-emerald-700 dark:text-emerald-400";
@@ -116,7 +142,13 @@ function diagnosticRowTextClass(status: TaskStatus): string {
 }
 
 /** Diagnostic log color inside dark modal `<pre>` matching task status. */
-function diagnosticModalTextClass(status: TaskStatus): string {
+function diagnosticModalTextClass(
+  status: TaskStatus,
+  isWarning = false,
+): string {
+  if (isWarning) {
+    return "text-amber-300";
+  }
   switch (status) {
     case "delivered":
       return "text-emerald-300";
@@ -138,7 +170,9 @@ function summarizeCheckpoint(
   if (!cp) return null;
   switch (cp.kind) {
     case "smtp":
-      return m.tasks.checkpoints.smtp;
+      return cp.sent_recipients && cp.sent_recipients.length > 0
+        ? m.tasks.checkpoints.smtpSent(cp.sent_recipients.length)
+        : m.tasks.checkpoints.smtp;
     case "telegram":
       if (cp.degraded_to_compact) return m.tasks.checkpoints.tgCompact;
       return m.tasks.checkpoints.tgBatch(cp.next_batch_offset);
@@ -516,7 +550,8 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
               </thead>
               <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/80">
                 {tasks.map((task) => {
-                  const badge = statusBadge(task.status, m);
+                  const badge = statusBadge(task, m);
+                  const isPartialWarning = Boolean(badge.warning);
                   const cpSummary = summarizeCheckpoint(task.checkpoint, m);
                   const canRetry =
                     task.status === "dead_letter" ||
@@ -594,7 +629,12 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
 
                       <td className="px-3 py-3">
                         <div className="flex flex-wrap items-center gap-1">
-                          <Badge variant={badge.variant}>{badge.label}</Badge>
+                          <Badge variant={badge.variant}>
+                            {isPartialWarning && (
+                              <AlertTriangle className="h-3 w-3 shrink-0" />
+                            )}
+                            {badge.label}
+                          </Badge>
                           {cpSummary && (
                             <Badge variant="mono">{cpSummary}</Badge>
                           )}
@@ -657,7 +697,10 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                           <div
                             className={cn(
                               "mt-1 max-w-[200px] truncate font-sans text-[11px]",
-                              diagnosticRowTextClass(task.status),
+                              diagnosticRowTextClass(
+                                task.status,
+                                isPartialWarning,
+                              ),
                             )}
                             title={task.diagnostic_log}
                           >
@@ -759,9 +802,17 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
               <div>
                 <div className="text-zinc-500">{m.tasks.modal.status}</div>
                 <div className="mt-1">
-                  <Badge variant={statusBadge(inspectingTask.status, m).variant}>
-                    {statusBadge(inspectingTask.status, m).label}
-                  </Badge>
+                  {(() => {
+                    const modalBadge = statusBadge(inspectingTask, m);
+                    return (
+                      <Badge variant={modalBadge.variant}>
+                        {modalBadge.warning && (
+                          <AlertTriangle className="h-3 w-3 shrink-0" />
+                        )}
+                        {modalBadge.label}
+                      </Badge>
+                    );
+                  })()}
                 </div>
               </div>
               <div>
@@ -837,7 +888,10 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                 className={cn(
                   "max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-900 p-3 font-mono text-[11px]",
                   inspectingTask.diagnostic_log
-                    ? diagnosticModalTextClass(inspectingTask.status)
+                    ? diagnosticModalTextClass(
+                        inspectingTask.status,
+                        hasDeliveredWarning(inspectingTask),
+                      )
                     : "text-zinc-400",
                 )}
               >

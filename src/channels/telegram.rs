@@ -728,8 +728,13 @@ impl TelegramSender {
                 ctx.channel.use_proxy,
             )
             .await?;
-        let rich_message =
-            build_rich_message_payload_with_options(ctx.feed, ctx.entry, self.locale, ctx.timezone);
+        let rich_message = build_rich_message_payload_with_overrides(
+            ctx.feed,
+            ctx.entry,
+            self.locale,
+            ctx.timezone,
+            &ctx.overrides,
+        );
 
         let mut payload = json!({
             "chat_id": dest.chat_id.trim(),
@@ -752,10 +757,15 @@ impl TelegramSender {
                 if let Some(sink) = ctx.checkpoint_sink {
                     sink.save_checkpoint(&cp).await?;
                 }
+                let mut diag = format!("Telegram sendRichMessage delivered (id={msg_id})");
+                if !ctx.overrides.warnings.is_empty() {
+                    diag.push_str(" | ");
+                    diag.push_str(&ctx.overrides.warnings.join(" | "));
+                }
                 Ok(DeliveryOutcome::Delivered {
                     status_code: Some(200),
                     checkpoint: Some(cp),
-                    diagnostic: Some(format!("Telegram sendRichMessage delivered (id={msg_id})")),
+                    diagnostic: Some(diag),
                     updated_capabilities: None,
                 })
             }
@@ -817,7 +827,14 @@ impl TelegramSender {
                 ctx.channel.use_proxy,
             )
             .await?;
-        let html_text = format_compact_card_html_with_locale(ctx.feed, ctx.entry, self.locale);
+        let html_text = format_compact_card_html_with_overrides(
+            ctx.feed,
+            ctx.entry,
+            self.locale,
+            &ctx.overrides,
+        );
+        // Link preview intentionally targets the original canonical URL (v0.3.0 Q6) so Telegram
+        // fetches the origin site's title/image card rather than a blank short-link redirector.
         let canonical_url = ctx
             .entry
             .canonical_url
@@ -861,11 +878,15 @@ impl TelegramSender {
                 if let Some(sink) = ctx.checkpoint_sink {
                     sink.save_checkpoint(&cp).await?;
                 }
-                let diag = if degraded_to_compact {
+                let mut diag = if degraded_to_compact {
                     format!("Telegram degraded to compact_card and delivered (id={msg_id})")
                 } else {
                     format!("Telegram compact_card delivered (id={msg_id})")
                 };
+                if !ctx.overrides.warnings.is_empty() {
+                    diag.push_str(" | ");
+                    diag.push_str(&ctx.overrides.warnings.join(" | "));
+                }
                 Ok(DeliveryOutcome::Delivered {
                     status_code: Some(200),
                     checkpoint: Some(cp),
@@ -911,11 +932,12 @@ impl TelegramSender {
                 });
             }
 
-            let text = format_media_mode_caption_with_locale(
+            let text = format_media_mode_caption_with_overrides(
                 ctx.feed,
                 ctx.entry,
                 MAX_MESSAGE_UTF16_UNITS,
                 self.locale,
+                &ctx.overrides,
             );
             let msg_id = match self
                 .send_plain_text_fallback(&client, cfg, dest, ctx, &text)
@@ -959,11 +981,12 @@ impl TelegramSender {
             });
         }
 
-        let base_caption = format_media_mode_caption_with_locale(
+        let base_caption = format_media_mode_caption_with_overrides(
             ctx.feed,
             ctx.entry,
             MAX_CAPTION_UTF16_UNITS,
             self.locale,
+            &ctx.overrides,
         );
 
         for (batch_idx, batch) in batches.iter().enumerate().skip(state.next_batch_offset) {
@@ -1007,14 +1030,19 @@ impl TelegramSender {
         }
 
         let final_cp = state.clone().into_checkpoint();
+        let mut diag = format!(
+            "Telegram media_mode delivered {} message(s) across {} batch(es)",
+            state.sent_message_ids.len(),
+            batches.len()
+        );
+        if !ctx.overrides.warnings.is_empty() {
+            diag.push_str(" | ");
+            diag.push_str(&ctx.overrides.warnings.join(" | "));
+        }
         Ok(DeliveryOutcome::Delivered {
             status_code: Some(200),
             checkpoint: Some(final_cp),
-            diagnostic: Some(format!(
-                "Telegram media_mode delivered {} message(s) across {} batch(es)",
-                state.sent_message_ids.len(),
-                batches.len()
-            )),
+            diagnostic: Some(diag),
             updated_capabilities: None,
         })
     }
@@ -1606,6 +1634,23 @@ pub fn build_rich_message_payload_with_options(
     locale: AppLocale,
     tz: Tz,
 ) -> InputRichMessage {
+    build_rich_message_payload_with_overrides(
+        feed,
+        entry,
+        locale,
+        tz,
+        &crate::plugins::RenderOverrides::default(),
+    )
+}
+
+/// Build a Bot API 10.4 `InputRichMessage` honoring any `on_render` plugin HTML/link overrides.
+pub fn build_rich_message_payload_with_overrides(
+    feed: &Feed,
+    entry: &Entry,
+    locale: AppLocale,
+    tz: Tz,
+    overrides: &crate::plugins::RenderOverrides,
+) -> InputRichMessage {
     let default_title = if locale.is_zh() {
         "无标题"
     } else {
@@ -1618,13 +1663,17 @@ pub fn build_rich_message_payload_with_options(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_title.to_owned());
 
-    let canonical_url = entry
+    let original_url = entry
         .canonical_url
         .as_deref()
         .map(str::trim)
         .filter(|u| u.starts_with("http://") || u.starts_with("https://"));
 
-    let fallback_url = canonical_url.or_else(|| {
+    let primary_url = overrides
+        .effective_primary_link(entry)
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+
+    let fallback_url = primary_url.or_else(|| {
         feed.site_url
             .as_deref()
             .map(str::trim)
@@ -1634,7 +1683,7 @@ pub fn build_rich_message_payload_with_options(
     let mut blocks: Vec<Block> = Vec::new();
 
     // 1. Demoted `<h2>` title header (avoids oversized `<h1>` on mobile Telegram clients).
-    let title_inlines = match canonical_url {
+    let title_inlines = match primary_url {
         Some(url) => vec![Inline::Link {
             href: url.to_owned(),
             content: vec![Inline::Text(title)],
@@ -1664,15 +1713,16 @@ pub fn build_rich_message_payload_with_options(
 
     // 3. Body parsed with heading demotion (`h1`->`h3`..`h6`) and consecutive media grouping.
     let parse_opts = ParseOptions {
-        base_url: fallback_url.and_then(|u| Url::parse(u).ok()),
+        base_url: original_url
+            .or(fallback_url)
+            .and_then(|u| Url::parse(u).ok()),
         keep_tracking_pixels: false,
         heading_offset: 2,
         group_consecutive_media: true,
     };
 
-    let body_blocks: Vec<Block> = if let Some(body_html) = entry
-        .content_html
-        .as_deref()
+    let body_blocks: Vec<Block> = if let Some(body_html) = overrides
+        .effective_content_html(entry)
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
@@ -1735,6 +1785,21 @@ pub fn format_compact_card_html_with_locale(
     entry: &Entry,
     locale: AppLocale,
 ) -> String {
+    format_compact_card_html_with_overrides(
+        feed,
+        entry,
+        locale,
+        &crate::plugins::RenderOverrides::default(),
+    )
+}
+
+/// Format `TelegramDeliveryMode::CompactCard` HTML localized to `locale` with plugin overrides.
+pub fn format_compact_card_html_with_overrides(
+    feed: &Feed,
+    entry: &Entry,
+    locale: AppLocale,
+    overrides: &crate::plugins::RenderOverrides,
+) -> String {
     let default_title = if locale.is_zh() {
         "无标题"
     } else {
@@ -1751,11 +1816,7 @@ pub fn format_compact_card_html_with_locale(
     let raw_meta = format_source_author_line(feed, entry);
     let meta = truncate_utf16(&raw_meta, 200, "…");
 
-    let canonical_url = entry
-        .canonical_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|u| !u.is_empty());
+    let canonical_url = overrides.effective_primary_link(entry);
 
     let mut header = format!("<b>{}</b>", escape_html(&title));
     if !meta.is_empty() {
@@ -1829,6 +1890,23 @@ pub fn format_media_mode_caption_with_locale(
     max_utf16_units: usize,
     locale: AppLocale,
 ) -> String {
+    format_media_mode_caption_with_overrides(
+        feed,
+        entry,
+        max_utf16_units,
+        locale,
+        &crate::plugins::RenderOverrides::default(),
+    )
+}
+
+/// Format `TelegramDeliveryMode::MediaMode` 3-line minimalist HTML caption with plugin overrides.
+pub fn format_media_mode_caption_with_overrides(
+    feed: &Feed,
+    entry: &Entry,
+    max_utf16_units: usize,
+    locale: AppLocale,
+    overrides: &crate::plugins::RenderOverrides,
+) -> String {
     let line1_raw = entry
         .author
         .as_deref()
@@ -1858,11 +1936,7 @@ pub fn format_media_mode_caption_with_locale(
         })
         .unwrap_or_else(|| "Update".to_owned());
 
-    let canonical_url = entry
-        .canonical_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let canonical_url = overrides.effective_primary_link(entry);
 
     let link_label = if locale.is_zh() { "链接" } else { "Link" };
     let line3_html =

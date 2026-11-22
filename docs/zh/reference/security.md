@@ -1,5 +1,5 @@
 ---
-description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加密、Argon2id 密码哈希、TOTP 两步验证与恢复码、投递目的地锁定、提示词注入隔离与连接层防 SSRF。"
+description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加密、Argon2id 与 TOTP 2FA、目的地锁定、提示词注入隔离、连接层防 SSRF、HMAC-SHA256 公开合规令牌与插件凭据脱敏。"
 ---
 
 # 安全与防注入机制
@@ -46,7 +46,7 @@ WebUI 管理员可选启用第二重验证（在 **Settings → 账号与安全*
 | 数据接口 | 返回结构体 | 凭据与目的地暴露策略 |
 | :--- | :--- | :--- |
 | **WebUI REST API**<br>（`GET /api/v1/channels`、`/api/v1/channels/{id}/destinations`） | `ChannelDto`、`ChannelDestinationDto`<br>（`src/api/dto.rs`） | 返回非敏感账号信息（`host`、`from_address`、`api_base_url`）及内嵌目的地配置（`to_addresses`、`chat_id`、`data_source_id`），并将密钥字段替换为掩码提示：`has_password: bool`、`bot_token_hint: "123456...abcd"`、`secret_hint: "ntn_12...ef"`。`PATCH /api/v1/channels/{id}` 在密码/Token 留空时自动保留原密文。 |
-| **MCP 端点**<br>（`list_feeds_status`） | `McpChannelSummary`、`McpDestinationSummary`<br>（`src/mcp/tools.rs`） | **完全省略凭据与目的地标识**：返回脱敏 `channels`（`{ id, name, kind, enabled, cooldown_until, destinations }`）及顶层 `destinations`（`{ id, channel_id, name, kind, enabled }`）。AI 客户端无法读取任何 SMTP 密码/收件人邮箱、Telegram `bot_token`/`chat_id` 或 Notion `integration_secret`/`data_source_id`。 |
+| **MCP 端点**<br>（`list_feeds_status`、`list_plugins`） | `McpChannelSummary`、`McpDestinationSummary`、`McpPluginSummary`<br>（`src/mcp/tools.rs`） | **完全省略凭据、服务端点与目的地标识**：返回脱敏 `channels`、`destinations` 及插件/服务商实例摘要（`{ id, name, enabled }`）。AI 客户端无法读取任何 SMTP 密码/收件人邮箱、Telegram `bot_token`/`chat_id`、Notion `integration_secret`/`data_source_id`，以及插件服务商 URL、签名令牌或密码。 |
 
 ---
 
@@ -58,8 +58,8 @@ FeedCourier 在架构层实施 **投递目的地锁定（Destination Lock）**�
 1. **`/mcp` 零通道/目的地写接口**：MCP 服务端点不提供任何用于创建、修改或删除通道账号或目的地的工具，也没有任何工具接受凭据或目的地址。所有 `channels` 与 `channel_destinations` 表的变更必须由人类管理员通过受 `fc_session` 保护的 WebUI（`/api/v1/channels*`、`/api/v1/destinations*`）完成。
 2. **`configure_route` 与 `test_push_feed_entry` 强校验整数 `destination_id`**：当持有 `admin` 权限令牌的 AI Agent 调用 `configure_route` 或 `test_push_feed_entry` 时，目标参数仅接受整数 `destination_id`（或在账号仅含 1 个目的地时兼容旧版 `channel_id`），不接受任何原始邮箱地址、Webhook URL、`chat_id` 或 API 密钥。处理器在执行前统一调用 `db.resolve_destination_target(destination_id, channel_id)` 验证该目标必须对应已存在的 WebUI 授信目的地与通道账号。
 3. **双级令牌权限隔离（`readonly` vs `admin`）**：
-   - `readonly` 令牌仅可调用只读工具（`list_feeds_status`、`inspect_failed_deliveries`、`preview_feed_latest`）；
-   - `admin` 令牌额外允许管理订阅源、编排指向既有 `destination_id` 的路由、复位熔断源、重投死信任务、暂停/恢复全局队列及调试推送（`manage_feed`（含 `clear_cache`）、`configure_route`、`reset_and_poll_feed`、`retry_dead_tasks`、`manage_outbox_queue`、`test_push_feed_entry`），仍无法突破授信目的地边界；`test_push_feed_entry` 只会把文章发送到既有目的地，无法创建或修改目的地。
+   - `readonly` 令牌仅可调用只读工具（`list_feeds_status`、`list_plugins`、`inspect_failed_deliveries`、`preview_feed_latest`）；
+   - `admin` 令牌额外允许管理订阅源、编排指向既有 `destination_id` 与插件 `provider_id` 的路由、复位熔断源、重投死信任务、暂停/恢复全局队列及调试推送（`manage_feed`、`configure_route`、`reset_and_poll_feed`、`retry_dead_tasks`、`manage_outbox_queue`、`test_push_feed_entry`）；通道/目的地管理、插件服务商凭据维护与 SMTP 收件人验证仍严格锁定在 WebUI 内。
 
 ---
 
@@ -159,3 +159,40 @@ sequenceDiagram
 - **连接期 DNS 校验与禁用重定向**：所有 Telegram Bot API 请求（官方地址与自定义 `api_base_url` / 自建 Local Bot API Server）均经过 `SsrfDnsResolver` 连接期解析校验，并禁用自动重定向（`redirect::Policy::none()`）；走 `OUTBOUND_PROXY` 代理时仍对字面量 IP 与 `localhost` 执行逐跳校验。
 - **严格的 `api_base_url` 语法校验**：仅允许 `http://` 与 `https://` 协议，禁止携带 userinfo（`user:pass@`）、查询字符串（`?…`）或片段（`#…`）；创建、编辑或探测时触发 SSRF 拦截统一返回 HTTP `403`（`ssrf_blocked`）。
 - **存量内网地址不自动放行**：升级至 `v0.2.0` 时，已配置的内网/私网 Local Bot API 地址不会被自动加入白名单，运维人员需手动将其主机名或 IP/CIDR 添加至 `SSRF_ALLOWLIST`。
+
+---
+
+## 5. 公开 SMTP 合规端点与 HMAC 令牌（`src/api/public.rs`、`src/crypto.rs`）
+
+配置 `PUBLIC_URL` 后，FeedCourier 仅对外提供两个免登录合规路由（`/u/{token}` 与 `/v/{token}`），注册于 SPA 回退之前，便于反向代理**仅对外暴露 `/u/` 与 `/v/`**，将 `/api/v1/*`、`/mcp` 与 WebUI 留在内网：
+
+### 1. 域隔离 HKDF-SHA256 子密钥与零 PII 令牌
+`MasterKey::derive_subkey` 通过 RFC 5869 HKDF-SHA256（`salt = 0^32`，`ikm = master_key`，不同 `info` 标签）派生相互隔离的 256 位子密钥：
+
+| 用途 | HKDF `info` 上下文 | 编码布局与安全属性 |
+| :--- | :--- | :--- |
+| **收件人地址摘要**（`smtp_recipients.address_hmac`） | `fc-smtp-addr-v1` | `hex(HMAC-SHA256(subkey, lowercase(email)))`，无需在 `smtp_recipients` 中保存明文邮箱即可按地址追踪状态。 |
+| **退订令牌**（`/u/{token}`） | `fc-unsub-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| HMAC-SHA256[..16])`（32 字节）。不设过期时间（确保历史邮件长期可退订）、**不含任何明文 PII**，并采用常量时间校验。 |
+| **验证令牌**（`/v/{token}`） | `fc-verify-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| expires_at_be_8 \|\| code_sha256[..8] \|\| HMAC-SHA256[..16])`（48 字节）。30 分钟有效期且绑定当前激活验证码哈希前 8 字节，重新发送验证邮件后旧链接立即失效（`410 Gone`）。 |
+
+### 2. 严格 `GET` 只读 / `POST` 变更不变量
+- 企业邮件安全网关（Safe Links、Proofpoint、Mimecast 等）会自动通过 `GET` 预抓取邮件中的链接。
+- **`GET /u/{token}`** 与 **`GET /v/{token}`** 严格保持**只读**，仅渲染最小化的本地化确认页面（只显示打码后的邮箱如 `a***e@example.com` 与表单按钮），绝不修改数据库状态。
+- 状态变更仅在 **`POST /u/{token}`**（兼容浏览器表单提交及免登录幂等 RFC 8058 `List-Unsubscribe=One-Click` POST）与 **`POST /v/{token}`** 时执行。
+
+### 3. 按 IP 限流与响应头加固
+- 所有 `/u/*` 与 `/v/*` 请求均受进程内按 IP 滑动窗口限流器约束（**每 IP 每 `60` 秒最多 `30` 次请求**，识别反向代理传入的 `X-Forwarded-For` / `X-Real-IP`，并定期惰性回收防止内存膨胀），超限返回 `429`。
+- 令牌篡改或无效统一返回通用 `404` 页面，不泄露任何管理信息或收件人存在性。
+- 响应强制附加安全头：
+  - `X-Robots-Tag: noindex, nofollow`
+  - `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`
+  - `Referrer-Policy: no-referrer`
+  - `Cache-Control: no-store`
+
+---
+
+## 6. 插件防 SSRF 与凭据脱敏（`src/plugins/`）
+
+- **强制 `ProtectedHttpClient` 出站校验**：插件发起的全部外部请求——包括 YOURLS `action=shorturl` 调用（`64 KiB` 响应上限、`5s` 超时、`4` 并发）以及市场索引拉取（`PLUGIN_INDEX_URL`，`1 MiB` 上限、`8s` 超时、6 小时缓存）——均强制走 `ProtectedHttpClient` 连接期 `SsrfDnsResolver` 校验并受 `SSRF_ALLOWLIST` 约束；内网或 Docker 部署的 YOURLS 在显式加入白名单前一律拦截。
+- **服务商凭据加密与脱敏**：`plugin_instances.encrypted_config` 使用与渠道相同的 256 位 `MasterKey` ChaCha20-Poly1305 AEAD 加密保存；`/api/v1/plugins*` 响应自动掩码化密钥（`has_signature`、`signature_hint`、`has_password`），`PATCH` 留空自动保留原密文；MCP `list_plugins` 严格只返回 `{ id, name, enabled }`，零凭据泄露。
+- **安全 HTML 属性改写**：`link-rewrite` 仅解析 `<a ...>` 开始标签（采用完整 HTML5 命名实体解码）并仅改写 `http://` / `https://` 的 `href` 属性，绝不触碰媒体 `src`、`mailto:` 或退订/验证链接。

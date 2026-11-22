@@ -1,10 +1,10 @@
 ---
-description: "FeedCourier 9 个 MCP 工具参数与返回结构说明：涵盖状态查询、失败任务诊断、文章预览、订阅源管理、路由编排、死信重投、全局队列控制与调试推送。"
+description: "FeedCourier 10 个 MCP 工具参数与返回结构说明：涵盖状态查询、零凭据插件发现（list_plugins）、失败任务诊断、文章预览、订阅源管理、路由与插件编排、死信重投、全局队列控制与调试推送。"
 ---
 
 # 工具说明
 
-FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读查询/预览工具（`readonly` 与 `admin` 令牌均可调用）和配置管理/运维工具（仅限 `admin` 令牌调用）。
+FeedCourier 的 `/mcp` 接口共提供 **10 个工具（Tools）**，分为只读查询/预览工具（`readonly` 与 `admin` 令牌均可调用）和配置管理/运维工具（仅限 `admin` 令牌调用）。
 
 ---
 
@@ -12,15 +12,19 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 | 工具名称 | 所需最低权限 | 读写属性 | 功能说明 |
 | :--- | :---: | :---: | :--- |
-| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | 只读 | 查看全局统计概览、脱敏通道账号与目的地列表（仅含 ID、备注名、类型与启用状态）、路由列表及订阅源健康状态。 |
-| [`inspect_failed_deliveries`](#2-inspect-failed-deliveries) | `readonly` | 只读 | 查看投递失败（`dead_letter`）、等待重试（`retrying`）、顺延（`deferred`）或排队中的任务与诊断日志。 |
-| [`preview_feed_latest`](#3-preview-feed-latest) | `readonly` | 只读 | 实时试抓指定订阅源 URL 或已有 `feed_id` 的最新 10 篇文章，支持测试全文提取与过滤规则。 |
-| [`manage_feed`](#4-manage-feed) | **`admin`** | 写操作 | 新增、修改、暂停（`pause`）、恢复（`resume`）、清除缓存（`clear_cache`）或删除订阅源，设置标签、轮询间隔、全文提取与代理开关。 |
-| [`configure_route`](#5-configure-route) | **`admin`** | 写操作 | 创建、更新或删除路由规则，将订阅源/标签及关键词/正则过滤规则绑定至已有授信目的地 `destination_id`（或单目的地账号的 `channel_id`）。 |
-| [`reset_and_poll_feed`](#6-reset-and-poll-feed) | **`admin`** | 写操作 | 重置指定订阅源的失败计数与退避/熔断状态，并立即执行一次拉取。 |
-| [`retry_dead_tasks`](#7-retry-dead-tasks) | **`admin`** | 写操作 | 按任务 ID 列表或一键将全部死信任务（`all_dead_letter: true`）重新加入发送队列。 |
-| [`manage_outbox_queue`](#8-manage-outbox-queue) | **`admin`** | 写操作 | 查看、暂停或恢复全局投递队列（可设定自动恢复时间）。 |
-| [`test_push_feed_entry`](#9-test-push-feed-entry) | **`admin`** | 无状态 | 将一条订阅源文章调试推送到指定授信目的地 `destination_id`（或单目的地账号的 `channel_id`），不写入指纹、不入队、不占用配额。 |
+| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | 只读 | 查看全局统计概览、脱敏通道账号与目的地列表（仅含 ID、备注名、类型与启用状态）、路由列表（含 `plugins` 绑定摘要）及订阅源健康状态。 |
+| [`list_plugins`](#2-list-plugins) | `readonly` | 只读 | 列出已安装插件及服务商实例（仅含 ID、名称、钩子与启用状态，**严格不含任何 API URL、签名或密码凭据**）。 |
+| [`inspect_failed_deliveries`](#3-inspect-failed-deliveries) | `readonly` | 只读 | 查看投递失败（`dead_letter`）、等待重试（`retrying`）、顺延（`deferred`）或排队中的任务与诊断日志。 |
+| [`preview_feed_latest`](#4-preview-feed-latest) | `readonly` | 只读 | 实时试抓指定订阅源 URL 或已有 `feed_id` 的最新 10 篇文章，支持测试全文提取与过滤规则。 |
+| [`manage_feed`](#5-manage-feed) | **`admin`** | 写操作 | 新增、修改、暂停（`pause`）、恢复（`resume`）、清除缓存（`clear_cache`）或删除订阅源，设置标签、轮询间隔、全文提取与代理开关。 |
+| [`configure_route`](#6-configure-route) | **`admin`** | 写操作 | 创建、更新或删除路由规则，将订阅源/标签及关键词/正则过滤规则绑定至已有授信目的地 `destination_id`（或单目的地账号的 `channel_id`），并支持按路由配置 `plugins`。 |
+| [`reset_and_poll_feed`](#7-reset-and-poll-feed) | **`admin`** | 写操作 | 重置指定订阅源的失败计数与退避/熔断状态，并立即执行一次拉取。 |
+| [`retry_dead_tasks`](#8-retry-dead-tasks) | **`admin`** | 写操作 | 按任务 ID 列表或一键将全部死信任务（`all_dead_letter: true`）重新加入发送队列。 |
+| [`manage_outbox_queue`](#9-manage-outbox-queue) | **`admin`** | 写操作 | 查看、暂停或恢复全局投递队列（可设定自动恢复时间）。 |
+| [`test_push_feed_entry`](#10-test-push-feed-entry) | **`admin`** | 无状态 | 将一条订阅源文章调试推送到指定授信目的地 `destination_id`（或单目的地账号的 `channel_id`），不写入指纹、不入队、不占用配额。 |
+
+> [!NOTE]
+> 通道账号/目的地增删改、插件服务商凭据管理（如 YOURLS 地址与签名令牌）以及 SMTP 收件人验证与退订**仅限 WebUI 操作**，不向 `/mcp` 暴露变更接口。
 
 ---
 
@@ -37,7 +41,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 | `health_status` | `string` | 否 | `null` | 按健康状态筛选订阅源：`"active"`、`"backoff"`、`"circuit_open"` 或 `"paused"`。 |
 | `tag` | `string` | 否 | `null` | 按标签（不区分大小写）筛选包含该标签的订阅源。 |
 
-返回内容中，每条路由包含 `channel_id`、`destination_id`、投递语言 `locale`、可选路由时区 `timezone`、投递时间窗口 `active_windows` 与允许的星期 `active_weekdays`；响应另含全局队列状态 `queue: { paused, resume_at }` 以及默认系统时区 `timezone`。
+返回内容中，每条路由包含 `channel_id`、`destination_id`、投递语言 `locale`、可选路由时区 `timezone`、投递时间窗口 `active_windows`、允许的星期 `active_weekdays` 以及 `plugins`（路由级插件配置映射）；响应另含全局队列状态 `queue: { paused, resume_at }` 以及默认系统时区 `timezone`。
 
 #### 返回示例
 
@@ -104,6 +108,9 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
       "timezone": "Asia/Shanghai",
       "active_windows": [],
       "active_weekdays": [],
+      "plugins": {
+        "link-rewrite": { "provider_id": 1 }
+      },
       "enabled": true
     }
   ],
@@ -127,7 +134,40 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ---
 
-### 2. `inspect_failed_deliveries` {#2-inspect-failed-deliveries}
+### 2. `list_plugins` {#2-list-plugins}
+
+返回所有已安装插件及其服务商实例的**零凭据脱敏清单**，方便 AI 助手在调用 [`configure_route`](#6-configure-route) 时查找合法的 `plugin_id` 与 `provider_id`，绝不暴露服务商 API URL、签名令牌、用户名或密码。
+
+#### 参数说明
+无参数（传入空对象 `{}`）。
+
+#### 返回示例
+
+```json
+{
+  "plugins": [
+    {
+      "id": "link-rewrite",
+      "name": "Link Rewrite (YOURLS)",
+      "version": "0.3.0",
+      "api_version": "1",
+      "enabled": true,
+      "hooks": ["on_render"],
+      "instances": [
+        {
+          "id": 1,
+          "name": "自建短链 sho.rt",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### 3. `inspect_failed_deliveries` {#3-inspect-failed-deliveries}
 
 查看发件箱中处于死信（`dead_letter`）、重试等待（`retrying`）、配额顺延（`deferred`）或排队中（`queued`）的任务详情与错误诊断日志，用于排查投递异常。
 
@@ -146,7 +186,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ---
 
-### 3. `preview_feed_latest` {#3-preview-feed-latest}
+### 4. `preview_feed_latest` {#4-preview-feed-latest}
 
 实时拉取并解析指定订阅源 URL（或已添加的 `feed_id`）的**最新最多 10 篇文章**（试抓结果不会写入数据库）。支持同时测试开启网页全文提取（`fetch_full_content`，会对前 3 篇执行实时正文提取）的效果，也可以传入关键词或正则表达式测试过滤规则的命中情况。
 
@@ -178,7 +218,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 > [!WARNING]
 > 若使用 `readonly` 令牌调用以下 6 个工具，服务端会拒绝执行并返回权限不足（`insufficient_scope`）错误。
 
-### 4. `manage_feed` {#4-manage-feed}
+### 5. `manage_feed` {#5-manage-feed}
 
 新增、修改、暂停、恢复、清除缓存或删除订阅源。当执行 `"add"` 新增订阅源时，创建后会立即触发一次首次拉取（默认启用 `silent_init: true` 静默记录存量历史文章，可通过设置 `push_latest_one: true` 立即推送最新 1 篇）。
 
@@ -209,7 +249,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ---
 
-### 5. `configure_route` {#5-configure-route}
+### 6. `configure_route` {#6-configure-route}
 
 创建、更新或删除投递路由规则。
 
@@ -237,13 +277,14 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 | `timezone` | `string` | 否 | `null` | 可选的路由级 IANA 时区（如 `"Asia/Shanghai"`；在 `"update"` 时传 `""` 可清空并回退继承系统时区），同时控制推送窗口、SMTP 文章时间与 Telegram 富文本页脚时间。 |
 | `active_windows` | `{start, end}[]` | 否 | `[]` | **路由时区**（默认继承系统时区）下的每日投递窗口，采用夏令时（DST）安全边界，如 `[{"start":"08:00","end":"22:00"}]`。`end` 早于 `start` 表示跨午夜；仅 `00:00`–`00:00`（或 `[]`）表示全天，其余 `start == end` 窗口将返回校验错误。 |
 | `active_weekdays` | `integer[]` | 否 | `[]` | 允许投递的星期，`1`（周一）到 `7`（周日），`[]` 表示每天。 |
+| `plugins` | `Record<string, object>` | 否 | `{}` | 按插件 ID 组织的路由级插件配置（如 `{"link-rewrite": {"provider_id": 1}}`）。保存前会校验插件及服务商实例存在；传入 `{}` 或 `{"link-rewrite": {"provider_id": null}}` 可解绑。可通过 [`list_plugins`](#2-list-plugins) 查询可用 ID。 |
 | `enabled` | `bool` | 否 | `true` | 是否启用该路由规则。 |
 
 窗口或星期之外产生的任务仍会入队，并在下一个窗口开始时投递。执行 `"update"` 更换目标目的地时，会在同一事务内重指 `queued` / `deferred` / `retrying` 任务并清空断点、重置尝试次数（进行中的 `delivering` 任务不受影响）；修改 `active_windows`、`active_weekdays` 或 `timezone` 时，立即将 `queued` / `deferred` 任务的 `next_attempt_at` 重置为当前时间并唤醒发件箱。
 
 ---
 
-### 6. `reset_and_poll_feed` {#6-reset-and-poll-feed}
+### 7. `reset_and_poll_feed` {#7-reset-and-poll-feed}
 
 当某个订阅源因为上游站点临时故障进入退避（`backoff`）或连续失败 15 次进入熔断暂停（`circuit_open`）状态时，调用此工具可重置其连续失败计数、恢复为 `active` 状态，并忽略缓存头立即执行一次拉取。
 
@@ -267,7 +308,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ---
 
-### 7. `retry_dead_tasks` {#7-retry-dead-tasks}
+### 8. `retry_dead_tasks` {#8-retry-dead-tasks}
 
 将处于失败死信（`dead_letter`）状态（或指定任务 ID 列表中的待重试/顺延状态）的投递任务重新设为排队状态（`queued`），清零已尝试次数并立即通知后台发件箱重投。
 
@@ -288,7 +329,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ---
 
-### 8. `manage_outbox_queue` {#8-manage-outbox-queue}
+### 9. `manage_outbox_queue` {#9-manage-outbox-queue}
 
 查看或修改全局投递队列状态。暂停期间订阅源仍会轮询、任务持续累积；恢复后所有订阅源中到期的任务按文章发布时间（缺失时按发现时间）从旧到新投递。
 
@@ -311,7 +352,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ---
 
-### 9. `test_push_feed_entry` {#9-test-push-feed-entry}
+### 10. `test_push_feed_entry` {#10-test-push-feed-entry}
 
 调试推送：实时抓取一条订阅源文章并向指定授信目的地投递一次。它是**无状态**的：不写入指纹、不进入队列，也不使用路由过滤、时间窗口或配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。下游投递失败时返回诊断结果，而不是抛出错误。
 

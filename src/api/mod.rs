@@ -5,6 +5,7 @@ pub mod account;
 pub mod auth;
 pub mod dto;
 pub mod handlers;
+pub mod public;
 pub mod spa;
 
 use axum::Router;
@@ -20,7 +21,7 @@ use crate::crypto::{MasterKey, hash_password};
 use crate::db::Database;
 use crate::db::models::{
     SETTING_ADMIN_PASSWORD_HASH, SETTING_ADMIN_USERNAME, SETTING_LOCALE,
-    SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE,
+    SETTING_OUTBOUND_PROXY_URL, SETTING_PUBLIC_URL, SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE,
 };
 use crate::error::AppResult;
 use crate::ingest::IngestEngine;
@@ -89,7 +90,16 @@ pub fn build_api_only_router(state: AppState) -> Router {
         .route("/api/v1/auth/setup", post(auth::auth_setup))
         .route("/api/v1/auth/login", post(auth::auth_login))
         .route("/api/v1/auth/login/2fa", post(auth::auth_login_2fa))
-        .route("/api/v1/auth/logout", post(auth::auth_logout));
+        .route("/api/v1/auth/logout", post(auth::auth_logout))
+        // Public SMTP compliance endpoints (RFC 8058 unsubscribe + double opt-in confirmation)
+        .route(
+            "/u/{token}",
+            get(public::get_unsubscribe_page).post(public::post_unsubscribe),
+        )
+        .route(
+            "/v/{token}",
+            get(public::get_verify_page).post(public::post_verify),
+        );
 
     let protected_routes = Router::new()
         // Overview & Maintenance
@@ -146,6 +156,47 @@ pub fn build_api_only_router(state: AppState) -> Router {
         .route(
             "/api/v1/destinations/{id}/test",
             post(handlers::test_destination),
+        )
+        // SMTP Per-Recipient Compliance
+        .route(
+            "/api/v1/destinations/{id}/recipients",
+            get(handlers::list_destination_recipients),
+        )
+        .route(
+            "/api/v1/destinations/{id}/recipients/{rid}/send-verification",
+            post(handlers::send_recipient_verification),
+        )
+        .route(
+            "/api/v1/destinations/{id}/recipients/{rid}/verify",
+            post(handlers::verify_recipient_code),
+        )
+        .route(
+            "/api/v1/destinations/{id}/recipients/{rid}/reactivate",
+            post(handlers::reactivate_recipient),
+        )
+        .route(
+            "/api/v1/destinations/{id}/recipients/{rid}/unsubscribe",
+            post(handlers::unsubscribe_recipient_admin),
+        )
+        // Plugins & Marketplace
+        .route("/api/v1/plugins", get(handlers::list_plugins))
+        .route("/api/v1/plugins/market", get(handlers::get_plugin_market))
+        .route("/api/v1/plugins/{id}", patch(handlers::update_plugin))
+        .route(
+            "/api/v1/plugins/{id}/instances",
+            get(handlers::list_plugin_instances).post(handlers::create_plugin_instance),
+        )
+        .route(
+            "/api/v1/plugins/{id}/instances/{iid}",
+            patch(handlers::update_plugin_instance).delete(handlers::delete_plugin_instance),
+        )
+        .route(
+            "/api/v1/plugins/{id}/instances/{iid}/test",
+            post(handlers::test_plugin_instance),
+        )
+        .route(
+            "/api/v1/plugins/{id}/instances/{iid}/cache",
+            delete(handlers::clear_plugin_instance_cache),
         )
         // Routes
         .route(
@@ -239,6 +290,11 @@ pub async fn bootstrap_env_settings(config: &AppConfig, db: &Database) -> AppRes
             .clone()
             .unwrap_or_else(|| DEFAULT_TIMEZONE.to_string());
         db.set_setting_typed(SETTING_TIMEZONE, &tz).await?;
+    }
+    if let Some(ref public_url) = config.public_url
+        && db.get_setting(SETTING_PUBLIC_URL).await?.is_none()
+    {
+        db.set_setting_typed(SETTING_PUBLIC_URL, public_url).await?;
     }
     if config.reset_2fa {
         account::clear_totp_state_db(db).await?;

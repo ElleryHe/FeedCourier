@@ -1,10 +1,16 @@
 ---
-description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, channel_destinations, routes, delivery_tasks, delivery_quota_ledger, sessions, mcp_tokens, and system_settings."
+description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, channel_destinations, smtp_recipients, plugins, plugin_instances, plugin_link_cache, routes, delivery_tasks, delivery_quota_ledger, sessions, mcp_tokens, and system_settings."
 ---
 
 # SQLite Database Schema
 
-FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) and [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql) and run automatically on startup. When upgrading an existing `v0.1.x` database, `Database::connect` first creates a pure `v0.1.x` online `VACUUM INTO` snapshot at `<DATA_DIR>/pre-v0.2.0-backup.db` (or `pre-v0.2.0-backup-<timestamp>.db` if a backup already exists) **before** `0002_channel_destinations.sql` executes, followed by the atomic Rust migration hook `Database::migrate_channels_to_v2`. All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and relational business foreign keys enforce **`ON DELETE CASCADE`** (while `delivery_quota_ledger` intentionally omits foreign keys so deletions never clear quota usage).
+FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql), [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql), and [`migrations/0003_plugins_and_smtp_compliance.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0003_plugins_and_smtp_compliance.sql) and run automatically on startup.
+
+Before applying major DDL migrations against an existing database, `Database::connect` captures a pure pre-DDL online `VACUUM INTO` snapshot without overwriting prior backups (appending a UTC timestamp and collision suffix if the file or companion `-wal`/`-shm` sidecars exist, and cleaning up residual sidecar files afterward):
+- Upgrading `v0.1.x` → `v0.2.0+`: writes `<DATA_DIR>/pre-v0.2.0-backup.db` before `0002_channel_destinations.sql`, followed by `Database::migrate_channels_to_v2`.
+- Upgrading `v0.2.x` → `v0.3.0`: writes `<DATA_DIR>/pre-v0.3.0-backup.db` before `0003_plugins_and_smtp_compliance.sql`, followed by the idempotent startup backfill `Database::backfill_legacy_smtp_recipients`.
+
+All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and relational business foreign keys enforce **`ON DELETE CASCADE`** (while `delivery_quota_ledger` intentionally omits foreign keys so deletions never clear quota usage).
 
 ---
 
@@ -14,12 +20,15 @@ FeedCourier stores all persistent state in a single SQLite `WAL` database at `<D
 erDiagram
     feeds ||--o{ entries : "feed_id (ON DELETE CASCADE)"
     channels ||--o{ channel_destinations : "channel_id (ON DELETE CASCADE)"
+    channel_destinations ||--o{ smtp_recipients : "destination_id (ON DELETE CASCADE)"
     channels ||--o{ routes : "channel_id (ON DELETE CASCADE)"
     channel_destinations ||--o{ routes : "destination_id (ON DELETE CASCADE)"
     routes ||--o{ delivery_tasks : "route_id (ON DELETE CASCADE)"
     channels ||--o{ delivery_tasks : "channel_id (ON DELETE CASCADE)"
     channel_destinations ||--o{ delivery_tasks : "destination_id (ON DELETE CASCADE)"
     entries ||--o{ delivery_tasks : "entry_id (ON DELETE CASCADE)"
+    plugins ||--o{ plugin_instances : "plugin_id (ON DELETE CASCADE)"
+    plugin_instances ||--o{ plugin_link_cache : "instance_id (ON DELETE CASCADE)"
 ```
 
 ---
@@ -145,7 +154,7 @@ Binds feed IDs or tags to a target `destination_id` (alongside its parent `chann
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of case-insensitive excluded keywords. |
 | `include_regex` | `TEXT` | `NULL` | Optional regular expression that must match. |
 | `exclude_regex` | `TEXT` | `NULL` | Optional regular expression that rejects matching entries. |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `timezone` (optional per-route IANA timezone override inheriting `system_settings.timezone`), `active_windows` (`[{start, end}]`, `HH:MM` in the route timezone), and `active_weekdays` (`1` = Mon … `7` = Sun). |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `timezone` (optional per-route IANA timezone override inheriting `system_settings.timezone`), `active_windows` (`[{start, end}]`, `HH:MM` in the route timezone), `active_weekdays` (`1` = Mon … `7` = Sun), and `plugins` (`{ "<plugin_id>": { ... } }`). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when disabled. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
@@ -168,7 +177,7 @@ Tracks every `Entry × Route` delivery lifecycle.
 | `entry_id` | `INTEGER` | `NOT NULL` | Foreign key to `entries(id) ON DELETE CASCADE`. |
 | `status` | `TEXT` | `NOT NULL DEFAULT 'queued'` | `'queued'` (pending), `'delivering'` (leased), `'delivered'`, `'retrying'` (failed/backoff), `'deferred'`, or `'dead_letter'`. |
 | `lease_until` | `INTEGER` | `NULL` | Worker lease expiration timestamp while `status = 'delivering'`. |
-| `checkpoint_json` | `TEXT` | `NULL` | Serialized `DeliveryCheckpoint` (`smtp` / `telegram` / `notion`). |
+| `checkpoint_json` | `TEXT` | `NULL` | Serialized `DeliveryCheckpoint` (`smtp { message_id, sent_recipients }` / `telegram` / `notion`). |
 | `attempt_count` | `INTEGER` | `NOT NULL DEFAULT 0` | Number of delivery attempts consumed (`dead_letter` at `6`). |
 | `next_attempt_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Earliest timestamp when the task may be claimed. |
 | `last_status_code` | `INTEGER` | `NULL` | Downstream HTTP or SMTP status code from the last attempt. |
@@ -219,8 +228,80 @@ Added in `migrations/0002_channel_destinations.sql` to decouple rolling 1-hour /
   | `timezone` | Default IANA system timezone inherited by routes (seeded from `TIMEZONE` / `TZ`, default `America/Los_Angeles`). |
   | `outbox_queue` | Global queue pause state (`paused`, optional `resume_at`). |
   | `channel_model_version` | Integer schema marker (`2` once the v0.2.0 two-layer Account + Destinations migration completes; prevents re-running migration on subsequent restarts). |
+  | `smtp_recipient_model_version` | Integer marker (`1` once the v0.3.0 legacy SMTP recipient backfill completes idempotently). |
+  | `public_url` | Optional public base URL (`https://...`) for RFC 8058 `/u/{token}` and `/v/{token}` links (overridden whenever `PUBLIC_URL` is set in the environment). |
   | `locale` | **Legacy** fallback delivery language for routes without `options.locale`. |
   | `outbound_proxy_url` | Global outbound proxy URL. |
   | `ssrf_allowlist` | SSRF CIDR / hostname allowlist entries. |
 - **`mcp_tokens`** (`id`, `name`, `token_hash UNIQUE`, `token_prefix`, `scope CHECK (scope IN ('readonly', 'admin'))`, `last_used_at`, `created_at`): Stores SHA-256 digests of issued MCP Bearer tokens.
 - **`sessions`** (`token_hash TEXT PRIMARY KEY`, `expires_at INTEGER`, `created_at INTEGER`): Stores SHA-256 digests of active WebUI `fc_session` cookies (`30`-day TTL, `2,592,000` seconds).
+
+---
+
+### 7. `plugins`, `plugin_instances` & `plugin_link_cache` (`0003_plugins_and_smtp_compliance.sql`)
+
+Added in `v0.3.0` to store plugin enablement, encrypted provider configurations, and persistent short-link caches:
+
+#### `plugins`
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `TEXT` | `PRIMARY KEY NOT NULL` | Canonical plugin identifier (e.g., `'link-rewrite'`). |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | Global enable toggle (disabling skips hooks while keeping route configs). |
+| `installed_version` | `TEXT` | `NOT NULL` | Installed plugin SemVer version. |
+| `settings_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Optional plugin-wide JSON settings. |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Timestamps. |
+
+#### `plugin_instances`
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | Unique provider instance ID referenced by `routes.options_json -> $.plugins.<id>.provider_id`. |
+| `plugin_id` | `TEXT` | `NOT NULL REFERENCES plugins(id) ON DELETE CASCADE` | Owning plugin ID. |
+| `name` | `TEXT` | `NOT NULL` | Human-readable provider label (shown in WebUI and secret-free MCP `list_plugins`). |
+| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 AEAD ciphertext of provider settings (e.g., YOURLS `api_url`, `auth_mode`, `signature`/`password`, `exclude_domains`, `strict_mode`, `pass_title`, `use_proxy`). |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | Provider instance toggle. |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Timestamps. |
+
+- **Index:** `idx_plugin_instances_plugin_id ON plugin_instances (plugin_id)`
+
+#### `plugin_link_cache`
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `instance_id` | `INTEGER` | `NOT NULL REFERENCES plugin_instances(id) ON DELETE CASCADE` | Provider instance ID (part of composite PK). |
+| `long_url_sha256` | `TEXT` | `NOT NULL` | 64-char SHA-256 hex digest of the original URL (part of composite PK). |
+| `short_url` | `TEXT` | `NOT NULL` | Resolved short URL returned by the provider. |
+| `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Cache insertion timestamp. |
+| `last_used_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Refreshed on cache hit; rows unused for > **90 days** are pruned by background maintenance. |
+
+- **Primary Key:** `(instance_id, long_url_sha256)`
+- **Index:** `idx_plugin_link_cache_last_used ON plugin_link_cache (last_used_at)`
+
+---
+
+### 8. `smtp_recipients` (`0003_plugins_and_smtp_compliance.sql`)
+
+Tracks per-recipient double opt-in verification, consent audit, unsubscribe, and synchronous hard-bounce state without storing plaintext email addresses in the table (plaintext addresses live exclusively inside `channel_destinations.encrypted_config`):
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | Unique recipient record ID. |
+| `destination_id` | `INTEGER` | `NOT NULL REFERENCES channel_destinations(id) ON DELETE CASCADE` | Parent SMTP destination ID. |
+| `address_hmac` | `TEXT` | `NOT NULL` | Keyed HMAC-SHA256 hex digest (`HKDF(master_key, "fc-smtp-addr-v1")`) of the normalized lowercase email address. |
+| `status` | `TEXT` | `NOT NULL CHECK (IN ('unverified','pending','verified','unsubscribed','bounced'))` | Current delivery eligibility status. |
+| `code_sha256` | `TEXT` | `NULL` | SHA-256 hex digest of the active 6-digit verification code. |
+| `code_expires_at` | `INTEGER` | `NULL` | Expiration timestamp (`now + 1800s` / 30 minutes). |
+| `code_attempts` | `INTEGER` | `NOT NULL DEFAULT 0` | Failed code verification attempts (max `5`). |
+| `last_code_sent_at` | `INTEGER` | `NULL` | Timestamp of last verification email (enforces 60s cooldown). |
+| `codes_sent_window_start` | `INTEGER` | `NULL` | Rolling 1-hour window start for verification send throttling. |
+| `codes_sent_in_window` | `INTEGER` | `NOT NULL DEFAULT 0` | Verification emails sent in current 1-hour window (max `5`). |
+| `consent_method` | `TEXT` | `NULL` | Audit trail: `'code'`, `'link'`, or `'legacy'` (upgrade backfill). |
+| `consented_at` | `INTEGER` | `NULL` | Timestamp when consent was recorded. |
+| `revoked_method` | `TEXT` | `NULL` | Revocation reason: `'one_click'`, `'link'`, `'admin'`, or `'hard_bounce'`. |
+| `revoked_at` | `INTEGER` | `NULL` | Timestamp when revoked or hard-bounced. |
+| `bounce_diagnostic` | `TEXT` | `NULL` | SMTP 5xx diagnostic text recorded on synchronous hard bounce. |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Timestamps. |
+
+- **Unique Constraint:** `UNIQUE (destination_id, address_hmac)`
+- **Index:** `idx_smtp_recipients_destination_status ON smtp_recipients (destination_id, status)`

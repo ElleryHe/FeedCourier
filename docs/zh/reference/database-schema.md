@@ -1,10 +1,16 @@
 ---
-description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、channel_destinations、routes、delivery_tasks、delivery_quota_ledger、sessions、mcp_tokens 与 system_settings。"
+description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、channel_destinations、smtp_recipients、plugins、plugin_instances、plugin_link_cache、routes、delivery_tasks、delivery_quota_ledger、sessions、mcp_tokens 与 system_settings。"
 ---
 
 # SQLite 数据库表结构参考
 
-FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) 与 [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql)。升级存量 `v0.1.x` 数据库时，`Database::connect` 会**先于 `0002_channel_destinations.sql` 执行** `VACUUM INTO` 生成纯 `v0.1.x` 快照 `<DATA_DIR>/pre-v0.2.0-backup.db`（若已存在则写为带 UTC 时间戳的 `pre-v0.2.0-backup-<timestamp>.db`，不覆盖旧备份），随后再由启动钩子 `Database::migrate_channels_to_v2` 在单事务内完成通道拆分合并。所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，业务表外键关联均启用 **`ON DELETE CASCADE`** 级联清理（`delivery_quota_ledger` 刻意不设外键，确保删除操作不会清空配额计数）。
+FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql)、[`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql) 与 [`migrations/0003_plugins_and_smtp_compliance.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0003_plugins_and_smtp_compliance.sql)。
+
+对存量数据库执行重大 DDL 迁移前，`Database::connect` 会**先于 SQL 迁移执行** `VACUUM INTO` 生成在线热备快照，并在检测目标文件或伴生 `-wal` / `-shm` 文件冲突时自动追加 UTC 时间戳与序号后缀、备份完成后清理残留 sidecar 文件：
+- 升级 `v0.1.x` → `v0.2.0+`：先生成 `<DATA_DIR>/pre-v0.2.0-backup.db`，再执行 `0002_channel_destinations.sql` 与单事务迁移钩子 `Database::migrate_channels_to_v2`。
+- 升级 `v0.2.x` → `v0.3.0`：先生成 `<DATA_DIR>/pre-v0.3.0-backup.db`，再执行 `0003_plugins_and_smtp_compliance.sql` 与幂等启动回填 `Database::backfill_legacy_smtp_recipients`。
+
+所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，业务表外键关联均启用 **`ON DELETE CASCADE`** 级联清理（`delivery_quota_ledger` 刻意不设外键，确保删除操作不会清空配额计数）。
 
 ---
 
@@ -14,12 +20,15 @@ FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<
 erDiagram
     feeds ||--o{ entries : "1 : N (ON DELETE CASCADE)"
     channels ||--o{ channel_destinations : "1 : N (ON DELETE CASCADE)"
+    channel_destinations ||--o{ smtp_recipients : "1 : N (ON DELETE CASCADE)"
     channels ||--o{ routes : "1 : N (ON DELETE CASCADE)"
     channel_destinations ||--o{ routes : "1 : N (ON DELETE CASCADE)"
     routes ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
     channels ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
     channel_destinations ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
     entries ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
+    plugins ||--o{ plugin_instances : "1 : N (ON DELETE CASCADE)"
+    plugin_instances ||--o{ plugin_link_cache : "1 : N (ON DELETE CASCADE)"
 
     feeds {
         INTEGER id PK
@@ -210,7 +219,7 @@ erDiagram
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | 排除关键词数组 JSON（命中任意一词即排除）。 |
 | `include_regex` | `TEXT` | `NULL` | 包含正则表达式（非空时必须匹配）。 |
 | `exclude_regex` | `TEXT` | `NULL` | 排除正则表达式（匹配即排除）。 |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 路由选项 JSON（`RouteOptions`）：`telegram_mode`、`link_preview`、`locale`（路由投递语言）、`timezone`（可选路由级 IANA 时区覆盖，留空继承 `system_settings.timezone`）、`active_windows`（`[{start, end}]`，路由时区下的 `HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日）。 |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 路由选项 JSON（`RouteOptions`）：`telegram_mode`、`link_preview`、`locale`（路由投递语言）、`timezone`（可选路由级 IANA 时区覆盖，留空继承 `system_settings.timezone`）、`active_windows`（`[{start, end}]`，路由时区下的 `HH:MM` 区间）、`active_weekdays`（`1` = 周一 … `7` = 周日）以及 `plugins`（`{ "<plugin_id>": { ... } }`）。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 路由启用开关。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
@@ -231,7 +240,7 @@ erDiagram
 | `entry_id` | `INTEGER` | `NOT NULL REFERENCES entries(id) ON DELETE CASCADE` | 关联的条目 ID。受 `UNIQUE (route_id, entry_id)` 唯一约束保护。 |
 | `status` | `TEXT` | `NOT NULL DEFAULT 'queued'` | 状态机枚举：`'queued'`（待处理）、`'delivering'`（租约投递中）、`'delivered'`（已送达）、`'retrying'`（失败重试中）、`'deferred'`（流控/配额延后）、`'dead_letter'`（死信）。 |
 | `lease_until` | `INTEGER` | `NULL` | 当 `status = 'delivering'` 时的 Worker 租约过期时间戳（过期后允许被重新领取）。 |
-| `checkpoint_json` | `TEXT` | `NULL` | `DeliveryCheckpoint` 序列化 JSON（保存 SMTP `message_id`、Telegram `next_batch_offset` 或 Notion `create_initiated` / `async_task_id` / `page_id`）。 |
+| `checkpoint_json` | `TEXT` | `NULL` | `DeliveryCheckpoint` 序列化 JSON（保存 SMTP `message_id` / `sent_recipients`、Telegram `next_batch_offset` 或 Notion `create_initiated` / `async_task_id` / `page_id`）。 |
 | `attempt_count` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (>= 0)` | 已尝试发送次数（默认达到 6 次临时错误后转入 `'dead_letter'`）。 |
 | `next_attempt_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 下次可被调度领取的时间戳。 |
 | `last_status_code` | `INTEGER` | `NULL` | 下游最近一次返回的 HTTP 状态码或 SMTP 响应码。 |
@@ -272,7 +281,7 @@ erDiagram
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `key` | `TEXT` | `PRIMARY KEY NOT NULL` | 配置项键名：<br>• `'admin_username'`：管理员用户名（默认 `Courier`，每次启动时被 `ADMIN_USERNAME` 覆盖）<br>• `'admin_password_hash'`：Argon2id PHC 管理员密码哈希<br>• `'admin_totp_secret'`：已生效的 TOTP 密钥（ChaCha20-Poly1305 加密后 Base64 存储；关闭 2FA 或 `RESET_2FA=true` 时删除）<br>• `'admin_totp_pending'`：启用 2FA 过程中等待首次验证码确认的加密密钥<br>• `'admin_totp_last_step'`：最近一次已接受的 TOTP 时间步（重放防护）<br>• `'admin_recovery_hashes'`：未使用恢复码的 SHA-256 哈希<br>• `'timezone'`：供路由默认继承的 IANA 系统时区（首次由 `TIMEZONE` / `TZ` 写入，默认 `America/Los_Angeles`）<br>• `'outbox_queue'`：全局队列暂停状态（`paused`、可选 `resume_at`）<br>• `'channel_model_version'`：通道数据模型版本号（完成 v0.2.0 双层账号/目的地迁移后写入 `2`，防止后续重启重复迁移）<br>• `'locale'`：**旧版**兼容回退投递语言（仅用于未设置 `options.locale` 的路由）<br>• `'outbound_proxy_url'`：全局出站代理地址<br>• `'ssrf_allowlist'`：内网 SSRF 白名单字符串数组 |
+| `key` | `TEXT` | `PRIMARY KEY NOT NULL` | 配置项键名：<br>• `'admin_username'`：管理员用户名（默认 `Courier`，每次启动时被 `ADMIN_USERNAME` 覆盖）<br>• `'admin_password_hash'`：Argon2id PHC 管理员密码哈希<br>• `'admin_totp_secret'`：已生效的 TOTP 密钥（ChaCha20-Poly1305 加密后 Base64 存储；关闭 2FA 或 `RESET_2FA=true` 时删除）<br>• `'admin_totp_pending'`：启用 2FA 过程中等待首次验证码确认的加密密钥<br>• `'admin_totp_last_step'`：最近一次已接受的 TOTP 时间步（重放防护）<br>• `'admin_recovery_hashes'`：未使用恢复码的 SHA-256 哈希<br>• `'timezone'`：供路由默认继承的 IANA 系统时区（首次由 `TIMEZONE` / `TZ` 写入，默认 `America/Los_Angeles`）<br>• `'outbox_queue'`：全局队列暂停状态（`paused`、可选 `resume_at`）<br>• `'channel_model_version'`：通道数据模型版本号（完成 v0.2.0 双层账号/目的地迁移后写入 `2`）<br>• `'smtp_recipient_model_version'`：SMTP 收件人合规回填标记（完成 v0.3.0 存量回填后写入 `1`）<br>• `'public_url'`：可选公网根地址（供 `/u/{token}` 与 `/v/{token}` 使用；设置环境变量 `PUBLIC_URL` 时优先以环境变量为准）<br>• `'locale'`：**旧版**兼容回退投递语言（仅用于未设置 `options.locale` 的路由）<br>• `'outbound_proxy_url'`：全局出站代理地址<br>• `'ssrf_allowlist'`：内网 SSRF 白名单字符串数组 |
 | `value_json` | `TEXT` | `NOT NULL` | JSON 序列化后的配置值。 |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 最后修改时间戳。 |
 
@@ -295,3 +304,73 @@ erDiagram
 | `token_hash` | `TEXT` | `PRIMARY KEY NOT NULL` | `fc_session` Cookie 随机令牌的 SHA-256 哈希。 |
 | `expires_at` | `INTEGER` | `NOT NULL` | 会话过期时间戳（默认签发后 30 天 / `2,592,000` 秒，由后台维护协程定期清理过期行）。 |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 登录时间戳。 |
+
+---
+
+## 7. 插件表族（`plugins`、`plugin_instances`、`plugin_link_cache`）
+
+在 `migrations/0003_plugins_and_smtp_compliance.sql` 中新增，用于保存插件启停状态、加密服务商凭据与短链持久化缓存：
+
+### `plugins`（已安装插件表）
+
+| 字段名 | 类型 | 约束与默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | `TEXT` | `PRIMARY KEY NOT NULL` | 插件唯一标识（如 `'link-rewrite'`）。 |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 插件全局启用开关（禁用时跳过钩子并保留路由配置）。 |
+| `installed_version` | `TEXT` | `NOT NULL` | 已安装插件的语义化版本号。 |
+| `settings_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 可选插件级 JSON 配置。 |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
+
+### `plugin_instances`（加密插件服务商实例表）
+
+| 字段名 | 类型 | 约束与默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 服务商实例 ID（供 `routes.options_json -> $.plugins.<id>.provider_id` 引用）。 |
+| `plugin_id` | `TEXT` | `NOT NULL REFERENCES plugins(id) ON DELETE CASCADE` | 所属插件 ID。 |
+| `name` | `TEXT` | `NOT NULL` | 服务商显示名称（用于 WebUI 与零凭据 MCP `list_plugins`）。 |
+| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的服务商配置（如 YOURLS `api_url`、`auth_mode`、`signature`/`password`、`exclude_domains`、`strict_mode`、`pass_title`、`use_proxy`）。 |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 服务商实例启用开关。 |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
+
+- **索引**：`idx_plugin_instances_plugin_id ON plugin_instances (plugin_id)`
+
+### `plugin_link_cache`（短链缓存表）
+
+| 字段名 | 类型 | 约束与默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `instance_id` | `INTEGER` | `NOT NULL REFERENCES plugin_instances(id) ON DELETE CASCADE` | 所属服务商实例 ID（复合主键）。 |
+| `long_url_sha256` | `TEXT` | `NOT NULL` | 原始长链的 64 位 SHA-256 十六进制摘要（复合主键）。 |
+| `short_url` | `TEXT` | `NOT NULL` | 服务商返回的短链。 |
+| `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 首次缓存时间戳。 |
+| `last_used_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 最近命中时间戳；超过 **90 天**未使用的记录由后台维护任务自动清理。 |
+
+- **主键**：`PRIMARY KEY (instance_id, long_url_sha256)`
+- **索引**：`idx_plugin_link_cache_last_used ON plugin_link_cache (last_used_at)`
+
+---
+
+## 8. `smtp_recipients`（SMTP 按收件人合规状态表）
+
+在 `migrations/0003_plugins_and_smtp_compliance.sql` 中新增，记录每个 SMTP 收件地址的验证、授权审计、退订与同步硬退信状态；表内**不存任何明文邮箱**（明文地址仅存于 `channel_destinations.encrypted_config`）：
+
+| 字段名 | 类型 | 约束与默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 收件人记录主键 ID。 |
+| `destination_id` | `INTEGER` | `NOT NULL REFERENCES channel_destinations(id) ON DELETE CASCADE` | 所属 SMTP 目的地 ID。 |
+| `address_hmac` | `TEXT` | `NOT NULL` | 小写化邮箱地址经 HKDF 派生子密钥（`fc-smtp-addr-v1`）计算的 HMAC-SHA256 十六进制摘要。 |
+| `status` | `TEXT` | `NOT NULL CHECK (IN ('unverified','pending','verified','unsubscribed','bounced'))` | 收件人合规投递状态。 |
+| `code_sha256` | `TEXT` | `NULL` | 当前有效 6 位验证码的 SHA-256 哈希。 |
+| `code_expires_at` | `INTEGER` | `NULL` | 验证码过期时间戳（`now + 1800` 秒 / 30 分钟）。 |
+| `code_attempts` | `INTEGER` | `NOT NULL DEFAULT 0` | 已输错次数（上限 `5`）。 |
+| `last_code_sent_at` | `INTEGER` | `NULL` | 最近一次发送验证邮件的时间戳（60 秒冷却）。 |
+| `codes_sent_window_start` | `INTEGER` | `NULL` | 每小时发送频率窗口起点。 |
+| `codes_sent_in_window` | `INTEGER` | `NOT NULL DEFAULT 0` | 当前小时窗口内已发验证邮件数（上限 `5`）。 |
+| `consent_method` | `TEXT` | `NULL` | 授权方式审计：`'code'`、`'link'` 或 `'legacy'`（存量升级回填）。 |
+| `consented_at` | `INTEGER` | `NULL` | 完成验证的时间戳。 |
+| `revoked_method` | `TEXT` | `NULL` | 撤销原因：`'one_click'`、`'link'`、`'admin'` 或 `'hard_bounce'`。 |
+| `revoked_at` | `INTEGER` | `NULL` | 退订或硬退信时间戳。 |
+| `bounce_diagnostic` | `TEXT` | `NULL` | 同步 SMTP 5xx 硬退信诊断原文。 |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
+
+- **唯一约束**：`UNIQUE (destination_id, address_hmac)`
+- **索引**：`idx_smtp_recipients_destination_status ON smtp_recipients (destination_id, status)`

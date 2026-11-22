@@ -35,11 +35,19 @@ use feedcourier::error::AppResult;
 #[derive(Default)]
 struct RecordingCheckpointSink {
     saved: Mutex<Vec<DeliveryCheckpoint>>,
+    updated_destinations: Mutex<Vec<DestinationConfig>>,
 }
 
 impl RecordingCheckpointSink {
     fn history(&self) -> Vec<DeliveryCheckpoint> {
         self.saved.lock().expect("checkpoint mutex").clone()
+    }
+
+    fn updated_destinations(&self) -> Vec<DestinationConfig> {
+        self.updated_destinations
+            .lock()
+            .expect("updated_destinations mutex")
+            .clone()
     }
 }
 
@@ -50,6 +58,14 @@ impl CheckpointSink for RecordingCheckpointSink {
             .lock()
             .expect("checkpoint mutex")
             .push(checkpoint.clone());
+        Ok(())
+    }
+
+    async fn update_destination_config(&self, updated: &DestinationConfig) -> AppResult<()> {
+        self.updated_destinations
+            .lock()
+            .expect("updated_destinations mutex")
+            .push(updated.clone());
         Ok(())
     }
 }
@@ -386,9 +402,10 @@ async fn init_database_sends_2026_03_11_and_nests_7_columns_in_initial_data_sour
             let props = body["initial_data_source"]["properties"]
                 .as_object()
                 .expect("initial_data_source.properties object");
-            assert_eq!(props.len(), 7);
+            assert_eq!(props.len(), 8);
             assert!(props["Title"]["title"].is_object());
             assert!(props["Link"]["url"].is_object());
+            assert!(props["Short URL"]["url"].is_object());
             assert!(props["Source"]["select"]["options"].is_array());
             assert!(props["Published"]["date"].is_object());
             assert_eq!(props["State"]["select"]["options"][0]["name"], "UnRead");
@@ -540,7 +557,7 @@ async fn inspect_schema_resolves_db_to_data_source_maps_name_title_and_patches_m
     assert_eq!(source_check.actual_type.as_deref(), Some("rich_text"));
 
     // Step 2: Patch missing columns (`patch_missing: true`).
-    // Verify PATCH adds ONLY missing columns (`FC-ID`, `Published`, `State`, `Tag`) and NEVER
+    // Verify PATCH adds ONLY missing columns (`FC-ID`, `Short URL`, `Published`, `State`, `Tag`) and NEVER
     // overwrites `Name`/`Title` or the existing mismatched `Source`!
     Mock::given(method("PATCH"))
         .and(path(format!("/v1/data_sources/{ds_id}")))
@@ -548,8 +565,9 @@ async fn inspect_schema_resolves_db_to_data_source_maps_name_title_and_patches_m
         .respond_with(move |req: &Request| {
             let body: Value = serde_json::from_slice(&req.body).expect("patch json");
             let props = body["properties"].as_object().expect("patch properties");
-            assert_eq!(props.len(), 4);
+            assert_eq!(props.len(), 5);
             assert!(props.contains_key("FC-ID"));
+            assert!(props.contains_key("Short URL"));
             assert!(props.contains_key("Published"));
             assert!(props.contains_key("State"));
             assert!(props.contains_key("Tag"));
@@ -568,6 +586,7 @@ async fn inspect_schema_resolves_db_to_data_source_maps_name_title_and_patches_m
                 "properties": {
                     "Name": { "type": "title", "title": {} },
                     "Link": { "type": "url", "url": {} },
+                    "Short URL": { "type": "url", "url": {} },
                     "Source": { "type": "rich_text", "rich_text": {} },
                     "FC-ID": { "type": "rich_text", "rich_text": {} },
                     "Published": { "type": "date", "date": {} },
@@ -594,10 +613,14 @@ async fn inspect_schema_resolves_db_to_data_source_maps_name_title_and_patches_m
     assert!(patched.ready, "ready must be true once Name + FC-ID exist");
     assert_eq!(
         patched.patched_columns,
-        vec!["FC-ID", "Published", "State", "Tag"]
+        vec!["FC-ID", "Short URL", "Published", "State", "Tag"]
     );
     assert_eq!(patched.suggested_mapping.title, "Name");
     assert_eq!(patched.suggested_mapping.fc_id, "FC-ID");
+    assert_eq!(
+        patched.suggested_mapping.short_url.as_deref(),
+        Some("Short URL")
+    );
     assert_eq!(
         patched.suggested_mapping.published.as_deref(),
         Some("Published")
@@ -694,6 +717,8 @@ async fn send_creates_minimalist_v2_page_sanitizes_commas_and_flushes_checkpoint
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&sink),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("send");
@@ -798,6 +823,8 @@ async fn crash_recovery_reconciles_fc_id_with_zero_duplicate_page_creates() {
         timezone: chrono_tz::UTC,
         checkpoint: Some(crashed_checkpoint),
         checkpoint_sink: Some(&sink),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("reconcile send");
@@ -1001,6 +1028,8 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&db_sink),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome1 = sender.send(&ctx1).await.expect("attempt 1");
@@ -1057,6 +1086,8 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
         timezone: chrono_tz::UTC,
         checkpoint: Some(expected_mid_cp),
         checkpoint_sink: Some(&db_sink),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome2 = sender.send(&ctx2).await.expect("attempt 2");
@@ -1110,6 +1141,7 @@ async fn rate_limit_429_triggers_credential_group_cooldown_and_send_test_verifie
                 "Title": { "type": "title" },
                 "FC-ID": { "type": "rich_text" },
                 "Link": { "type": "url" },
+                "Short URL": { "type": "url" },
                 "Source": { "type": "select" },
                 "Published": { "type": "date" },
                 "State": { "type": "select" },
@@ -1134,6 +1166,8 @@ async fn rate_limit_429_triggers_credential_group_cooldown_and_send_test_verifie
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("send 429");
@@ -1198,6 +1232,8 @@ async fn in_trash_page_is_ignored_during_fc_id_reconcile_and_confirmed_page_id_s
             page_id: Some("already-confirmed-page".to_string()),
         }),
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     match sender.send(&already_done_ctx).await.expect("short-circuit") {
         DeliveryOutcome::Delivered { checkpoint, .. } => {
@@ -1259,6 +1295,8 @@ async fn in_trash_page_is_ignored_during_fc_id_reconcile_and_confirmed_page_id_s
             page_id: None,
         }),
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     match sender
         .send(&trashed_ctx)
@@ -1311,6 +1349,8 @@ async fn send_classifies_5xx_as_retry_preserving_create_initiated_and_4xx_as_per
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     match sender_503.send(&ctx_503).await.expect("send 503") {
         DeliveryOutcome::Retry {
@@ -1361,6 +1401,8 @@ async fn send_classifies_5xx_as_retry_preserving_create_initiated_and_4xx_as_per
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     match sender_401.send(&ctx_401).await.expect("send 401") {
         DeliveryOutcome::PermanentFailure {
@@ -1423,6 +1465,8 @@ async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_4
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: Some(&sink),
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         match sender.send(&ctx).await.expect("inline failed outcome") {
             DeliveryOutcome::Retry {
@@ -1506,6 +1550,8 @@ async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_4
                 page_id: None,
             }),
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         match sender.send(&ctx).await.expect("resume failed outcome") {
             DeliveryOutcome::Retry {
@@ -1594,6 +1640,7 @@ async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_4
             .await;
 
         let sender = NotionSender::with_base_url(server.uri(), None).expect("sender");
+        let sink = RecordingCheckpointSink::default();
         let ctx = DeliveryContext {
             task: &fx.task,
             entry: &fx.entry,
@@ -1606,7 +1653,9 @@ async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_4
             destination_config: &fx.destination_config,
             timezone: chrono_tz::UTC,
             checkpoint: None,
-            checkpoint_sink: None,
+            checkpoint_sink: Some(&sink),
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         match sender.send(&ctx).await.expect("fallback send") {
             DeliveryOutcome::Delivered {
@@ -1616,6 +1665,16 @@ async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_4
                 assert_eq!(page_id.as_deref(), Some("resolved-ds-page-1"));
             }
             other => panic!("expected Delivered via database_id fallback, got {other:?}"),
+        }
+
+        // R2-07: Lazy `database_id` -> `data_source_id` resolution must write back via CheckpointSink.
+        let updates = sink.updated_destinations();
+        assert_eq!(updates.len(), 1);
+        match &updates[0] {
+            DestinationConfig::Notion(n) => {
+                assert_eq!(n.data_source_id, real_ds_id);
+            }
+            other => panic!("expected Notion DestinationConfig writeback, got {other:?}"),
         }
     }
 }

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
+### Added
+
+- **Built-In Plugin Framework (Protocol v1) & Marketplace (`src/plugins/`, `migrations/0003_plugins_and_smtp_compliance.sql`, `ElleryHe/FeedCourier-Plugins`)**:
+  - Introduced FeedCourier Plugin Protocol v1 (`api_version: "1"`) with delivery-time `on_render` hooks (and reserved `on_ingest` / `on_delivered` hook contracts for future releases), non-destructive `RenderOverrides` (`content_html`, `primary_link`, `warnings`), per-route plugin configuration stored in `RouteOptions.plugins`, and SQLite tables `plugins`, `plugin_instances` (ChaCha20-Poly1305 encrypted), and `plugin_link_cache` (automatically pruned after 90 days of inactivity).
+  - Added `/api/v1/plugins`, `/api/v1/plugins/{id}`, `/api/v1/plugins/{id}/instances*` (with `409 Conflict` route-reference delete protection, live connectivity tests, and per-provider cache clearing), and `/api/v1/plugins/market` (SSRF-guarded remote index loader with 6-hour in-memory cache, `PLUGIN_INDEX_URL` override, and compiled-in `src/plugins/market_snapshot.json` fallback).
+  - Scaffolded the independent [`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins) registry repository (`schema/manifest.schema.json`, `registry/link-rewrite.json`, zero-dependency Node.js 24 validator/index builder, and GitHub Actions workflows).
+  - Added the WebUI **Plugins** console (Installed + Marketplace tabs, provider CRUD/test/cache controls, schema-driven collapsible route plugin options, route card plugin badges, and amber partial-rewrite warnings in the Outbox view).
+- **First-Party Link Rewrite (YOURLS) Plugin (`src/plugins/link_rewrite.rs`)**:
+  - Added built-in YOURLS link rewriting supporting multiple encrypted provider instances, `signature` (recommended), `timed_signature` (`md5(timestamp + token)`), and `password` authentication modes, duplicate-URL (`code: "error:url"`) handling, `exclude_domains` (`*.example.com` wildcard matching + automatic provider self-host skip), `pass_title`, `use_proxy`, and `strict_mode` (whole-task retry on failure vs. default per-URL graceful degradation with task warnings).
+  - Enforced a 50-URL per-article cap, 4-way concurrency, 5-second per-URL timeout, `64 KiB` response limit, and SQLite short-link caching (`plugin_link_cache`). Strictly rewrites only HTTP/HTTPS `<a href>` and primary links—preserving all media `src` URLs, Telegram `link_preview_options.url`, SMTP compliance links, and Notion's original `Link` column.
+- **SMTP Per-Recipient Compliance, Double Opt-In & RFC 8058 One-Click Unsubscribe (`src/channels/smtp.rs`, `src/api/public.rs`, `src/crypto.rs`)**:
+  - Switched outbox SMTP delivery to individual per-recipient envelopes (single `To:` address, deterministic per-recipient `Message-ID`, 1-second inter-recipient delay with lease renewal, and `sent_recipients` checkpoint resume; quota ledger continues counting 1 per article task).
+  - Added `smtp_recipients` (keyed by HKDF-derived `address_hmac` with zero plaintext emails stored in table) and `/api/v1/destinations/{id}/recipients*` endpoints for manual-trigger double opt-in verification: 6-digit SHA-256 hashed codes (30-minute TTL, max 5 attempts, 60-second resend cooldown, 5/hour cap), optional `/v/{token}` confirmation links when `PUBLIC_URL` is configured, immediate wakeup of deferred tasks upon verification, administrator unsubscribe/reactivate controls, synchronous 5xx hard-bounce marking (`bounced`), and automatic destination pause when all recipients are unsubscribed or bounced.
+  - Added `PUBLIC_URL` (environment variable or WebUI **Settings**), optional CAN-SPAM `sender_identity` on SMTP accounts, RFC 8058 headers (`List-Unsubscribe`, `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, `List-Id: <dest-{id}.{from_domain}>`, `Auto-Submitted: auto-generated`), and unauthenticated `/u/{token}` & `/v/{token}` endpoints registered before SPA fallback.
+  - Added automatic pre-v0.3.0 online `VACUUM INTO` snapshot backup (`<DATA_DIR>/pre-v0.3.0-backup.db`) before migration `0003` and idempotent startup backfill (`backfill_legacy_smtp_recipients`, `status = 'verified'`, `consent_method = 'legacy'`, marked by `system_settings.smtp_recipient_model_version = 1`).
+- **MCP `list_plugins` & Route Plugin Configuration (`src/mcp/tools.rs`)**:
+  - Expanded `/mcp` to **10 tools** by adding `readonly` secret-free `list_plugins` (exposing only plugin/provider IDs, names, hooks, and enabled status), and added `plugins` support to `configure_route` and `list_feeds_status`.
+- **Bilingual Plugins & SMTP Compliance Documentation (`docs/`)**:
+  - Added the **Plugins / 插件** documentation section with a build-time VitePress marketplace loader (`docs/.vitepress/plugins.data.ts`, remote fetch with snapshot fallback), YOURLS setup & `SSRF_ALLOWLIST` guide, Protocol v1 development reference, and Nginx/Caddy reverse-proxy examples exposing only `/u/` and `/v/`.
+
+### Changed
+
+- **Destination Delete Reference Guard (`DELETE /api/v1/destinations/{id}`)**: Deleting a destination still referenced by one or more routes now returns **`409 Conflict`** listing `referencing_routes`, requiring explicit `?cascade=true` to cascade-delete the destination together with its routes.
+- **Notion 8-Column Standard Schema (`Short URL`)**: `POST /api/v1/channels/notion/init-db` now provisions an optional `Short URL` (`url`) property alongside the 7 existing columns so Notion destinations preserve the original article permalink in `Link` while recording shortened URLs from route plugins in `Short URL` when mapped (`inspect-schema` detects and optionally patches it).
+
+### Security
+
+- **Zero-PII HKDF/HMAC Public Compliance Tokens & Read-Only GET Invariant (`src/crypto.rs`, `src/api/public.rs`)**: Derived domain-separated HKDF-SHA256 subkeys (`fc-smtp-addr-v1`, `fc-unsub-v1`, `fc-verify-v1`) with constant-time validation, kept `GET /u/{token}` and `GET /v/{token}` strictly read-only against mail-scanner prefetch, and enforced per-IP sliding-window rate limiting (`30 req / 60s`), `X-Robots-Tag: noindex, nofollow`, strict CSP, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store`.
+- **Plugin SSRF & Secret Isolation (`src/plugins/`)**: Routed all plugin API calls (YOURLS) and remote marketplace index fetches (`PLUGIN_INDEX_URL`) through `ProtectedHttpClient` with connect-time `SsrfDnsResolver` and `SSRF_ALLOWLIST` enforcement, encrypted provider configs at rest with ChaCha20-Poly1305, masked secrets in `/api/v1/plugins*`, and omitted all credentials/URLs from MCP `list_plugins`.
+
+### Fixed
+
+- **Pre-DDL Backup Sidecar Hygiene (`src/db/mod.rs`)**: Verified both target `.db` and companion `-wal`/`-shm` sidecar non-existence before `VACUUM INTO` (appending collision suffixes when needed) and cleaned up residual sidecars after backup completion.
+- **Notion `database_id` → `data_source_id` Auto-Writeback (`src/channels/notion.rs`)**: Persisted resolved `data_source_id` values back to re-encrypted `channel_destinations` rows after `404 object_not_found` fallback resolution so subsequent deliveries avoid extra 404 round-trips.
+- **Full HTML5 Entity Decoding & Fractional Percentage Image Widths (`src/ingest/html.rs`, `src/channels/smtp.rs`)**: Upgraded HTML attribute decoding to full HTML5 named entities via `html-escape` (accurate `<a href>` rewriting and email attribute escaping) and preserved fractional percentage widths (such as `width="33.3%"`) in SMTP email images.
+- **Bilingual Release Pipeline Documentation Parity (`docs/zh/reference/releasing.md`)**: Aligned the Chinese Mermaid release workflow diagram with the English reference.
+
 ## [0.2.0] - 2026-11-22
 
 ### Breaking Changes
@@ -204,7 +243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Encrypted Credential Vault & Scoped Auth**: Channel credentials are encrypted at rest with `ChaCha20-Poly1305` AEAD (`master.key`, `0600`); WebUI administrator passwords use `Argon2id` PHC hashing with `HttpOnly` session cookies (`fc_session`); and `/mcp` Bearer tokens are stored exclusively as `SHA-256` hashes.
 - **MCP Trust Boundaries & Untrusted Content Framing**: Channel secrets and recipient targets (email addresses, `chat_id`, `data_source_id`) are strictly locked to the WebUI and opaque to `/mcp` tools, while untrusted external feed text surfaced to AI agents is sanitized, truncated, and isolated inside `<untrusted_feed_content>` XML boundary tags (`src/mcp/sanitize.rs`), complemented by `ammonia` HTML sanitization across ingest and delivery pipelines.
 
-[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ElleryHe/FeedCourier/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.4...v0.1.5

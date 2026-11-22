@@ -43,3 +43,145 @@
 .VPFeature:hover {
   border-color: var(--vp-c-brand-1);
 }
+
+.fc-market {
+  margin: 1.5rem 0 2rem;
+}
+
+.fc-market-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  font-size: 0.85rem;
+  color: var(--vp-c-text-2);
+  margin-bottom: 1rem;
+}
+
+.fc-plugin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 1rem;
+}
+
+.fc-plugin-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1.25rem;
+  border-radius: 12px;
+  border: 1px solid var(--vp-c-divider);
+  background: var(--vp-c-bg-soft);
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.fc-plugin-card:hover {
+  border-color: var(--vp-c-brand-1);
+  transform: translateY(-1px);
+}
+
+.fc-plugin-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.fc-plugin-title {
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  font-size: 1.05rem !important;
+  line-height: 1.35;
+}
+
+.fc-plugin-id {
+  display: inline-block;
+  margin-top: 0.2rem;
+  font-size: 0.78rem;
+  color: var(--vp-c-text-2);
+}
+
+.fc-badge {
+  flex-shrink: 0;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.fc-badge-builtin {
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+}
+
+.fc-badge-external {
+  background: rgba(59, 130, 246, 0.14);
+  color: #3b82f6;
+}
+
+.fc-badge-soon {
+  background: rgba(245, 158, 11, 0.16);
+  color: #d97706;
+}
+
+.fc-plugin-desc {
+  margin: 0 !important;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+  flex: 1;
+}
+
+.fc-plugin-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.fc-tag {
+  padding: 0.1rem 0.45rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  background: var(--vp-c-bg-elv);
+  border: 1px solid var(--vp-c-divider);
+  color: var(--vp-c-text-2);
+  font-family: var(--vp-font-family-mono);
+}
+
+.fc-tag-hook {
+  border-color: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+}
+
+.fc-tag-perm {
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.fc-plugin-links {
+  display: flex;
+  gap: 1rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--vp-c-divider);
+  font-size: 0.88rem;
+  font-weight: 500;
+}
+
+.fc-link-primary {
+  color: var(--vp-c-brand-1);
+  text-decoration: none;
+}
+
+.fc-link-primary:hover {
+  text-decoration: underline;
+}
+
+.fc-link-secondary {
+  color: var(--vp-c-text-2);
+  text-decoration: none;
+}
+
+.fc-link-secondary:hover {
+  color: var(--vp-c-text-1);
+  text-decoration: underline;
+}

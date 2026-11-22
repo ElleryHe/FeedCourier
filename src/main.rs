@@ -34,6 +34,9 @@ async fn main() -> AppResult<()> {
     // atomically (taking a `pre-v0.2.0-backup.db` snapshot first when legacy rows exist).
     db.migrate_channels_to_v2(&master_key).await?;
 
+    // Backfill existing pre-v0.3.0 SMTP destination recipients as `verified (legacy)` idempotently.
+    db.backfill_legacy_smtp_recipients(&master_key).await?;
+
     let runtime =
         DeliveryDispatcher::from_db_settings(config.clone(), db.clone(), master_key.clone())
             .await?;

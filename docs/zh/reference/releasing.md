@@ -34,13 +34,15 @@ FeedCourier 使用 GitHub Actions 流水线（`.github/workflows/ci.yml` 与 `.g
 
 ```mermaid
 flowchart LR
-    Merge["合入 main 分支\n(Cargo.toml 含新版本号)"] --> Prep["prepare: 检测 v<version> 标签状态"]
-    Prep --> Web["web-dist: 构建 React 19 前端"]
-    Web --> Linux["binaries: 构建 Linux x86_64 & aarch64"]
-    Web --> Mac["binaries-macos: 构建 macOS arm64 & x86_64"]
-    Web --> DockerBuild["docker-build: 原生双架构并行构建\n(ubuntu-24.04 & ubuntu-24.04-arm)"]
-    DockerBuild --> Docker["docker: 合并推送多架构 Manifest"]
-    Linux & Mac & Docker --> Rel["release: 自动创建推送 v<version> 附注标签 + SHA256SUMS.txt + 发布 GitHub Release"]
+    Merge["合入 main 分支\n(Cargo.toml 含新版本号)"] --> Prep["Job 0: prepare\n(检测 v<version> 标签)"]
+    Prep --> Web["Job 1: 构建 web/dist\n(Node 24 + pnpm 10)"]
+    Web --> Linux["Job 2: Linux 二进制\n(x86_64 & aarch64)"]
+    Web --> Mac["Job 3: macOS 二进制\n(arm64 & x86_64)"]
+    Web --> DockerBuild["Job 4a: 原生双架构镜像\n(ubuntu-24.04 & ubuntu-24.04-arm)"]
+    DockerBuild --> DockerMerge["Job 4b: 合并多架构 Manifest\n(imagetools create)"]
+    Linux --> GH["Job 5: 推送 v<version> 附注标签\n+ 发布 GitHub Release"]
+    Mac --> GH
+    DockerMerge --> GH
 ```
 
 ### 第一步：计划版本检测与四平台二进制打包
@@ -54,8 +56,8 @@ flowchart LR
 ### 第二步：Docker Hub 原生双架构镜像并行构建与合并推送
 - `docker-build` 矩阵任务分别在原生 `ubuntu-24.04`（`linux/amd64`）与 `ubuntu-24.04-arm`（`linux/arm64`）运行器上并行编译镜像（无需 QEMU 指令模拟，按架构独立缓存 Cargo 外部依赖层），并按不可变摘要（`push-by-digest`）推送分片；随后由 `docker` 任务调用 `docker buildx imagetools create` 合并生成统一的多架构 Manifest 并发布至 [`elleryhe/feedcourier`](https://hub.docker.com/r/elleryhe/feedcourier)；
 - **镜像标签规则**：
-  - `<version>`（如 `0.2.0`）
-  - `<major>.<minor>`（如 `0.2`）
+  - `<version>`（如 `0.3.0`）
+  - `<major>.<minor>`（如 `0.3`）
   - `<major>`（自 `1.0.0` 正式版起启用）
   - `latest`（仅对不带 `-rc` / `-beta` / `-alpha` 后缀的正式版标签更新）
 
@@ -75,6 +77,7 @@ flowchart LR
    - `web/package.json`（`version`）
    - `docs/package.json`（`version`）
    - `web/src/api/types.ts`（`DEFAULT_VERSION`）
+   - `src/plugins/market_snapshot.json`（与 `ElleryHe/FeedCourier-Plugins` 保持内置市场快照同步）
    - `CHANGELOG.md`（新增对应 `## [<version>] - YYYY-MM-DD` 章节与对比链接）
 2. **在 `develop` 分支执行并确保本地检查全部通过**：
 

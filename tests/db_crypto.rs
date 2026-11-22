@@ -563,6 +563,7 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
         password: Some("pw".to_string()),
         security: SmtpSecurity::StartTls,
         from_address: "mailer@example.com".to_string(),
+        sender_identity: None,
     });
     let smtp_dest = DestinationConfig::Smtp(SmtpDestinationConfig {
         to_addresses: vec!["reader@example.com".to_string()],
@@ -1350,6 +1351,132 @@ async fn migrate_channels_to_v2_smtp_strict_merge_pre_ddl_backup_no_overwrite_an
     assert!(snap_target.exists());
     assert!(!stale_wal.exists(), "stale -wal sidecar must be removed");
     assert!(!stale_shm.exists(), "stale -shm sidecar must be removed");
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn r2_06_pre_v3_ddl_backup_skips_stale_sidecar_filenames_and_leaves_clean_snapshot() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("feedcourier.db");
+    let key = MasterKey::from_bytes([0x5a; 32]);
+
+    // Simulate a pre-v0.3.0 (v0.2.x) database with migrations 1 + 2 applied and 1 destination row.
+    {
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("open v2 db");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for m in feedcourier::db::MIGRATOR.iter().filter(|m| m.version <= 2) {
+            sqlx::raw_sql(m.sql.clone()).execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?1, ?2, 1, ?3, 1)",
+            )
+            .bind(m.version)
+            .bind(m.description.as_ref())
+            .bind(m.checksum.as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let smtp_cfg = ChannelConfig::Smtp(SmtpChannelConfig {
+            host: "smtp.legacy.example.com".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            security: SmtpSecurity::StartTls,
+            from_address: "alerts@legacy.example.com".to_string(),
+            sender_identity: None,
+        });
+        let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
+            to_addresses: vec!["legacy@example.org".to_string()],
+            reply_to: None,
+        });
+        sqlx::query(
+            "INSERT INTO channels (id, name, kind, encrypted_config, credential_group_key, capabilities_json, enabled) VALUES (1, 'Legacy SMTP', 'smtp', ?1, ?2, '{}', 1)",
+        )
+        .bind(key.encrypt_json(&smtp_cfg).unwrap())
+        .bind(smtp_cfg.credential_group_key())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO channel_destinations (id, channel_id, name, encrypted_config, enabled) VALUES (10, 1, 'Legacy Dest', ?1, 1)",
+        )
+        .bind(key.encrypt_json(&dest_cfg).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    // Plant ONLY a stale `-wal` sidecar for the default `pre-v0.3.0-backup.db` filename (no main file!).
+    // R2-06 requires `choose_pre_ddl_backup_path` to treat it as occupied and pick a fresh timestamped path.
+    let occupied_default = tmp.path().join("pre-v0.3.0-backup.db");
+    let orphan_wal = tmp.path().join("pre-v0.3.0-backup.db-wal");
+    std::fs::write(&orphan_wal, b"orphan wal sidecar").unwrap();
+
+    let db = Database::connect(&db_path, 4).await.expect("upgrade to v3");
+    let backup = db
+        .pre_v3_backup_path()
+        .expect("pre-v0.3.0 DDL backup must be created")
+        .to_path_buf();
+    assert_ne!(
+        backup, occupied_default,
+        "R2-06: must skip default backup filename when stale -wal sidecar exists"
+    );
+    assert!(backup.exists(), "created pre-v0.3.0 backup file must exist");
+
+    let backup_wal = format!("{}-wal", backup.display());
+    let backup_shm = format!("{}-shm", backup.display());
+    assert!(
+        !std::path::Path::new(&backup_wal).exists() && !std::path::Path::new(&backup_shm).exists(),
+        "R2-06: pre-v0.3.0 backup must leave zero -wal/-shm sidecar files"
+    );
+
+    // Verify backup is pure v0.2.x (no migration 3, no plugins table).
+    {
+        let b_opts = SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true);
+        let b_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(b_opts)
+            .await
+            .unwrap();
+        let (v3_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 3")
+                .fetch_one(&b_pool)
+                .await
+                .unwrap();
+        assert_eq!(v3_count, 0);
+        b_pool.close().await;
+    }
 
     db.close().await;
 }

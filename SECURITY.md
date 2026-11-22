@@ -2,13 +2,13 @@
 
 ## Supported Versions
 
-`FeedCourier` is currently in `0.1.x` development; only the latest released
+`FeedCourier` is currently in `0.3.x` development; only the latest released
 version receives security fixes.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| 0.3.x   | :white_check_mark: |
+| < 0.3.0 | :x:                |
 
 ## Scope
 
@@ -42,6 +42,16 @@ Security-relevant issues include:
   `telegram-rich`, `htmd`, or `minijinja`, as well as panics, unbounded
   stream/memory allocation, or algorithmic complexity denial-of-service (DoS)
   bypassing response body caps.
+- **Public Unsubscribe & Verification Endpoints (`src/api/public.rs`, `src/crypto.rs`)**:
+  HMAC-SHA256 token forgery or replay on `/u/{token}` and `/v/{token}`,
+  PII leakage in signed tokens or confirmation pages, state mutation on `GET`
+  requests (e.g. corporate mail-scanner pre-fetch triggering unsubscribe or
+  opt-in), or bypass of per-IP public endpoint rate limiting.
+- **Plugins & Marketplace Index (`src/plugins/`)**:
+  SSRF bypasses when plugins call external endpoints (e.g. YOURLS API) or when
+  fetching the remote plugin marketplace index (`PLUGIN_INDEX_URL`), credential
+  leakage across `/api/v1/plugins/*` or MCP `list_plugins`, or unsafe HTML link
+  rewriting.
 
 When exposing `FeedCourier` outside `127.0.0.1` or a private overlay network,
 always terminate TLS in front of `LISTEN_ADDR` and restrict `SSRF_ALLOWLIST` to

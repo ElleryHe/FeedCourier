@@ -74,6 +74,10 @@ export const en = {
         label: "Routes",
         subtitle: "Filters & Delivery Modes",
       },
+      plugins: {
+        label: "Plugins",
+        subtitle: "Extensions & Marketplace",
+      },
       tasks: {
         label: "Outbox",
         subtitle: "Queue & Dead-Letter",
@@ -101,6 +105,7 @@ export const en = {
       quotaDeferred: "Quota Deferred",
       dead_letter: "Dead Letter",
       delivered: "Delivered",
+      deliveredWarning: "Delivered (Partial)",
     },
   },
 
@@ -399,9 +404,12 @@ export const en = {
     addDestination: "Add Destination",
     noDestinationsHint:
       "No destinations attached yet. Add a destination (chat, recipient list, or Notion database) so routes can deliver through this account.",
+    publicUrlMissingBanner:
+      "Automatic RFC 8058 one-click unsubscribe and verification links require PUBLIC_URL in System Settings. Until configured, emails fall back to mailto: unsubscribe and manual 6-digit verification codes.",
     card: {
       server: "Server:",
       fromAddress: "From:",
+      senderIdentity: "Identity:",
       auth: "Auth:",
       anonymous: "anonymous",
       noPassword: "(no password)",
@@ -449,6 +457,61 @@ export const en = {
     deleteDestModalDesc: (name: string) =>
       `Delete destination "${name}"? Any routes and pending delivery tasks bound to this destination will also be removed.`,
     deleteDestModalConfirm: "Delete Destination",
+    deleteConflict: {
+      title: "Destination Referenced by Active Routes",
+      desc: (destName: string, count: number) =>
+        `Destination "${destName}" is currently used by ${count} ${count === 1 ? "route" : "routes"}. Deleting it with cascade enabled will also permanently delete the routes below and their pending delivery tasks.`,
+      affectedRoutesLabel: "Affected Routes",
+      confirmCascade: (count: number) =>
+        `Delete Destination & ${count} ${count === 1 ? "Route" : "Routes"}`,
+    },
+    smtpCompliance: {
+      verifiedCountBadge: (verified: number, total: number) =>
+        `${verified}/${total} verified`,
+      recipientsToggle: "Recipients & Compliance",
+      loading: "Loading recipient compliance status…",
+      empty: "No recipients configured for this destination.",
+      status: {
+        unverified: "Unverified",
+        pending: "Pending",
+        verified: "Verified",
+        unsubscribed: "Unsubscribed",
+        bounced: "Bounced",
+      },
+      consentMethod: {
+        legacy: "Legacy backfill",
+        code: "Verified via code",
+        link: "Verified via link",
+        other: (method: string) => `Verified (${method})`,
+      },
+      revokedMethod: {
+        one_click: "One-click unsubscribe",
+        hard_bounce: "Hard bounce (5xx)",
+        admin: "Admin unsubscribed",
+        other: (method: string) => `Revoked (${method})`,
+      },
+      auditWithTime: (label: string, rel: string) => `${label} · ${rel}`,
+      codeExpires: (rel: string) => `Code expires ${rel}`,
+      bounceTooltipPrefix: "Bounce diagnostic: ",
+      sendVerification: "Send Verification",
+      resendVerification: "Resend Code",
+      codePlaceholder: "6-digit code",
+      verifyBtn: "Verify",
+      unsubscribeBtn: "Unsubscribe",
+      reactivateBtn: "Reactivate",
+      errCodeInvalid: "Enter the 6-digit verification code.",
+      toastVerificationSentTitle: "Verification email sent",
+      toastVerifiedTitle: "Recipient verified",
+      toastVerifiedDesc: (email: string) =>
+        `${email} is now verified and eligible for delivery.`,
+      toastUnsubscribedTitle: "Recipient unsubscribed",
+      toastUnsubscribedDesc: (email: string) =>
+        `${email} will no longer receive emails from this destination.`,
+      toastReactivatedTitle: "Recipient reactivated",
+      toastReactivatedDesc: (email: string) =>
+        `${email} was reset to unverified. Send a fresh verification email to resume delivery.`,
+      toastActionFailed: "Recipient action failed",
+    },
     wizard: {
       editTitle: (name: string) => `Edit Account: ${name}`,
       newTitle: "New Channel Account",
@@ -479,10 +542,16 @@ export const en = {
         fromLabel: "From Address (SPF/DKIM Verified)",
         fromHint:
           "Display name adopts each feed's title, with deterministic Message-ID and List-ID headers.",
+        senderIdentityLabel: "Sender Identity / Contact Line (Optional)",
+        senderIdentityPlaceholder: "Acme News · 123 Main St",
+        senderIdentityHint:
+          "Optional sender identity or physical contact line appended to email footers (CAN-SPAM compliance).",
         destHeading: "SMTP Recipients",
         replyToLabel: "Reply-To Address (Optional)",
         replyToPlaceholder: "Optional Reply-To address",
         toLabel: "Recipient Addresses (Press Enter to add)",
+        newRecipientsHint:
+          "New recipients start as Unverified and will not receive verification emails automatically. Trigger verification manually from Recipients & Compliance after saving.",
       },
       telegram: {
         heading: "Telegram Bot Credentials",
@@ -502,7 +571,7 @@ export const en = {
       notion: {
         accountHeading: "Notion Integration Credentials",
         heading: "Notion Target Database",
-        modeInit: "1. Auto-Create 7-Column DB",
+        modeInit: "1. Auto-Create 8-Column DB",
         modeBind: "2. Bind Existing Database",
         secretLabel: "Notion Internal Integration Secret",
         secretStoredPlaceholder: (hint: string) =>
@@ -510,12 +579,12 @@ export const en = {
         usingStoredSecretHint:
           "Reuses the Notion integration secret and proxy setting stored on this account.",
         initIntro:
-          "Creates a new Notion database under your authorized parent page with the 7 standard columns (Title, Link, Source, Published, State, Tag, FC-ID) and binds its data source automatically.",
+          "Creates a new Notion database under your authorized parent page with the 8 standard columns (Title, Link, Short URL, Source, Published, State, Tag, FC-ID) and binds its data source automatically.",
         parentPageLabel: "Authorized Parent Page ID or URL",
         dbTitleLabel: "New Database Title",
-        autoCreateBtn: "Create 7-Column Database Now",
+        autoCreateBtn: "Create 8-Column Database Now",
         autoCreatedBanner: (dbId: string, dsId: string) =>
-          `Created 7-column database (${dbId}) → bound data_source_id ${dsId}.`,
+          `Created 8-column database (${dbId}) → bound data_source_id ${dsId}.`,
         toastCreatedTitle: "Notion database created",
         toastCreatedDesc: (dsId: string) => `Bound data_source_id: ${dsId}`,
         existingTargetLabel: "Existing Data Source ID or Database URL",
@@ -545,6 +614,7 @@ export const en = {
           title: "Article title",
           fc_id: "SHA-256 fingerprint for deduplication",
           link: "Original article URL",
+          short_url: "Shortened article URL (Link Rewrite plugin)",
           source: "Feed source title",
           published: "Publication timestamp",
           state: "UnRead / Read reading state",
@@ -738,6 +808,172 @@ export const en = {
       queuedOutsideHint:
         "Tasks outside the active window are not dropped: they stay queued and are sent when the next window opens.",
       errWindowTime: "Each active window needs a valid start and end time (HH:MM).",
+      pluginsHeading: "Plugins",
+      pluginsActiveCount: (count: number) => `${count} configured`,
+      pluginsNoneEnabled:
+        "No plugins are currently enabled. Enable a plugin in the Plugins tab to attach it to routes.",
+      pluginsGloballyDisabled: "Globally disabled",
+      pluginsNoProviders:
+        "No providers configured yet — add a provider in Plugins.",
+      pluginsMissingProvider: (id: number) => `Provider #${id} (missing)`,
+      pluginWarningPluginMissing: "Plugin not found",
+      pluginWarningPluginDisabled: "Plugin globally disabled",
+      pluginWarningProviderMissing: "Selected provider missing",
+      pluginWarningProviderDisabled: "Selected provider disabled",
+    },
+  },
+
+  plugins: {
+    title: "Plugins & Extensions",
+    subtitle:
+      "Extend FeedCourier's delivery pipeline with built-in plugins and discover upcoming extensions from the plugin marketplace.",
+    tabs: {
+      installed: "Installed",
+      marketplace: "Marketplace",
+    },
+    loading: "Loading plugins…",
+    emptyInstalledTitle: "No plugins installed",
+    emptyInstalledDesc:
+      "Built-in plugins appear here automatically once synchronized with the server.",
+    providerCount: (count: number) =>
+      `${count} ${count === 1 ? "provider" : "providers"}`,
+    configureBtn: "Configure",
+    backToPlugins: "Back to Plugins",
+    globallyDisabledNotice:
+      "This plugin is currently globally disabled. Routes referencing its providers will keep original content until you enable the plugin.",
+    hooksLabel: "Hooks",
+    permissionsLabel: "Permissions",
+    homepageLink: "Homepage",
+    detail: {
+      providersHeading: (count: number) => `Provider Instances (${count})`,
+      addProvider: "Add Provider",
+      emptyProvidersTitle: "No provider instances configured",
+      emptyProvidersDesc:
+        "Add a YOURLS short-link provider instance below, then assign it to individual routes.",
+      colName: "Provider",
+      colApiUrl: "API Endpoint",
+      colAuth: "Auth Mode",
+      colBehavior: "Mode & Options",
+      colCache: "Cached Links",
+      colActions: "Actions",
+      authModes: {
+        signature: "Signature",
+        timed_signature: "Timed Signature",
+        password: "Password",
+      },
+      strictBadge: "Strict",
+      gracefulBadge: "Graceful",
+      passTitleBadge: "Title",
+      excludedDomainsBadge: (count: number) => `${count} excluded`,
+      cachedLinksCount: (count: number) => `${count}`,
+      testBtn: "Test",
+      clearCacheBtn: "Clear Cache",
+      editTitle: "Edit provider",
+      deleteTitle: "Delete provider",
+      clearCacheConfirmTitle: "Clear Short-Link Cache",
+      clearCacheConfirmDesc: (name: string, count: number) =>
+        `Clear ${count} cached short ${count === 1 ? "link" : "links"} for "${name}"? Future deliveries will call the YOURLS API again for previously shortened URLs.`,
+      clearCacheConfirmBtn: "Clear Cache",
+      deleteConfirmTitle: "Delete Provider Instance",
+      deleteConfirmDesc: (name: string) =>
+        `Delete provider "${name}" and its encrypted credentials and short-link cache?`,
+      deleteConfirmBtn: "Delete Provider",
+      conflictModalTitle: "Cannot Delete Referenced Provider",
+      conflictModalDesc: (name: string, count: number) =>
+        `Provider "${name}" is still assigned to ${count} ${count === 1 ? "route" : "routes"}. Unassign this provider from the routes listed below before deleting it.`,
+      conflictRoutesLabel: "Referencing Routes",
+      toastPluginEnabled: "Plugin enabled",
+      toastPluginDisabled: "Plugin disabled",
+      toastPluginToggleFailed: "Failed to toggle plugin",
+      toastProviderCreated: "Provider added",
+      toastProviderUpdated: "Provider updated",
+      toastProviderDeleted: "Provider deleted",
+      toastProviderToggleFailed: "Failed to toggle provider",
+      toastProviderDeleteFailed: "Failed to delete provider",
+      toastTestOk: "Provider connection verified",
+      toastTestFailed: "Provider test failed",
+      toastCacheClearedTitle: "Short-link cache cleared",
+      toastCacheClearedDesc: (count: number) =>
+        `Removed ${count} cached ${count === 1 ? "entry" : "entries"}.`,
+      toastCacheClearFailed: "Failed to clear cache",
+    },
+    providerModal: {
+      addTitle: "Add YOURLS Provider",
+      editTitle: (name: string) => `Edit Provider: ${name}`,
+      desc: "Provider credentials are encrypted at rest with ChaCha20-Poly1305. Secret tokens are never returned to the browser.",
+      nameLabel: "Provider Name",
+      namePlaceholder: "e.g. Primary YOURLS",
+      apiUrlLabel: "YOURLS API URL",
+      apiUrlPlaceholder: "https://sho.rt/yourls-api.php",
+      authModeLabel: "Authentication Mode",
+      authModeHints: {
+        signature: "Passwordless YOURLS signature token (recommended).",
+        timed_signature:
+          "Timestamped MD5(timestamp + signature) request signing.",
+        password: "Classic YOURLS username and password form authentication.",
+      },
+      signatureLabel: "Signature Token",
+      signaturePlaceholder: "Enter YOURLS signature token…",
+      signatureStoredPlaceholder: (hint: string) =>
+        `Stored (${hint}) — leave blank to keep`,
+      secretPreserveHint: "Leave blank to keep the currently stored secret.",
+      usernameLabel: "Username",
+      usernamePlaceholder: "admin",
+      passwordLabel: "Password",
+      passwordPlaceholder: "Enter YOURLS password…",
+      passwordStoredPlaceholder: "Stored (••••••••) — leave blank to keep",
+      excludeDomainsLabel: "Excluded Domains (Optional)",
+      excludeDomainsPlaceholder: "example.com\n*.internal.lan",
+      excludeDomainsHint:
+        "Comma or newline separated domains to skip shortening (supports *.domain.com wildcards). The provider's own domain is always skipped automatically.",
+      strictModeLabel: "Strict Mode",
+      strictModeDesc:
+        "Retry the entire delivery task if any link fails to shorten, instead of keeping the original URL with a warning.",
+      passTitleLabel: "Pass Article Title",
+      passTitleDesc:
+        "Send the article's title to YOURLS when shortening the primary article link.",
+      useProxyLabel: "Use Outbound Proxy",
+      useProxyDesc:
+        "Send YOURLS API calls through the global HTTP/SOCKS5 outbound proxy configured in System Settings.",
+      enabledLabel: "Provider Enabled",
+      enabledDesc:
+        "Disabled providers keep original URLs with a warning on routes that reference them.",
+      ssrfLanNotice:
+        "Self-hosted LAN YOURLS note: FeedCourier blocks private/LAN IP addresses by default. Add your YOURLS host or CIDR to the SSRF Allowlist in System Settings if it runs on a private network.",
+      createBtn: "Add Provider",
+      saveBtn: "Save Provider",
+      errEmptyName: "Provider name is required.",
+      errInvalidApiUrl:
+        "Enter a valid http:// or https:// YOURLS API endpoint URL.",
+      errSignatureRequired:
+        "Signature token is required for signature authentication.",
+      errPasswordAuthRequired:
+        "Both username and password are required for password authentication.",
+    },
+    market: {
+      searchPlaceholder: "Search plugins by name, category, or description…",
+      allCategories: "All categories",
+      sourceRemote: "Remote index",
+      sourceSnapshot: "Offline snapshot",
+      sourceTooltip: (url: string, generatedAt: string | null) =>
+        `Index: ${url}${generatedAt ? ` · Generated ${generatedAt}` : ""}`,
+      refreshBtn: "Refresh Index",
+      toastRefreshed: "Marketplace index refreshed",
+      toastRefreshFailed: "Failed to refresh marketplace index",
+      loading: "Loading plugin marketplace…",
+      emptyTitle: "No matching plugins found",
+      emptyDesc:
+        "Try adjusting your search query or switching the category filter.",
+      kindBuiltin: "Built-in",
+      kindExternal: "External",
+      kindComingSoon: "Coming Soon",
+      wasmUpcomingBadge: "External / Upcoming WASM",
+      installedBadge: "Installed",
+      enabledBadge: "Enabled",
+      enableAndConfigureBtn: "Enable & Configure",
+      configureBtn: "Configure",
+      homepageBtn: "Homepage",
+      repositoryBtn: "Repository",
     },
   },
 
@@ -768,6 +1004,7 @@ export const en = {
     inspectTitle: "Inspect checkpoint & diagnostic log",
     checkpoints: {
       smtp: "SMTP Msg-ID",
+      smtpSent: (count: number) => `SMTP ${count} sent`,
       tgCompact: "TG fallback→compact",
       tgBatch: (offset: number) => `TG batch #${offset}`,
       notionAsync: (id: string) => `Notion async:${id}`,
@@ -849,6 +1086,22 @@ export const en = {
     saveTimezone: "Save Timezone",
     errInvalidTimezone: "Select a valid IANA timezone from the list.",
     toastTimezoneSaved: "System timezone saved",
+    publicUrlTitle: "Public Base URL (PUBLIC_URL)",
+    publicUrlDesc:
+      "Externally reachable base URL for FeedCourier, used to generate RFC 8058 one-click unsubscribe links (/u/…) and SMTP recipient verification links (/v/…).",
+    publicUrlLabel: "Public URL",
+    publicUrlPlaceholder: "https://feeds.example.com",
+    publicUrlHint:
+      "Leave empty to disable public HTTP compliance links (SMTP falls back to mailto: unsubscribe and manual 6-digit verification codes).",
+    publicUrlEnvManagedBadge: "Env managed",
+    publicUrlEnvManagedHint:
+      "Managed by the PUBLIC_URL environment variable and locked from WebUI changes.",
+    publicUrlHttpWarning:
+      "Non-HTTPS URL detected: Gmail, Yahoo, and other major mailbox providers require HTTPS for RFC 8058 one-click unsubscribe links in production.",
+    savePublicUrl: "Save Public URL",
+    errInvalidPublicUrl:
+      "Public URL must start with http:// or https:// and include a valid hostname.",
+    toastPublicUrlSaved: "Public URL saved",
     networkTitle: "Outbound Proxy & SSRF Allowlist",
     networkDesc:
       "FeedCourier blocks loopback, link-local, cloud metadata, and private IPs at DNS connect time across every redirect hop. Add internal CIDRs or hostnames below only for trusted self-hosted services (such as FreshRSS, RSSHub, or a Local Bot API Server).",
