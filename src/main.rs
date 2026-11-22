@@ -30,6 +30,10 @@ async fn main() -> AppResult<()> {
     // so persisted DB settings are active immediately on startup.
     bootstrap_env_settings(&config, &db).await?;
 
+    // Upgrade pre-v0.2.0 single-layer channels into the two-layer Account + Destinations model
+    // atomically (taking a `pre-v0.2.0-backup.db` snapshot first when legacy rows exist).
+    db.migrate_channels_to_v2(&master_key).await?;
+
     let runtime =
         DeliveryDispatcher::from_db_settings(config.clone(), db.clone(), master_key.clone())
             .await?;

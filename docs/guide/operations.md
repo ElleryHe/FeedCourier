@@ -14,15 +14,16 @@ When running in Docker (`-v ./data:/data`) or on the host (`DATA_DIR=./data`), F
 
 ```text
 /data/
-├── feedcourier.db        # Primary SQLite database file
-├── feedcourier.db-wal    # Write-Ahead Log (active during runtime)
-├── feedcourier.db-shm    # Shared-memory WAL index
-└── master.key            # Auto-generated 32-byte encryption key (0600 permissions, if MASTER_KEY env is unset)
+├── feedcourier.db         # Primary SQLite database file
+├── feedcourier.db-wal     # Write-Ahead Log (active during runtime)
+├── feedcourier.db-shm     # Shared-memory WAL index
+├── master.key             # Auto-generated 32-byte encryption key (0600 permissions, if MASTER_KEY env is unset)
+└── pre-v0.2.0-backup.db   # Created automatically once when upgrading a v0.1.x database to v0.2.0
 ```
 
 ::: danger Always Back Up `feedcourier.db` and `master.key` Together
-Channel credentials (SMTP passwords, Telegram Bot Tokens, and Notion Integration Secrets) are encrypted using your 32-byte master key.
-If you restore `feedcourier.db` on a new server without the matching `master.key` (or `MASTER_KEY` environment variable), saved channel credentials cannot be decrypted and will need to be re-entered.
+Channel account credentials (SMTP passwords, Telegram Bot Tokens, Notion Integration Secrets) and destination configurations (`to_addresses`, `chat_id`, `data_source_id`) are encrypted using your 32-byte master key.
+If you restore `feedcourier.db` on a new server without the matching `master.key` (or `MASTER_KEY` environment variable), saved channels and destinations cannot be decrypted and will need to be re-entered.
 :::
 
 ---
@@ -87,6 +88,25 @@ curl -s -b cookies.txt -OJ \
 
 ---
 
+## Upgrading from `v0.1.x` to `v0.2.0` {#upgrading-from-v0-1-x-to-v0-2-0}
+
+FeedCourier `v0.2.0` introduces a **two-layer Delivery Channel model** (**Channel Account** + multiple **Destinations**). Upgrading an existing `v0.1.x` deployment is **automatic and atomic** on startup—no manual SQL scripts are required:
+
+1. **Pre-Migration Backup (`pre-v0.2.0-backup.db`)**: Before modifying any legacy channel rows, FeedCourier runs an online SQLite `VACUUM INTO` snapshot to `<DATA_DIR>/pre-v0.2.0-backup.db`. Keep this file alongside `master.key` if you ever need to roll back to `v0.1.6`.
+2. **Schema & Transactional Split**: `migrations/0002_channel_destinations.sql` creates `channel_destinations` and adds `destination_id` to `routes` and `delivery_tasks`. The Rust startup hook (`Database::migrate_channels_to_v2`) then uses your `MasterKey` inside a **single SQLite transaction** to decrypt each legacy channel and split it into account credentials (`channels`) and target settings (`channel_destinations`).
+3. **Automatic Deduplication by `credential_group_key`**: Legacy channels that shared the same underlying credentials (same `credential_group_key`, such as one Telegram Bot pointing to two groups or one SMTP account sending to two lists) are merged into a single Channel Account with each legacy channel preserved as a child Destination keeping its original name:
+   - **Pacing & Quotas (Strictest Value)**: `min_interval_secs` = maximum, `jitter_max_secs` = maximum, `hourly_quota` = minimum non-null, `daily_quota` = minimum non-null, `cooldown_until` = latest.
+   - **Proxy & Enabled (Union)**: `use_proxy` is `true` if **any** merged legacy channel used a proxy; `enabled` is `true` if **any** merged legacy channel was enabled (each destination keeps its own individual `enabled` state).
+   - **Account Display Name**: Derived from the SMTP `from_address` or cached Telegram `@username` when available, otherwise keeping the surviving channel's original name.
+4. **Route & History Repointing**: All `routes` and `delivery_tasks` (including `delivered` and `dead_letter` history) are automatically repointed to their new `destination_id` and surviving `channel_id`.
+5. **Idempotency**: Once the transaction commits, `system_settings.channel_model_version = 2` is recorded so subsequent restarts skip migration immediately.
+
+::: warning API & MCP Callers After Upgrading
+If you have scripts calling `POST`/`PATCH /api/v1/routes`, `POST /api/v1/feeds/preview/push`, or MCP `configure_route` / `test_push_feed_entry` with `channel_id`, they continue working automatically for accounts that own **1 destination**. Once an account has **multiple destinations** (including after legacy channels are merged), switch callers to pass `destination_id` explicitly.
+:::
+
+---
+
 ## Pausing & Resuming the Delivery Queue {#pausing-resuming-the-delivery-queue}
 
 All routes share one global outbox. To hold back every delivery (for example during maintenance of a downstream service), use the control bar on the **Tasks** page:
@@ -99,6 +119,20 @@ While the queue is paused, feeds keep being polled and new tasks keep accumulati
 ::: tip Routes with Time Windows
 A route's own delivery time windows work independently: tasks outside the window are still queued and are delivered at the next window start. See [Pacing & Quotas](/channels/pacing-and-quotas#route-delivery-time-windows).
 :::
+
+### Outbox Queue Status Colors
+
+On the **Tasks** page, status badges, HTTP/SMTP status codes, attempt counters, and diagnostic logs use consistent semantic colors so failures stand out immediately:
+
+| State / Signal | Color |
+| :--- | :--- |
+| **Delivered** / HTTP `2xx` (excluding `202`) / SMTP `2xx` | **Green** |
+| **Retrying** / **Deferred** / `202 Accepted` (async) / `429` or other recoverable responses | **Amber (Yellow)** |
+| **Dead Letter** / permanent `4xx` / `5xx` | **Red** |
+| **Queued** | **Gray** |
+| **Attempt Count**: `1` / `≥ 2` / reached max (`6`) | **Neutral** / **Amber** / **Red** |
+
+Diagnostic log lines inherit the color of their task status, so informational delivery logs on succeeded tasks render in green rather than red.
 
 ---
 

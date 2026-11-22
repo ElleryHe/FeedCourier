@@ -11,7 +11,7 @@ use std::sync::Arc;
 use feedcourier::channels::{ChannelKind, RouteOptions};
 use feedcourier::db::Database;
 use feedcourier::db::models::{
-    DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewFeed, NewRoute, now_unix,
+    DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewDestination, NewFeed, NewRoute, now_unix,
 };
 use feedcourier::error::AppError;
 use feedcourier::ingest::{
@@ -524,6 +524,15 @@ async fn ingest_silent_init_routing_readability_304_preview_and_circuit_breaker(
         })
         .await
         .expect("create channel");
+    let dest = db
+        .create_destination(&NewDestination {
+            channel_id: channel.id,
+            name: "Core Chat".to_string(),
+            encrypted_config: vec![5, 6, 7, 8],
+            enabled: true,
+        })
+        .await
+        .expect("create dest");
 
     let route_rust = db
         .create_route(&NewRoute {
@@ -531,6 +540,7 @@ async fn ingest_silent_init_routing_readability_304_preview_and_circuit_breaker(
             feed_ids: vec![],
             match_tags: vec!["rust".to_string()],
             channel_id: channel.id,
+            destination_id: dest.id,
             include_keywords: vec![],
             exclude_keywords: vec!["sponsored".to_string()],
             include_regex: Some(r"(?i)\b(rust|cargo|tokio)\b".to_string()),
@@ -547,6 +557,7 @@ async fn ingest_silent_init_routing_readability_304_preview_and_circuit_breaker(
             feed_ids: vec![],
             match_tags: vec![],
             channel_id: channel.id,
+            destination_id: dest.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -1096,6 +1107,24 @@ async fn redirect_hop_limit_and_conditional_last_modified_and_atom_json_feed() {
         })
         .await
         .unwrap();
+    let enabled_dest = db
+        .create_destination(&NewDestination {
+            channel_id: enabled_ch.id,
+            name: "Enabled Dest".to_string(),
+            encrypted_config: vec![9, 1],
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let disabled_dest = db
+        .create_destination(&NewDestination {
+            channel_id: enabled_ch.id,
+            name: "Disabled Dest".to_string(),
+            encrypted_config: vec![9, 2],
+            enabled: false,
+        })
+        .await
+        .unwrap();
 
     let disabled_ch = db
         .create_channel(&NewChannel {
@@ -1113,6 +1142,15 @@ async fn redirect_hop_limit_and_conditional_last_modified_and_atom_json_feed() {
         })
         .await
         .unwrap();
+    let disabled_ch_dest = db
+        .create_destination(&NewDestination {
+            channel_id: disabled_ch.id,
+            name: "Dest On Disabled Channel".to_string(),
+            encrypted_config: vec![8, 1],
+            enabled: true,
+        })
+        .await
+        .unwrap();
 
     // Catch-all route (`feed_ids = []` and `match_tags = []` -> matches ALL feeds).
     let catch_all_route = db
@@ -1121,6 +1159,25 @@ async fn redirect_hop_limit_and_conditional_last_modified_and_atom_json_feed() {
             feed_ids: vec![],
             match_tags: vec![],
             channel_id: enabled_ch.id,
+            destination_id: enabled_dest.id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions::default(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    // Enabled route pointing to a DISABLED destination on an enabled channel -> must NOT enqueue!
+    let _disabled_dest_route = db
+        .create_route(&NewRoute {
+            name: "Route on Disabled Dest".to_string(),
+            feed_ids: vec![],
+            match_tags: vec![],
+            channel_id: enabled_ch.id,
+            destination_id: disabled_dest.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -1138,6 +1195,7 @@ async fn redirect_hop_limit_and_conditional_last_modified_and_atom_json_feed() {
             feed_ids: vec![],
             match_tags: vec![],
             channel_id: disabled_ch.id,
+            destination_id: disabled_ch_dest.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,

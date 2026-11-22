@@ -28,24 +28,24 @@ features:
     details: Retains SHA-256 article fingerprints in SQLite to prevent duplicate sends, while automatically cleaning up sanitized HTML bodies and media metadata once the retention window expires.
     link: /guide/introduction
     linkText: Read Project Overview
-  - title: Send Rate Pacing & Quotas
-    details: Enqueues an independent task per matched article and route (1 Task = 1 Entry × 1 Route) with configurable minimum intervals, random jitter, shared credential rate limits, and hourly/daily quotas.
+  - title: Send Rate Pacing & Per-Route Timezones
+    details: Enqueues an independent task per matched article and route (1 Task = 1 Entry × 1 Route), sharing minimum intervals, per-delivery random jitter, hourly/daily quotas, and 429 cooldowns across all destinations of a channel account, with per-route IANA timezone overrides.
     link: /channels/pacing-and-quotas
     linkText: Configure Pacing & Quotas
   - title: SMTP Email Delivery
-    details: Renders articles into a responsive inline-CSS email template with Force-From sender alignment for SPF/DKIM/DMARC compatibility, deterministic Message-IDs, and per-feed List-Id headers.
+    details: Renders articles into a responsive inline-CSS email template with Outlook-safe image width scaling, localized timestamps, Force-From sender alignment, deterministic Message-IDs, and per-feed List-Id headers—deliverable to multiple recipient groups per SMTP account.
     link: /channels/smtp
     linkText: Set Up SMTP Email
   - title: Telegram Delivery Modes
-    details: Supports Rich Message, Compact Card, and Media delivery modes per route, with in-memory anti-hotlink media relay, batched media groups, and Local Bot API fallback.
+    details: Connect one Bot account to multiple chats, groups, topics, or channels. Supports Rich Message (native footers, heading demotion, image collages/slideshows), Compact Card, and Media Mode per route, with in-memory anti-hotlink relay and Local Bot API fallback.
     link: /channels/telegram
     linkText: Set Up Telegram
   - title: Notion Database Sync
-    details: Initializes database properties under a parent page or binds to an existing data source, converting HTML into Notion Markdown with asynchronous creation for long articles.
+    details: Reuse one Notion Integration across multiple databases—initializing standard 7-column properties under a parent page or binding existing data sources, with Markdown v2 conversion and asynchronous creation for long articles.
     link: /channels/notion
     linkText: Set Up Notion
   - title: Embedded Web Console & /mcp Server
-    details: Ships a React web console and a Streamable HTTP /mcp endpoint in a single binary with readonly and admin Bearer tokens, encrypted channel credentials, and connect-time SSRF protection.
+    details: Ships a React web console (tag filtering, persistent sorting & pagination, cascading route filters, semantic outbox colors) and a Streamable HTTP /mcp endpoint in a single binary with encrypted credentials, destination lock, and connect-time SSRF protection.
     link: /mcp/setup
     linkText: Connect MCP Clients
 ---

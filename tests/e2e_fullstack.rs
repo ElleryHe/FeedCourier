@@ -542,9 +542,16 @@ async fn fullstack_webui_mcp_and_live_scheduler_telegram_rich_delivery() {
             "config": {
                 "kind": "telegram",
                 "bot_token": SECRET_BOT_TOKEN,
-                "chat_id": SECRET_CHAT_ID,
-                "message_thread_id": SECRET_THREAD_ID,
                 "api_base_url": mock_server.uri()
+            },
+            "initial_destination": {
+                "name": "Release Topic",
+                "config": {
+                    "kind": "telegram",
+                    "chat_id": SECRET_CHAT_ID,
+                    "message_thread_id": SECRET_THREAD_ID
+                },
+                "enabled": true
             },
             "min_interval_secs": 0,
             "jitter_max_secs": 0,
@@ -556,6 +563,9 @@ async fn fullstack_webui_mcp_and_live_scheduler_telegram_rich_delivery() {
     assert_eq!(create_chan_resp.status(), StatusCode::CREATED);
     let chan_dto: Value = create_chan_resp.json().await.expect("valid ChannelDto");
     let channel_id = chan_dto["id"].as_i64().expect("channel id must be i64");
+    let destination_id = chan_dto["destinations"][0]["id"]
+        .as_i64()
+        .expect("initial destination id must be i64");
     assert_eq!(chan_dto["capabilities"]["supports_rich_message"], true);
     assert_eq!(chan_dto["capabilities"]["bot_api_version"], "10.4");
     assert!(
@@ -674,7 +684,7 @@ async fn fullstack_webui_mcp_and_live_scheduler_telegram_rich_delivery() {
     assert!(instructions.contains(LICENSE_SPDX));
     assert!(instructions.contains("<untrusted_feed_content>"));
 
-    // Bind trusted `channel_id` via `configure_route` (`telegram_mode: "rich_message"`).
+    // Bind trusted `destination_id` via `configure_route` (`telegram_mode: "rich_message"`).
     let route_res = mcp_client
         .call_tool_json(
             "configure_route",
@@ -682,13 +692,14 @@ async fn fullstack_webui_mcp_and_live_scheduler_telegram_rich_delivery() {
                 "action": "create",
                 "name": "Releases -> Telegram Rich",
                 "match_tags": ["releases"],
-                "channel_id": channel_id,
+                "destination_id": destination_id,
                 "telegram_mode": "rich_message"
             }),
         )
         .await;
     assert_eq!(route_res["action"], "create");
     assert_eq!(route_res["route"]["channel_id"], channel_id);
+    assert_eq!(route_res["route"]["destination_id"], destination_id);
     assert_eq!(route_res["route"]["telegram_mode"], "rich_message");
 
     // Add feed via `manage_feed` (`silent_init: true, push_latest_one: true`):

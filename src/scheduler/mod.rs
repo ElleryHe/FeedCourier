@@ -23,7 +23,7 @@ use crate::channels::smtp::SmtpSender;
 use crate::channels::telegram::{FetchedMedia, MediaStreamFetcher, TelegramSender};
 use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, RouteOptions,
+    DeliveryOutcome, DestinationConfig, RouteOptions,
 };
 use crate::config::AppConfig;
 use crate::crypto::MasterKey;
@@ -35,7 +35,7 @@ use crate::db::models::{
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
-use crate::schedule::{has_schedule, next_allowed_at};
+use crate::schedule::{has_schedule, next_allowed_at, resolve_route_timezone};
 
 /// Default lease duration in seconds granted when a worker claims a `delivery_tasks` row.
 pub const DEFAULT_TASK_LEASE_SECS: i64 = 120;
@@ -362,6 +362,7 @@ impl DeliveryDispatcher {
         db: Database,
         master_key: MasterKey,
     ) -> AppResult<Self> {
+        db.migrate_channels_to_v2(&master_key).await?;
         let net_settings = load_persisted_net_settings(&config, &db).await?;
         let persisted_locale = load_persisted_locale(&config, &db).await?;
         let http = ProtectedHttpClient::new(net_settings)?;
@@ -744,24 +745,40 @@ impl DeliveryDispatcher {
             return Ok(true);
         };
 
-        if !route.enabled || !channel.enabled {
+        let Some(destination) = self.inner.db.get_destination(task.destination_id).await? else {
+            self.inner
+                .db
+                .mark_task_dead_letter(
+                    task.id,
+                    now,
+                    None,
+                    existing_checkpoint.as_ref(),
+                    "Target destination no longer exists",
+                )
+                .await?;
+            return Ok(true);
+        };
+
+        if !route.enabled || !channel.enabled || !destination.enabled {
             self.inner
                 .db
                 .mark_task_deferred(
                     task.id,
                     now.saturating_add(300),
                     existing_checkpoint.as_ref(),
-                    "Route or channel currently disabled",
+                    "Route, channel, or destination currently disabled",
                 )
                 .await?;
             return Ok(true);
         }
 
-        // 1b. Route delivery windows (system timezone): defer to the next allowed window start.
+        // 1b. Route delivery windows (route timezone, inheriting system timezone):
+        // defer to the next allowed window start when outside the schedule.
         let route_options = route.options();
+        let system_tz = self.inner.db.get_timezone().await;
+        let route_tz = resolve_route_timezone(&route_options, system_tz);
         if has_schedule(&route_options) {
-            let tz = self.inner.db.get_timezone().await;
-            let next_window = next_allowed_at(&route_options, now, tz);
+            let next_window = next_allowed_at(&route_options, now, route_tz);
             if next_window > now {
                 self.inner
                     .db
@@ -776,15 +793,22 @@ impl DeliveryDispatcher {
             }
         }
 
-        // 2. Quota & anti-spam pacing pre-check (`mark_task_deferred` restores `attempt_count`).
+        // 2. Shared channel & credential-group quota + anti-spam pacing pre-check
+        // (`mark_task_deferred` restores `attempt_count`).
+        // All destinations under a channel account (and any channels sharing identical credentials)
+        // share the same hourly/daily quota budget and min_interval + jitter pacing window.
         let usage = self
             .inner
             .db
             .get_channel_quota_usage(channel.id, &channel.credential_group_key, now)
             .await?;
+        let used_last_hour = usage
+            .channel_last_hour
+            .max(usage.credential_group_last_hour);
+        let used_last_day = usage.channel_last_day.max(usage.credential_group_last_day);
 
         if let Some(hourly_quota) = channel.hourly_quota
-            && (hourly_quota <= 0 || usage.channel_last_hour >= hourly_quota)
+            && (hourly_quota <= 0 || used_last_hour >= hourly_quota)
         {
             self.inner
                 .db
@@ -793,8 +817,7 @@ impl DeliveryDispatcher {
                     now.saturating_add(300),
                     existing_checkpoint.as_ref(),
                     &format!(
-                        "Channel hourly quota reached ({}/{hourly_quota}); deferred to next window",
-                        usage.channel_last_hour
+                        "Channel hourly quota reached ({used_last_hour}/{hourly_quota}); deferred to next window"
                     ),
                 )
                 .await?;
@@ -802,7 +825,7 @@ impl DeliveryDispatcher {
         }
 
         if let Some(daily_quota) = channel.daily_quota
-            && (daily_quota <= 0 || usage.channel_last_day >= daily_quota)
+            && (daily_quota <= 0 || used_last_day >= daily_quota)
         {
             self.inner
                 .db
@@ -811,8 +834,7 @@ impl DeliveryDispatcher {
                     now.saturating_add(900),
                     existing_checkpoint.as_ref(),
                     &format!(
-                        "Channel daily quota reached ({}/{daily_quota}); deferred to next window",
-                        usage.channel_last_day
+                        "Channel daily quota reached ({used_last_day}/{daily_quota}); deferred to next window"
                     ),
                 )
                 .await?;
@@ -835,7 +857,7 @@ impl DeliveryDispatcher {
             return Ok(true);
         }
 
-        // 3. Decrypt channel configuration & execute downstream delivery.
+        // 3. Decrypt channel account credentials & destination target config, then execute delivery.
         let channel_config: ChannelConfig = match self
             .inner
             .master_key
@@ -856,6 +878,26 @@ impl DeliveryDispatcher {
                 return Ok(true);
             }
         };
+        let destination_config: DestinationConfig = match self
+            .inner
+            .master_key
+            .decrypt_json(&destination.encrypted_config)
+        {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                self.inner
+                    .db
+                    .mark_task_dead_letter(
+                        task.id,
+                        now,
+                        None,
+                        existing_checkpoint.as_ref(),
+                        &format!("Failed to decrypt destination config: {err}"),
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        };
 
         let checkpoint_sink = self.inner.db.checkpoint_sink(task.id);
         let ctx = DeliveryContext {
@@ -866,6 +908,9 @@ impl DeliveryDispatcher {
             route_options,
             channel: &channel,
             channel_config: &channel_config,
+            destination: &destination,
+            destination_config: &destination_config,
+            timezone: route_tz,
             checkpoint: existing_checkpoint.clone(),
             checkpoint_sink: Some(&checkpoint_sink),
         };
@@ -894,23 +939,27 @@ impl DeliveryDispatcher {
         Ok(true)
     }
 
-    /// Stateless debug push: fetch the live feed item, render it for `params.channel_id` with the
-    /// requested route options and send it immediately through the channel adapter. Nothing is
+    /// Stateless debug push: fetch the live feed item, render it for the resolved destination with
+    /// the requested route options, and send it immediately through the channel adapter. Nothing is
     /// persisted (no entries, fingerprints, tasks or quota usage); Notion pages carry a
     /// `test-` prefixed `FC-ID`.
     pub async fn debug_push(&self, params: DebugPushParams) -> AppResult<DebugPushResult> {
-        let channel = self
+        let (channel, destination) = self
             .inner
             .db
-            .get_channel(params.channel_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound(format!("channel {} not found", params.channel_id))
-            })?;
+            .resolve_destination_target(params.destination_id, params.channel_id)
+            .await?;
         let channel_config: ChannelConfig = self
             .inner
             .master_key
             .decrypt_json(&channel.encrypted_config)?;
+        let destination_config: DestinationConfig = self
+            .inner
+            .master_key
+            .decrypt_json(&destination.encrypted_config)?;
+
+        let system_tz = self.inner.db.get_timezone().await;
+        let route_tz = resolve_route_timezone(&params.options, system_tz);
 
         let debug = self
             .inner
@@ -962,6 +1011,7 @@ impl DeliveryDispatcher {
             feed_ids_json: "[]".to_string(),
             match_tags_json: "[]".to_string(),
             channel_id: channel.id,
+            destination_id: destination.id,
             include_keywords_json: "[]".to_string(),
             exclude_keywords_json: "[]".to_string(),
             include_regex: None,
@@ -975,6 +1025,7 @@ impl DeliveryDispatcher {
             id: 0,
             route_id: 0,
             channel_id: channel.id,
+            destination_id: destination.id,
             entry_id: 0,
             status: DeliveryTaskStatus::Delivering,
             lease_until: None,
@@ -994,6 +1045,9 @@ impl DeliveryDispatcher {
             route_options: params.options.clone(),
             channel: &channel,
             channel_config: &channel_config,
+            destination: &destination,
+            destination_config: &destination_config,
+            timezone: route_tz,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -1462,7 +1516,8 @@ impl DeliveryDispatcher {
 /// Input of [`DeliveryDispatcher::debug_push`].
 #[derive(Debug, Clone)]
 pub struct DebugPushParams {
-    pub channel_id: i64,
+    pub destination_id: Option<i64>,
+    pub channel_id: Option<i64>,
     pub url: String,
     pub feed_id: Option<i64>,
     pub fingerprint: Option<String>,

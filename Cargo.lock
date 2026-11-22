@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "feedcourier"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -3486,9 +3486,9 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "telegram-rich"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aa58f2babaaefb174994f6b2496aeaf3054e00db2772fbf0559397dfcc73ded"
+checksum = "671868b5f72909f5f6849b0bfc0e674ac7d90c98fe330c5281f9d0e38686fc0d"
 dependencies = [
  "ego-tree",
  "scraper",

@@ -35,6 +35,28 @@ pub fn parse_timezone(raw: &str) -> AppResult<Tz> {
         .map_err(|_| AppError::Validation(format!("unknown IANA timezone '{}'", raw.trim())))
 }
 
+/// Resolve the effective timezone for a route: `options.timezone` if valid, otherwise `system_tz`.
+pub fn resolve_route_timezone(options: &RouteOptions, system_tz: Tz) -> Tz {
+    options
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Tz>().ok())
+        .unwrap_or(system_tz)
+}
+
+/// Format a UTC Unix timestamp in `tz` with explicit UTC offset, e.g. `2026-11-08 11:00 (UTC+08:00)`.
+pub fn format_local_timestamp(ts: i64, tz: Tz) -> Option<String> {
+    let utc = Utc.timestamp_opt(ts, 0).single()?;
+    let local = utc.with_timezone(&tz);
+    Some(format!(
+        "{} (UTC{})",
+        local.format("%Y-%m-%d %H:%M"),
+        local.format("%:z")
+    ))
+}
+
 /// Parse `HH:MM` (also `24:00` as end-of-day) into minutes since midnight.
 pub fn parse_hhmm(raw: &str) -> Option<u32> {
     let (h, m) = raw.trim().split_once(':')?;
@@ -49,8 +71,15 @@ pub fn parse_hhmm(raw: &str) -> Option<u32> {
     Some(h * 60 + m)
 }
 
-/// Validate and normalize windows/weekdays of [`RouteOptions`].
+/// Validate and normalize timezone, windows, and weekdays of [`RouteOptions`].
 pub fn validate_schedule(options: &mut RouteOptions) -> AppResult<()> {
+    if let Some(raw_tz) = options.timezone.take() {
+        let trimmed = raw_tz.trim();
+        if !trimmed.is_empty() {
+            let parsed = parse_timezone(trimmed)?;
+            options.timezone = Some(parsed.name().to_string());
+        }
+    }
     if options.active_windows.len() > 12 {
         return Err(AppError::Validation(
             "at most 12 active_windows are allowed".to_string(),
@@ -242,6 +271,45 @@ mod tests {
         assert_eq!(ok.active_weekdays, vec![1, 7]);
         let mut bad = opts(&[], &[8]);
         assert!(validate_schedule(&mut bad).is_err());
+
+        let mut tz_ok = RouteOptions {
+            timezone: Some("  Asia/Shanghai  ".to_string()),
+            ..RouteOptions::default()
+        };
+        validate_schedule(&mut tz_ok).unwrap();
+        assert_eq!(tz_ok.timezone.as_deref(), Some("Asia/Shanghai"));
+
+        let mut tz_blank = RouteOptions {
+            timezone: Some("   ".to_string()),
+            ..RouteOptions::default()
+        };
+        validate_schedule(&mut tz_blank).unwrap();
+        assert_eq!(tz_blank.timezone, None);
+
+        let mut tz_bad = RouteOptions {
+            timezone: Some("Mars/Olympus".to_string()),
+            ..RouteOptions::default()
+        };
+        assert!(validate_schedule(&mut tz_bad).is_err());
+    }
+
+    #[test]
+    fn format_local_timestamp_uses_timezone_offset() {
+        let shanghai: Tz = "Asia/Shanghai".parse().unwrap();
+        let utc_ts = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 8, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            format_local_timestamp(utc_ts, shanghai).as_deref(),
+            Some("2026-11-08 11:00 (UTC+08:00)")
+        );
+        let la: Tz = "America/Los_Angeles".parse().unwrap();
+        assert_eq!(
+            format_local_timestamp(utc_ts, la).as_deref(),
+            Some("2026-11-07 19:00 (UTC-08:00)")
+        );
     }
 
     #[test]

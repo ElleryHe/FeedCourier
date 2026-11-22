@@ -47,6 +47,12 @@ pub const SETTING_ADMIN_TOTP_LAST_STEP: &str = "admin_totp_last_step";
 /// `system_settings.key`: SHA-256 hashes of unused recovery codes.
 pub const SETTING_ADMIN_RECOVERY_HASHES: &str = "admin_recovery_hashes";
 
+/// `system_settings.key`: schema/data version of the delivery channel model (`2` = Account + Destinations).
+pub const SETTING_CHANNEL_MODEL_VERSION: &str = "channel_model_version";
+
+/// Current delivery channel data model version (v0.2.0 two-layer Channel Account + Destinations).
+pub const CHANNEL_MODEL_VERSION_V2: i64 = 2;
+
 /// Supported system UI and delivery template locales (`system_settings.locale`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AppLocale {
@@ -483,6 +489,36 @@ pub struct UpdateChannel {
     pub enabled: Option<bool>,
 }
 
+/// Row from `channel_destinations` (a delivery destination attached to a parent `Channel` account).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChannelDestination {
+    pub id: i64,
+    pub channel_id: i64,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub encrypted_config: Vec<u8>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Input parameters for creating a destination under an existing channel account.
+#[derive(Debug, Clone)]
+pub struct NewDestination {
+    pub channel_id: i64,
+    pub name: String,
+    pub encrypted_config: Vec<u8>,
+    pub enabled: bool,
+}
+
+/// Partial update payload for `channel_destinations`.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateDestination {
+    pub name: Option<String>,
+    pub encrypted_config: Option<Vec<u8>>,
+    pub enabled: Option<bool>,
+}
+
 /// Row from `routes`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Route {
@@ -491,6 +527,7 @@ pub struct Route {
     pub feed_ids_json: String,
     pub match_tags_json: String,
     pub channel_id: i64,
+    pub destination_id: i64,
     pub include_keywords_json: String,
     pub exclude_keywords_json: String,
     pub include_regex: Option<String>,
@@ -530,6 +567,7 @@ pub struct NewRoute {
     pub feed_ids: Vec<i64>,
     pub match_tags: Vec<String>,
     pub channel_id: i64,
+    pub destination_id: i64,
     pub include_keywords: Vec<String>,
     pub exclude_keywords: Vec<String>,
     pub include_regex: Option<String>,
@@ -545,6 +583,7 @@ pub struct UpdateRoute {
     pub feed_ids: Option<Vec<i64>>,
     pub match_tags: Option<Vec<String>>,
     pub channel_id: Option<i64>,
+    pub destination_id: Option<i64>,
     pub include_keywords: Option<Vec<String>>,
     pub exclude_keywords: Option<Vec<String>>,
     pub include_regex: Option<Option<String>>,
@@ -559,6 +598,7 @@ pub struct DeliveryTask {
     pub id: i64,
     pub route_id: i64,
     pub channel_id: i64,
+    pub destination_id: i64,
     pub entry_id: i64,
     pub status: DeliveryTaskStatus,
     pub lease_until: Option<i64>,
@@ -584,7 +624,8 @@ impl DeliveryTask {
     }
 }
 
-/// Enriched outbox row joining `entries`, `routes`, and `channels` for WebUI & MCP inspection.
+/// Enriched outbox row joining `entries`, `routes`, `channels`, and `channel_destinations` for
+/// WebUI & MCP inspection.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DeliveryTaskDetail {
     pub id: i64,
@@ -593,6 +634,8 @@ pub struct DeliveryTaskDetail {
     pub channel_id: i64,
     pub channel_name: String,
     pub channel_kind: ChannelKind,
+    pub destination_id: i64,
+    pub destination_name: String,
     pub entry_id: i64,
     pub entry_title: Option<String>,
     pub entry_url: Option<String>,

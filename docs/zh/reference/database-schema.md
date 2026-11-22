@@ -1,10 +1,10 @@
 ---
-description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、routes、delivery_tasks、sessions、mcp_tokens 与 system_settings。"
+description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、channel_destinations、routes、delivery_tasks、sessions、mcp_tokens 与 system_settings。"
 ---
 
 # SQLite 数据库表结构参考
 
-FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql)。所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，所有外键关联均启用 **`ON DELETE CASCADE`** 级联清理。
+FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) 与 [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql)（升级 `v0.1.x` 数据库时还会由启动钩子 `Database::migrate_channels_to_v2` 先生成 `<DATA_DIR>/pre-v0.2.0-backup.db` 快照并在单事务内完成通道拆分合并）。所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，所有外键关联均启用 **`ON DELETE CASCADE`** 级联清理。
 
 ---
 
@@ -13,9 +13,12 @@ FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<
 ```mermaid
 erDiagram
     feeds ||--o{ entries : "1 : N (ON DELETE CASCADE)"
+    channels ||--o{ channel_destinations : "1 : N (ON DELETE CASCADE)"
     channels ||--o{ routes : "1 : N (ON DELETE CASCADE)"
+    channel_destinations ||--o{ routes : "1 : N (ON DELETE CASCADE)"
     routes ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
     channels ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
+    channel_destinations ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
     entries ||--o{ delivery_tasks : "1 : N (ON DELETE CASCADE)"
 
     feeds {
@@ -57,12 +60,21 @@ erDiagram
         INTEGER cooldown_until
     }
 
+    channel_destinations {
+        INTEGER id PK
+        INTEGER channel_id FK
+        TEXT name
+        BLOB encrypted_config
+        INTEGER enabled
+    }
+
     routes {
         INTEGER id PK
         TEXT name
         TEXT feed_ids_json
         TEXT match_tags_json
         INTEGER channel_id FK
+        INTEGER destination_id FK
         TEXT include_keywords_json
         TEXT exclude_keywords_json
         TEXT options_json
@@ -72,6 +84,7 @@ erDiagram
         INTEGER id PK
         INTEGER route_id FK
         INTEGER channel_id FK
+        INTEGER destination_id FK
         INTEGER entry_id FK
         TEXT status
         INTEGER lease_until
@@ -139,34 +152,51 @@ erDiagram
 
 ---
 
-## 3. `channels`（授信投递通道与流控配置表）
+## 3. `channels`（授信投递通道账号与流控配置表）
 
-保存由管理员在 WebUI 中配置的下游通道加密凭证、能力探测快照以及步进流控/配额参数（加密与脱敏细节见[安全与防注入机制](/zh/reference/security)）。
+保存由管理员在 WebUI 中配置的账号级加密凭据（`ChannelConfig`）、能力探测快照、代理开关以及由该账号下所有目的地（`channel_destinations`）共享的步进流控/配额/冷却参数（加密与脱敏细节见[安全与防注入机制](/zh/reference/security)）。
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 授信通道主键 ID（MCP 仅通过此整数 ID 引用通道）。 |
-| `name` | `TEXT` | `NOT NULL` | 通道显示名称。 |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 通道账号主键 ID。 |
+| `name` | `TEXT` | `NOT NULL` | 账号显示名称（留空时自动取 Telegram `getMe` `@username`、SMTP `from_address` 或 Notion `/v1/users/me` 集成名）。 |
 | `kind` | `TEXT` | `NOT NULL CHECK (IN ('smtp', 'telegram', 'notion'))` | 通道协议类型。 |
-| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的 `ChannelConfig` JSON 密文（`12B nonce \|\| ciphertext \|\| 16B tag`）。 |
-| `credential_group_key` | `TEXT` | `NOT NULL` | 基于底层发信身份计算的 SHA-256 分组标识，使同账号/同 Token/同 Secret 通道共享步进与冷却时间。 |
-| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 探测到的平台能力快照（如 Telegram `supports_rich_message`、`bot_api_version`、`fallback_reason`）。 |
-| `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15 CHECK (>= 0)` | 最小发信间隔秒数。 |
-| `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10 CHECK (>= 0)` | 随机抖动上限秒数。 |
-| `hourly_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每小时最大投递篇数上限。 |
-| `daily_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每日最大投递篇数上限。 |
-| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 该通道出站请求是否经由全局代理转发。 |
-| `cooldown_until` | `INTEGER` | `NULL` | 触发下游 `429` / `Retry-After` 时的通道冷却截止时间戳。 |
-| `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 通道启用开关。 |
+| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的账号级 `ChannelConfig` JSON 密文（`12B nonce \|\| ciphertext \|\| 16B tag`）。 |
+| `credential_group_key` | `TEXT` | `NOT NULL` | 基于底层发信身份计算的 SHA-256 分组标识，使同账号与同凭据组共享步进、配额与冷却时间。 |
+| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 探测到的平台能力快照（如 Telegram `supports_rich_message`、`bot_api_version`、`bot_username`、`fallback_reason`）。 |
+| `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15 CHECK (>= 0)` | 账号下全部目的地共享的最小发信间隔秒数。 |
+| `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10 CHECK (>= 0)` | 每次投递后独立抽取的随机抖动上限秒数（仅存内存）。 |
+| `hourly_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每小时最大投递篇数上限（账号下全部目的地共享）。 |
+| `daily_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每日最大投递篇数上限（账号下全部目的地共享）。 |
+| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 该账号及其所有目的地的出站请求是否经由全局代理转发。 |
+| `cooldown_until` | `INTEGER` | `NULL` | 触发下游 `429` / `Retry-After` 时的账号及同组冷却截止时间戳。 |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 账号启用开关。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
 - **索引**：`idx_channels_credential_group ON channels (credential_group_key)` —— 支持按共享凭据组批量更新冷却时间。
 
 ---
 
+## 3b. `channel_destinations`（授信投递目的地表）
+
+挂载在 `channels` 账号下的具体投递目标（`migrations/0002_channel_destinations.sql`），每个目的地独立加密存储目标配置、独立启停与独立测试。
+
+| 字段名 | 类型 | 约束与默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 授信目的地主键 ID（`routes` 与 MCP `configure_route`/`test_push_feed_entry` 的主要目标标识）。 |
+| `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 所属父通道账号 ID。 |
+| `name` | `TEXT` | `NOT NULL` | 目的地备注名（留空时自动取 Telegram `getChat` 群/频道名、SMTP 首个收件人或 Notion 数据库标题）。 |
+| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的 `DestinationConfig` JSON 密文（Telegram `chat_id`/`message_thread_id`、SMTP `to_addresses`/`reply_to` 或 Notion `data_source_id`/`column_mapping`）。 |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 该目的地的独立启用开关。 |
+| `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
+
+- **索引**：`idx_channel_destinations_channel_id ON channel_destinations (channel_id)`
+
+---
+
 ## 4. `routes`（路由编排与展现模式规则表）
 
-定义订阅源或标签在通过关键词/正则过滤规则后，以何种展现选项投递至目标 `channel_id`。
+定义订阅源或标签在通过关键词/正则过滤规则后，以何种展现选项投递至目标 `destination_id`（并记录父 `channel_id`）。
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -174,14 +204,17 @@ erDiagram
 | `name` | `TEXT` | `NOT NULL` | 路由规则名称。 |
 | `feed_ids_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | 显式匹配的 `feed_id` 整数数组 JSON（与 `match_tags_json` 均为空时匹配所有订阅源）。 |
 | `match_tags_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | 按标签匹配的标签字符串数组 JSON。 |
-| `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 目标授信通道 ID。 |
+| `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 所属父通道账号 ID。 |
+| `destination_id` | `INTEGER` | `REFERENCES channel_destinations(id) ON DELETE CASCADE` | 目标授信目的地 ID（v0.2.0 迁移与新建路由均自动填充）。 |
 | `include_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | 包含关键词数组 JSON（非空时标题或正文至少命中其一）。 |
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | 排除关键词数组 JSON（命中任意一词即排除）。 |
 | `include_regex` | `TEXT` | `NULL` | 包含正则表达式（非空时必须匹配）。 |
 | `exclude_regex` | `TEXT` | `NULL` | 排除正则表达式（匹配即排除）。 |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 路由选项 JSON（`RouteOptions`）：`telegram_mode`、`link_preview`、`locale`（路由投递语言）、`active_windows`（`[{start, end}]`，系统时区下的 `HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日）。 |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 路由选项 JSON（`RouteOptions`）：`telegram_mode`、`link_preview`、`locale`（路由投递语言）、`timezone`（可选路由级 IANA 时区覆盖，留空继承 `system_settings.timezone`）、`active_windows`（`[{start, end}]`，路由时区下的 `HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日）。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 路由启用开关。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
+
+- **索引**：`idx_routes_destination_id ON routes (destination_id)`
 
 ---
 
@@ -193,7 +226,8 @@ erDiagram
 | :--- | :--- | :--- | :--- |
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 投递任务主键 ID。 |
 | `route_id` | `INTEGER` | `NOT NULL REFERENCES routes(id) ON DELETE CASCADE` | 关联的路由 ID。 |
-| `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 目标通道 ID。 |
+| `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 所属父通道账号 ID（保留用于账号/凭据组级配额统计）。 |
+| `destination_id` | `INTEGER` | `REFERENCES channel_destinations(id) ON DELETE CASCADE` | 目标授信目的地 ID。 |
 | `entry_id` | `INTEGER` | `NOT NULL REFERENCES entries(id) ON DELETE CASCADE` | 关联的条目 ID。受 `UNIQUE (route_id, entry_id)` 唯一约束保护。 |
 | `status` | `TEXT` | `NOT NULL DEFAULT 'queued'` | 状态机枚举：`'queued'`（待处理）、`'delivering'`（租约投递中）、`'delivered'`（已送达）、`'retrying'`（失败重试中）、`'deferred'`（流控/配额延后）、`'dead_letter'`（死信）。 |
 | `lease_until` | `INTEGER` | `NULL` | 当 `status = 'delivering'` 时的 Worker 租约过期时间戳（过期后允许被重新领取）。 |
@@ -210,6 +244,7 @@ erDiagram
   - `idx_delivery_tasks_status_lease ON delivery_tasks (status, lease_until)` —— 用于发现并接管过期租约任务。
   - `idx_delivery_tasks_entry_status ON delivery_tasks (entry_id, status)` —— 支撑 `entries` 正文 GC 的 `NOT EXISTS` 子查询。
   - `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` —— 支撑滚动小时/每日配额（`hourly_quota` / `daily_quota`）统计。
+  - `idx_delivery_tasks_destination_id ON delivery_tasks (destination_id)`
 
 ---
 
@@ -219,7 +254,7 @@ erDiagram
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `key` | `TEXT` | `PRIMARY KEY NOT NULL` | 配置项键名：<br>• `'admin_username'`：管理员用户名（默认 `Courier`，每次启动时被 `ADMIN_USERNAME` 覆盖）<br>• `'admin_password_hash'`：Argon2id PHC 管理员密码哈希<br>• `'admin_totp_secret'`：已生效的 TOTP 密钥（ChaCha20-Poly1305 加密后 Base64 存储；关闭 2FA 或 `RESET_2FA=true` 时删除）<br>• `'admin_totp_pending'`：启用 2FA 过程中等待首次验证码确认的加密密钥<br>• `'admin_totp_last_step'`：最近一次已接受的 TOTP 时间步（重放防护）<br>• `'admin_recovery_hashes'`：未使用恢复码的 SHA-256 哈希<br>• `'timezone'`：路由时间窗口使用的 IANA 系统时区（首次由 `TIMEZONE` / `TZ` 写入，默认 `America/Los_Angeles`）<br>• `'outbox_queue'`：全局队列暂停状态（`paused`、可选 `resume_at`）<br>• `'locale'`：**旧版**兼容回退投递语言（仅用于未设置 `options.locale` 的路由）<br>• `'outbound_proxy_url'`：全局出站代理地址<br>• `'ssrf_allowlist'`：内网 SSRF 白名单字符串数组 |
+| `key` | `TEXT` | `PRIMARY KEY NOT NULL` | 配置项键名：<br>• `'admin_username'`：管理员用户名（默认 `Courier`，每次启动时被 `ADMIN_USERNAME` 覆盖）<br>• `'admin_password_hash'`：Argon2id PHC 管理员密码哈希<br>• `'admin_totp_secret'`：已生效的 TOTP 密钥（ChaCha20-Poly1305 加密后 Base64 存储；关闭 2FA 或 `RESET_2FA=true` 时删除）<br>• `'admin_totp_pending'`：启用 2FA 过程中等待首次验证码确认的加密密钥<br>• `'admin_totp_last_step'`：最近一次已接受的 TOTP 时间步（重放防护）<br>• `'admin_recovery_hashes'`：未使用恢复码的 SHA-256 哈希<br>• `'timezone'`：供路由默认继承的 IANA 系统时区（首次由 `TIMEZONE` / `TZ` 写入，默认 `America/Los_Angeles`）<br>• `'outbox_queue'`：全局队列暂停状态（`paused`、可选 `resume_at`）<br>• `'channel_model_version'`：通道数据模型版本号（完成 v0.2.0 双层账号/目的地迁移后写入 `2`，防止后续重启重复迁移）<br>• `'locale'`：**旧版**兼容回退投递语言（仅用于未设置 `options.locale` 的路由）<br>• `'outbound_proxy_url'`：全局出站代理地址<br>• `'ssrf_allowlist'`：内网 SSRF 白名单字符串数组 |
 | `value_json` | `TEXT` | `NOT NULL` | JSON 序列化后的配置值。 |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 最后修改时间戳。 |
 

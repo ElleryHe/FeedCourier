@@ -61,8 +61,8 @@ Once all four `.tar.gz` archives and the multi-arch Docker Hub manifest succeed,
 In parallel, `docker-build` compiles `linux/amd64` natively on `ubuntu-24.04` and `linux/arm64` natively on `ubuntu-24.04-arm` (without QEMU emulation, caching external Cargo dependencies independently per architecture and pushing by digest), and `docker` combines both digests via `docker buildx imagetools create` to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
 
 - **Published Image Tags**:
-  - `<version>` (e.g., `0.1.6`)
-  - `<major>.<minor>` (e.g., `0.1`)
+  - `<version>` (e.g., `0.2.0`)
+  - `<major>.<minor>` (e.g., `0.2`)
   - `<major>` (enabled from `1.0.0`+)
   - `latest` (for stable non-prerelease tags)
 - **Required GitHub Actions Secrets / Variables**:

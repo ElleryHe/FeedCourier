@@ -1,31 +1,44 @@
 ---
-description: "Sync RSS, Atom, and JSON Feed entries into a Notion database with structured page properties, tags, and full article content converted to Notion blocks."
+description: "Sync RSS, Atom, and JSON Feed entries from one Notion Integration Account into multiple Notion database Destinations with structured properties, tags, and Markdown v2 body conversion."
 ---
 
 # Notion
 
 The Notion channel saves each matched feed entry as a page in a Notion database, writing both structured database properties (title, link, source, publish date, reading state, and tags) and the full article body converted into Notion blocks.
 
+Under FeedCourier's two-layer channel model, you configure your **Notion Integration Account** once (`integration_secret`, proxy, pacing, and quotas) and attach one or more **Destinations**—each targeting a different Notion database (`data_source_id`) with its own column mapping and independent enable/test controls.
+
 ---
 
-## 1. Creating a Notion Integration & Connecting Your Page
+## 1. Creating a Notion Integration & Connecting Your Pages
 
 1. Open the [Notion Integrations dashboard](https://www.notion.so/profile/integrations) and click **New integration** to create an **Internal Integration**.
 2. Under **Capabilities**, ensure **Read content**, **Update content**, and **Insert content** are enabled, then copy the **`Internal Integration Secret`** (starts with `ntn_` or `secret_`).
-3. In Notion, open the parent page (where you want FeedCourier to create a new database) or your existing reading database, click the **`•••`** menu in the top-right corner → **Connections**, and connect the integration you just created.
+3. In Notion, open each parent page (where you want FeedCourier to create a new database) or each existing reading database, click the **`•••`** menu in the top-right corner → **Connections**, and connect the integration you just created.
 
 ---
 
-## 2. Setting Up the Channel in the WebUI
+## 2. Setting Up Account & Destinations in the WebUI
 
-In the WebUI, go to **Channels → New Channel → Notion**. You can choose between two setup methods:
+In the WebUI, go to **Channels → New Channel → Notion**:
 
-### Option 1: One-Click Database Initialization Under a Parent Page
+### Notion Account (Integration) Fields
+
+| Field | Required | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `name` | No | *Auto-fetched* | Account display name. If left blank, automatically fetched from Notion's `/v1/users/me` integration name. |
+| `integration_secret` | Yes | — | Notion Internal Integration Secret (`ntn_...` or `secret_...`, encrypted at rest; shown masked in the WebUI). |
+
+### Adding One or More Database Destinations
+
+Under a Notion Account, you can add multiple **Destinations** (leaving the destination `name` blank automatically fills it with the **Notion database title**). Each destination supports two setup methods:
+
+#### Option 1: One-Click Database Initialization Under a Parent Page
 
 If you want FeedCourier to create a ready-to-use reading database for you:
-1. Enter your **Integration Secret** and the **Parent Page ID or URL** that you shared with the integration.
+1. Enter the **Parent Page ID or URL** that you shared with the integration.
 2. Click **Initialize Standard Database**.
-3. FeedCourier creates a database under that parent page with **7 standard properties** and binds it to the channel automatically:
+3. FeedCourier creates a database under that parent page with **7 standard properties** and binds its `data_source_id` to the destination automatically:
 
 | Property Name | Notion Type | Required | Description |
 | :--- | :---: | :---: | :--- |
@@ -37,7 +50,7 @@ If you want FeedCourier to create a ready-to-use reading database for you:
 | **`State`** | `select` | Optional | Reading status (`UnRead` and `Read`); new entries default to `UnRead`. |
 | **`Tag`** | `multi_select` | Optional | Synced from the feed's configured tags in FeedCourier. |
 
-### Option 2: Bind an Existing Database with Column Mapping
+#### Option 2: Bind an Existing Database with Column Mapping
 
 If you already have a Notion database for reading or knowledge management:
 1. Select **Bind Existing Data Source** and paste your **Database URL**, **Database ID**, or **Data Source ID**.
@@ -45,6 +58,12 @@ If you already have a Notion database for reading or knowledge management:
    - **Required Columns**: Only **`Title`** (`title`) and **`FC-ID`** (`rich_text`) are required.
    - **Optional Columns**: `Link`, `Source`, `Published`, `State`, and `Tag` can be mapped to your own custom column names or left unmapped (`null`) if you do not need them.
    - **One-Click Column Patching**: If your database is missing `FC-ID` or any other standard columns you want to use, enable auto-patching in the wizard to add the missing properties automatically.
+
+### Account vs. Destination Testing & Shared Limits
+
+- **Test Account**: Verifies your Integration Secret via `GET /v1/users/me` without creating a page.
+- **Test Destination**: Creates a verification page inside that specific Notion database.
+- **Shared Rate Limits & Quotas**: All database destinations under the same Notion Integration share `min_interval_secs`, per-delivery random jitter, `hourly_quota`, `daily_quota`, `use_proxy`, and Notion `429` cooldowns. See [Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas).
 
 ---
 

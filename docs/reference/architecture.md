@@ -17,7 +17,7 @@ For downstream channel protocol specifications and security isolation details, s
 FeedCourier runs inside a single Rust process composed of five primary subsystems:
 - **`ProtectedHttpClient` (`src/net/`)**: Performs pre-connect DNS IP validation against SSRF, hop-by-hop redirect validation (up to 5 hops), streaming response byte caps, and optional outbound proxy routing.
 - **`IngestEngine` (`src/ingest/`)**: Executes feed polling (`ETag` / `Last-Modified` conditional requests), optional `dom_smoothie` Readability full-article extraction, `ammonia` HTML sanitization, four-tier SHA-256 fingerprint calculation, and route content filtering.
-- **`Database` (`src/db/`)**: Manages a serialized SQLite WAL writer pool (`write_pool`) and a concurrent read-only pool (`read_pool`) over `feeds`, `entries`, `channels`, `routes`, and `delivery_tasks`.
+- **`Database` (`src/db/`)**: Manages a serialized SQLite WAL writer pool (`write_pool`) and a concurrent read-only pool (`read_pool`) over `feeds`, `entries`, `channels`, `channel_destinations`, `routes`, and `delivery_tasks`, including the automatic atomic v0.2.0 migration hook (`Database::migrate_channels_to_v2`).
 - **`DeliveryDispatcher` (`src/scheduler/`)**: Drives the background feed polling loop, the lease-based outbox worker (with shared-credential pacing, rolling quotas, and `checkpoint_json` crash recovery), and the periodic maintenance loop (`NOT EXISTS` payload GC and `PRAGMA optimize`).
 - **Axum HTTP Server (`src/api/`, `src/mcp/`)**: Serves the embedded React 19 WebUI, the JSON REST API (`/api/v1/*`), and the Streamable HTTP MCP endpoint (`/mcp`) on a single listen address.
 
@@ -174,24 +174,24 @@ If the process terminates mid-delivery (`SIGKILL`, container restart, or power l
 
 ### 3. Shared-Credential Rate Limiting (`credential_group_key`) & Quotas
 
-Multiple logical channels may share the same underlying sender credential (for example, one Telegram `bot_token` posting to multiple chats/topics, or one Notion `integration_secret` writing to multiple data sources). When a channel is saved, FeedCourier computes a SHA-256 `credential_group_key` from the channel kind and primary credential:
+Under the two-layer channel model (`channels` Account + multiple `channel_destinations`), every destination attached to the same Channel Account inherits that account's credentials, proxy, pacing, quotas, and cooldowns. In addition, if separate Channel Accounts share the same underlying sender credential (same SMTP login/host/port, same Telegram `bot_token` + `api_base_url`, or same Notion `integration_secret`), FeedCourier computes an identical SHA-256 `credential_group_key` so they share rate limits too:
 
-- **Pacing & Jitter**: `DeliveryDispatcher` tracks the next allowed send timestamp per `credential_group_key`. After each delivery, all channels sharing that key wait `min_interval_secs + uniform_random(0..=jitter_max_secs)` seconds;
-- **Group-Wide `429` Cooldown (`cooldown_until`)**: When an upstream API returns `429 Too Many Requests` (with a Telegram `retry_after` parameter or HTTP `Retry-After` header), `cooldown_until` is applied across all channels sharing the same `credential_group_key`;
-- **Rolling Quotas (`hourly_quota` / `daily_quota`)**: Before sending, the worker counts `status = 'delivered'` tasks for the channel over the trailing `3,600` and `86,400` seconds. When a quota is reached, the task is moved to `deferred` until the oldest delivered task exits the rolling window.
+- **Independent Per-Delivery Pacing & In-Memory Jitter**: `DeliveryDispatcher` tracks the next allowed send timestamp per `credential_group_key` in memory (`pacing_next_allowed_at`). After **each** completed delivery, it independently samples a fresh `uniform_random(0..=jitter_max_secs)` delay and sets `next_allowed = completed_at + min_interval_secs + jitter` (jitter is never shared across a batch). Because the randomized jitter state is kept in memory only, after a restart the first delivery enforces `min_interval_secs` from the persisted `last_completed_at` timestamp in SQLite (`max(last_completed_at + min_interval_secs, mem_earliest)`), and subsequent deliveries resume full jittered pacing;
+- **Group-Wide `429` Cooldown (`cooldown_until`)**: When an upstream API returns `429 Too Many Requests` (with a Telegram `retry_after` parameter or HTTP `Retry-After` header), `cooldown_until` is applied across the account and all sibling accounts sharing the same `credential_group_key`;
+- **Account & Group Rolling Quotas (`hourly_quota` / `daily_quota`)**: Before sending, `get_channel_quota_usage` counts `status = 'delivered'` tasks across all destinations of the account (and its `credential_group_key`) over the trailing `3,600` and `86,400` seconds. When a quota is reached, the task is moved to `deferred` without burning retry attempts.
 
-### 4. Route Time Windows & Global Queue Pause
+### 4. Route Timezones, Delivery Windows & Global Queue Pause
 
 Two gates sit in front of the claim loop:
 
-- **Route time windows**: `routes.options_json` may carry `active_windows` (`HH:MM` pairs) and `active_weekdays` (`1`=Mon … `7`=Sun). They are evaluated in the IANA timezone stored in `system_settings.timezone` (`src/schedule.rs`). A window whose `end` is earlier than `start` wraps midnight, `start == end` covers the whole day, and an empty list means always; for wrapped windows the weekday is that of the day the window starts. A task outside its window is **not dropped**: it keeps status `queued` / `deferred` and `next_attempt_at` is set to the next window start, so the regular claim query picks it up then.
+- **Route timezone & delivery windows**: `routes.options_json` may carry an optional IANA `timezone` override (defaulting to `system_settings.timezone` via `resolve_route_timezone`), `active_windows` (`HH:MM` pairs), and `active_weekdays` (`1`=Mon … `7`=Sun) (`src/schedule.rs`). The effective route timezone governs delivery window evaluation as well as localized article timestamps rendered in SMTP emails and Telegram rich-message `<footer>` blocks (`format_local_timestamp`, formatted as `YYYY-MM-DD HH:MM (UTC±HH:MM)`). A window whose `end` is earlier than `start` wraps midnight, `start == end` covers the whole day, and an empty list means always; for wrapped windows the weekday is that of the day the window starts. A task outside its window is **not dropped**: it keeps status `queued` / `deferred` and `next_attempt_at` is set to the next window start, so the regular claim query picks it up then.
 - **Global pause**: `system_settings.outbox_queue` stores the pause state and optional `resume_at`. While paused the dispatcher claims nothing, but feed polling and task enqueueing continue. An expired `resume_at` counts as resumed (`GET /api/v1/tasks/queue` returns `paused: false`). After resume, all due tasks drain in the chronological order above.
 
 Delivery language is resolved per task from `routes.options_json.locale`, falling back to the legacy `system_settings.locale`. The WebUI language is only a browser preference (`localStorage`) and is not stored on the server.
 
 ### 5. Debug Push (`POST /api/v1/feeds/preview/push`, MCP `test_push_feed_entry`)
 
-A debug push fetches one entry live and calls the channel sender directly with an in-memory entry. It writes no `entries` fingerprint and no `delivery_tasks` row, and bypasses route filters, time windows, the global pause, pacing, and quotas. Notion pages use a `test-` prefixed `FC-ID`, and downstream errors are returned to the caller as `ok: false` diagnostics.
+A debug push fetches one entry live and calls the channel sender directly against a trusted `destination_id` (or legacy single-destination `channel_id`) with an in-memory entry and optional `options.timezone`. It writes no `entries` fingerprint and no `delivery_tasks` row, and bypasses route filters, time windows, the global pause, pacing, and quotas. Notion pages use a `test-` prefixed `FC-ID`, and downstream errors are returned to the caller as `ok: false` diagnostics.
 
 ---
 

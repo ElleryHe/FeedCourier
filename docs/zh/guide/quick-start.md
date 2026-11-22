@@ -21,7 +21,7 @@ docker run -d \
   -e TZ=Asia/Shanghai \
   elleryhe/feedcourier:latest
   # 也可指定具体版本号：
-  # elleryhe/feedcourier:0.1.6
+  # elleryhe/feedcourier:0.2.0
 ```
 
 容器启动后会自动在挂载的 `/data` 目录中初始化：
@@ -37,7 +37,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # 或指定版本 elleryhe/feedcourier:0.1.6
+    image: elleryhe/feedcourier:latest # 或指定版本 elleryhe/feedcourier:0.2.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -72,17 +72,17 @@ docker compose logs -f feedcourier
 
 每次版本发布均在 [GitHub Releases](https://github.com/ElleryHe/FeedCourier/releases) 提供四个主流平台的预编译压缩包与 `SHA256SUMS.txt` 校验文件：
 
-| 操作系统与架构 | 目标三元组（Target Triple） | 压缩包文件名（以 `0.1.6` 为例） |
+| 操作系统与架构 | 目标三元组（Target Triple） | 压缩包文件名（以 `0.2.0` 为例） |
 | :--- | :--- | :--- |
-| **Linux x86_64** | `x86_64-unknown-linux-gnu` | `feedcourier-0.1.6-x86_64-unknown-linux-gnu.tar.gz` |
-| **Linux ARM64** | `aarch64-unknown-linux-gnu` | `feedcourier-0.1.6-aarch64-unknown-linux-gnu.tar.gz` |
-| **macOS Apple Silicon** | `aarch64-apple-darwin` | `feedcourier-0.1.6-aarch64-apple-darwin.tar.gz` |
-| **macOS Intel** | `x86_64-apple-darwin` | `feedcourier-0.1.6-x86_64-apple-darwin.tar.gz` |
+| **Linux x86_64** | `x86_64-unknown-linux-gnu` | `feedcourier-0.2.0-x86_64-unknown-linux-gnu.tar.gz` |
+| **Linux ARM64** | `aarch64-unknown-linux-gnu` | `feedcourier-0.2.0-aarch64-unknown-linux-gnu.tar.gz` |
+| **macOS Apple Silicon** | `aarch64-apple-darwin` | `feedcourier-0.2.0-aarch64-apple-darwin.tar.gz` |
+| **macOS Intel** | `x86_64-apple-darwin` | `feedcourier-0.2.0-x86_64-apple-darwin.tar.gz` |
 
 下载、校验 SHA-256 并启动（以 Linux `x86_64` 为例）：
 
 ```bash
-VERSION="0.1.6"
+VERSION="0.2.0"
 TARGET="x86_64-unknown-linux-gnu"
 ARCHIVE="feedcourier-${VERSION}-${TARGET}.tar.gz"
 
@@ -154,7 +154,7 @@ curl -s http://127.0.0.1:8080/api/v1/health
 ```json
 {
   "name": "FeedCourier",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "license": "AGPL-3.0",
   "repo_url": "https://github.com/ElleryHe/FeedCourier",
   "status": "ok"
@@ -167,9 +167,9 @@ curl -s http://127.0.0.1:8080/api/v1/health
 
 完成登录后，可按以下顺序完成基本配置：
 
-1. **创建推送通道**：前往 **Channels** 页面，配置 [SMTP 邮件](/zh/channels/smtp)、[Telegram](/zh/channels/telegram) 或 [Notion](/zh/channels/notion)，并点击 **Test** 按钮发送测试消息。
-2. **添加订阅源或导入 OPML**：前往 **Feeds** 页面添加 RSS / Atom / JSON Feed（支持开启 `silent_init` 静默记录存量历史文章，或勾选 `push_latest_one` 立即试推最新 1 篇）。
-3. **配置路由规则**：前往 **Routes** 页面将指定订阅源或标签（`tags`）绑定到目标通道，按需设置关键词/正则过滤与投递模式。每条路由还有独立的**投递语言**（默认取当前 WebUI 界面语言），以及可选的**投递时间窗口**与**星期**（按系统时区判定）。
+1. **创建推送通道账号与目的地**：前往 **Channels** 页面，配置 [SMTP 邮件](/zh/channels/smtp)、[Telegram](/zh/channels/telegram) 或 [Notion](/zh/channels/notion) 账号（留空名称会自动拉取默认名称），并在该账号下添加一个或多个**目的地**（如不同的群组/话题、收件人组或 Notion 数据库）。可分别测试账号连通性或向单个目的地发送测试消息。
+2. **添加订阅源或导入 OPML**：前往 **Feeds** 页面添加 RSS / Atom / JSON Feed（支持开启 `silent_init` 静默记录存量历史文章，或勾选 `push_latest_one` 立即试推最新 1 篇）。订阅数量较多时，可使用页面顶部的**标签下拉筛选**、**持久化排序**（添加时间或名称）、名称/URL 搜索以及 **15 / 30 / 50** 条每页分页。
+3. **配置路由规则**：前往 **Routes** 页面将指定订阅源或标签（`tags`）绑定到目标**目的地**，按需设置关键词/正则过滤与投递模式。每条路由支持独立的**投递语言**（默认取当前 WebUI 界面语言）、可选的**路由级时区**（默认继承系统时区，同时作用于推送时段与文章本地时间）以及**投递时间窗口**与**星期**。
 4. **（可选）接入 MCP 客户端**：前往 **Settings → Native MCP Server (`/mcp`)** 签发令牌，参阅 [客户端接入与安全说明](/zh/mcp/setup)。
 
 ---

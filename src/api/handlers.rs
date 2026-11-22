@@ -17,27 +17,29 @@ use url::Url;
 
 use crate::api::AppState;
 use crate::api::dto::{
-    ActionAckResponse, ChannelCooldownSummary, ChannelDto, ClearFeedCacheRequest,
-    ClearFeedCacheResponse, CreateChannelRequest, CreateFeedRequest, CreateMcpTokenRequest,
-    CreateMcpTokenResponse, CreateRouteRequest, DebugPushRequest, DebugPushResponse,
-    DeliveryTaskDto, FeedDto, FeedPreviewRequest, GcResponse, ListTasksQuery, McpTokenDto,
-    OpmlImportRequest, OpmlImportResponse, OverviewResponse, PollFeedResponse, QueueStateDto,
-    RetryTasksRequest, RetryTasksResponse, RouteDto, SystemSettingsDto, TestChannelRequest,
-    TestChannelResponse, UpdateChannelRequest, UpdateFeedRequest, UpdateQueueRequest,
-    UpdateRouteRequest, UpdateSystemSettingsRequest, normalize_channel_config_on_create,
-    normalize_opt_string, normalize_string_vec,
+    ActionAckResponse, ChannelCooldownSummary, ChannelDestinationDto, ChannelDto,
+    ClearFeedCacheRequest, ClearFeedCacheResponse, CreateChannelRequest, CreateDestinationRequest,
+    CreateFeedRequest, CreateMcpTokenRequest, CreateMcpTokenResponse, CreateRouteRequest,
+    DebugPushRequest, DebugPushResponse, DeliveryTaskDto, FeedDto, FeedPreviewRequest, GcResponse,
+    ListTasksQuery, McpTokenDto, OpmlImportRequest, OpmlImportResponse, OverviewResponse,
+    PollFeedResponse, QueueStateDto, RetryTasksRequest, RetryTasksResponse, RouteDto,
+    SystemSettingsDto, TestChannelRequest, TestChannelResponse, UpdateChannelRequest,
+    UpdateDestinationRequest, UpdateFeedRequest, UpdateQueueRequest, UpdateRouteRequest,
+    UpdateSystemSettingsRequest, normalize_channel_config_on_create,
+    normalize_destination_config_on_create, normalize_opt_string, normalize_string_vec,
 };
 use crate::channels::notion::{
     NotionInitDbRequest, NotionInitDbResponse, NotionInspectSchemaRequest,
     NotionInspectSchemaResponse,
 };
-use crate::channels::{ChannelConfig, ChannelKind, ChannelSender, RouteOptions};
+use crate::channels::{ChannelConfig, ChannelKind, ChannelSender, DestinationConfig, RouteOptions};
 use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::hash_token;
 use crate::db::models::{
-    AppLocale, DeliveryTaskStatus, FeedHealthStatus, NewChannel, NewFeed, NewRoute, SETTING_LOCALE,
-    SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE, UpdateChannel,
-    UpdateFeed, UpdateRoute, now_unix, unix_to_rfc3339,
+    AppLocale, Channel, ChannelDestination, DeliveryTaskStatus, FeedHealthStatus, NewChannel,
+    NewDestination, NewFeed, NewRoute, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL,
+    SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE, UpdateChannel, UpdateDestination, UpdateFeed,
+    UpdateRoute, now_unix, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::{ContentFilterRules, FeedPreviewResponse};
@@ -316,15 +318,18 @@ pub async fn debug_push_feed(
     Json(req): Json<DebugPushRequest>,
 ) -> AppResult<Json<DebugPushResponse>> {
     let url = validate_http_url(&req.url)?;
-    let options = RouteOptions {
+    let mut options = RouteOptions {
         telegram_mode: req.options.telegram_mode.unwrap_or_default(),
         link_preview: req.options.link_preview.unwrap_or(true),
         locale: req.options.locale,
+        timezone: req.options.timezone,
         ..RouteOptions::default()
     };
+    validate_schedule(&mut options)?;
     let result = state
         .runtime()
         .debug_push(DebugPushParams {
+            destination_id: req.destination_id,
             channel_id: req.channel_id,
             url,
             feed_id: req.feed_id,
@@ -384,15 +389,22 @@ pub async fn export_opml(State(state): State<AppState>) -> AppResult<Response> {
 }
 
 // ===========================================================================
-// Trusted Channels (`/api/v1/channels*`)
+// Trusted Channels (Accounts) & Destinations (`/api/v1/channels*`, `/api/v1/destinations*`)
 // ===========================================================================
 
 /// `GET /api/v1/channels`
 pub async fn list_channels(State(state): State<AppState>) -> AppResult<Json<Vec<ChannelDto>>> {
     let channels = state.db().list_channels().await?;
+    let destinations = state.db().list_destinations().await?;
+    let mut dests_by_channel: HashMap<i64, Vec<ChannelDestination>> = HashMap::new();
+    for d in destinations {
+        dests_by_channel.entry(d.channel_id).or_default().push(d);
+    }
+
     let mut out = Vec::with_capacity(channels.len());
     for ch in channels {
-        out.push(ChannelDto::from_model(ch, state.master_key())?);
+        let dests = dests_by_channel.remove(&ch.id).unwrap_or_default();
+        out.push(ChannelDto::from_model(ch, dests, state.master_key())?);
     }
     Ok(Json(out))
 }
@@ -402,12 +414,6 @@ pub async fn create_channel(
     State(state): State<AppState>,
     Json(mut req): Json<CreateChannelRequest>,
 ) -> AppResult<(StatusCode, Json<ChannelDto>)> {
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return Err(AppError::Validation(
-            "Channel name must not be empty".to_string(),
-        ));
-    }
     if req.kind != req.config.kind() {
         return Err(AppError::Validation(format!(
             "channel kind '{}' does not match config.kind '{}'",
@@ -424,29 +430,89 @@ pub async fn create_channel(
 
     normalize_channel_config_on_create(&mut req.config)?;
 
-    let credential_group_key = req.config.credential_group_key();
-    let encrypted_config = state.master_key().encrypt_json(&req.config)?;
+    if let Some(ref mut init_dest) = req.initial_destination {
+        if init_dest.config.kind() != req.kind {
+            return Err(AppError::Validation(format!(
+                "initial_destination kind '{}' does not match channel kind '{}'",
+                init_dest.config.kind(),
+                req.kind
+            )));
+        }
+        normalize_destination_config_on_create(&mut init_dest.config)?;
+    }
 
-    let capabilities_json = if let ChannelConfig::Telegram(ref tg_cfg) = req.config {
-        match state
-            .runtime()
-            .telegram_sender()
-            .probe_capabilities(tg_cfg, req.use_proxy)
-            .await
-        {
-            Ok(caps) => serde_json::to_string(&caps)?,
-            Err(err) => {
-                warn!(
-                    channel_name = %name,
-                    error = %err,
-                    "best-effort Telegram capability probe skipped during channel creation"
-                );
-                "{}".to_string()
+    let explicit_name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    let (derived_name, capabilities_json) = match &req.config {
+        ChannelConfig::Telegram(tg_cfg) => {
+            match state
+                .runtime()
+                .telegram_sender()
+                .probe_capabilities(tg_cfg, req.use_proxy)
+                .await
+            {
+                Ok(caps) => {
+                    let default_name = caps
+                        .bot_username
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .map(|u| format!("@{}", u.trim_start_matches('@')))
+                        .or_else(|| {
+                            caps.bot_first_name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|n| !n.is_empty())
+                                .map(ToOwned::to_owned)
+                        })
+                        .unwrap_or_else(|| "Telegram Bot".to_string());
+                    (default_name, serde_json::to_string(&caps)?)
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "best-effort Telegram capability probe skipped during channel creation"
+                    );
+                    ("Telegram Bot".to_string(), "{}".to_string())
+                }
             }
         }
-    } else {
-        "{}".to_string()
+        ChannelConfig::Smtp(smtp_cfg) => {
+            (smtp_cfg.from_address.trim().to_string(), "{}".to_string())
+        }
+        ChannelConfig::Notion(notion_cfg) => {
+            let bot_name = if explicit_name.is_none() {
+                match state
+                    .runtime()
+                    .notion_sender()
+                    .get_bot_name(&notion_cfg.integration_secret, req.use_proxy)
+                    .await
+                {
+                    Ok(Some(n)) => n,
+                    Ok(None) => "Notion Integration".to_string(),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "best-effort Notion /v1/users/me lookup skipped during channel creation"
+                        );
+                        "Notion Integration".to_string()
+                    }
+                }
+            } else {
+                "Notion Integration".to_string()
+            };
+            (bot_name, "{}".to_string())
+        }
     };
+
+    let name = explicit_name.unwrap_or(derived_name);
+    let credential_group_key = req.config.credential_group_key();
+    let encrypted_config = state.master_key().encrypt_json(&req.config)?;
 
     let created = state
         .db()
@@ -465,9 +531,19 @@ pub async fn create_channel(
         })
         .await?;
 
+    let mut created_dests = Vec::new();
+    if let Some(init_dest) = req.initial_destination {
+        let dest = create_destination_for_channel(&state, &created, &req.config, init_dest).await?;
+        created_dests.push(dest);
+    }
+
     Ok((
         StatusCode::CREATED,
-        Json(ChannelDto::from_model(created, state.master_key())?),
+        Json(ChannelDto::from_model(
+            created,
+            created_dests,
+            state.master_key(),
+        )?),
     ))
 }
 
@@ -535,7 +611,12 @@ pub async fn update_channel(
         state.runtime().notify_outbox();
     }
 
-    Ok(Json(ChannelDto::from_model(updated, state.master_key())?))
+    let dests = state.db().list_destinations_for_channel(updated.id).await?;
+    Ok(Json(ChannelDto::from_model(
+        updated,
+        dests,
+        state.master_key(),
+    )?))
 }
 
 /// `DELETE /api/v1/channels/{id}`
@@ -552,18 +633,331 @@ pub async fn delete_channel(
 }
 
 /// `POST /api/v1/channels/{id}/test`
+///
+/// When `destination_id` is passed in the request body, sends a full test delivery to that
+/// destination; otherwise verifies account-level credentials (`getMe` + `sendRichMessage` probe
+/// for Telegram, `GET /v1/users/me` for Notion, `EHLO`/`AUTH` connection test for SMTP).
 pub async fn test_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<i64>,
     body: Option<Json<TestChannelRequest>>,
 ) -> AppResult<Json<TestChannelResponse>> {
-    let test_locale: Option<AppLocale> = body.and_then(|Json(req)| req.locale);
+    let req = body.map(|Json(r)| r).unwrap_or_default();
     let channel = state
         .db()
         .get_channel(channel_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("channel {channel_id} not found")))?;
+
+    if let Some(dest_id) = req.destination_id {
+        let dest = state
+            .db()
+            .get_destination(dest_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("destination {dest_id} not found")))?;
+        if dest.channel_id != channel.id {
+            return Err(AppError::Validation(format!(
+                "destination {dest_id} does not belong to channel {channel_id}"
+            )));
+        }
+        return run_destination_test(&state, &channel, &dest, req.locale)
+            .await
+            .map(Json);
+    }
+
     let cfg: ChannelConfig = state.master_key().decrypt_json(&channel.encrypted_config)?;
+    match &cfg {
+        ChannelConfig::Smtp(smtp_cfg) => {
+            let message = state.runtime().smtp_sender().test_account(smtp_cfg).await?;
+            Ok(Json(TestChannelResponse {
+                ok: true,
+                message,
+                capabilities: None,
+            }))
+        }
+        ChannelConfig::Telegram(tg_cfg) => {
+            let sender = state.runtime().telegram_sender();
+            let caps = sender.probe_capabilities(tg_cfg, channel.use_proxy).await?;
+            let caps_val = serde_json::to_value(&caps)?;
+            state
+                .db()
+                .update_channel_capabilities(channel.id, &caps_val)
+                .await?;
+            let bot_label = caps
+                .bot_username
+                .as_deref()
+                .map(|u| format!("@{u}"))
+                .or_else(|| caps.bot_first_name.clone())
+                .unwrap_or_else(|| "bot".to_string());
+            Ok(Json(TestChannelResponse {
+                ok: true,
+                message: format!(
+                    "Telegram bot {bot_label} verified (sendRichMessage={})",
+                    caps.supports_rich_message
+                ),
+                capabilities: Some(caps_val),
+            }))
+        }
+        ChannelConfig::Notion(notion_cfg) => {
+            let name = state
+                .runtime()
+                .notion_sender()
+                .get_bot_name(&notion_cfg.integration_secret, channel.use_proxy)
+                .await?
+                .unwrap_or_else(|| "Notion Integration".to_string());
+            Ok(Json(TestChannelResponse {
+                ok: true,
+                message: format!("Notion integration \"{name}\" verified via GET /v1/users/me"),
+                capabilities: None,
+            }))
+        }
+    }
+}
+
+/// `GET /api/v1/channels/{id}/destinations`
+pub async fn list_channel_destinations(
+    State(state): State<AppState>,
+    Path(channel_id): Path<i64>,
+) -> AppResult<Json<Vec<ChannelDestinationDto>>> {
+    let channel = state
+        .db()
+        .get_channel(channel_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("channel {channel_id} not found")))?;
+    let dests = state.db().list_destinations_for_channel(channel_id).await?;
+    let mut out = Vec::with_capacity(dests.len());
+    for d in dests {
+        out.push(ChannelDestinationDto::from_model(
+            d,
+            channel.kind,
+            state.master_key(),
+        )?);
+    }
+    Ok(Json(out))
+}
+
+/// `POST /api/v1/channels/{id}/destinations`
+pub async fn create_destination(
+    State(state): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Json(mut req): Json<CreateDestinationRequest>,
+) -> AppResult<(StatusCode, Json<ChannelDestinationDto>)> {
+    let channel = state
+        .db()
+        .get_channel(channel_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("channel {channel_id} not found")))?;
+
+    if req.config.kind() != channel.kind {
+        return Err(AppError::Validation(format!(
+            "destination config kind '{}' does not match parent channel kind '{}'",
+            req.config.kind(),
+            channel.kind
+        )));
+    }
+    normalize_destination_config_on_create(&mut req.config)?;
+
+    let account_cfg: ChannelConfig = state.master_key().decrypt_json(&channel.encrypted_config)?;
+    let created = create_destination_for_channel(&state, &channel, &account_cfg, req).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ChannelDestinationDto::from_model(
+            created,
+            channel.kind,
+            state.master_key(),
+        )?),
+    ))
+}
+
+/// `PATCH /api/v1/destinations/{id}`
+pub async fn update_destination(
+    State(state): State<AppState>,
+    Path(destination_id): Path<i64>,
+    Json(req): Json<UpdateDestinationRequest>,
+) -> AppResult<Json<ChannelDestinationDto>> {
+    let existing = state
+        .db()
+        .get_destination(destination_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("destination {destination_id} not found")))?;
+    let channel = state
+        .db()
+        .get_channel(existing.channel_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("channel {} not found", existing.channel_id)))?;
+
+    if let Some(ref raw_name) = req.name
+        && raw_name.trim().is_empty()
+    {
+        return Err(AppError::Validation(
+            "Destination name must not be empty".to_string(),
+        ));
+    }
+
+    let mut patch = UpdateDestination {
+        name: req.name.map(|s| s.trim().to_string()),
+        enabled: req.enabled,
+        ..UpdateDestination::default()
+    };
+
+    if let Some(ref cfg_patch) = req.config {
+        let current_cfg: DestinationConfig = state
+            .master_key()
+            .decrypt_json(&existing.encrypted_config)?;
+        let merged = cfg_patch.apply_to(&current_cfg)?;
+        patch.encrypted_config = Some(state.master_key().encrypt_json(&merged)?);
+    }
+
+    let updated = state
+        .db()
+        .update_destination(destination_id, &patch)
+        .await?;
+    if req.enabled == Some(true) {
+        state.runtime().notify_outbox();
+    }
+
+    Ok(Json(ChannelDestinationDto::from_model(
+        updated,
+        channel.kind,
+        state.master_key(),
+    )?))
+}
+
+/// `DELETE /api/v1/destinations/{id}`
+pub async fn delete_destination(
+    State(state): State<AppState>,
+    Path(destination_id): Path<i64>,
+) -> AppResult<Json<ActionAckResponse>> {
+    if !state.db().delete_destination(destination_id).await? {
+        return Err(AppError::NotFound(format!(
+            "destination {destination_id} not found"
+        )));
+    }
+    Ok(Json(ActionAckResponse::ok()))
+}
+
+/// `POST /api/v1/destinations/{id}/test`
+pub async fn test_destination(
+    State(state): State<AppState>,
+    Path(destination_id): Path<i64>,
+    body: Option<Json<TestChannelRequest>>,
+) -> AppResult<Json<TestChannelResponse>> {
+    let test_locale = body.and_then(|Json(r)| r.locale);
+    let dest = state
+        .db()
+        .get_destination(destination_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("destination {destination_id} not found")))?;
+    let channel = state
+        .db()
+        .get_channel(dest.channel_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("channel {} not found", dest.channel_id)))?;
+    run_destination_test(&state, &channel, &dest, test_locale)
+        .await
+        .map(Json)
+}
+
+async fn create_destination_for_channel(
+    state: &AppState,
+    channel: &Channel,
+    account_cfg: &ChannelConfig,
+    req: CreateDestinationRequest,
+) -> AppResult<ChannelDestination> {
+    let explicit_name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    let name = match explicit_name {
+        Some(n) => n,
+        None => derive_default_destination_name(state, channel, account_cfg, &req.config).await,
+    };
+
+    let encrypted_config = state.master_key().encrypt_json(&req.config)?;
+    state
+        .db()
+        .create_destination(&NewDestination {
+            channel_id: channel.id,
+            name,
+            encrypted_config,
+            enabled: req.enabled,
+        })
+        .await
+}
+
+async fn derive_default_destination_name(
+    state: &AppState,
+    channel: &Channel,
+    account_cfg: &ChannelConfig,
+    dest_cfg: &DestinationConfig,
+) -> String {
+    match (account_cfg, dest_cfg) {
+        (ChannelConfig::Telegram(tg_acc), DestinationConfig::Telegram(tg_dest)) => {
+            match state
+                .runtime()
+                .telegram_sender()
+                .get_chat_name(tg_acc, &tg_dest.chat_id, channel.use_proxy)
+                .await
+            {
+                Ok(Some(chat_name)) => chat_name,
+                Ok(None) => tg_dest.chat_id.trim().to_string(),
+                Err(err) => {
+                    warn!(
+                        channel_id = channel.id,
+                        chat_id = %tg_dest.chat_id,
+                        error = %err,
+                        "best-effort Telegram getChat lookup skipped; falling back to chat_id"
+                    );
+                    tg_dest.chat_id.trim().to_string()
+                }
+            }
+        }
+        (_, DestinationConfig::Smtp(smtp_dest)) => smtp_dest
+            .to_addresses
+            .first()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "SMTP Recipient".to_string()),
+        (ChannelConfig::Notion(n_acc), DestinationConfig::Notion(n_dest)) => {
+            match state
+                .runtime()
+                .notion_sender()
+                .get_data_source_title(
+                    &n_acc.integration_secret,
+                    &n_dest.data_source_id,
+                    channel.use_proxy,
+                )
+                .await
+            {
+                Ok(Some(title)) => title,
+                Ok(None) => n_dest.data_source_id.clone(),
+                Err(err) => {
+                    warn!(
+                        channel_id = channel.id,
+                        data_source_id = %n_dest.data_source_id,
+                        error = %err,
+                        "best-effort Notion database title lookup skipped; falling back to data_source_id"
+                    );
+                    n_dest.data_source_id.clone()
+                }
+            }
+        }
+        _ => "Destination".to_string(),
+    }
+}
+
+async fn run_destination_test(
+    state: &AppState,
+    channel: &Channel,
+    dest: &ChannelDestination,
+    test_locale: Option<AppLocale>,
+) -> AppResult<TestChannelResponse> {
+    let channel_cfg: ChannelConfig = state.master_key().decrypt_json(&channel.encrypted_config)?;
+    let dest_cfg: DestinationConfig = state.master_key().decrypt_json(&dest.encrypted_config)?;
 
     match channel.kind {
         ChannelKind::Smtp => {
@@ -571,17 +965,20 @@ pub async fn test_channel(
                 Some(loc) => state.runtime().smtp_sender().for_locale(loc),
                 None => state.runtime().smtp_sender().clone(),
             };
-            let message = sender.send_test(&cfg, channel.use_proxy).await?;
-            Ok(Json(TestChannelResponse {
+            let message = sender
+                .send_test(&channel_cfg, &dest_cfg, channel.use_proxy)
+                .await?;
+            Ok(TestChannelResponse {
                 ok: true,
                 message,
                 capabilities: None,
-            }))
+            })
         }
         ChannelKind::Telegram => {
-            let ChannelConfig::Telegram(ref tg_cfg) = cfg else {
+            let ChannelConfig::Telegram(ref tg_cfg) = channel_cfg else {
                 return Err(AppError::Internal(anyhow::anyhow!(
-                    "decrypted config kind mismatch for telegram channel {channel_id}"
+                    "decrypted config kind mismatch for telegram channel {}",
+                    channel.id
                 )));
             };
             let mut sender = state.runtime().telegram_sender();
@@ -595,24 +992,26 @@ pub async fn test_channel(
                 .update_channel_capabilities(channel.id, &caps_val)
                 .await?;
 
-            let message = sender.send_test(&cfg, channel.use_proxy).await?;
-            Ok(Json(TestChannelResponse {
+            let message = sender
+                .send_test(&channel_cfg, &dest_cfg, channel.use_proxy)
+                .await?;
+            Ok(TestChannelResponse {
                 ok: true,
                 message,
                 capabilities: Some(caps_val),
-            }))
+            })
         }
         ChannelKind::Notion => {
             let message = state
                 .runtime()
                 .notion_sender()
-                .send_test(&cfg, channel.use_proxy)
+                .send_test(&channel_cfg, &dest_cfg, channel.use_proxy)
                 .await?;
-            Ok(Json(TestChannelResponse {
+            Ok(TestChannelResponse {
                 ok: true,
                 message,
                 capabilities: None,
-            }))
+            })
         }
     }
 }
@@ -620,8 +1019,32 @@ pub async fn test_channel(
 /// `POST /api/v1/channels/notion/init-db`
 pub async fn notion_init_db(
     State(state): State<AppState>,
-    Json(req): Json<NotionInitDbRequest>,
+    Json(mut req): Json<NotionInitDbRequest>,
 ) -> AppResult<Json<NotionInitDbResponse>> {
+    if req.secret.trim().is_empty()
+        && let Some(cid) = req.channel_id
+    {
+        let channel = state
+            .db()
+            .get_channel(cid)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("channel {cid} not found")))?;
+        let decrypted: ChannelConfig =
+            state.master_key().decrypt_json(&channel.encrypted_config)?;
+        match decrypted {
+            ChannelConfig::Notion(ncfg) => {
+                req.secret = ncfg.integration_secret;
+                req.use_proxy = req.use_proxy || channel.use_proxy;
+            }
+            other => {
+                return Err(AppError::Validation(format!(
+                    "channel {cid} is of kind '{}', expected 'notion'",
+                    other.kind()
+                )));
+            }
+        }
+    }
+
     let resp = state.runtime().notion_sender().init_database(&req).await?;
     Ok(Json(resp))
 }
@@ -644,6 +1067,7 @@ pub async fn notion_inspect_schema(
         match decrypted {
             ChannelConfig::Notion(ncfg) => {
                 req.secret = ncfg.integration_secret;
+                req.use_proxy = req.use_proxy || channel.use_proxy;
             }
             other => {
                 return Err(AppError::Validation(format!(
@@ -680,12 +1104,10 @@ pub async fn create_route(
         ));
     }
 
-    if state.db().get_channel(req.channel_id).await?.is_none() {
-        return Err(AppError::Validation(format!(
-            "Target channel {} does not exist",
-            req.channel_id
-        )));
-    }
+    let (channel, destination) = state
+        .db()
+        .resolve_destination_target(req.destination_id, req.channel_id)
+        .await?;
 
     let include_keywords = normalize_string_vec(req.include_keywords);
     let exclude_keywords = normalize_string_vec(req.exclude_keywords);
@@ -709,7 +1131,8 @@ pub async fn create_route(
             name,
             feed_ids: deduplicate_ids(req.feed_ids),
             match_tags: normalize_string_vec(req.match_tags),
-            channel_id: req.channel_id,
+            channel_id: channel.id,
+            destination_id: destination.id,
             include_keywords,
             exclude_keywords,
             include_regex,
@@ -742,13 +1165,16 @@ pub async fn update_route(
         ));
     }
 
-    if let Some(cid) = req.channel_id
-        && state.db().get_channel(cid).await?.is_none()
-    {
-        return Err(AppError::Validation(format!(
-            "Target channel {cid} does not exist"
-        )));
-    }
+    let (resolved_channel_id, resolved_destination_id) =
+        if req.destination_id.is_some() || req.channel_id.is_some() {
+            let (ch, dest) = state
+                .db()
+                .resolve_destination_target(req.destination_id, req.channel_id)
+                .await?;
+            (Some(ch.id), Some(dest.id))
+        } else {
+            (None, None)
+        };
 
     let include_keywords = req.include_keywords.map(normalize_string_vec);
     let exclude_keywords = req.exclude_keywords.map(normalize_string_vec);
@@ -783,7 +1209,8 @@ pub async fn update_route(
         name: req.name.map(|s| s.trim().to_string()),
         feed_ids: req.feed_ids.map(deduplicate_ids),
         match_tags: req.match_tags.map(normalize_string_vec),
-        channel_id: req.channel_id,
+        channel_id: resolved_channel_id,
+        destination_id: resolved_destination_id,
         include_keywords,
         exclude_keywords,
         include_regex,

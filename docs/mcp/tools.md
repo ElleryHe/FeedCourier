@@ -12,15 +12,15 @@ FeedCourier exposes **9 structured MCP tools** across two permission scopes (`re
 
 | Tool Name | Minimum Scope | Modifies State? | Purpose |
 | :--- | :--- | :--- | :--- |
-| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | No | View system overview counters, channel summaries (ID and name only), active routes, and feed health. |
+| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | No | View system overview counters, redacted channel accounts and destinations (ID, name, kind, enabled only), active routes, and feed health. |
 | [`inspect_failed_deliveries`](#2-inspect-failed-deliveries) | `readonly` | No | Inspect delivery tasks in `dead_letter`, `retrying`, `deferred`, `queued`, or `all` states. |
 | [`preview_feed_latest`](#3-preview-feed-latest) | `readonly` | No | Fetch up to 10 recent entries from a URL or `feed_id` to test full-text extraction and content filters. |
-| [`manage_feed`](#4-manage-feed) | `admin` | Yes | Add, update, pause, resume, or delete a feed subscription. |
-| [`configure_route`](#5-configure-route) | `admin` | Yes | Create, update, or delete a delivery route linked to an existing `channel_id`. |
+| [`manage_feed`](#4-manage-feed) | `admin` | Yes | Add, update, pause, resume, clear cache, or delete a feed subscription. |
+| [`configure_route`](#5-configure-route) | `admin` | Yes | Create, update, or delete a delivery route linked to an existing trusted `destination_id` (or legacy single-destination `channel_id`). |
 | [`reset_and_poll_feed`](#6-reset-and-poll-feed) | `admin` | Yes | Reset failure counters on a feed and trigger an immediate poll. |
 | [`retry_dead_tasks`](#7-retry-dead-tasks) | `admin` | Yes | Requeue failed delivery tasks by `task_ids` or `all_dead_letter: true`. |
 | [`manage_outbox_queue`](#8-manage-outbox-queue) | `admin` | Yes | Check, pause, or resume the global delivery queue (optionally with a scheduled resume). |
-| [`test_push_feed_entry`](#9-test-push-feed-entry) | `admin` | No (stateless) | Debug push of one feed entry to a channel without fingerprints, queue, or quota. |
+| [`test_push_feed_entry`](#9-test-push-feed-entry) | `admin` | No (stateless) | Debug push of one feed entry to a trusted `destination_id` (or legacy single-destination `channel_id`) without fingerprints, queue, or quota. |
 
 ---
 
@@ -28,7 +28,7 @@ FeedCourier exposes **9 structured MCP tools** across two permission scopes (`re
 
 ### 1. `list_feeds_status` {#1-list-feeds-status}
 
-Returns system-wide counters (`overview`), channel summaries (`id`, `name`, `kind`, `enabled`, `cooldown_until`—without secrets or recipient addresses), configured routes, and subscribed feeds. Each route also carries its delivery `locale`, `active_windows`, and `active_weekdays`. The response additionally includes the global outbox state `queue: { paused, resume_at }` and the system `timezone` used to evaluate route time windows.
+Returns system-wide counters (`overview`), redacted channel accounts (`channels`, each with `id`, `name`, `kind`, `enabled`, `cooldown_until`, and nested `destinations`), a top-level redacted `destinations` list (`id`, `channel_id`, `name`, `kind`, `enabled` — never exposing secrets, email addresses, `chat_id`, or `data_source_id`), configured routes (with `channel_id`, `destination_id`, `locale`, `timezone`, `active_windows`, and `active_weekdays`), and subscribed feeds. The response also includes the global outbox state `queue: { paused, resume_at }` and the system `timezone`.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
@@ -54,7 +54,7 @@ Returns system-wide counters (`overview`), channel summaries (`id`, `name`, `kin
 
 ### 2. `inspect_failed_deliveries` {#2-inspect-failed-deliveries}
 
-Retrieves delivery tasks along with their attempt count, last status code, and diagnostic error log.
+Retrieves delivery tasks along with their route, channel account, destination (`destination_id`, `destination_name`), attempt count, last status code, and diagnostic error log.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
@@ -174,7 +174,7 @@ Adds, updates, pauses, resumes, clears the cache of, or deletes a feed subscript
 
 ### 5. `configure_route` {#5-configure-route}
 
-Creates, updates, or deletes a delivery route that connects feeds/tags and content filters to an existing `channel_id` created in the WebUI.
+Creates, updates, or deletes a delivery route that connects feeds/tags and content filters to an existing trusted `destination_id` created in the WebUI (discoverable via `list_feeds_status`). For backward compatibility, `channel_id` is still accepted if that channel account owns **exactly one** destination; if the account has multiple destinations, an error is returned asking for `destination_id`.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
@@ -182,7 +182,8 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 | `action` | `string` | **Yes** | `"create"`, `"update"`, or `"delete"`. |
 | `route_id` | `i64?` | For `update`/`delete` | Target route ID. |
 | `name` | `string?` | For `create` | Route name. |
-| `channel_id` | `i64?` | For `create` | Integer ID of an existing delivery channel created in the WebUI. |
+| `destination_id` | `i64?` | For `create` (primary) | Integer ID of an existing trusted destination created in the WebUI (required for `"create"` unless a single-destination `channel_id` is passed). |
+| `channel_id` | `i64?` | Legacy fallback | Integer ID of a Channel Account; automatically resolves only when that account owns exactly 1 destination. |
 | `feed_ids` | `i64[]?` | Optional | Explicit feed IDs matched by this route (`[]` with empty `match_tags` matches all feeds). |
 | `match_tags` | `string[]?` | Optional | Feed tags matched case-insensitively by this route. |
 | `include_keywords` | `string[]?` | Optional | Case-insensitive keywords where at least one must match. |
@@ -192,7 +193,8 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 | `telegram_mode` | `string?` | Optional | Telegram mode: `"rich_message"` (default), `"compact_card"`, or `"media_mode"`. |
 | `link_preview` | `bool?` | Optional | Enable link preview in compact/text Telegram messages (`true` by default). |
 | `locale` | `string?` | Optional | Delivery language of this route: `"en"` or `"zh-CN"`. |
-| `active_windows` | `{start, end}[]?` | Optional | Daily delivery windows in the system timezone, e.g. `[{"start":"08:00","end":"22:00"}]`. `end` earlier than `start` wraps midnight; `start == end` means all day; `[]` means always. |
+| `timezone` | `string?` | Optional | Optional per-route IANA timezone override (e.g., `"Asia/Shanghai"`; `""` clears on `"update"` to inherit the system timezone). Governs delivery windows, SMTP article timestamps, and Telegram rich-message footer timestamps. |
+| `active_windows` | `{start, end}[]?` | Optional | Daily delivery windows in the **route timezone** (inheriting system timezone), e.g. `[{"start":"08:00","end":"22:00"}]`. `end` earlier than `start` wraps midnight; `start == end` means all day; `[]` means always. |
 | `active_weekdays` | `u8[]?` | Optional | Allowed weekdays `1` (Mon) – `7` (Sun); `[]` means every day. |
 | `enabled` | `bool?` | Optional | Whether this route is active (`true` by default). |
 
@@ -203,11 +205,12 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
   "arguments": {
     "action": "create",
     "name": "Rust Feeds -> Telegram Rich",
-    "channel_id": 2,
+    "destination_id": 5,
     "match_tags": ["rust"],
     "telegram_mode": "rich_message",
     "link_preview": true,
     "locale": "en",
+    "timezone": "America/New_York",
     "active_windows": [{ "start": "08:00", "end": "22:00" }],
     "active_weekdays": [1, 2, 3, 4, 5]
   }
@@ -217,7 +220,7 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 Tasks outside a route's window or weekdays are still queued and are delivered at the next window start.
 
 #### Example Prompt
-> *"Create a route sending all feeds with the `rust` tag to Telegram channel #2 in `rich_message` mode, only on weekdays between 08:00 and 22:00."*
+> *"Create a route sending all feeds with the `rust` tag to Telegram destination #5 in `rich_message` mode, using `America/New_York` timezone on weekdays between 08:00 and 22:00."*
 
 ---
 
@@ -301,33 +304,36 @@ Without `resume_in_minutes` or `resume_at`, a pause lasts until `"resume"` is ca
 
 ### 9. `test_push_feed_entry` {#9-test-push-feed-entry}
 
-Debug push: fetches a feed entry live and delivers it to a channel once. It is **stateless**: it creates no fingerprints, does not enter the queue, and does not use route filters, time windows, or quotas. Notion pages use a `test-` prefixed `FC-ID`. Downstream failures are returned as a diagnostic result instead of an error.
+Debug push: fetches a feed entry live and delivers it to a trusted destination once. It is **stateless**: it creates no fingerprints, does not enter the queue, and does not use route filters, time windows, or quotas. Notion pages use a `test-` prefixed `FC-ID`. Downstream failures are returned as a diagnostic result instead of an error.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `channel_id` | `i64` | **Yes** | Existing delivery channel to push to. |
+| `destination_id` | `i64?` | **Primary** | Trusted WebUI-configured delivery destination ID (required unless a single-destination `channel_id` is passed). |
+| `channel_id` | `i64?` | Legacy fallback | Channel account ID; accepted only when that account owns exactly 1 destination. |
 | `feed_id` | `i64?` | Conditional | Existing feed to read from (provide `feed_id` or `url`). |
 | `url` | `string?` | Conditional | Direct feed URL. |
 | `fingerprint_sha256` | `string?` | Optional | Entry to push; omit to push the latest item. |
 | `fetch_full_content` | `bool?` | Optional | Extract the full article before pushing. |
 | `use_proxy` | `bool?` | Optional | Use the configured outbound proxy when fetching. |
-| `telegram_mode` | `string?` | Optional | `"rich_message"`, `"compact_card"`, or `"media_mode"` (Telegram channels). |
+| `telegram_mode` | `string?` | Optional | `"rich_message"`, `"compact_card"`, or `"media_mode"` (Telegram destinations). |
 | `link_preview` | `bool?` | Optional | Telegram link preview toggle. |
 | `locale` | `string?` | Optional | Delivery language: `"en"` or `"zh-CN"`. |
+| `timezone` | `string?` | Optional | Optional IANA timezone for article timestamps (inherits system timezone when omitted). |
 
 #### Example Call
 ```json
 {
   "name": "test_push_feed_entry",
   "arguments": {
-    "channel_id": 2,
+    "destination_id": 5,
     "feed_id": 4,
     "telegram_mode": "media_mode",
-    "locale": "en"
+    "locale": "en",
+    "timezone": "Asia/Shanghai"
   }
 }
 ```
 
 #### Example Prompt
-> *"Push the latest item of feed #4 to Telegram channel #2 in media mode as a test."*
+> *"Push the latest item of feed #4 to Telegram destination #5 in media mode as a test."*

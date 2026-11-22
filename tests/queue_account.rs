@@ -18,12 +18,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use feedcourier::api::{AppState, build_api_router};
 use feedcourier::channels::{
-    ChannelConfig, ChannelKind, RouteOptions, TelegramChannelConfig, TelegramDeliveryMode,
+    ChannelConfig, ChannelKind, DestinationConfig, RouteOptions, TelegramChannelConfig,
+    TelegramDeliveryMode, TelegramDestinationConfig,
 };
 use feedcourier::config::AppConfig;
 use feedcourier::crypto::MasterKey;
 use feedcourier::db::Database;
-use feedcourier::db::models::{DeliveryTaskStatus, NewChannel, NewFeed, NewRoute, now_unix};
+use feedcourier::db::models::{
+    DeliveryTaskStatus, NewChannel, NewDestination, NewFeed, NewRoute, now_unix,
+};
 use feedcourier::net::{NetSettings, ProtectedHttpClient};
 use feedcourier::scheduler::DeliveryDispatcher;
 use feedcourier::totp;
@@ -105,14 +108,23 @@ impl Harness {
         cookie_pair(&headers)
     }
 
-    async fn telegram_channel(&self, api_base: &str) -> feedcourier::db::models::Channel {
+    async fn telegram_channel(
+        &self,
+        api_base: &str,
+    ) -> (
+        feedcourier::db::models::Channel,
+        feedcourier::db::models::ChannelDestination,
+    ) {
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "123456:queue_test_token_abcdef".to_string(),
-            chat_id: "-100777".to_string(),
-            message_thread_id: None,
             api_base_url: Some(api_base.to_string()),
         });
-        self.db
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
+            chat_id: "-100777".to_string(),
+            message_thread_id: None,
+        });
+        let ch = self
+            .db
             .create_channel(&NewChannel {
                 name: "Queue TG".to_string(),
                 kind: ChannelKind::Telegram,
@@ -127,12 +139,24 @@ impl Harness {
                 enabled: true,
             })
             .await
-            .unwrap()
+            .unwrap();
+        let dest = self
+            .db
+            .create_destination(&NewDestination {
+                channel_id: ch.id,
+                name: "Queue Chat".to_string(),
+                encrypted_config: self.master_key.encrypt_json(&dest_cfg).unwrap(),
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        (ch, dest)
     }
 
     async fn catch_all_route(
         &self,
         channel_id: i64,
+        destination_id: i64,
         options: RouteOptions,
     ) -> feedcourier::db::models::Route {
         self.db
@@ -141,6 +165,7 @@ impl Harness {
                 feed_ids: vec![],
                 match_tags: vec![],
                 channel_id,
+                destination_id,
                 include_keywords: vec![],
                 exclude_keywords: vec![],
                 include_regex: None,
@@ -266,10 +291,10 @@ async fn paused_queue_accumulates_then_delivers_all_feeds_oldest_first_in_route_
     )
     .await;
 
-    let channel = h.telegram_channel(&tg.uri()).await;
+    let (channel, dest) = h.telegram_channel(&tg.uri()).await;
     let mut opts = compact_options();
     opts.locale = Some(feedcourier::db::models::AppLocale::ZhCn);
-    h.catch_all_route(channel.id, opts).await;
+    h.catch_all_route(channel.id, dest.id, opts).await;
     let feed_a = h.feed(format!("{base}/a.xml")).await;
     let feed_b = h.feed(format!("{base}/b.xml")).await;
 
@@ -392,7 +417,7 @@ async fn route_windows_hold_tasks_until_the_next_allowed_window() {
         ),
     )
     .await;
-    let channel = h.telegram_channel(&tg.uri()).await;
+    let (channel, dest) = h.telegram_channel(&tg.uri()).await;
 
     // Allow every weekday except "today" in the (default) system timezone.
     let tz = h.db.get_timezone().await;
@@ -409,7 +434,7 @@ async fn route_windows_hold_tasks_until_the_next_allowed_window() {
         start: "00:00".to_string(),
         end: "00:00".to_string(),
     }];
-    let route = h.catch_all_route(channel.id, opts).await;
+    let route = h.catch_all_route(channel.id, dest.id, opts).await;
     let feed = h.feed(format!("{base}/w.xml")).await;
 
     let outcome = h
@@ -478,8 +503,9 @@ async fn clear_feed_cache_reingests_the_full_backlog_oldest_first() {
         ),
     )
     .await;
-    let channel = h.telegram_channel(&tg.uri()).await;
-    h.catch_all_route(channel.id, compact_options()).await;
+    let (channel, dest) = h.telegram_channel(&tg.uri()).await;
+    h.catch_all_route(channel.id, dest.id, compact_options())
+        .await;
     let feed = h.feed(format!("{base}/c.xml")).await;
 
     let first = h
@@ -556,7 +582,7 @@ async fn debug_push_is_stateless_and_honors_language() {
         ),
     )
     .await;
-    let channel = h.telegram_channel(&tg.uri()).await;
+    let (channel, dest) = h.telegram_channel(&tg.uri()).await;
 
     let (status, _, body) = h
         .send(
@@ -565,8 +591,8 @@ async fn debug_push_is_stateless_and_honors_language() {
             Some(&cookie),
             Some(json!({
                 "url": format!("{base}/d.xml"),
-                "channel_id": channel.id,
-                "options": { "telegram_mode": "compact_card", "locale": "zh-CN" }
+                "destination_id": dest.id,
+                "options": { "telegram_mode": "compact_card", "locale": "zh-CN", "timezone": "Asia/Shanghai" }
             })),
         )
         .await;
@@ -661,7 +687,7 @@ async fn timezone_setting_and_route_schedule_validation() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let channel = h.telegram_channel("http://127.0.0.1:1").await;
+    let (channel, dest) = h.telegram_channel("http://127.0.0.1:1").await;
     let (status, _, _) = h
         .send(
             Method::POST,
@@ -669,13 +695,29 @@ async fn timezone_setting_and_route_schedule_validation() {
             Some(&cookie),
             Some(json!({
                 "name": "bad window",
-                "channel_id": channel.id,
+                "destination_id": dest.id,
                 "options": { "active_windows": [{ "start": "25:00", "end": "07:00" }] }
             })),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    // Invalid per-route timezone is rejected with 400.
+    let (status, _, _) = h
+        .send(
+            Method::POST,
+            "/api/v1/routes",
+            Some(&cookie),
+            Some(json!({
+                "name": "bad route tz",
+                "destination_id": dest.id,
+                "options": { "timezone": "Mars/Olympus" }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Legacy `channel_id` fallback resolves when channel has exactly 1 destination; route `timezone` persists.
     let (status, _, route) = h
         .send(
             Method::POST,
@@ -686,6 +728,7 @@ async fn timezone_setting_and_route_schedule_validation() {
                 "channel_id": channel.id,
                 "options": {
                     "locale": "zh-CN",
+                    "timezone": "Asia/Tokyo",
                     "active_windows": [{ "start": "22:00", "end": "06:00" }],
                     "active_weekdays": [1, 2, 3, 4, 5, 6, 7]
                 }
@@ -693,7 +736,9 @@ async fn timezone_setting_and_route_schedule_validation() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{route}");
+    assert_eq!(route["destination_id"], dest.id);
     assert_eq!(route["options"]["locale"], "zh-CN");
+    assert_eq!(route["options"]["timezone"], "Asia/Tokyo");
     assert_eq!(route["options"]["active_windows"][0]["end"], "06:00");
     assert_eq!(route["options"]["active_weekdays"], json!([]));
 }

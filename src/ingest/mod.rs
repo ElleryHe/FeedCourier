@@ -25,7 +25,7 @@ use crate::db::models::{
 };
 use crate::error::{AppError, AppResult};
 use crate::net::{DEFAULT_MAX_FEED_BYTES, OutboundRequest, ProtectedHttpClient};
-use crate::schedule::next_allowed_at;
+use crate::schedule::{next_allowed_at, resolve_route_timezone};
 
 pub use self::filter::{
     CompiledContentFilter, ContentFilterRules, route_matches_entry, route_matches_feed,
@@ -350,14 +350,17 @@ impl IngestEngine {
                             let (matched, _) = compiled_route
                                 .filter
                                 .evaluate(cand.title.as_deref(), Some(&filter_body));
+                            let route_tz =
+                                resolve_route_timezone(&compiled_route.options, timezone);
                             if matched
                                 && self
                                     .db
                                     .enqueue_delivery_task(
                                         compiled_route.route.id,
                                         compiled_route.route.channel_id,
+                                        compiled_route.route.destination_id,
                                         inserted.id,
-                                        next_allowed_at(&compiled_route.options, now, timezone),
+                                        next_allowed_at(&compiled_route.options, now, route_tz),
                                     )
                                     .await?
                                     .is_some()

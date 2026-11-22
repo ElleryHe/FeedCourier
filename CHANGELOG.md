@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
+### Breaking Changes
+
+- **Two-Layer Delivery Channel Model (`Channel Account` + Multiple `Destinations`)**:
+  - Split delivery channels into a **Channel Account** (`channels` — storing encrypted account credentials, outbound proxy toggle, shared pacing/jitter, rolling hourly/daily quotas, and shared cooldowns) and one or more child **Destinations** (`channel_destinations` — storing independently encrypted Telegram `chat_id`/`message_thread_id`, SMTP `to_addresses`/`reply_to`, or Notion `data_source_id`/`column_mapping`, each with its own enable toggle and connectivity test).
+  - **Automatic Atomic SQLite Migration**: On first startup, `migrations/0002_channel_destinations.sql` and the Rust startup hook `Database::migrate_channels_to_v2` automatically create a consistent online `VACUUM INTO` snapshot at `<DATA_DIR>/pre-v0.2.0-backup.db`, split all pre-v0.2.0 channels inside a single SQLite transaction, merge accounts sharing the same `credential_group_key` (keeping the strictest pacing/quota limits and unioning `use_proxy` / `enabled`), repoint all `routes` and `delivery_tasks` (including `delivered` and `dead_letter` history), and record `system_settings.channel_model_version = 2` for idempotency.
+  - **Shared Account-Level Rate Limiting & Quotas**: Minimum interval, random jitter, rolling hourly/daily quotas, and upstream `429` cooldowns are enforced across all destinations belonging to the same Channel Account (and any accounts sharing identical credentials).
+  - **REST API & MCP Destination Targeting**: Route creation/updates (`POST`/`PATCH /api/v1/routes`, MCP `configure_route`) and debug pushes (`POST /api/v1/feeds/preview/push`, MCP `test_push_feed_entry`) now take `destination_id` as the primary target. Legacy `channel_id` payloads remain accepted when the account owns exactly one destination and return a validation error when multiple destinations exist. Added `/api/v1/channels/{id}/destinations`, `/api/v1/destinations/{id}`, and `/api/v1/destinations/{id}/test`; `POST /api/v1/channels/{id}/test` now verifies account credentials when `destination_id` is omitted.
+
+### Added
+
+- **Auto-Fetched Account & Destination Default Names**: Leaving the display name blank when creating a Channel Account or Destination automatically derives it from Telegram `getMe` (`@username`) / `getChat` (group or channel title), SMTP `from_address` / first recipient address, or Notion `/v1/users/me` integration name / database title.
+- **Per-Route Timezone Override (`RouteOptions.timezone`)**: Routes now accept an optional IANA timezone (e.g., `Asia/Shanghai`, `America/New_York`) that overrides the system timezone for that route's delivery time windows/weekdays, SMTP email article timestamps, and Telegram rich-message `<footer>` timestamps—formatted with explicit UTC offsets such as `2026-11-08 11:00 (UTC+08:00)`. Configurable in the WebUI route editor, REST API, debug push, and MCP (`configure_route`, `test_push_feed_entry`).
+- **Feeds List Tag Filter, Persistent Sort & Pagination**: Narrowed the Feeds search box to feed title and URL; added a single-select **Tag** filter dropdown (with per-tag counts and an **Untagged** option), a persistent **Sort** control (added time or `Intl.Collator` CJK/Latin-aware title, ascending/descending), and **15 / 30 / 50** per-page pagination persisted in `localStorage`.
+- **Channels & Routes Page Filters**: Added a **Channel Kind** filter (`All` / `Telegram` / `SMTP` / `Notion`) to the **Channels** view and cascading **Channel Kind → Account** filters to the **Routes** view.
+- **Semantic Outbox Queue Status Colors**: Standardized Outbox badges, HTTP/SMTP status codes, attempt-count escalation (`1` neutral, `≥ 2` amber, maxed red), and status-matched diagnostic log text so successful delivery logs no longer render in red.
+
+### Changed
+
+- **Telegram Rich Message Typography (`telegram-rich 0.0.2`)**: Upgraded to `telegram-rich 0.0.2` and refined `rich_message` layout—demoting article titles from `<h1>` to `<h2>`, moving `Source · Author · Localized Publish Time` into a native Telegram `<footer>` below the title, inserting an `<hr>` divider before the body, enabling `heading_offset = 2` (`h1→h3`, `h2→h4`, …, up to `h6`), and enabling `group_consecutive_media = true` to merge 2+ consecutive images into `<tg-collage>` (or `<tg-slideshow>` when exceeding collage limits).
+- **Redacted MCP Destinations Discovery (`list_feeds_status`)**: Exposed secret-free `destinations` summaries (`id`, `channel_id`, `name`, `kind`, `enabled`) both nested under each channel and as a top-level list without ever leaking credentials, email addresses, `chat_id`, or `data_source_id`; `inspect_failed_deliveries` now includes `destination_id` and `destination_name`.
+- **Pacing & Jitter Documentation**: Clarified that random jitter (`0..=jitter_max_secs`) is sampled independently after every delivered task (never shared across a batch) and held in memory only (after a restart, the first delivery enforces `min_interval_secs` from SQLite `last_completed_at`).
+
+### Fixed
+
+- **SMTP Responsive Images, Figures, Tables & Code Blocks (`src/channels/smtp.rs`)**: Rewrote `<img>` tags in email bodies with Outlook-compatible `width="592"` (preserving explicitly narrower widths), stripped fixed `height` attributes, and added responsive inline CSS (`max-width:100%;height:auto`) alongside `<figure>`/`<figcaption>`, `<table>`, and `<pre>` width/overflow rules and `<head>` CSS fallbacks so wide feed images and tables no longer overflow the `640px` email card.
+
 ## [0.1.6] - 2026-11-18
 
 ### Added
@@ -172,7 +200,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Encrypted Credential Vault & Scoped Auth**: Channel credentials are encrypted at rest with `ChaCha20-Poly1305` AEAD (`master.key`, `0600`); WebUI administrator passwords use `Argon2id` PHC hashing with `HttpOnly` session cookies (`fc_session`); and `/mcp` Bearer tokens are stored exclusively as `SHA-256` hashes.
 - **MCP Trust Boundaries & Untrusted Content Framing**: Channel secrets and recipient targets (email addresses, `chat_id`, `data_source_id`) are strictly locked to the WebUI and opaque to `/mcp` tools, while untrusted external feed text surfaced to AI agents is sanitized, truncated, and isolated inside `<untrusted_feed_content>` XML boundary tags (`src/mcp/sanitize.rs`), complemented by `ammonia` HTML sanitization across ingest and delivery pipelines.
 
-[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/ElleryHe/FeedCourier/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ElleryHe/FeedCourier/compare/v0.1.3...v0.1.4

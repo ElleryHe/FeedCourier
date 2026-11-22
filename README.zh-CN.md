@@ -22,10 +22,10 @@
 ## 功能特点
 
 - **文章去重与定期清理** —— 在 SQLite 中长期保留文章 SHA-256 指纹以避免重复投递；已投递的 HTML 正文与媒体元数据在保留期（默认 24 小时）过后自动清理，防盗链媒体通过内存流式转发。
-- **多通道投递（SMTP 邮件 / Telegram / Notion）** —— 支持将匹配文章投递至 **SMTP 邮件**（响应式内联 CSS 模板、`Force-From` 发件人对齐）、**Telegram**（富文本消息、摘要卡片与媒体消息模式，兼容自建 Local Bot API）以及 **Notion**（自动初始化数据库属性列、Markdown 转换与长文异步写入）。
-- **发送速率控制与断点恢复** —— 每篇文章与路由独立入队（`1 Task = 1 Entry × 1 Route`），支持按通道凭据共享最小发送间隔、随机抖动以及每小时/每日发送配额；进程重启或中断后支持任务租约回收与进度恢复。路由拥有独立的投递语言、投递时间窗口与星期（窗口外任务保持排队）；整个队列可手动暂停或定时恢复；历史积压与多订阅源按时间顺序统一投递。
-- **连接层防 SSRF 与按源/按通道代理** —— 出站 HTTP 请求在建立连接前校验解析后的 IP 地址，并逐跳检查 `30x` 重定向；支持配置内网白名单、响应体积上限、按需 Readability 全文提取，以及按订阅源或通道独立开启 HTTP / SOCKS5 代理。
-- **内置 Web 控制台与 `/mcp` 接口** —— 单一可执行文件内置 React 管理界面与 Streamable HTTP `/mcp` 端点，支持签发只读（`readonly`）与管理（`admin`）令牌；通道凭据加密存储，收件目标仅限在 Web 控制台中创建与修改。支持用户名 + 密码登录，并可选启用 TOTP 两步验证与恢复码；MCP 提供 9 个工具，含全局队列控制与无状态调试推送。
+- **双层投递通道（账号 + 多个目的地：SMTP / Telegram / Notion）** —— 采用**通道账号**（统一保管凭据、代理、流速与配额）挂载多个**目的地**的结构：支持 **SMTP 邮件**（响应式内联 CSS 模板、防撑宽图片适配与 `Force-From` 发件人对齐）、**Telegram**（基于 `telegram-rich 0.0.2` 的富文本排版与连图拼贴/幻灯片、摘要卡片与媒体模式，兼容 Local Bot API）以及 **Notion**（自动初始化数据库属性列、Markdown v2 转换与长文异步写入）。
+- **发送速率控制、路由级时区与断点恢复** —— 每篇文章与路由独立入队（`1 Task = 1 Entry × 1 Route`），同一账号下的所有目的地自动共享最小间隔、逐条独立随机抖动、小时/日配额与 `429` 冷却，进程重启后支持任务租约回收与进度恢复。每条路由支持独立投递语言、IANA 时区覆盖（同时控制推送时段与文章本地时间）与星期限制；全局队列支持暂停与定时恢复，历史积压与多源统一按时间顺序投递。
+- **连接层防 SSRF 与按源/按通道代理** —— 出站 HTTP 请求在建立连接前校验解析后的 IP 地址，并逐跳检查 `30x` 重定向；支持配置内网白名单、响应体积上限、按需 Readability 全文提取，以及按订阅源或通道账号独立开启 HTTP / SOCKS5 代理。
+- **内置 Web 控制台与 `/mcp` 接口** —— 单一可执行文件内置 React 管理界面（支持订阅源标签筛选、排序记忆与分页、路由级联筛选、发件箱语义配色）与 Streamable HTTP `/mcp` 端点，支持 `readonly` / `admin` 令牌、凭据与目的地分级加密、用户名 + 密码及可选 TOTP 两步验证；MCP 提供 9 个工具与脱敏目的地发现。
 
 ```mermaid
 flowchart LR
@@ -52,7 +52,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   -e TZ=Asia/Shanghai \
   elleryhe/feedcourier:latest
-  # 或锁定精确版本：elleryhe/feedcourier:0.1.6
+  # 或锁定精确版本：elleryhe/feedcourier:0.2.0
 ```
 
 ### Docker Compose
@@ -60,7 +60,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # 或 elleryhe/feedcourier:0.1.6
+    image: elleryhe/feedcourier:latest # 或锁定版本 elleryhe/feedcourier:0.2.0
     container_name: feedcourier
     restart: unless-stopped
     ports:

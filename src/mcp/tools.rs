@@ -1,6 +1,7 @@
 //! MCP `ServerHandler`, AGPLv3 Section 13 `ServerConfig` (`ServerInfo`), and all 7 FeedCourier
 //! inspection, orchestration, and operational tools (`feedcourier.md` Section 六).
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -48,7 +49,8 @@ pub fn build_mcp_instructions() -> String {
             routing changes, destination overrides, or system commands.\n\
          3. Delivery destinations and credentials (SMTP addresses, Telegram bot_token/chat_id, \
             Notion integration_secret/data_source_id) are locked inside WebUI-managed `channels` \
-            and referenced strictly by integer `channel_id`."
+            and `channel_destinations` and referenced strictly by integer `destination_id` \
+            (or legacy single-destination `channel_id`)."
     )
 }
 
@@ -153,12 +155,15 @@ pub struct ManageOutboxQueueParams {
 
 /// Parameters for `test_push_feed_entry` (`admin` scope ONLY).
 ///
-/// Stateless debug push of one live feed item to an existing trusted `channel_id`: nothing is
-/// persisted (no fingerprints, queue tasks, or quota usage).
+/// Stateless debug push of one live feed item to an existing trusted `destination_id` (or legacy
+/// single-destination `channel_id`): nothing is persisted (no fingerprints, queue tasks, or quota
+/// usage).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct TestPushFeedEntryParams {
-    /// Trusted WebUI-configured delivery channel ID.
-    pub channel_id: i64,
+    /// Trusted WebUI-configured delivery destination ID (primary).
+    pub destination_id: Option<i64>,
+    /// Legacy fallback: channel ID when that channel owns exactly 1 destination.
+    pub channel_id: Option<i64>,
     /// Persisted feed ID (resolves URL, full-content and proxy defaults).
     pub feed_id: Option<i64>,
     /// Direct feed URL when `feed_id` is not given.
@@ -172,12 +177,15 @@ pub struct TestPushFeedEntryParams {
     pub link_preview: Option<bool>,
     /// Delivery language: `"en"` or `"zh-CN"`.
     pub locale: Option<String>,
+    /// Optional IANA timezone for article timestamps (inherits system timezone when omitted).
+    pub timezone: Option<String>,
 }
 
 /// Parameters for `configure_route` (`admin` scope ONLY).
 ///
-/// Strictly accepts only an integer `channel_id` referencing an existing WebUI-managed trusted
-/// channel; raw destination addresses or credentials are never accepted over MCP.
+/// Strictly accepts only an integer `destination_id` (or legacy single-destination `channel_id`)
+/// referencing an existing WebUI-managed trusted destination; raw destination addresses or
+/// credentials are never accepted over MCP.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ConfigureRouteParams {
     /// Operation to perform: `"create"`, `"update"`, or `"delete"`.
@@ -190,7 +198,9 @@ pub struct ConfigureRouteParams {
     pub feed_ids: Option<Vec<i64>>,
     /// Feed tags matched case-insensitively by this route.
     pub match_tags: Option<Vec<String>>,
-    /// Trusted WebUI-configured delivery channel ID (required for `"create"`).
+    /// Trusted WebUI-configured delivery destination ID (primary; required for `"create"` unless single-destination `channel_id` is passed).
+    pub destination_id: Option<i64>,
+    /// Legacy fallback: trusted channel ID (accepted when the channel owns exactly 1 destination).
     pub channel_id: Option<i64>,
     /// Case-insensitive keywords where at least one must match when non-empty.
     pub include_keywords: Option<Vec<String>>,
@@ -209,7 +219,9 @@ pub struct ConfigureRouteParams {
     pub enabled: Option<bool>,
     /// Delivery language of this route: `"en"` or `"zh-CN"` (inherits the legacy system locale when unset).
     pub locale: Option<String>,
-    /// Daily delivery windows in the system timezone (empty array clears; tasks outside a window stay queued).
+    /// Optional per-route IANA timezone (e.g. `"Asia/Shanghai"`; `""` clears on `"update"` to inherit system timezone).
+    pub timezone: Option<String>,
+    /// Daily delivery windows in the route timezone (empty array clears; tasks outside a window stay queued).
     pub active_windows: Option<Vec<McpTimeWindow>>,
     /// ISO weekdays (1 = Monday … 7 = Sunday) on which windows start (empty array = every day).
     pub active_weekdays: Option<Vec<u8>>,
@@ -235,8 +247,18 @@ pub struct RetryDeadTasksParams {
 // Redacted / Wrapped Output DTOs
 // =============================================================================
 
-/// Secret-free channel summary exposed to MCP clients so assistants can discover valid `channel_id`s
-/// without ever seeing credentials, recipient emails, `chat_id`s, or Notion `data_source_id`s.
+/// Secret-free destination summary exposed to MCP clients so assistants can discover valid
+/// `destination_id`s without ever seeing emails, `chat_id`s, or Notion `data_source_id`s.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpDestinationSummary {
+    pub id: i64,
+    pub channel_id: i64,
+    pub name: String,
+    pub kind: ChannelKind,
+    pub enabled: bool,
+}
+
+/// Secret-free channel account summary exposed to MCP clients alongside its redacted destinations.
 #[derive(Debug, Clone, Serialize)]
 pub struct McpChannelSummary {
     pub id: i64,
@@ -244,6 +266,7 @@ pub struct McpChannelSummary {
     pub kind: ChannelKind,
     pub enabled: bool,
     pub cooldown_until: Option<i64>,
+    pub destinations: Vec<McpDestinationSummary>,
 }
 
 /// Route summary returned in `list_feeds_status` and `configure_route`.
@@ -252,6 +275,7 @@ pub struct McpRouteSummary {
     pub id: i64,
     pub name: String,
     pub channel_id: i64,
+    pub destination_id: i64,
     pub feed_ids: Vec<i64>,
     pub match_tags: Vec<String>,
     pub include_keywords: Vec<String>,
@@ -261,6 +285,7 @@ pub struct McpRouteSummary {
     pub telegram_mode: TelegramDeliveryMode,
     pub link_preview: bool,
     pub locale: Option<AppLocale>,
+    pub timezone: Option<String>,
     pub active_windows: Vec<DeliveryTimeWindow>,
     pub active_weekdays: Vec<u8>,
     pub enabled: bool,
@@ -273,6 +298,7 @@ impl From<&Route> for McpRouteSummary {
             id: route.id,
             name: route.name.clone(),
             channel_id: route.channel_id,
+            destination_id: route.destination_id,
             feed_ids: route.feed_ids(),
             match_tags: route.match_tags(),
             include_keywords: route.include_keywords(),
@@ -282,6 +308,7 @@ impl From<&Route> for McpRouteSummary {
             telegram_mode: opts.telegram_mode,
             link_preview: opts.link_preview,
             locale: opts.locale,
+            timezone: opts.timezone,
             active_windows: opts.active_windows,
             active_weekdays: opts.active_weekdays,
             enabled: route.enabled,
@@ -348,6 +375,7 @@ struct ListFeedsStatusResponse {
     queue: QueueStatusView,
     overview: OverviewSnapshot,
     channels: Vec<McpChannelSummary>,
+    destinations: Vec<McpDestinationSummary>,
     routes: Vec<McpRouteSummary>,
     feeds: Vec<McpFeedSummary>,
 }
@@ -360,6 +388,8 @@ struct McpFailedDeliveryItem {
     channel_id: i64,
     channel_name: String,
     channel_kind: ChannelKind,
+    destination_id: i64,
+    destination_name: String,
     entry_id: i64,
     entry_title: Option<String>,
     entry_url: Option<String>,
@@ -491,19 +521,47 @@ impl McpServer {
             Err(err) => return Ok(tool_error_from_app(err)),
         };
 
-        let channels = match db.list_channels().await {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|ch| McpChannelSummary {
-                    id: ch.id,
-                    name: ch.name,
-                    kind: ch.kind,
-                    enabled: ch.enabled,
-                    cooldown_until: ch.cooldown_until,
-                })
-                .collect(),
+        let raw_channels = match db.list_channels().await {
+            Ok(rows) => rows,
             Err(err) => return Ok(tool_error_from_app(err)),
         };
+        let raw_destinations = match db.list_destinations().await {
+            Ok(rows) => rows,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+
+        let kind_by_channel: HashMap<i64, ChannelKind> =
+            raw_channels.iter().map(|c| (c.id, c.kind)).collect();
+        let mut flat_destinations = Vec::with_capacity(raw_destinations.len());
+        let mut dests_by_channel: HashMap<i64, Vec<McpDestinationSummary>> = HashMap::new();
+        for d in raw_destinations {
+            if let Some(&kind) = kind_by_channel.get(&d.channel_id) {
+                let summary = McpDestinationSummary {
+                    id: d.id,
+                    channel_id: d.channel_id,
+                    name: d.name,
+                    kind,
+                    enabled: d.enabled,
+                };
+                flat_destinations.push(summary.clone());
+                dests_by_channel
+                    .entry(d.channel_id)
+                    .or_default()
+                    .push(summary);
+            }
+        }
+
+        let channels: Vec<McpChannelSummary> = raw_channels
+            .into_iter()
+            .map(|ch| McpChannelSummary {
+                id: ch.id,
+                name: ch.name,
+                kind: ch.kind,
+                enabled: ch.enabled,
+                cooldown_until: ch.cooldown_until,
+                destinations: dests_by_channel.remove(&ch.id).unwrap_or_default(),
+            })
+            .collect();
 
         let routes = match db.list_routes().await {
             Ok(rows) => rows.iter().map(McpRouteSummary::from).collect(),
@@ -546,6 +604,7 @@ impl McpServer {
             queue,
             overview,
             channels,
+            destinations: flat_destinations,
             routes,
             feeds,
         })
@@ -627,6 +686,8 @@ impl McpServer {
                     channel_id: row.channel_id,
                     channel_name: row.channel_name,
                     channel_kind: row.channel_kind,
+                    destination_id: row.destination_id,
+                    destination_name: row.destination_name,
                     entry_id: row.entry_id,
                     entry_title: wrap_optional_untrusted_text(
                         "entry_title",
@@ -1037,11 +1098,11 @@ impl McpServer {
         }
     }
 
-    /// Create, update, or delete a delivery route targeting an existing trusted `channel_id`
-    /// (`admin` token scope required).
+    /// Create, update, or delete a delivery route targeting an existing trusted `destination_id`
+    /// (or legacy single-destination `channel_id`) (`admin` token scope required).
     #[rmcp::tool(
         name = "configure_route",
-        description = "Requires 'admin' MCP token scope. Create, update, or delete a delivery route binding feeds/tags and content filters to an existing trusted WebUI channel_id.",
+        description = "Requires 'admin' MCP token scope. Create, update, or delete a delivery route binding feeds/tags and content filters to an existing trusted WebUI destination_id (or legacy single-destination channel_id).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1074,26 +1135,15 @@ impl McpServer {
                         "configure_route action 'create' requires a non-empty 'name'",
                     ));
                 };
-                let Some(channel_id) = params.channel_id else {
-                    return Ok(tool_error(
-                        "validation_error",
-                        "configure_route action 'create' requires 'channel_id'",
-                    ));
-                };
 
-                // Enforce Trusted Channel Boundary: verify `channel_id` exists in `channels`.
-                match db.get_channel(channel_id).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        return Ok(tool_error(
-                            "not_found",
-                            format!(
-                                "trusted channel {channel_id} does not exist; channels must be created in WebUI"
-                            ),
-                        ));
-                    }
+                // Enforce Trusted Destination Boundary: verify target exists in WebUI-managed channels/destinations.
+                let (channel, destination) = match db
+                    .resolve_destination_target(params.destination_id, params.channel_id)
+                    .await
+                {
+                    Ok(pair) => pair,
                     Err(err) => return Ok(tool_error_from_app(err)),
-                }
+                };
 
                 let include_keywords =
                     normalize_string_list(params.include_keywords.unwrap_or_default());
@@ -1120,6 +1170,7 @@ impl McpServer {
                     telegram_mode: params.telegram_mode.unwrap_or_default(),
                     link_preview: params.link_preview.unwrap_or(true),
                     locale,
+                    timezone: params.timezone.clone(),
                     active_windows: params
                         .active_windows
                         .clone()
@@ -1140,7 +1191,8 @@ impl McpServer {
                     name: name.to_string(),
                     feed_ids: params.feed_ids.unwrap_or_default(),
                     match_tags: normalize_string_list(params.match_tags.unwrap_or_default()),
-                    channel_id,
+                    channel_id: channel.id,
+                    destination_id: destination.id,
                     include_keywords,
                     exclude_keywords,
                     include_regex,
@@ -1185,20 +1237,18 @@ impl McpServer {
                     ));
                 }
 
-                if let Some(channel_id) = params.channel_id {
-                    match db.get_channel(channel_id).await {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            return Ok(tool_error(
-                                "not_found",
-                                format!(
-                                    "trusted channel {channel_id} does not exist; channels must be created in WebUI"
-                                ),
-                            ));
+                let (resolved_channel_id, resolved_destination_id) =
+                    if params.destination_id.is_some() || params.channel_id.is_some() {
+                        match db
+                            .resolve_destination_target(params.destination_id, params.channel_id)
+                            .await
+                        {
+                            Ok((ch, dest)) => (Some(ch.id), Some(dest.id)),
+                            Err(err) => return Ok(tool_error_from_app(err)),
                         }
-                        Err(err) => return Ok(tool_error_from_app(err)),
-                    }
-                }
+                    } else {
+                        (None, None)
+                    };
 
                 let include_regex_patch = params.include_regex.map(|raw| {
                     let trimmed = raw.trim();
@@ -1247,6 +1297,7 @@ impl McpServer {
                 let options_patch = if params.telegram_mode.is_some()
                     || params.link_preview.is_some()
                     || params.locale.is_some()
+                    || params.timezone.is_some()
                     || params.active_windows.is_some()
                     || params.active_weekdays.is_some()
                 {
@@ -1262,6 +1313,9 @@ impl McpServer {
                             Ok(l) => current_opts.locale = l,
                             Err(msg) => return Ok(tool_error("validation_error", msg)),
                         }
+                    }
+                    if let Some(ref tz) = params.timezone {
+                        current_opts.timezone = Some(tz.clone());
                     }
                     if let Some(windows) = params.active_windows.clone() {
                         current_opts.active_windows = windows
@@ -1287,7 +1341,8 @@ impl McpServer {
                     name: params.name.map(|n| n.trim().to_string()),
                     feed_ids: params.feed_ids,
                     match_tags: params.match_tags.map(normalize_string_list),
-                    channel_id: params.channel_id,
+                    channel_id: resolved_channel_id,
+                    destination_id: resolved_destination_id,
                     include_keywords: params.include_keywords.map(normalize_string_list),
                     exclude_keywords: params.exclude_keywords.map(normalize_string_list),
                     include_regex: include_regex_patch,
@@ -1500,10 +1555,10 @@ impl McpServer {
         }
     }
 
-    /// Stateless debug push of one live feed item to a trusted channel (`admin` token scope required).
+    /// Stateless debug push of one live feed item to a trusted destination (`admin` token scope required).
     #[rmcp::tool(
         name = "test_push_feed_entry",
-        description = "Requires 'admin' MCP token scope. Send one live feed item (latest, or a fingerprint from preview_feed_latest) to an existing trusted channel_id with a chosen Telegram mode and delivery language. Stateless: does not store fingerprints, create queue tasks, or consume quota.",
+        description = "Requires 'admin' MCP token scope. Send one live feed item (latest, or a fingerprint from preview_feed_latest) to an existing trusted destination_id (or legacy single-destination channel_id) with a chosen Telegram mode, delivery language, and timezone. Stateless: does not store fingerprints, create queue tasks, or consume quota.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1564,14 +1619,19 @@ impl McpServer {
             Err(msg) => return Ok(tool_error("validation_error", msg)),
         };
 
-        let options = RouteOptions {
+        let mut options = RouteOptions {
             telegram_mode: params.telegram_mode.unwrap_or_default(),
             link_preview: params.link_preview.unwrap_or(true),
             locale,
+            timezone: params.timezone,
             ..RouteOptions::default()
         };
+        if let Err(err) = validate_schedule(&mut options) {
+            return Ok(tool_error_from_app(err));
+        }
         match runtime
             .debug_push(DebugPushParams {
+                destination_id: params.destination_id,
                 channel_id: params.channel_id,
                 url,
                 feed_id: params.feed_id,

@@ -22,10 +22,10 @@
 ## Key Features
 
 - **Article Deduplication & Automatic Cleanup** — Stores SHA-256 article fingerprints in SQLite to prevent duplicate deliveries while automatically cleaning up sanitized HTML bodies and media metadata after the retention window (24 hours by default). Anti-hotlink media is relayed in memory.
-- **Multi-Channel Delivery (SMTP Email / Telegram / Notion)** — Delivers matched articles to **SMTP Email** (inline-CSS email template with `Force-From` sender alignment), **Telegram** (Rich Message, Compact Card, and Media delivery modes, with Local Bot API support), and **Notion** (automatic data source property initialization, Markdown conversion, and asynchronous long-page creation).
-- **Rate Pacing & Crash Recovery** — Enqueues an independent delivery task for each matched article and route (`1 Task = 1 Entry × 1 Route`), supporting credential-shared minimum intervals, random jitter, and hourly/daily quotas, with task lease recovery across restarts. Routes have their own delivery language, time windows, and weekdays (outside a window tasks stay queued), the whole queue can be paused or resumed on a schedule, and backlogs and multiple feeds are delivered in chronological order.
-- **Connect-Time DNS SSRF Protection & Per-Resource Proxy** — Validates resolved IPs before TCP connection and re-validates every `30x` redirect hop; supports CIDR/host allowlists, response size caps, optional Readability full-text extraction, and per-feed or per-channel HTTP / SOCKS5 proxy routing.
-- **Embedded Web Console & `/mcp` Endpoint** — Ships the React management console and a Streamable HTTP `/mcp` server in a single binary, supporting `readonly` and `admin` Bearer tokens, encrypted channel credentials, and WebUI-managed delivery destinations. Sign in with username and password plus optional TOTP 2FA with recovery codes; the MCP server exposes 9 tools, including global queue control and a stateless debug push.
+- **Multi-Channel Accounts & Destinations (SMTP / Telegram / Notion)** — Organizes delivery into **Channel Accounts** (credentials, proxy, pacing, quotas) with multiple **Destinations** per account: **SMTP Email** (responsive inline-CSS template with Outlook-safe image scaling and `Force-From` alignment), **Telegram** (Rich Message via `telegram-rich 0.0.2` with native footers and image collages, Compact Card, and Media Mode, with Local Bot API support), and **Notion** (automatic data source initialization, Markdown v2 conversion, and asynchronous long-page creation).
+- **Rate Pacing, Per-Route Timezones & Crash Recovery** — Enqueues an independent task per matched article and route (`1 Task = 1 Entry × 1 Route`), sharing minimum intervals, per-delivery random jitter, hourly/daily quotas, and `429` cooldowns across all destinations of an account, with lease recovery across restarts. Routes support their own delivery language, IANA timezone override (governing delivery windows and localized article timestamps), and weekdays; the global queue can be paused or scheduled to resume, delivering backlogs chronologically.
+- **Connect-Time DNS SSRF Protection & Per-Resource Proxy** — Validates resolved IPs before TCP connection and re-validates every `30x` redirect hop; supports CIDR/host allowlists, response size caps, optional Readability full-text extraction, and per-feed or per-account HTTP / SOCKS5 proxy routing.
+- **Embedded Web Console & `/mcp` Endpoint** — Ships the React management console (with Feeds tag filtering, persistent sorting & pagination, cascading Routes filters, and semantic Outbox status colors) and a Streamable HTTP `/mcp` server in a single binary, supporting `readonly` and `admin` Bearer tokens, encrypted credentials & destinations, username/password + optional TOTP 2FA, and 9 MCP tools with redacted destination discovery.
 
 ```mermaid
 flowchart LR
@@ -52,7 +52,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
-  # Or pin an exact release: elleryhe/feedcourier:0.1.6
+  # Or pin an exact release: elleryhe/feedcourier:0.2.0
 ```
 
 ### Docker Compose
@@ -60,7 +60,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.6
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.2.0
     container_name: feedcourier
     restart: unless-stopped
     ports:

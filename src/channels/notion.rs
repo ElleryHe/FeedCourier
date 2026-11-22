@@ -30,7 +30,7 @@ use url::Url;
 
 use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, NotionChannelConfig, NotionColumnMapping,
+    DeliveryOutcome, DestinationConfig, NotionColumnMapping, NotionDestinationConfig,
 };
 use crate::config::{APP_NAME, VERSION};
 use crate::db::models::{Entry, Feed, unix_to_rfc3339};
@@ -82,12 +82,15 @@ const DEFAULT_RESUME_ASYNC_POLLS: usize = 3;
 /// `POST /api/v1/channels/notion/init-db` request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotionInitDbRequest {
+    #[serde(default)]
     pub secret: String,
     pub parent_page_id: String,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub use_proxy: bool,
+    #[serde(default)]
+    pub channel_id: Option<i64>,
 }
 
 /// `POST /api/v1/channels/notion/init-db` response payload.
@@ -187,6 +190,7 @@ pub struct NotionColumnCheckItem {
 /// `POST /api/v1/channels/notion/inspect-schema` request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotionInspectSchemaRequest {
+    #[serde(default)]
     pub secret: String,
     pub data_source_or_db_id: String,
     #[serde(default)]
@@ -1263,6 +1267,47 @@ impl NotionSender {
         })
     }
 
+    /// Fetch the Notion integration (bot) name via `GET /v1/users/me` for default account naming
+    /// and account-level credential verification.
+    pub async fn get_bot_name(&self, secret: &str, use_proxy: bool) -> AppResult<Option<String>> {
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return Err(AppError::Validation(
+                "Notion integration secret must not be empty".to_string(),
+            ));
+        }
+        let resp = self
+            .execute_json(Method::GET, "/v1/users/me", secret, use_proxy, None)
+            .await
+            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+        if !resp.status.is_success() {
+            return Err(resp.into_app_error("GET /v1/users/me"));
+        }
+        let name = resp
+            .body
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        Ok(name)
+    }
+
+    /// Fetch the display title of a Notion data source or database for default destination naming.
+    pub async fn get_data_source_title(
+        &self,
+        secret: &str,
+        data_source_or_db_id: &str,
+        use_proxy: bool,
+    ) -> AppResult<Option<String>> {
+        let secret = secret.trim();
+        let target_id = normalize_notion_id(data_source_or_db_id)?;
+        let resolved = self
+            .resolve_data_source_metadata(secret, &target_id, use_proxy)
+            .await?;
+        Ok(resolved.title)
+    }
+
     // -----------------------------------------------------------------------
     // Mode 1: Zero-Friction Auto-Create 7-Column Database (`POST /v1/databases`)
     // -----------------------------------------------------------------------
@@ -1798,10 +1843,16 @@ impl ChannelSender for NotionSender {
                 ctx.channel_config.kind()
             )));
         };
-        cfg.column_mapping.validate()?;
+        let DestinationConfig::Notion(dest) = ctx.destination_config else {
+            return Err(AppError::Validation(format!(
+                "NotionSender received incompatible '{}' destination configuration",
+                ctx.destination_config.kind()
+            )));
+        };
+        dest.column_mapping.validate()?;
 
         let secret = cfg.integration_secret.trim();
-        let data_source_id = normalize_notion_id(&cfg.data_source_id)?;
+        let data_source_id = normalize_notion_id(&dest.data_source_id)?;
         let use_proxy = ctx.channel.use_proxy;
 
         let effective_checkpoint = match &ctx.checkpoint {
@@ -1840,7 +1891,7 @@ impl ChannelSender for NotionSender {
                 .poll_async_task_bounded(AsyncPollParams {
                     secret,
                     data_source_id: &data_source_id,
-                    fc_id_col: &cfg.column_mapping.fc_id,
+                    fc_id_col: &dest.column_mapping.fc_id,
                     fingerprint: &ctx.entry.fingerprint_sha256,
                     task_id: &task_id,
                     use_proxy,
@@ -1912,7 +1963,7 @@ impl ChannelSender for NotionSender {
                 .query_existing_page_by_fc_id(
                     secret,
                     &data_source_id,
-                    &cfg.column_mapping.fc_id,
+                    &dest.column_mapping.fc_id,
                     &ctx.entry.fingerprint_sha256,
                     use_proxy,
                 )
@@ -1953,7 +2004,7 @@ impl ChannelSender for NotionSender {
         }
 
         // 3. Build minimalist `POST /v1/pages` payload (`markdown_version: "v2"`).
-        let page_payload = build_create_page_payload(cfg, &data_source_id, ctx.entry, ctx.feed);
+        let page_payload = build_create_page_payload(dest, &data_source_id, ctx.entry, ctx.feed);
 
         let create_resp = match self
             .execute_json(
@@ -1996,7 +2047,7 @@ impl ChannelSender for NotionSender {
                         .poll_async_task_bounded(AsyncPollParams {
                             secret,
                             data_source_id: &data_source_id,
-                            fc_id_col: &cfg.column_mapping.fc_id,
+                            fc_id_col: &dest.column_mapping.fc_id,
                             fingerprint: &ctx.entry.fingerprint_sha256,
                             task_id: &task_id,
                             use_proxy,
@@ -2150,17 +2201,29 @@ impl ChannelSender for NotionSender {
         })
     }
 
-    async fn send_test(&self, config: &ChannelConfig, use_proxy: bool) -> AppResult<String> {
-        let ChannelConfig::Notion(cfg) = config else {
+    async fn send_test(
+        &self,
+        channel_config: &ChannelConfig,
+        destination_config: &DestinationConfig,
+        use_proxy: bool,
+    ) -> AppResult<String> {
+        let ChannelConfig::Notion(cfg) = channel_config else {
             return Err(AppError::Validation(format!(
-                "NotionSender::send_test expected 'notion' config, got '{}'",
-                config.kind()
+                "NotionSender::send_test expected 'notion' account config, got '{}'",
+                channel_config.kind()
             )));
         };
-        config.validate()?;
+        let DestinationConfig::Notion(dest) = destination_config else {
+            return Err(AppError::Validation(format!(
+                "NotionSender::send_test expected 'notion' destination config, got '{}'",
+                destination_config.kind()
+            )));
+        };
+        channel_config.validate()?;
+        destination_config.validate()?;
 
         let secret = cfg.integration_secret.trim();
-        let data_source_id = normalize_notion_id(&cfg.data_source_id)?;
+        let data_source_id = normalize_notion_id(&dest.data_source_id)?;
 
         let resp = self
             .execute_json(
@@ -2178,7 +2241,7 @@ impl ChannelSender for NotionSender {
         }
 
         let ds = parse_data_source_object(&resp.body, &data_source_id, None, None);
-        let verified_cols = verify_configured_mapping(&ds.properties, &cfg.column_mapping)?;
+        let verified_cols = verify_configured_mapping(&ds.properties, &dest.column_mapping)?;
         let ds_label = ds.title.as_deref().unwrap_or("Untitled Data Source");
 
         Ok(format!(
@@ -2705,12 +2768,12 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn build_create_page_payload(
-    cfg: &NotionChannelConfig,
+    dest: &NotionDestinationConfig,
     data_source_id: &str,
     entry: &Entry,
     feed: &Feed,
 ) -> Value {
-    let mapping = &cfg.column_mapping;
+    let mapping = &dest.column_mapping;
     let normalized = entry_to_notion_markdown_v2(entry);
 
     let title_text = entry

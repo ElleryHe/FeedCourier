@@ -14,17 +14,18 @@ FeedCourier 的所有持久化数据均保存在单一 `DATA_DIR`（容器内默
 
 ```text
 /data/
-├── master.key          # 32 字节 ChaCha20-Poly1305 主密钥（权限 0600，未设置 MASTER_KEY 环境变量时自动生成）
-├── feedcourier.db      # SQLite 主数据库文件（表结构、文章指纹、加密后的通道配置、路由与任务队列）
-├── feedcourier.db-wal  # SQLite WAL 预写日志文件
-└── feedcourier.db-shm  # SQLite WAL 共享内存索引文件
+├── master.key            # 32 字节 ChaCha20-Poly1305 主密钥（权限 0600，未设置 MASTER_KEY 环境变量时自动生成）
+├── feedcourier.db        # SQLite 主数据库文件（表结构、文章指纹、加密后的账号与目的地配置、路由与任务队列）
+├── feedcourier.db-wal    # SQLite WAL 预写日志文件
+├── feedcourier.db-shm    # SQLite WAL 共享内存索引文件
+└── pre-v0.2.0-backup.db  # 从 v0.1.x 升级到 v0.2.0 时自动生成的升级前在线快照备份
 ```
 
 ### 主密钥（`master.key`）保存须知
 
 > [!IMPORTANT]
-> 数据库中保存的 SMTP 密码、Telegram `bot_token` 与 Notion `integration_secret` 均使用 `master.key`（或环境变量 `MASTER_KEY`）加密存储。
-> **备份或迁移 `feedcourier.db` 时，必须同时保留对应的 `master.key`（或相同的 `MASTER_KEY` 环境变量）**；若丢失主密钥，已保存的通道凭据将无法解密，需要在 WebUI 中重新填写通道密钥。
+> 数据库中保存的通道账号凭据（SMTP 密码、Telegram `bot_token`、Notion `integration_secret`）与目的地配置（收件人列表、`chat_id`、`data_source_id`）均使用 `master.key`（或环境变量 `MASTER_KEY`）加密存储。
+> **备份或迁移 `feedcourier.db` 时，必须同时保留对应的 `master.key`（或相同的 `MASTER_KEY` 环境变量）**；若丢失主密钥，已保存的账号凭据与目的地配置将无法解密，需要在 WebUI 中重新填写。
 
 ---
 
@@ -64,7 +65,26 @@ curl -fL -b cookies.txt \
 1. 停止目标机器上的 FeedCourier 容器或进程；
 2. 删除目标 `/data/` 下的旧 `feedcourier.db`、`feedcourier.db-wal`、`feedcourier.db-shm`；
 3. 将备份的 `.db` 快照文件复制到 `/data/feedcourier.db`，并确保原实例的 `/data/master.key`（权限 `0600`）已放置在 `/data/` 下；
-4. 启动 FeedCourier 服务，即可恢复全部订阅源、去重指纹、推送通道、路由规则与 MCP 令牌。
+4. 启动 FeedCourier 服务，即可恢复全部订阅源、去重指纹、推送通道与目的地、路由规则与 MCP 令牌。
+
+---
+
+## 从 `v0.1.x` 升级至 `v0.2.0` {#upgrading-from-v0-1-x-to-v0-2-0}
+
+FeedCourier `v0.2.0` 引入了**双层投递通道模型（通道账号 + 多个目的地）**。从 `v0.1.x` 升级时，服务会在首次启动阶段**自动、原子地**完成旧数据迁移，无需手动执行 SQL：
+
+1. **升级前自动备份（`pre-v0.2.0-backup.db`）**：在修改任何旧通道记录前，系统会自动通过 `VACUUM INTO` 在数据目录下生成一致性快照 `<DATA_DIR>/pre-v0.2.0-backup.db`。若后续需要回退至 `v0.1.6`，将该备份与原 `master.key` 一同还原即可。
+2. **表结构变更与单事务拆分**：`migrations/0002_channel_destinations.sql` 先创建 `channel_destinations` 表并为 `routes` / `delivery_tasks` 增加 `destination_id` 列；随后启动钩子 `Database::migrate_channels_to_v2` 使用 `MasterKey` 在**单个 SQLite 事务**内解密每条旧通道配置，拆分为账号凭据（`channels`）与目的地配置（`channel_destinations`）。
+3. **按 `credential_group_key` 自动合并重复账号**：共享同一底层凭据的旧通道（相同 `credential_group_key`，例如同一 Telegram Bot 分别推送至两个群组，或同一 SMTP 账号发送至两组收件人）会自动合并为同一个通道账号，每个旧通道转化为其下一个独立目的地并沿用旧名称作为备注：
+   - **流速与配额（取最严格值）**：`min_interval_secs` 取最大值、`jitter_max_secs` 取最大值、`hourly_quota` 与 `daily_quota` 取非空最小值、`cooldown_until` 取最晚截止时间。
+   - **代理与启用状态（取并集）**：只要任一被合并的旧通道开启了代理，合并后的账号即开启 `use_proxy`；只要任一旧通道处于启用状态，合并后的账号即保持启用（每个目的地仍各自保留原有的启用/停用状态）。
+   - **账号名称**：SMTP 账号优先使用 `from_address`，Telegram 账号优先使用已缓存的 `@username`，否则沿用主通道原名。
+4. **路由与历史任务重指向**：所有 `routes` 与 `delivery_tasks`（含历史 `delivered` 与 `dead_letter` 任务）会自动更新指向新的 `destination_id` 与合并后的 `channel_id`。
+5. **幂等标记**：事务提交后写入 `system_settings.channel_model_version = 2`，后续重启不会重复迁移。
+
+> [!WARNING]
+> **API 与 MCP 调用方兼容提示**
+> 升级后，仍使用 `channel_id` 调用 `POST`/`PATCH /api/v1/routes`、`POST /api/v1/feeds/preview/push` 或 MCP `configure_route` / `test_push_feed_entry` 的脚本，在目标账号仅拥有 **1 个目的地** 时仍可自动解析；若账号下存在**多个目的地**（包括旧通道合并后产生多个目的地的情况），服务端会返回校验错误并提示改用 `destination_id`。
 
 ---
 
@@ -79,6 +99,20 @@ curl -fL -b cookies.txt \
 
 > [!TIP]
 > 路由自身的投递时间窗口独立生效：窗口外的任务仍会入队，并在下一个窗口开始时投递。参见[发送频率、配额与时间窗口](/zh/channels/pacing-and-quotas#route-delivery-time-windows)。
+
+### 发件箱队列状态配色
+
+在 **Tasks** 页面中，任务状态标签、HTTP/SMTP 状态码、尝试次数与诊断日志采用统一的语义配色，便于一眼区分正常投递、临时等待与永久错误：
+
+| 状态 / 信号 | 颜色 |
+| :--- | :--- |
+| **已送达** / `2xx`（不含 `202`） | **绿色** |
+| **重试中** / **延后** / `202`（异步任务） / `429` 等可恢复情况 | **黄色** |
+| **死信** / 永久性 `4xx` / `5xx` | **红色** |
+| **排队中** | **灰色** |
+| **尝试次数**：1 次 / ≥ 2 次 / 达到上限（6 次） | **中性色** / **黄色** / **红色** |
+
+诊断日志的文字颜色跟随对应任务的状态变化，成功送达的提示日志以绿色显示，不再显示为红色。
 
 ---
 

@@ -12,15 +12,15 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 | 工具名称 | 所需最低权限 | 读写属性 | 功能说明 |
 | :--- | :---: | :---: | :--- |
-| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | 只读 | 查看全局统计概览、通道列表（仅含 ID、名称和类型）、路由列表及订阅源健康状态。 |
+| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | 只读 | 查看全局统计概览、脱敏通道账号与目的地列表（仅含 ID、备注名、类型与启用状态）、路由列表及订阅源健康状态。 |
 | [`inspect_failed_deliveries`](#2-inspect-failed-deliveries) | `readonly` | 只读 | 查看投递失败（`dead_letter`）、等待重试（`retrying`）、顺延（`deferred`）或排队中的任务与诊断日志。 |
 | [`preview_feed_latest`](#3-preview-feed-latest) | `readonly` | 只读 | 实时试抓指定订阅源 URL 或已有 `feed_id` 的最新 10 篇文章，支持测试全文提取与过滤规则。 |
 | [`manage_feed`](#4-manage-feed) | **`admin`** | 写操作 | 新增、修改、暂停（`pause`）、恢复（`resume`）、清除缓存（`clear_cache`）或删除订阅源，设置标签、轮询间隔、全文提取与代理开关。 |
-| [`configure_route`](#5-configure-route) | **`admin`** | 写操作 | 创建、更新或删除路由规则，将订阅源/标签及关键词/正则过滤规则绑定至已有的 `channel_id`。 |
+| [`configure_route`](#5-configure-route) | **`admin`** | 写操作 | 创建、更新或删除路由规则，将订阅源/标签及关键词/正则过滤规则绑定至已有授信目的地 `destination_id`（或单目的地账号的 `channel_id`）。 |
 | [`reset_and_poll_feed`](#6-reset-and-poll-feed) | **`admin`** | 写操作 | 重置指定订阅源的失败计数与退避/熔断状态，并立即执行一次拉取。 |
 | [`retry_dead_tasks`](#7-retry-dead-tasks) | **`admin`** | 写操作 | 按任务 ID 列表或一键将全部死信任务（`all_dead_letter: true`）重新加入发送队列。 |
 | [`manage_outbox_queue`](#8-manage-outbox-queue) | **`admin`** | 写操作 | 查看、暂停或恢复全局投递队列（可设定自动恢复时间）。 |
-| [`test_push_feed_entry`](#9-test-push-feed-entry) | **`admin`** | 无状态 | 将一条订阅源文章调试推送到指定通道，不写入指纹、不入队、不占用配额。 |
+| [`test_push_feed_entry`](#9-test-push-feed-entry) | **`admin`** | 无状态 | 将一条订阅源文章调试推送到指定授信目的地 `destination_id`（或单目的地账号的 `channel_id`），不写入指纹、不入队、不占用配额。 |
 
 ---
 
@@ -28,7 +28,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ### 1. `list_feeds_status` {#1-list-feeds-status}
 
-查询服务全局统计概览、已配置的推送通道摘要（不含密钥与收件地址）、全部路由规则以及订阅源运行状态。
+查询服务全局统计概览、已配置的脱敏通道账号（`channels`，内嵌各自 `destinations`）与扁平脱敏目的地列表（`destinations`，仅含 `id`、`channel_id`、`name`、`kind`、`enabled`，不泄露任何密钥、邮箱、`chat_id` 或 `data_source_id`）、全部路由规则以及订阅源运行状态。
 
 #### 参数说明
 
@@ -37,12 +37,14 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 | `health_status` | `string` | 否 | `null` | 按健康状态筛选订阅源：`"active"`、`"backoff"`、`"circuit_open"` 或 `"paused"`。 |
 | `tag` | `string` | 否 | `null` | 按标签（不区分大小写）筛选包含该标签的订阅源。 |
 
-返回内容中，每条路由还包含其投递语言 `locale`、投递时间窗口 `active_windows` 与允许的星期 `active_weekdays`；响应另含全局队列状态 `queue: { paused, resume_at }` 以及用于判定时间窗口的系统时区 `timezone`。
+返回内容中，每条路由包含 `channel_id`、`destination_id`、投递语言 `locale`、可选路由时区 `timezone`、投递时间窗口 `active_windows` 与允许的星期 `active_weekdays`；响应另含全局队列状态 `queue: { paused, resume_at }` 以及默认系统时区 `timezone`。
 
 #### 返回示例
 
 ```json
 {
+  "timezone": "Asia/Shanghai",
+  "queue": { "paused": false, "resume_at": null },
   "overview": {
     "feeds_active": 12,
     "feeds_backoff": 1,
@@ -60,10 +62,28 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
   "channels": [
     {
       "id": 1,
-      "name": "Telegram 技术频道",
+      "name": "@my_feed_bot",
       "kind": "telegram",
       "enabled": true,
-      "cooldown_until": null
+      "cooldown_until": null,
+      "destinations": [
+        {
+          "id": 5,
+          "channel_id": 1,
+          "name": "Telegram 技术频道",
+          "kind": "telegram",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "destinations": [
+    {
+      "id": 5,
+      "channel_id": 1,
+      "name": "Telegram 技术频道",
+      "kind": "telegram",
+      "enabled": true
     }
   ],
   "routes": [
@@ -71,6 +91,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
       "id": 1,
       "name": "Rust 与 AI 资讯推送",
       "channel_id": 1,
+      "destination_id": 5,
       "feed_ids": [],
       "match_tags": ["rust", "ai"],
       "include_keywords": [],
@@ -79,6 +100,10 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
       "exclude_regex": null,
       "telegram_mode": "rich_message",
       "link_preview": true,
+      "locale": "zh-CN",
+      "timezone": "Asia/Shanghai",
+      "active_windows": [],
+      "active_weekdays": [],
       "enabled": true
     }
   ],
@@ -117,7 +142,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 - `status_filter`：实际生效的状态筛选值；
 - `count`：返回的任务数量；
-- `tasks`：任务列表，每项包含任务 `id`、路由与通道名称、文章标题与链接、当前状态、已尝试次数（`attempt_count`）、最后一次响应状态码（`last_status_code`）、诊断日志（`diagnostic_log`）以及下次尝试时间（`next_attempt_at`）。
+- `tasks`：任务列表，每项包含任务 `id`、路由名称、通道账号名称与目的地（`destination_id`、`destination_name`）、文章标题与链接、当前状态、已尝试次数（`attempt_count`）、最后一次响应状态码（`last_status_code`）、诊断日志（`diagnostic_log`）以及下次尝试时间（`next_attempt_at`）。
 
 ---
 
@@ -189,7 +214,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 创建、更新或删除投递路由规则。
 
 > [!IMPORTANT]
-> `configure_route` 仅接受整数类型的 `channel_id`（可先通过 `list_feeds_status` 返回的 `channels` 列表查看已有通道 ID），不支持传入收件邮箱、Telegram `chat_id` 或 Notion 数据库地址。推送通道需事先在 WebUI 中创建。
+> `configure_route` 以整数类型的授信目的地 **`destination_id`** 为主（可通过 `list_feeds_status` 返回的 `destinations` 列表查看），不支持传入收件邮箱、Telegram `chat_id` 或 Notion 数据库地址。为兼容旧调用方，仍接受 `channel_id`，但仅在对应账号下**恰好只有 1 个目的地**时自动解析；若账号下有多个目的地则会报错并提示改用 `destination_id`。通道账号与目的地需事先在 WebUI 中创建。
 
 #### 参数说明
 
@@ -198,7 +223,8 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 | `action` | `string` | **是** | — | 操作类型：`"create"`、`"update"` 或 `"delete"`。 |
 | `route_id` | `integer` | 条件必填 | `null` | 目标路由 ID（在 `"update"` 与 `"delete"` 时必填）。 |
 | `name` | `string` | 条件必填 | `null` | 路由规则名称（在 `"create"` 时必填）。 |
-| `channel_id` | `integer` | 条件必填 | `null` | 目标推送通道的整数 ID（在 `"create"` 时必填）。 |
+| `destination_id` | `integer` | 条件必填（首选） | `null` | 目标授信目的地的整数 ID（在 `"create"` 时必填，除非传入单目的地账号的 `channel_id`）。 |
+| `channel_id` | `integer` | 兼容回退 | `null` | 旧版兼容字段：仅在目标账号下恰好只有 1 个目的地时自动解析。 |
 | `feed_ids` | `integer[]` | 否 | `[]` | 显式匹配的订阅源 ID 列表（与 `match_tags` 同时为空时匹配全部订阅源）。 |
 | `match_tags` | `string[]` | 否 | `[]` | 匹配的标签列表（不区分大小写）。 |
 | `include_keywords` | `string[]` | 否 | `[]` | 标题或正文必须至少包含其中一个词的关键词列表。 |
@@ -208,7 +234,8 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 | `telegram_mode` | `string` | 否 | `"rich_message"` | Telegram 投递模式：`"rich_message"`、`"compact_card"` 或 `"media_mode"`。 |
 | `link_preview` | `bool` | 否 | `true` | Telegram 快讯模式下是否开启网页链接预览。 |
 | `locale` | `string` | 否 | `null` | 该路由的投递语言：`"en"` 或 `"zh-CN"`。 |
-| `active_windows` | `{start, end}[]` | 否 | `[]` | 系统时区下的每日投递窗口，如 `[{"start":"08:00","end":"22:00"}]`。`end` 早于 `start` 表示跨午夜，`start == end` 表示全天，`[]` 表示不限制。 |
+| `timezone` | `string` | 否 | `null` | 可选的路由级 IANA 时区（如 `"Asia/Shanghai"`；在 `"update"` 时传 `""` 可清空并回退继承系统时区），同时控制推送窗口、SMTP 文章时间与 Telegram 富文本页脚时间。 |
+| `active_windows` | `{start, end}[]` | 否 | `[]` | **路由时区**（默认继承系统时区）下的每日投递窗口，如 `[{"start":"08:00","end":"22:00"}]`。`end` 早于 `start` 表示跨午夜，`start == end` 表示全天，`[]` 表示不限制。 |
 | `active_weekdays` | `integer[]` | 否 | `[]` | 允许投递的星期，`1`（周一）到 `7`（周日），`[]` 表示每天。 |
 | `enabled` | `bool` | 否 | `true` | 是否启用该路由规则。 |
 
@@ -286,26 +313,28 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 ### 9. `test_push_feed_entry` {#9-test-push-feed-entry}
 
-调试推送：实时抓取一条订阅源文章并向指定通道投递一次。它是**无状态**的：不写入指纹、不进入队列，也不使用路由过滤、时间窗口或配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。下游投递失败时返回诊断结果，而不是抛出错误。
+调试推送：实时抓取一条订阅源文章并向指定授信目的地投递一次。它是**无状态**的：不写入指纹、不进入队列，也不使用路由过滤、时间窗口或配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。下游投递失败时返回诊断结果，而不是抛出错误。
 
 #### 参数说明
 
 | 参数名 | 类型 | 必填 | 默认值 | 说明 |
 | :--- | :--- | :---: | :--- | :--- |
-| `channel_id` | `integer` | **是** | — | 要推送到的已有推送通道 ID。 |
+| `destination_id` | `integer` | **首选** | `null` | 要推送到的已有授信目的地 ID（除非传入单目的地账号的 `channel_id`）。 |
+| `channel_id` | `integer` | 兼容回退 | `null` | 旧版兼容字段：仅在目标通道账号恰好只有 1 个目的地时自动解析。 |
 | `feed_id` | `integer` | 二选一 | `null` | 读取文章的已有订阅源（`feed_id` 与 `url` 二选一）。 |
 | `url` | `string` | 二选一 | `null` | 订阅源 URL。 |
 | `fingerprint_sha256` | `string` | 否 | `null` | 要推送的文章指纹；留空则推送最新一篇。 |
 | `fetch_full_content` | `bool` | 否 | `false` | 推送前是否提取全文。 |
 | `use_proxy` | `bool` | 否 | `false` | 抓取时是否使用全局出站代理。 |
-| `telegram_mode` | `string` | 否 | `null` | Telegram 通道的投递模式：`"rich_message"`、`"compact_card"` 或 `"media_mode"`。 |
+| `telegram_mode` | `string` | 否 | `null` | Telegram 目的地的投递模式：`"rich_message"`、`"compact_card"` 或 `"media_mode"`。 |
 | `link_preview` | `bool` | 否 | `null` | Telegram 网页链接预览开关。 |
 | `locale` | `string` | 否 | `null` | 投递语言：`"en"` 或 `"zh-CN"`。 |
+| `timezone` | `string` | 否 | `null` | 可选的 IANA 时区，用于渲染文章本地发布时间（省略时继承系统时区）。 |
 
 ```json
 {
   "name": "test_push_feed_entry",
-  "arguments": { "channel_id": 2, "feed_id": 4, "telegram_mode": "media_mode", "locale": "zh-CN" }
+  "arguments": { "destination_id": 5, "feed_id": 4, "telegram_mode": "media_mode", "locale": "zh-CN", "timezone": "Asia/Shanghai" }
 }
 ```
 
@@ -317,7 +346,7 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 
 - **查看状态与异常订阅源**：“*帮我查看一下 FeedCourier 当前的订阅源状态，有没有处于退避（backoff）或熔断（circuit_open）状态的源？*”
 - **试抓与对比全文提取效果**：“*帮我试抓一下 `https://blog.rust-lang.org/feed.xml`，对比开启 `fetch_full_content` 前后的正文提取效果。*”
-- **添加订阅源并配置路由**：“*把上面那个 Rust 官方博客添加到订阅源里，打上 `rust` 和 `programming` 标签，开启全文提取并立即试推最新 1 篇；然后检查是否已有匹配 `rust` 标签发往 Telegram 通道的路由。*”
+- **添加订阅源并配置路由**：“*把上面那个 Rust 官方博客添加到订阅源里，打上 `rust` 和 `programming` 标签，开启全文提取并立即试推最新 1 篇；然后检查是否已有匹配 `rust` 标签发往 Telegram 目的地的路由。*”
 - **模拟并调整过滤规则**：“*用 `preview_feed_latest` 测试一下如果给 `feed_id = 3` 加上排除关键词 `["招聘", "周报"]`，最近 10 篇文章会有哪几篇被过滤掉？确认没问题后帮我更新到路由 #1。*”
 - **排查并重投失败任务**：“*查看一下当前有没有处于 `dead_letter` 状态的失败投递任务，告诉我报错原因，然后把它们全部重新加入队列投递。*”
-- **控制队列与调试推送**：“*把投递队列暂停 1 小时；然后把 `feed_id = 4` 的最新一篇用媒体模式调试推送到 Telegram 通道 #2。*”
+- **控制队列与调试推送**：“*把投递队列暂停 1 小时；然后把 `feed_id = 4` 的最新一篇用媒体模式调试推送到 Telegram 目的地 #5。*”

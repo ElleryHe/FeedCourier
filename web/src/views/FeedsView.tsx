@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BookOpen,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Download,
   Eraser,
   ExternalLink,
@@ -25,10 +27,13 @@ import {
 import { type ChangeEvent, type FormEvent, useMemo, useState } from "react";
 import { api } from "@/api/client";
 import type {
+  ChannelDestinationDto,
+  ChannelDto,
   ContentFilterRules,
   CreateFeedRequest,
   FeedDto,
   FeedHealthStatus,
+  FeedPreviewPushRequest,
   FeedPreviewResponse,
   SystemLocale,
   TelegramDeliveryMode,
@@ -54,6 +59,7 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { type Locale, useI18n } from "@/i18n";
 import type { Messages } from "@/i18n/en";
+import { listTimeZones } from "@/lib/timezone";
 import {
   errorMessage,
   formatDateTime,
@@ -65,6 +71,64 @@ import {
 
 export interface FeedsViewProps {
   initialStatusFilter?: FeedHealthStatus | "all";
+}
+
+type FeedSortMode = "created_desc" | "created_asc" | "name_asc" | "name_desc";
+type FeedPageSize = 15 | 30 | 50;
+
+const FEEDS_SORT_STORAGE_KEY = "fc-feeds-sort";
+const FEEDS_PAGE_SIZE_STORAGE_KEY = "fc-feeds-page-size";
+
+const VALID_SORT_MODES: readonly FeedSortMode[] = [
+  "created_desc",
+  "created_asc",
+  "name_asc",
+  "name_desc",
+];
+const VALID_PAGE_SIZES: readonly FeedPageSize[] = [15, 30, 50];
+
+function readStoredSortMode(): FeedSortMode {
+  if (typeof window === "undefined") return "created_desc";
+  try {
+    const raw = window.localStorage.getItem(FEEDS_SORT_STORAGE_KEY);
+    if (raw && (VALID_SORT_MODES as readonly string[]).includes(raw)) {
+      return raw as FeedSortMode;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return "created_desc";
+}
+
+function writeStoredSortMode(mode: FeedSortMode): void {
+  try {
+    window.localStorage.setItem(FEEDS_SORT_STORAGE_KEY, mode);
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
+function readStoredPageSize(): FeedPageSize {
+  if (typeof window === "undefined") return 15;
+  try {
+    const raw = Number(
+      window.localStorage.getItem(FEEDS_PAGE_SIZE_STORAGE_KEY),
+    );
+    if ((VALID_PAGE_SIZES as readonly number[]).includes(raw)) {
+      return raw as FeedPageSize;
+    }
+  } catch {
+    // Ignore storage access errors
+  }
+  return 15;
+}
+
+function writeStoredPageSize(size: FeedPageSize): void {
+  try {
+    window.localStorage.setItem(FEEDS_PAGE_SIZE_STORAGE_KEY, String(size));
+  } catch {
+    // Ignore storage access errors
+  }
 }
 
 const POLL_PRESETS = [
@@ -95,14 +159,18 @@ function healthBadge(
 }
 
 export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
-  const { m } = useI18n();
+  const { m, locale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
 
   const [statusFilter, setStatusFilter] = useState<FeedHealthStatus | "all">(
     initialStatusFilter,
   );
+  const [sortMode, setSortMode] = useState<FeedSortMode>(readStoredSortMode);
+  const [tagFilter, setTagFilter] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [pageSize, setPageSize] = useState<FeedPageSize>(readStoredPageSize);
+  const [page, setPage] = useState<number>(1);
 
   // Modals state
   const [editorOpen, setEditorOpen] = useState(false);
@@ -124,27 +192,133 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
     refetchInterval: 30_000,
   });
 
-  const allKnownTags = useMemo(() => {
-    const set = new Set<string>();
-    for (const feed of feedsQuery.data ?? []) {
-      for (const tag of feed.tags) set.add(tag);
-    }
-    return Array.from(set).sort();
-  }, [feedsQuery.data]);
+  const nameCollator = useMemo(
+    () =>
+      new Intl.Collator(locale === "zh-CN" ? "zh-Hans-CN" : "en", {
+        sensitivity: "base",
+        numeric: true,
+      }),
+    [locale],
+  );
 
-  const filteredFeeds = useMemo(() => {
+  const { allKnownTags, tagEntries, untaggedCount } = useMemo(() => {
+    const counts = new Map<string, number>();
+    let untagged = 0;
+    for (const feed of feedsQuery.data ?? []) {
+      if (feed.tags.length === 0) {
+        untagged += 1;
+      } else {
+        for (const tag of feed.tags) {
+          counts.set(tag, (counts.get(tag) ?? 0) + 1);
+        }
+      }
+    }
+    const sortedTags = Array.from(counts.keys()).sort((a, b) =>
+      nameCollator.compare(a, b),
+    );
+    return {
+      allKnownTags: sortedTags,
+      tagEntries: sortedTags.map((tag) => ({
+        tag,
+        count: counts.get(tag) ?? 0,
+      })),
+      untaggedCount: untagged,
+    };
+  }, [feedsQuery.data, nameCollator]);
+
+  const effectiveTagFilter = useMemo(() => {
+    if (
+      feedsQuery.isSuccess &&
+      tagFilter.startsWith("tag:") &&
+      !allKnownTags.includes(tagFilter.slice(4))
+    ) {
+      return "all";
+    }
+    return tagFilter;
+  }, [feedsQuery.isSuccess, tagFilter, allKnownTags]);
+
+  const filteredSortedFeeds = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return (feedsQuery.data ?? []).filter((feed) => {
+    const filtered = (feedsQuery.data ?? []).filter((feed) => {
       if (statusFilter !== "all" && feed.health_status !== statusFilter) {
         return false;
+      }
+      if (effectiveTagFilter === "untagged") {
+        if (feed.tags.length > 0) return false;
+      } else if (effectiveTagFilter.startsWith("tag:")) {
+        const targetTag = effectiveTagFilter.slice(4);
+        if (!feed.tags.includes(targetTag)) return false;
       }
       if (!q) return true;
       const inTitle = (feed.title ?? "").toLowerCase().includes(q);
       const inUrl = feed.url.toLowerCase().includes(q);
-      const inTags = feed.tags.some((t) => t.toLowerCase().includes(q));
-      return inTitle || inUrl || inTags;
+      return inTitle || inUrl;
     });
-  }, [feedsQuery.data, statusFilter, searchQuery]);
+
+    return [...filtered].sort((a, b) => {
+      switch (sortMode) {
+        case "created_desc": {
+          const diff = Date.parse(b.created_at) - Date.parse(a.created_at);
+          return Number.isFinite(diff) && diff !== 0 ? diff : b.id - a.id;
+        }
+        case "created_asc": {
+          const diff = Date.parse(a.created_at) - Date.parse(b.created_at);
+          return Number.isFinite(diff) && diff !== 0 ? diff : a.id - b.id;
+        }
+        case "name_asc": {
+          const cmp = nameCollator.compare(a.title || a.url, b.title || b.url);
+          return cmp !== 0 ? cmp : a.id - b.id;
+        }
+        case "name_desc": {
+          const cmp = nameCollator.compare(b.title || b.url, a.title || a.url);
+          return cmp !== 0 ? cmp : b.id - a.id;
+        }
+      }
+    });
+  }, [
+    feedsQuery.data,
+    statusFilter,
+    effectiveTagFilter,
+    searchQuery,
+    sortMode,
+    nameCollator,
+  ]);
+
+  const totalItems = filteredSortedFeeds.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const pageStart = (safePage - 1) * pageSize;
+  const paginatedFeeds = useMemo(
+    () => filteredSortedFeeds.slice(pageStart, pageStart + pageSize),
+    [filteredSortedFeeds, pageStart, pageSize],
+  );
+
+  const handleSortChange = (next: FeedSortMode) => {
+    setSortMode(next);
+    writeStoredSortMode(next);
+    setPage(1);
+  };
+
+  const handleTagFilterChange = (next: string) => {
+    setTagFilter(next);
+    setPage(1);
+  };
+
+  const handleSearchChange = (next: string) => {
+    setSearchQuery(next);
+    setPage(1);
+  };
+
+  const handleStatusChange = (next: FeedHealthStatus | "all") => {
+    setStatusFilter(next);
+    setPage(1);
+  };
+
+  const handlePageSizeChange = (next: FeedPageSize) => {
+    setPageSize(next);
+    writeStoredPageSize(next);
+    setPage(1);
+  };
 
   const pollMutation = useMutation({
     mutationFn: (id: number) => {
@@ -307,7 +481,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
         </div>
       </div>
 
-      {/* Filters & Search */}
+      {/* Filters, Sort, Tag Dropdown & Search */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-800 dark:bg-zinc-900">
           {(
@@ -322,7 +496,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
             <button
               key={tab.id}
               type="button"
-              onClick={() => setStatusFilter(tab.id)}
+              onClick={() => handleStatusChange(tab.id)}
               className={`cursor-pointer rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
                 statusFilter === tab.id
                   ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
@@ -334,14 +508,50 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
           ))}
         </div>
 
-        <div className="relative w-full sm:w-72">
-          <Search className="pointer-events-none absolute top-2.5 left-2.5 h-4 w-4 text-zinc-400" />
-          <Input
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder={m.feeds.searchPlaceholder}
-            className="pl-8"
-          />
+        {/* Sort -> Tag -> Search */}
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+          <Select
+            aria-label={m.feeds.sortLabel}
+            value={sortMode}
+            onChange={(e) => handleSortChange(e.target.value as FeedSortMode)}
+            className="h-9 w-full text-xs sm:w-44"
+          >
+            <option value="created_desc">
+              {m.feeds.sortOptions.created_desc}
+            </option>
+            <option value="created_asc">
+              {m.feeds.sortOptions.created_asc}
+            </option>
+            <option value="name_asc">{m.feeds.sortOptions.name_asc}</option>
+            <option value="name_desc">{m.feeds.sortOptions.name_desc}</option>
+          </Select>
+
+          <Select
+            aria-label={m.feeds.tagFilterLabel}
+            value={effectiveTagFilter}
+            onChange={(e) => handleTagFilterChange(e.target.value)}
+            className="h-9 w-full text-xs sm:w-44"
+          >
+            <option value="all">{m.feeds.allTagsOption}</option>
+            {tagEntries.map(({ tag, count }) => (
+              <option key={tag} value={`tag:${tag}`}>
+                {m.feeds.tagOption(tag, count)}
+              </option>
+            ))}
+            <option value="untagged">
+              {m.feeds.untaggedOption(untaggedCount)}
+            </option>
+          </Select>
+
+          <div className="relative w-full sm:w-60">
+            <Search className="pointer-events-none absolute top-2.5 left-2.5 h-4 w-4 text-zinc-400" />
+            <Input
+              value={searchQuery}
+              onChange={(e) => handleSearchChange(e.target.value)}
+              placeholder={m.feeds.searchPlaceholder}
+              className="pl-8"
+            />
+          </div>
         </div>
       </div>
 
@@ -350,7 +560,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
         <Card className="p-8 text-center text-xs text-zinc-500">
           {m.feeds.loading}
         </Card>
-      ) : filteredFeeds.length === 0 ? (
+      ) : totalItems === 0 ? (
         <EmptyState
           icon={Rss}
           title={
@@ -384,7 +594,7 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
         />
       ) : (
         <div className="space-y-2.5">
-          {filteredFeeds.map((feed) => {
+          {paginatedFeeds.map((feed) => {
             const badge = healthBadge(feed.health_status, m);
             const isPaused = feed.health_status === "paused";
             return (
@@ -459,9 +669,15 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
                     {feed.tags.length > 0 && (
                       <div className="flex flex-wrap items-center gap-1 pt-0.5">
                         {feed.tags.map((tag) => (
-                          <Badge key={tag} variant="mono">
-                            #{tag}
-                          </Badge>
+                          <button
+                            key={tag}
+                            type="button"
+                            onClick={() => handleTagFilterChange(`tag:${tag}`)}
+                            className="cursor-pointer"
+                            title={m.feeds.tagFilterLabel}
+                          >
+                            <Badge variant="mono">#{tag}</Badge>
+                          </button>
                         ))}
                       </div>
                     )}
@@ -598,6 +814,60 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
               </Card>
             );
           })}
+
+          {/* Pagination Footer */}
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200/90 bg-white px-4 py-2.5 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="flex flex-wrap items-center gap-3 text-zinc-500 dark:text-zinc-400">
+              <span>
+                {m.feeds.pagination.showing(
+                  pageStart + 1,
+                  Math.min(pageStart + pageSize, totalItems),
+                  totalItems,
+                )}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <span>{m.feeds.pagination.perPage}</span>
+                <Select
+                  aria-label={m.feeds.pagination.perPage}
+                  value={pageSize}
+                  onChange={(e) =>
+                    handlePageSizeChange(Number(e.target.value) as FeedPageSize)
+                  }
+                  className="h-7 w-16 px-2 font-mono text-xs"
+                >
+                  {VALID_PAGE_SIZES.map((sz) => (
+                    <option key={sz} value={sz}>
+                      {sz}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={safePage <= 1}
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                {m.feeds.pagination.prev}
+              </Button>
+              <span className="px-1 font-mono text-zinc-600 dark:text-zinc-300">
+                {m.feeds.pagination.pageOf(safePage, totalPages)}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={safePage >= totalPages}
+              >
+                {m.feeds.pagination.next}
+                <ChevronRight className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1024,12 +1294,39 @@ function FeedPreviewModal({
     queryKey: ["channels"],
     queryFn: () => api.channels.list(),
   });
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.settings.get(),
+  });
+  const systemTimezone = settingsQuery.data?.timezone ?? "UTC";
+  const timeZones = useMemo(() => listTimeZones(), []);
+
   const channels = channelsQuery.data ?? [];
-  const [pushChannelId, setPushChannelId] = useState<number | null>(null);
+  const channelsWithDestinations = useMemo(
+    () => channels.filter((c) => c.destinations.length > 0),
+    [channels],
+  );
+  const allDestinations = useMemo(() => {
+    const out: Array<{
+      channel: ChannelDto;
+      destination: ChannelDestinationDto;
+    }> = [];
+    for (const ch of channels) {
+      for (const dest of ch.destinations) {
+        out.push({ channel: ch, destination: dest });
+      }
+    }
+    return out;
+  }, [channels]);
+
+  const [pushDestinationId, setPushDestinationId] = useState<number | null>(
+    null,
+  );
   const [pushMode, setPushMode] =
     useState<TelegramDeliveryMode>("rich_message");
   const [pushLinkPreview, setPushLinkPreview] = useState(true);
   const [pushLocale, setPushLocale] = useState<Locale>(uiLocale);
+  const [pushTimezone, setPushTimezone] = useState("");
   const [pushingKey, setPushingKey] = useState<string | null>(null);
   const [pushResult, setPushResult] = useState<{
     ok: boolean;
@@ -1037,31 +1334,42 @@ function FeedPreviewModal({
     title: string;
   } | null>(null);
 
-  const activeChannelId = pushChannelId ?? channels[0]?.id ?? null;
-  const activeChannel = channels.find((c) => c.id === activeChannelId);
+  const activeDestinationId =
+    pushDestinationId ?? allDestinations[0]?.destination.id ?? null;
+  const activeEntry = allDestinations.find(
+    (entry) => entry.destination.id === activeDestinationId,
+  );
+  const activeChannel = activeEntry?.channel;
 
   const pushMutation = useMutation({
     mutationFn: ({ fingerprint }: { fingerprint?: string; key: string }) => {
-      if (activeChannelId === null) {
-        throw new Error(m.feeds.preview.debugNoChannel);
+      if (activeDestinationId === null) {
+        throw new Error(m.feeds.preview.debugNoDestination);
+      }
+      const trimmedTz = pushTimezone.trim();
+      if (trimmedTz && !timeZones.includes(trimmedTz)) {
+        throw new Error(m.feeds.preview.debugInvalidTimezone);
       }
       const locale: SystemLocale = pushLocale;
+      const options: NonNullable<FeedPreviewPushRequest["options"]> = {
+        locale,
+        ...(trimmedTz ? { timezone: trimmedTz } : {}),
+        ...(activeChannel?.kind === "telegram"
+          ? {
+              telegram_mode: pushMode,
+              link_preview:
+                pushMode === "compact_card" ? pushLinkPreview : undefined,
+            }
+          : {}),
+      };
       return api.feeds.previewPush({
         url: url.trim(),
         feed_id: feedId ?? undefined,
         fingerprint_sha256: fingerprint,
         fetch_full_content: fetchFullContent,
         use_proxy: useProxy,
-        channel_id: activeChannelId,
-        options:
-          activeChannel?.kind === "telegram"
-            ? {
-                telegram_mode: pushMode,
-                link_preview:
-                  pushMode === "compact_card" ? pushLinkPreview : undefined,
-                locale,
-              }
-            : { locale },
+        destination_id: activeDestinationId,
+        options,
       });
     },
     onMutate: ({ key }) => {
@@ -1290,30 +1598,40 @@ function FeedPreviewModal({
               </span>
             </div>
 
-            {channels.length === 0 ? (
+            {allDestinations.length === 0 ? (
               <p className="text-xs text-zinc-500">
-                {m.feeds.preview.debugNoChannel}
+                {m.feeds.preview.debugNoDestination}
               </p>
             ) : (
               <>
-                <div className="grid gap-2.5 sm:grid-cols-3">
-                  <div>
-                    <Label htmlFor="debug-push-channel">
-                      {m.feeds.preview.debugChannel}
+                <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
+                  <div className="sm:col-span-2 lg:col-span-1">
+                    <Label htmlFor="debug-push-destination">
+                      {m.feeds.preview.debugDestination}
                     </Label>
                     <Select
-                      id="debug-push-channel"
-                      value={activeChannelId ?? ""}
-                      onChange={(e) => setPushChannelId(Number(e.target.value))}
+                      id="debug-push-destination"
+                      value={activeDestinationId ?? ""}
+                      onChange={(e) =>
+                        setPushDestinationId(Number(e.target.value))
+                      }
                       className="mt-1 h-8 text-xs"
                     >
-                      {channels.map((ch) => (
-                        <option key={ch.id} value={ch.id}>
-                          {ch.name} ({ch.kind.toUpperCase()})
-                        </option>
+                      {channelsWithDestinations.map((ch) => (
+                        <optgroup
+                          key={ch.id}
+                          label={`${ch.name} (${ch.kind.toUpperCase()})`}
+                        >
+                          {ch.destinations.map((dest) => (
+                            <option key={dest.id} value={dest.id}>
+                              {dest.name}
+                            </option>
+                          ))}
+                        </optgroup>
                       ))}
                     </Select>
                   </div>
+
                   <div>
                     <Label htmlFor="debug-push-locale">
                       {m.feeds.preview.debugLanguage}
@@ -1328,6 +1646,30 @@ function FeedPreviewModal({
                       <option value="en">English</option>
                     </Select>
                   </div>
+
+                  <div>
+                    <Label htmlFor="debug-push-timezone">
+                      {m.feeds.preview.debugTimezone}
+                    </Label>
+                    <Input
+                      id="debug-push-timezone"
+                      list="fc-debug-timezone-options"
+                      value={pushTimezone}
+                      onChange={(e) => setPushTimezone(e.target.value)}
+                      placeholder={m.feeds.preview.debugTimezonePlaceholder(
+                        systemTimezone,
+                      )}
+                      autoComplete="off"
+                      spellCheck={false}
+                      className="mt-1 h-8 font-mono text-xs"
+                    />
+                    <datalist id="fc-debug-timezone-options">
+                      {timeZones.map((tz) => (
+                        <option key={tz} value={tz} />
+                      ))}
+                    </datalist>
+                  </div>
+
                   {activeChannel?.kind === "telegram" && (
                     <div>
                       <Label htmlFor="debug-push-mode">
@@ -1462,7 +1804,9 @@ function FeedPreviewModal({
                           )}
                           {item.media_urls.length > 0 && (
                             <Badge variant="outline">
-                              {m.feeds.preview.mediaCount(item.media_urls.length)}
+                              {m.feeds.preview.mediaCount(
+                                item.media_urls.length,
+                              )}
                             </Badge>
                           )}
                           <span className="font-mono text-[10px] text-zinc-400">
@@ -1498,7 +1842,7 @@ function FeedPreviewModal({
                         )}
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
-                        {channels.length > 0 && (
+                        {allDestinations.length > 0 && (
                           <Button
                             variant="outline"
                             size="sm"

@@ -2,22 +2,38 @@
 //! `PRAGMA optimize`, and `VACUUM INTO` online snapshot backup operations.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono_tz::Tz;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::channels::DeliveryCheckpoint;
+use crate::channels::{
+    ChannelConfig, ChannelKind, DeliveryCheckpoint, DestinationConfig, LegacyChannelConfig,
+    TelegramCapabilities,
+};
+use crate::crypto::MasterKey;
 use crate::db::Database;
 use crate::db::models::{
-    Channel, DeliveryTask, DeliveryTaskDetail, DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed,
-    FeedHealthStatus, McpToken, McpTokenScope, NewChannel, NewEntry, NewFeed, NewRoute,
-    OverviewSnapshot, QuotaUsage, Route, SETTING_OUTBOX_QUEUE, SETTING_TIMEZONE, Session,
-    SystemSetting, UpdateChannel, UpdateFeed, UpdateRoute, now_unix,
+    CHANNEL_MODEL_VERSION_V2, Channel, ChannelDestination, DeliveryTask, DeliveryTaskDetail,
+    DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed, FeedHealthStatus, McpToken, McpTokenScope,
+    NewChannel, NewDestination, NewEntry, NewFeed, NewRoute, OverviewSnapshot, QuotaUsage, Route,
+    SETTING_CHANNEL_MODEL_VERSION, SETTING_OUTBOX_QUEUE, SETTING_TIMEZONE, Session, SystemSetting,
+    UpdateChannel, UpdateDestination, UpdateFeed, UpdateRoute, now_unix,
 };
 use crate::error::{AppError, AppResult};
 use crate::schedule::{DEFAULT_TIMEZONE, OutboxQueueState};
+
+/// Summary returned by [`Database::migrate_channels_to_v2`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelMigrationReport {
+    pub migrated: bool,
+    pub legacy_channels_scanned: usize,
+    pub accounts_surviving: usize,
+    pub accounts_merged: usize,
+    pub destinations_created: usize,
+    pub backup_path: Option<PathBuf>,
+}
 
 impl Database {
     // =========================================================================
@@ -631,7 +647,7 @@ impl Database {
         Ok(res.rows_affected())
     }
 
-    /// Delete a channel (cascading its `routes` and `delivery_tasks`).
+    /// Delete a channel (cascading its `channel_destinations`, `routes`, and `delivery_tasks`).
     pub async fn delete_channel(&self, channel_id: i64) -> AppResult<bool> {
         let res = sqlx::query("DELETE FROM channels WHERE id = ?1")
             .bind(channel_id)
@@ -641,10 +657,476 @@ impl Database {
     }
 
     // =========================================================================
+    // Channel Destinations CRUD & Target Resolution (v0.2.0 Two-Layer Model)
+    // =========================================================================
+
+    /// Create a destination attached to an existing parent `channel_id`.
+    pub async fn create_destination(
+        &self,
+        input: &NewDestination,
+    ) -> AppResult<ChannelDestination> {
+        let now = now_unix();
+        let row = sqlx::query_as::<_, ChannelDestination>(
+            r#"
+            INSERT INTO channel_destinations (
+                channel_id, name, encrypted_config, enabled, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            RETURNING *
+            "#,
+        )
+        .bind(input.channel_id)
+        .bind(input.name.trim())
+        .bind(&input.encrypted_config)
+        .bind(input.enabled)
+        .bind(now)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Fetch a destination by ID from `read_pool`.
+    pub async fn get_destination(
+        &self,
+        destination_id: i64,
+    ) -> AppResult<Option<ChannelDestination>> {
+        let row = sqlx::query_as::<_, ChannelDestination>(
+            "SELECT * FROM channel_destinations WHERE id = ?1",
+        )
+        .bind(destination_id)
+        .fetch_optional(&self.read_pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// List all destinations ordered by `channel_id ASC, id ASC`.
+    pub async fn list_destinations(&self) -> AppResult<Vec<ChannelDestination>> {
+        let rows = sqlx::query_as::<_, ChannelDestination>(
+            "SELECT * FROM channel_destinations ORDER BY channel_id ASC, id ASC",
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// List all destinations attached to a single `channel_id` ordered by `id ASC`.
+    pub async fn list_destinations_for_channel(
+        &self,
+        channel_id: i64,
+    ) -> AppResult<Vec<ChannelDestination>> {
+        let rows = sqlx::query_as::<_, ChannelDestination>(
+            "SELECT * FROM channel_destinations WHERE channel_id = ?1 ORDER BY id ASC",
+        )
+        .bind(channel_id)
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Apply partial updates to a destination serially on `write_pool`.
+    pub async fn update_destination(
+        &self,
+        destination_id: i64,
+        patch: &UpdateDestination,
+    ) -> AppResult<ChannelDestination> {
+        let current = sqlx::query_as::<_, ChannelDestination>(
+            "SELECT * FROM channel_destinations WHERE id = ?1",
+        )
+        .bind(destination_id)
+        .fetch_optional(&self.write_pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("destination {destination_id} not found")))?;
+
+        let name = patch
+            .name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(&current.name)
+            .to_string();
+        let encrypted_config = patch
+            .encrypted_config
+            .clone()
+            .unwrap_or(current.encrypted_config);
+        let enabled = patch.enabled.unwrap_or(current.enabled);
+        let now = now_unix();
+
+        let updated = sqlx::query_as::<_, ChannelDestination>(
+            r#"
+            UPDATE channel_destinations
+            SET name = ?1,
+                encrypted_config = ?2,
+                enabled = ?3,
+                updated_at = ?4
+            WHERE id = ?5
+            RETURNING *
+            "#,
+        )
+        .bind(name)
+        .bind(encrypted_config)
+        .bind(enabled)
+        .bind(now)
+        .bind(destination_id)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(updated)
+    }
+
+    /// Delete a destination (cascading its `routes` and `delivery_tasks`).
+    pub async fn delete_destination(&self, destination_id: i64) -> AppResult<bool> {
+        let res = sqlx::query("DELETE FROM channel_destinations WHERE id = ?1")
+            .bind(destination_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Resolve a target `(Channel, ChannelDestination)` from either `destination_id` (primary) or
+    /// legacy `channel_id` (backward-compatible fallback when that channel owns exactly 1 destination).
+    pub async fn resolve_destination_target(
+        &self,
+        destination_id: Option<i64>,
+        channel_id: Option<i64>,
+    ) -> AppResult<(Channel, ChannelDestination)> {
+        if let Some(did) = destination_id {
+            let dest = self
+                .get_destination(did)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("destination {did} not found")))?;
+            if let Some(cid) = channel_id
+                && cid != dest.channel_id
+            {
+                return Err(AppError::Validation(format!(
+                    "destination {did} belongs to channel {}, not channel {cid}",
+                    dest.channel_id
+                )));
+            }
+            let channel = self.get_channel(dest.channel_id).await?.ok_or_else(|| {
+                AppError::NotFound(format!("channel {} not found", dest.channel_id))
+            })?;
+            return Ok((channel, dest));
+        }
+
+        if let Some(cid) = channel_id {
+            let channel = self
+                .get_channel(cid)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("channel {cid} not found")))?;
+            let mut dests = self.list_destinations_for_channel(cid).await?;
+            return match dests.len() {
+                1 => Ok((channel, dests.remove(0))),
+                0 => Err(AppError::Validation(format!(
+                    "channel {cid} has no destinations configured; add a destination first"
+                ))),
+                n => Err(AppError::Validation(format!(
+                    "channel {cid} has {n} destinations; specify destination_id explicitly"
+                ))),
+            };
+        }
+
+        Err(AppError::Validation(
+            "either destination_id or channel_id is required".to_string(),
+        ))
+    }
+
+    /// Automatically and atomically migrate pre-v0.2.0 single-layer `channels` rows into the
+    /// v0.2.0 two-layer (`channels` Account + `channel_destinations`) model.
+    ///
+    /// - No-op when `system_settings.channel_model_version >= 2`.
+    /// - Takes a consistent `VACUUM INTO` backup at `<db_dir>/pre-v0.2.0-backup.db` before
+    ///   mutating legacy data.
+    /// - Splits each legacy channel into account credentials + destination config, merges rows
+    ///   sharing the same `credential_group_key` (keeping the strictest pacing/quotas and
+    ///   unioning `use_proxy` / `enabled`), repoints all `routes` and `delivery_tasks` (including
+    ///   `delivered` and `dead_letter`), deletes absorbed duplicate rows, and records
+    ///   `channel_model_version = 2` inside a single SQLite transaction.
+    pub async fn migrate_channels_to_v2(
+        &self,
+        master_key: &MasterKey,
+    ) -> AppResult<ChannelMigrationReport> {
+        if let Some(ver) = self
+            .get_setting_typed::<i64>(SETTING_CHANNEL_MODEL_VERSION)
+            .await?
+            && ver >= CHANNEL_MODEL_VERSION_V2
+        {
+            return Ok(ChannelMigrationReport::default());
+        }
+
+        let existing_channels = self.list_channels().await?;
+        if existing_channels.is_empty() {
+            self.set_setting_typed(SETTING_CHANNEL_MODEL_VERSION, &CHANNEL_MODEL_VERSION_V2)
+                .await?;
+            return Ok(ChannelMigrationReport::default());
+        }
+
+        struct DecryptedLegacy {
+            row: Channel,
+            account_cfg: ChannelConfig,
+            dest_cfg: DestinationConfig,
+            group_key: String,
+        }
+
+        let mut legacy_rows = Vec::with_capacity(existing_channels.len());
+        for row in existing_channels {
+            match master_key.decrypt_json::<LegacyChannelConfig>(&row.encrypted_config) {
+                Ok(legacy_cfg) => {
+                    let (account_cfg, dest_cfg) = legacy_cfg.into_split();
+                    let group_key = account_cfg.credential_group_key();
+                    legacy_rows.push(DecryptedLegacy {
+                        row,
+                        account_cfg,
+                        dest_cfg,
+                        group_key,
+                    });
+                }
+                Err(legacy_err) => {
+                    // If this row is already stored in v2 account-only format, skip it cleanly;
+                    // otherwise propagate the decryption failure so we never silently lose data.
+                    if master_key
+                        .decrypt_json::<ChannelConfig>(&row.encrypted_config)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    return Err(legacy_err);
+                }
+            }
+        }
+
+        if legacy_rows.is_empty() {
+            self.set_setting_typed(SETTING_CHANNEL_MODEL_VERSION, &CHANNEL_MODEL_VERSION_V2)
+                .await?;
+            return Ok(ChannelMigrationReport::default());
+        }
+
+        // Snapshot backup right beside the live database BEFORE modifying any legacy rows.
+        let backup_dir = self
+            .db_path()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let backup_path = backup_dir.join("pre-v0.2.0-backup.db");
+        self.vacuum_into(&backup_path).await?;
+
+        // Group legacy rows by (kind, credential_group_key) while preserving deterministic ID order.
+        let mut groups: Vec<((ChannelKind, String), Vec<DecryptedLegacy>)> = Vec::new();
+        for item in legacy_rows {
+            let key = (item.row.kind, item.group_key.clone());
+            if let Some((_, bucket)) = groups.iter_mut().find(|(k, _)| *k == key) {
+                bucket.push(item);
+            } else {
+                groups.push((key, vec![item]));
+            }
+        }
+
+        let now = now_unix();
+        let legacy_channels_scanned: usize = groups.iter().map(|(_, g)| g.len()).sum();
+        let accounts_surviving = groups.len();
+        let accounts_merged = legacy_channels_scanned.saturating_sub(accounts_surviving);
+        let mut destinations_created = 0usize;
+
+        let mut tx = self.write_pool.begin().await?;
+
+        for (_, group) in groups {
+            let surviving = &group[0];
+            let surviving_id = surviving.row.id;
+
+            let min_interval_secs = group
+                .iter()
+                .map(|g| g.row.min_interval_secs)
+                .max()
+                .unwrap_or(15);
+            let jitter_max_secs = group
+                .iter()
+                .map(|g| g.row.jitter_max_secs)
+                .max()
+                .unwrap_or(10);
+            let hourly_quota = group.iter().filter_map(|g| g.row.hourly_quota).min();
+            let daily_quota = group.iter().filter_map(|g| g.row.daily_quota).min();
+            let use_proxy = group.iter().any(|g| g.row.use_proxy);
+            let enabled = group.iter().any(|g| g.row.enabled);
+            let cooldown_until = group.iter().filter_map(|g| g.row.cooldown_until).max();
+
+            let capabilities_json = group
+                .iter()
+                .find_map(|g| {
+                    let trimmed = g.row.capabilities_json.trim();
+                    if !trimmed.is_empty() && trimmed != "{}" {
+                        Some(trimmed.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "{}".to_string());
+
+            let account_name = match &surviving.account_cfg {
+                ChannelConfig::Smtp(smtp) if !smtp.from_address.trim().is_empty() => {
+                    smtp.from_address.trim().to_string()
+                }
+                ChannelConfig::Telegram(_) => {
+                    serde_json::from_str::<TelegramCapabilities>(&capabilities_json)
+                        .ok()
+                        .and_then(|caps| {
+                            caps.bot_username
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|u| !u.is_empty())
+                                .map(|u| format!("@{}", u.trim_start_matches('@')))
+                                .or_else(|| {
+                                    caps.bot_first_name
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|n| !n.is_empty())
+                                        .map(ToOwned::to_owned)
+                                })
+                        })
+                        .unwrap_or_else(|| surviving.row.name.clone())
+                }
+                _ => surviving.row.name.clone(),
+            };
+
+            let enc_account = master_key.encrypt_json(&surviving.account_cfg)?;
+            sqlx::query(
+                r#"
+                UPDATE channels
+                SET name = ?1,
+                    encrypted_config = ?2,
+                    credential_group_key = ?3,
+                    capabilities_json = ?4,
+                    min_interval_secs = ?5,
+                    jitter_max_secs = ?6,
+                    hourly_quota = ?7,
+                    daily_quota = ?8,
+                    use_proxy = ?9,
+                    cooldown_until = ?10,
+                    enabled = ?11,
+                    updated_at = ?12
+                WHERE id = ?13
+                "#,
+            )
+            .bind(&account_name)
+            .bind(&enc_account)
+            .bind(&surviving.group_key)
+            .bind(&capabilities_json)
+            .bind(min_interval_secs)
+            .bind(jitter_max_secs)
+            .bind(hourly_quota)
+            .bind(daily_quota)
+            .bind(use_proxy)
+            .bind(cooldown_until)
+            .bind(enabled)
+            .bind(now)
+            .bind(surviving_id)
+            .execute(&mut *tx)
+            .await?;
+
+            for item in &group {
+                let enc_dest = master_key.encrypt_json(&item.dest_cfg)?;
+                let (dest_id,): (i64,) = sqlx::query_as(
+                    r#"
+                    INSERT INTO channel_destinations (
+                        channel_id, name, encrypted_config, enabled, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    RETURNING id
+                    "#,
+                )
+                .bind(surviving_id)
+                .bind(item.row.name.trim())
+                .bind(&enc_dest)
+                .bind(item.row.enabled)
+                .bind(item.row.created_at)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await?;
+                destinations_created += 1;
+
+                // Repoint routes and historical/active delivery tasks from this legacy channel.
+                // Filtering `destination_id IS NULL` prevents touching rows already repointed
+                // onto `surviving_id` for an earlier sibling in the same merged group.
+                sqlx::query(
+                    r#"
+                    UPDATE routes
+                    SET channel_id = ?1,
+                        destination_id = ?2,
+                        updated_at = ?3
+                    WHERE channel_id = ?4
+                      AND destination_id IS NULL
+                    "#,
+                )
+                .bind(surviving_id)
+                .bind(dest_id)
+                .bind(now)
+                .bind(item.row.id)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    r#"
+                    UPDATE delivery_tasks
+                    SET channel_id = ?1,
+                        destination_id = ?2
+                    WHERE channel_id = ?3
+                      AND destination_id IS NULL
+                    "#,
+                )
+                .bind(surviving_id)
+                .bind(dest_id)
+                .bind(item.row.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Delete absorbed duplicate channel rows after all references have been repointed.
+            for item in group.iter().skip(1) {
+                sqlx::query("DELETE FROM channels WHERE id = ?1")
+                    .bind(item.row.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        let ver_json = serde_json::to_string(&CHANNEL_MODEL_VERSION_V2)?;
+        sqlx::query(
+            r#"
+            INSERT INTO system_settings (key, value_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT (key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(SETTING_CHANNEL_MODEL_VERSION)
+        .bind(ver_json)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            legacy_channels_scanned,
+            accounts_surviving,
+            accounts_merged,
+            destinations_created,
+            backup_path = %backup_path.display(),
+            "migrated legacy delivery channels to v0.2.0 two-layer Account + Destinations model"
+        );
+
+        Ok(ChannelMigrationReport {
+            migrated: true,
+            legacy_channels_scanned,
+            accounts_surviving,
+            accounts_merged,
+            destinations_created,
+            backup_path: Some(backup_path),
+        })
+    }
+
+    // =========================================================================
     // Routes CRUD
     // =========================================================================
 
-    /// Create a routing rule linking feeds/tags to a trusted channel.
+    /// Create a routing rule linking feeds/tags to a trusted channel destination.
     pub async fn create_route(&self, input: &NewRoute) -> AppResult<Route> {
         let now = now_unix();
         let feed_ids_json = serde_json::to_string(&input.feed_ids)?;
@@ -656,12 +1138,12 @@ impl Database {
         let row = sqlx::query_as::<_, Route>(
             r#"
             INSERT INTO routes (
-                name, feed_ids_json, match_tags_json, channel_id,
+                name, feed_ids_json, match_tags_json, channel_id, destination_id,
                 include_keywords_json, exclude_keywords_json,
                 include_regex, exclude_regex, options_json, enabled,
                 created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
             RETURNING *
             "#,
         )
@@ -669,6 +1151,7 @@ impl Database {
         .bind(feed_ids_json)
         .bind(match_tags_json)
         .bind(input.channel_id)
+        .bind(input.destination_id)
         .bind(include_keywords_json)
         .bind(exclude_keywords_json)
         .bind(&input.include_regex)
@@ -699,14 +1182,15 @@ impl Database {
         Ok(rows)
     }
 
-    /// List enabled routes whose target channel is also enabled.
+    /// List enabled routes whose parent channel account AND target destination are both enabled.
     pub async fn list_enabled_routes(&self) -> AppResult<Vec<Route>> {
         let rows = sqlx::query_as::<_, Route>(
             r#"
             SELECT r.*
             FROM routes r
             JOIN channels c ON c.id = r.channel_id
-            WHERE r.enabled = 1 AND c.enabled = 1
+            JOIN channel_destinations cd ON cd.id = r.destination_id
+            WHERE r.enabled = 1 AND c.enabled = 1 AND cd.enabled = 1
             ORDER BY r.id ASC
             "#,
         )
@@ -738,6 +1222,7 @@ impl Database {
             None => current.match_tags_json,
         };
         let channel_id = patch.channel_id.unwrap_or(current.channel_id);
+        let destination_id = patch.destination_id.unwrap_or(current.destination_id);
         let include_keywords_json = match &patch.include_keywords {
             Some(kws) => serde_json::to_string(kws)?,
             None => current.include_keywords_json,
@@ -762,14 +1247,15 @@ impl Database {
                 feed_ids_json = ?2,
                 match_tags_json = ?3,
                 channel_id = ?4,
-                include_keywords_json = ?5,
-                exclude_keywords_json = ?6,
-                include_regex = ?7,
-                exclude_regex = ?8,
-                options_json = ?9,
-                enabled = ?10,
-                updated_at = ?11
-            WHERE id = ?12
+                destination_id = ?5,
+                include_keywords_json = ?6,
+                exclude_keywords_json = ?7,
+                include_regex = ?8,
+                exclude_regex = ?9,
+                options_json = ?10,
+                enabled = ?11,
+                updated_at = ?12
+            WHERE id = ?13
             RETURNING *
             "#,
         )
@@ -777,6 +1263,7 @@ impl Database {
         .bind(feed_ids_json)
         .bind(match_tags_json)
         .bind(channel_id)
+        .bind(destination_id)
         .bind(include_keywords_json)
         .bind(exclude_keywords_json)
         .bind(include_regex)
@@ -811,6 +1298,7 @@ impl Database {
         &self,
         route_id: i64,
         channel_id: i64,
+        destination_id: i64,
         entry_id: i64,
         next_attempt_at: i64,
     ) -> AppResult<Option<DeliveryTask>> {
@@ -818,15 +1306,16 @@ impl Database {
         let row = sqlx::query_as::<_, DeliveryTask>(
             r#"
             INSERT INTO delivery_tasks (
-                route_id, channel_id, entry_id, status, next_attempt_at, created_at
+                route_id, channel_id, destination_id, entry_id, status, next_attempt_at, created_at
             )
-            VALUES (?1, ?2, ?3, 'queued', ?4, ?5)
+            VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)
             ON CONFLICT (route_id, entry_id) DO NOTHING
             RETURNING *
             "#,
         )
         .bind(route_id)
         .bind(channel_id)
+        .bind(destination_id)
         .bind(entry_id)
         .bind(next_attempt_at)
         .bind(now)
@@ -840,7 +1329,8 @@ impl Database {
     /// 1. Due tasks in `queued`, `retrying`, or `deferred` with `next_attempt_at <= now`, AND
     /// 2. Orphaned/crashed `delivering` tasks whose `lease_until <= now` (automatic crash recovery).
     ///
-    /// Channels that are disabled or currently inside `cooldown_until > now` are skipped.
+    /// Channels or destinations that are disabled, or parent channels currently inside
+    /// `cooldown_until > now`, are skipped.
     /// Existing `checkpoint_json` is preserved intact so the worker reconciles state before sending.
     pub async fn claim_next_delivery_task(
         &self,
@@ -859,8 +1349,10 @@ impl Database {
                 SELECT dt.id
                 FROM delivery_tasks dt
                 JOIN channels c ON c.id = dt.channel_id
+                JOIN channel_destinations cd ON cd.id = dt.destination_id
                 JOIN entries e ON e.id = dt.entry_id
                 WHERE c.enabled = 1
+                  AND cd.enabled = 1
                   AND (c.cooldown_until IS NULL OR c.cooldown_until <= ?2)
                   AND (
                       (dt.status IN ('queued', 'retrying', 'deferred') AND dt.next_attempt_at <= ?2)
@@ -1067,7 +1559,7 @@ impl Database {
         Ok(row)
     }
 
-    /// List delivery tasks joined with entry/route/channel metadata for WebUI and MCP inspection.
+    /// List delivery tasks joined with entry/route/channel/destination metadata for WebUI and MCP inspection.
     pub async fn list_delivery_task_details(
         &self,
         status: Option<DeliveryTaskStatus>,
@@ -1084,6 +1576,8 @@ impl Database {
                         dt.channel_id,
                         c.name AS channel_name,
                         c.kind AS channel_kind,
+                        dt.destination_id,
+                        cd.name AS destination_name,
                         dt.entry_id,
                         e.title AS entry_title,
                         e.canonical_url AS entry_url,
@@ -1099,6 +1593,7 @@ impl Database {
                     FROM delivery_tasks dt
                     JOIN routes r ON r.id = dt.route_id
                     JOIN channels c ON c.id = dt.channel_id
+                    JOIN channel_destinations cd ON cd.id = dt.destination_id
                     JOIN entries e ON e.id = dt.entry_id
                     WHERE dt.status = ?1
                     ORDER BY dt.id DESC
@@ -1120,6 +1615,8 @@ impl Database {
                         dt.channel_id,
                         c.name AS channel_name,
                         c.kind AS channel_kind,
+                        dt.destination_id,
+                        cd.name AS destination_name,
                         dt.entry_id,
                         e.title AS entry_title,
                         e.canonical_url AS entry_url,
@@ -1135,6 +1632,7 @@ impl Database {
                     FROM delivery_tasks dt
                     JOIN routes r ON r.id = dt.route_id
                     JOIN channels c ON c.id = dt.channel_id
+                    JOIN channel_destinations cd ON cd.id = dt.destination_id
                     JOIN entries e ON e.id = dt.entry_id
                     ORDER BY dt.id DESC
                     LIMIT ?1

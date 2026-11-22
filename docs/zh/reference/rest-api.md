@@ -1,5 +1,5 @@
 ---
-description: "FeedCourier REST API 接口参考（/api/v1/*）：涵盖用户名/密码与两步验证登录、账号安全、概览统计、订阅源（清除缓存、调试推送）与 OPML 导入导出、投递通道、路由规则（投递语言、时间窗口）、任务队列与全局队列控制、系统设置（时区）以及在线备份。"
+description: "FeedCourier REST API 接口参考（/api/v1/*）：涵盖用户名/密码与两步验证登录、账号安全、概览统计、订阅源（清除缓存、调试推送）与 OPML 导入导出、通道账号与目的地、路由规则（投递语言、路由时区、时间窗口）、任务队列与全局队列控制、系统设置以及在线备份。"
 ---
 
 # REST API 接口参考（`/api/v1/*`）
@@ -42,7 +42,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   ```json
   {
     "name": "FeedCourier",
-    "version": "0.1.6",
+    "version": "0.2.0",
     "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"
@@ -56,7 +56,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   {
     "setup_required": false,
     "authenticated": true,
-    "version": "0.1.6",
+    "version": "0.2.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "license": "AGPL-3.0"
   }
@@ -145,7 +145,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 ### 调试推送（`POST /api/v1/feeds/preview/push`）
 
-将单条订阅源文章投递到指定通道用于测试。该接口是**无状态**的：不写入指纹、不进入发件箱，也不应用路由过滤、时间窗口与配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。
+将单条订阅源文章投递到指定授信目的地用于测试。该接口是**无状态**的：不写入指纹、不进入发件箱，也不应用路由过滤、时间窗口与配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。
 
 ```json
 {
@@ -154,39 +154,56 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   "fingerprint_sha256": "…",
   "fetch_full_content": false,
   "use_proxy": false,
-  "channel_id": 2,
-  "options": { "telegram_mode": "rich_message", "link_preview": true, "locale": "zh-CN" }
+  "destination_id": 5,
+  "options": {
+    "telegram_mode": "rich_message",
+    "link_preview": true,
+    "locale": "zh-CN",
+    "timezone": "Asia/Shanghai"
+  }
 }
 ```
 
-`url` 与 `channel_id` 必填；`feed_id` 可选（预览已订阅的订阅源时传入）；省略 `fingerprint_sha256` 表示推送最新一篇；`options` 可选。响应（`200 OK`）：`{ "ok": true, "message": "...", "entry_title": "...", "entry_url": "https://..." \| null }`。下游投递失败时返回 `ok: false`，诊断信息在 `message` 中（HTTP 状态码仍为 `200`）。
+`url` 与 `destination_id` 必填（兼容旧调用方传入 `channel_id`：仅在对应账号恰好只有 **1 个目的地** 时自动解析，多目的地时返回校验错误）；`feed_id` 可选（预览已订阅的订阅源时传入）；省略 `fingerprint_sha256` 表示推送最新一篇；`options` 可选。响应（`200 OK`）：`{ "ok": true, "message": "...", "entry_title": "...", "entry_url": "https://..." | null }`。下游投递失败时返回 `ok: false`，诊断信息在 `message` 中（HTTP 状态码仍为 `200`）。
 
 ---
 
-## 三、授信投递通道与 Notion 向导（`/api/v1/channels*`）
+## 三、授信投递通道（账号）、目的地与 Notion 向导（`/api/v1/channels*`、`/api/v1/destinations*`）
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/channels` | 获取全部授信通道列表（敏感密码/Token 自动掩码脱敏为 `has_password` / `bot_token_hint` / `secret_hint`，详见[安全与防注入机制](/zh/reference/security)）。 |
-| `POST` | `/api/v1/channels` | 创建新通道（`smtp` / `telegram` / `notion`）；Telegram 通道创建时自动执行 `probe_capabilities` 探测。 |
-| `PATCH` | `/api/v1/channels/{id}` | 更新通道配置、步进间隔或配额（**密钥保留语义**：当 `password` / `bot_token` / `integration_secret` 省略或留空时，后端自动保留原加密密钥不变；将 `hourly_quota` 或 `daily_quota` 显式传 `null` 可清空配额限制）。 |
-| `DELETE` | `/api/v1/channels/{id}` | 删除指定通道（级联删除绑定该通道的路由与任务）。 |
-| `POST` | `/api/v1/channels/{id}/test` | 向该通道发送实时连通性测试邮件/消息/页面（Telegram 同时刷新 `capabilities_json`）。可选请求体 `{ "locale"?: "en" \| "zh-CN" }` 指定测试消息语言（WebUI 会发送当前界面语言）。 |
+| `GET` | `/api/v1/channels` | 获取全部授信通道账号列表（`ChannelDto[]`，敏感密码/Token 自动脱敏为 `has_password` / `bot_token_hint` / `secret_hint`，并内嵌 `destinations: ChannelDestinationDto[]`，详见[安全与防注入机制](/zh/reference/security)）。 |
+| `POST` | `/api/v1/channels` | 创建新通道账号（`smtp` / `telegram` / `notion`，`name` 可省略以自动获取，可选传入 `initial_destination` 一并创建首个目的地）；Telegram 账号创建时自动执行 `probe_capabilities` 探测。 |
+| `PATCH` | `/api/v1/channels/{id}` | 更新账号凭据、代理、共享步进间隔或配额（**密钥保留语义**：当 `password` / `bot_token` / `integration_secret` 省略或留空时，后端自动保留原加密密钥不变；将 `hourly_quota` 或 `daily_quota` 显式传 `null` 可清空配额限制）。 |
+| `DELETE` | `/api/v1/channels/{id}` | 删除指定通道账号（级联删除其所有目的地、路由与任务）。 |
+| `POST` | `/api/v1/channels/{id}/test` | 未传 `destination_id` 时，校验账号级凭据（SMTP `EHLO`/`AUTH`、Telegram `getMe` + `sendRichMessage` 探测、Notion `GET /v1/users/me`），不发送测试文章；传入 `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` 时向该目的地发送实时测试消息。 |
+| `GET` | `/api/v1/channels/{id}/destinations` | 列出通道账号 `{id}` 下的全部目的地（`ChannelDestinationDto[]`）。 |
+| `POST` | `/api/v1/channels/{id}/destinations` | 在通道账号 `{id}` 下新增目的地（`CreateDestinationRequest`；省略 `name` 时自动取 Telegram `getChat`、SMTP 首个收件人或 Notion 数据库标题）。 |
+| `PATCH` | `/api/v1/destinations/{id}` | 局部更新目的地备注名、目标配置（`DestinationPatch`）或启用状态（`enabled`）。 |
+| `DELETE` | `/api/v1/destinations/{id}` | 删除指定目的地（级联删除绑定该目的地的路由与任务）。 |
+| `POST` | `/api/v1/destinations/{id}/test` | 向指定目的地发送实时连通性测试邮件/消息/页面。可选请求体 `{ "locale"?: "en" \| "zh-CN" }` 指定测试消息语言。 |
 | `POST` | `/api/v1/channels/notion/init-db` | 在授权父页面下创建包含 7 个标准属性列的 Notion 数据库（`Notion-Version: 2026-03-11`，`initial_data_source.properties`）。 |
 | `POST` | `/api/v1/channels/notion/inspect-schema` | 检查已有 Notion 数据源属性列匹配情况，并在 `patch_missing: true` 时自动补齐缺失列。 |
 
-### 创建通道请求结构（`POST /api/v1/channels`）
+### 创建通道账号请求结构（`POST /api/v1/channels`）
 
 ```json
 {
-  "name": "Telegram 主频道",
+  "name": null,
   "kind": "telegram",
   "config": {
     "kind": "telegram",
     "bot_token": "123456789:AAH...",
-    "chat_id": "@my_tech_feed",
-    "message_thread_id": null,
     "api_base_url": null
+  },
+  "initial_destination": {
+    "name": "Telegram 主频道",
+    "config": {
+      "kind": "telegram",
+      "chat_id": "@my_tech_feed",
+      "message_thread_id": null
+    },
+    "enabled": true
   },
   "min_interval_secs": 15,
   "jitter_max_secs": 10,
@@ -203,9 +220,9 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/routes` | 获取全部路由规则列表（`RouteDto[]`）。 |
-| `POST` | `/api/v1/routes` | 创建路由规则（创建前编译校验 `include_regex` / `exclude_regex` 合法性）。 |
-| `PATCH` | `/api/v1/routes/{id}` | 更新路由规则（正则字段传 `null` 或 `""` 可清除）。 |
+| `GET` | `/api/v1/routes` | 获取全部路由规则列表（`RouteDto[]`，含 `channel_id` 与 `destination_id`）。 |
+| `POST` | `/api/v1/routes` | 创建路由规则（以 `destination_id` 为主；仅在目标账号恰好只有 1 个目的地时兼容旧版 `channel_id`；创建前编译校验 `include_regex` / `exclude_regex` 与 `options.timezone` 合法性）。 |
+| `PATCH` | `/api/v1/routes/{id}` | 更新路由规则（正则字段传 `null` 或 `""` 可清除；`options.timezone` 传 `""` 可恢复继承系统时区）。 |
 | `DELETE` | `/api/v1/routes/{id}` | 删除指定路由规则。 |
 
 ### 创建路由请求示例（`POST /api/v1/routes`）
@@ -215,7 +232,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
   "name": "Rust 动态推至 Telegram",
   "feed_ids": [],
   "match_tags": ["rust"],
-  "channel_id": 1,
+  "destination_id": 5,
   "include_keywords": [],
   "exclude_keywords": ["sponsored"],
   "include_regex": null,
@@ -224,6 +241,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
     "telegram_mode": "rich_message",
     "link_preview": true,
     "locale": "zh-CN",
+    "timezone": "Asia/Shanghai",
     "active_windows": [{ "start": "08:00", "end": "22:00" }],
     "active_weekdays": [1, 2, 3, 4, 5]
   },
@@ -238,7 +256,8 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 | `telegram_mode` | `"rich_message"`（默认）、`"compact_card"` 或 `"media_mode"`。 |
 | `link_preview` | Telegram 网页链接预览开关。 |
 | `locale` | 该路由的投递语言（`"en"` 或 `"zh-CN"`）。WebUI 默认填入当前界面语言；未设置的旧路由回退到旧版 `settings.locale`。 |
-| `active_windows` | 系统时区下的每日投递窗口（`HH:MM`）。`end` 早于 `start` 表示跨午夜，`start == end` 表示全天，空列表表示不限制。 |
+| `timezone` | 可选的路由级 IANA 时区（如 `"Asia/Shanghai"`；省略或传 `""` 继承 `settings.timezone`），同时控制 `active_windows` / `active_weekdays`、SMTP 邮件文章时间与 Telegram 富文本 `<footer>` 时间（`YYYY-MM-DD HH:MM (UTC±HH:MM)`）。 |
+| `active_windows` | **路由时区**（默认继承系统时区）下的每日投递窗口（`HH:MM`）。`end` 早于 `start` 表示跨午夜，`start == end` 表示全天，空列表表示不限制。 |
 | `active_weekdays` | `1`（周一）到 `7`（周日），空列表表示每天；跨午夜的窗口按开始那一天的星期判定。 |
 
 窗口或星期之外的任务**仍会入队**：状态保持 `queued` / `deferred`，`next_attempt_at` 被设为下一个窗口的开始时间。
@@ -249,7 +268,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/tasks` | 查询发件箱投递任务列表。支持 Query 参数 `status`（`queued` / `delivering` / `retrying` / `deferred` / `dead_letter` / `delivered`）与 `limit`（默认 `100`，最大 `500`）。 |
+| `GET` | `/api/v1/tasks` | 查询发件箱投递任务列表（`DeliveryTaskDto[]`，含 `destination_id` 与 `destination_name`）。支持 Query 参数 `status`（`queued` / `delivering` / `retrying` / `deferred` / `dead_letter` / `delivered`）与 `limit`（默认 `100`，最大 `500`）。 |
 | `POST` | `/api/v1/tasks/retry` | 批量重投失败任务：请求体传入 `{ "task_ids": [12, 15] }` 或 `{ "all_dead_letter": true }`，唤醒发件箱 Worker 并返回 `{ "requeued_count": 2 }`。 |
 | `GET` | `/api/v1/tasks/queue` | 查询全局发件箱状态：`{ "paused": false, "resume_at": null }`。已自动恢复的暂停会返回 `paused: false`。 |
 | `PUT` | `/api/v1/tasks/queue` | 请求体 `{ "action": "pause", "resume_in_secs"?: 3600, "resume_at"?: "2026-01-01T08:00:00Z" }` 或 `{ "action": "resume" }`，返回与 `GET` 相同的结构。暂停期间订阅源仍会轮询、任务持续累积；恢复后所有订阅源中到期的任务按 `COALESCE(published_at, discovered_at)` 从旧到新依次投递。 |
