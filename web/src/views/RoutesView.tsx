@@ -100,7 +100,7 @@ function extractConfiguredRoutePlugins(
   for (const [pluginId, raw] of Object.entries(pluginsMap)) {
     if (!isPlainObject(raw)) continue;
     const hasActiveVal = Object.values(raw).some(
-      (v) => v !== null && v !== undefined && v !== "" && v !== false,
+      (v) => v !== null && v !== undefined && v !== "",
     );
     if (hasActiveVal) {
       entries.push([pluginId, raw]);
@@ -116,7 +116,7 @@ function cleanPluginOptionsForSubmit(
   for (const [pluginId, obj] of Object.entries(draft)) {
     const cleaned: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (v === null || v === undefined || v === "" || v === false) continue;
+      if (v === null || v === undefined || v === "") continue;
       cleaned[k] = v;
     }
     if (Object.keys(cleaned).length > 0) {
@@ -792,6 +792,14 @@ function RouteEditorModal({
   const [activeWeekdays, setActiveWeekdays] = useState<number[]>(
     route?.options.active_weekdays ?? [],
   );
+  const [initialPluginIds] = useState<ReadonlySet<string>>(
+    () =>
+      new Set(
+        extractConfiguredRoutePlugins(route?.options.plugins).map(
+          ([pid]) => pid,
+        ),
+      ),
+  );
   const [pluginOptions, setPluginOptions] = useState<
     Record<string, Record<string, unknown>>
   >(() => {
@@ -810,8 +818,14 @@ function RouteEditorModal({
   const [formError, setFormError] = useState<string | null>(null);
 
   const visiblePlugins = useMemo(
-    () => plugins.filter((p) => p.enabled || pluginOptions[p.id] !== undefined),
-    [plugins, pluginOptions],
+    () =>
+      plugins.filter(
+        (p) =>
+          p.enabled ||
+          pluginOptions[p.id] !== undefined ||
+          initialPluginIds.has(p.id),
+      ),
+    [plugins, pluginOptions, initialPluginIds],
   );
   const activePluginCount = useMemo(
     () => Object.keys(cleanPluginOptionsForSubmit(pluginOptions)).length,
@@ -825,12 +839,7 @@ function RouteEditorModal({
   ) => {
     setPluginOptions((prev) => {
       const nextPluginObj = { ...(prev[pluginId] ?? {}) };
-      if (
-        value === null ||
-        value === undefined ||
-        value === "" ||
-        value === false
-      ) {
+      if (value === null || value === undefined || value === "") {
         delete nextPluginObj[propKey];
       } else {
         nextPluginObj[propKey] = value;
@@ -1651,7 +1660,11 @@ function RouteEditorModal({
                               <div key={propKey} className="sm:col-span-2">
                                 <Switch
                                   id={fieldId}
-                                  checked={Boolean(fieldVal)}
+                                  checked={
+                                    typeof fieldVal === "boolean"
+                                      ? fieldVal
+                                      : Boolean(schema.default)
+                                  }
                                   onCheckedChange={(checked) =>
                                     updatePluginField(
                                       plugin.id,

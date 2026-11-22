@@ -44,7 +44,7 @@ services:
 | `exclude_domains` | No | `[]` | Domains that should never be shortened. Supports exact hostnames (`github.com`) and wildcard subdomains (`*.example.com`, which also matches `example.com`). The YOURLS provider's own hostname is **always skipped automatically** to prevent recursive shortening. |
 | `strict_mode` | No | `false` | Failure policy:<br>• `false` *(default)*: Per-URL graceful degradation — failed URLs keep their original href, the article is still delivered, and a warning is recorded on the task (`diagnostic_log`, highlighted amber in Outbox).<br>• `true`: Any link-shortening failure returns `PluginResult::Retry`, retrying the entire delivery task via normal transient backoff. |
 | `pass_title` | No | `true` | Sends the article title (up to 200 chars) as the YOURLS `title` parameter when shortening the article's primary link, preventing YOURLS from making an outbound scrape request back to the origin site. |
-| `use_proxy` | No | `false` | Route YOURLS API calls through the global `OUTBOUND_PROXY`. |
+| `use_proxy` | No | `false` | Route YOURLS API calls through the global `OUTBOUND_PROXY`. Fails closed with an explicit error if enabled while no global proxy is configured. |
 
 4. Click **Test** to verify connectivity — FeedCourier runs a live `action=shorturl` call for `https://feedcourier.ellery.me/` and reports the resulting short URL.
 5. Open any route under **Routes**, expand the **Plugins** section, and select the provider from the **Link Rewrite Provider** dropdown.
@@ -59,13 +59,13 @@ When YOURLS receives a URL that already exists in its database, it returns `stat
 
 To protect outbox delivery throughput on link-heavy digests and avoid hammering your YOURLS instance:
 
-- **Per-Article URL Cap**: At most **`50` unique eligible URLs** (`MAX_REWRITE_URLS_PER_ENTRY = 50`) are shortened per delivery (the article's primary link first, followed by unique `<a href>` links in document order). Remaining links stay untouched with a warning note.
+- **Per-Article New-URL Cap**: FeedCourier batch-queries `plugin_link_cache` first so already-cached URLs do not consume budget; at most **`50` unique uncached eligible URLs** (`MAX_REWRITE_URLS_PER_ENTRY = 50`) are shortened per delivery (the article's primary link first, followed by unique `<a href>` links in document order). Remaining uncached links stay untouched with a warning note.
 - **Bounded Concurrency & Timeout**: Cache misses are dispatched with at most **`4` concurrent requests** (`REWRITE_CONCURRENCY = 4`), a **`5`-second timeout** per URL (`REWRITE_REQUEST_TIMEOUT = 5s`), and a `64 KiB` response size cap.
 - **SQLite Link Cache (`plugin_link_cache`)**:
   - Shortened links are cached per provider instance keyed by `(instance_id, sha256(long_url))`.
   - Retries, multi-route fanout, and multi-recipient SMTP deliveries reuse cached short links without repeat YOURLS calls.
   - Cache hits refresh `last_used_at`; the background maintenance job automatically purges entries unused for more than **90 days**.
-  - You can clear a provider's cache manually from the plugin detail page (or `DELETE /api/v1/plugins/{id}/instances/{iid}/cache`).
+  - Changing a provider's `api_url` automatically clears that instance's `plugin_link_cache`, and you can also clear cache manually from the plugin detail page (or `DELETE /api/v1/plugins/{id}/instances/{iid}/cache`).
   - Stateless **Debug Push** runs the full `on_render` hook so you can verify rewriting output, but does **not** write new entries into `plugin_link_cache`.
 
 ---

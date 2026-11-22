@@ -171,8 +171,20 @@ pub struct NotionColumnMapping {
 }
 
 impl Default for NotionColumnMapping {
+    /// Conservative default for manual/legacy 7-column Notion DB bindings (`short_url: None` so
+    /// routes using Link Rewrite won't write to a missing `Short URL` column and 400-dead-letter).
+    /// Newly provisioned databases via `init-db` use [`Self::standard`] (all 8 columns).
     fn default() -> Self {
-        Self::standard()
+        Self {
+            title: "Title".to_string(),
+            fc_id: "FC-ID".to_string(),
+            link: Some("Link".to_string()),
+            short_url: None,
+            source: Some("Source".to_string()),
+            published: Some("Published".to_string()),
+            state: Some("State".to_string()),
+            tag: Some("Tag".to_string()),
+        }
     }
 }
 
@@ -349,10 +361,16 @@ impl ChannelConfig {
                         "SMTP port must be greater than 0".to_string(),
                     ));
                 }
-                if cfg.from_address.trim().is_empty() {
+                let from_trimmed = cfg.from_address.trim();
+                if from_trimmed.is_empty() {
                     return Err(AppError::Validation(
                         "SMTP from_address must not be empty".to_string(),
                     ));
+                }
+                if from_trimmed.parse::<lettre::Address>().is_err() {
+                    return Err(AppError::Validation(format!(
+                        "invalid SMTP from_address '{from_trimmed}'"
+                    )));
                 }
                 Ok(())
             }
@@ -440,6 +458,25 @@ impl DestinationConfig {
                     return Err(AppError::Validation(
                         "SMTP to_addresses must contain at least one recipient".to_string(),
                     ));
+                }
+                for raw in &cfg.to_addresses {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() && trimmed.parse::<lettre::message::Mailbox>().is_err() {
+                        return Err(AppError::Validation(format!(
+                            "invalid SMTP recipient address '{trimmed}'"
+                        )));
+                    }
+                }
+                if let Some(rt) = cfg
+                    .reply_to
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    && rt.parse::<lettre::message::Mailbox>().is_err()
+                {
+                    return Err(AppError::Validation(format!(
+                        "invalid SMTP reply_to address '{rt}'"
+                    )));
                 }
                 Ok(())
             }

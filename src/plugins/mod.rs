@@ -39,6 +39,10 @@ pub const MARKET_SNAPSHOT_JSON: &str = include_str!("market_snapshot.json");
 /// Cache TTL for remote marketplace index fetches (`6 hours`).
 pub const MARKET_INDEX_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Shorter negative-cache TTL (`60 seconds`) when falling back to the embedded snapshot without a
+/// prior valid remote cache, so transient outages recover quickly.
+pub const MARKET_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
+
 /// Maximum response size accepted for a remote marketplace `index.json` (`1 MiB`).
 const MAX_MARKET_INDEX_BYTES: usize = 1024 * 1024;
 
@@ -372,6 +376,32 @@ fn default_market_kind() -> String {
     "external".to_string()
 }
 
+/// Validate that an optional external marketplace URL uses strictly `http://` or `https://`
+/// with a non-empty hostname; strips `javascript:`, `data:`, `file:`, and malformed values.
+pub fn sanitize_http_url(raw: Option<String>) -> Option<String> {
+    let trimmed = raw?.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = url::Url::parse(&trimmed).ok()?;
+    if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+impl MarketIndexDocument {
+    /// Sanitize untrusted external links (`homepage`, `repository`) on every plugin entry.
+    pub fn sanitized(mut self) -> Self {
+        for entry in &mut self.plugins {
+            entry.homepage = sanitize_http_url(entry.homepage.take());
+            entry.repository = sanitize_http_url(entry.repository.take());
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedMarketIndex {
     doc: MarketIndexDocument,
@@ -402,8 +432,10 @@ impl MarketIndexCache {
         &self.index_url
     }
 
-    /// Return the marketplace index, using the 6h cache, fetching remotely via the SSRF-guarded
-    /// client when stale, and gracefully falling back to the compiled snapshot on failure.
+    /// Return the marketplace index, using the 6h cache for remote entries (or 60s negative-cache
+    /// TTL for snapshot fallbacks), fetching remotely via the SSRF-guarded client when stale, and
+    /// gracefully falling back to the compiled snapshot on failure without clobbering an existing
+    /// fresh remote cache entry.
     pub async fn get_index(
         &self,
         http: &ProtectedHttpClient,
@@ -412,9 +444,15 @@ impl MarketIndexCache {
         if !force_refresh
             && let Ok(guard) = self.cache.lock()
             && let Some(ref cached) = *guard
-            && cached.fetched_at.elapsed() < MARKET_INDEX_CACHE_TTL
         {
-            return (cached.doc.clone(), cached.source);
+            let ttl = if cached.source == "remote" {
+                MARKET_INDEX_CACHE_TTL
+            } else {
+                MARKET_SNAPSHOT_CACHE_TTL
+            };
+            if cached.fetched_at.elapsed() < ttl {
+                return (cached.doc.clone(), cached.source);
+            }
         }
 
         let use_proxy = http.settings().outbound_proxy_url.is_some();
@@ -426,7 +464,8 @@ impl MarketIndexCache {
         match http.get_bytes(req).await {
             Ok(resp) if resp.status.is_success() => {
                 match serde_json::from_slice::<MarketIndexDocument>(&resp.bytes) {
-                    Ok(doc) => {
+                    Ok(raw_doc) => {
+                        let doc = raw_doc.sanitized();
                         if let Ok(mut guard) = self.cache.lock() {
                             *guard = Some(CachedMarketIndex {
                                 doc: doc.clone(),
@@ -461,14 +500,22 @@ impl MarketIndexCache {
             }
         }
 
-        let snapshot: MarketIndexDocument = serde_json::from_str(MARKET_SNAPSHOT_JSON)
-            .expect("embedded market_snapshot.json must be valid JSON");
+        let snapshot: MarketIndexDocument =
+            serde_json::from_str::<MarketIndexDocument>(MARKET_SNAPSHOT_JSON)
+                .expect("embedded market_snapshot.json must be valid JSON")
+                .sanitized();
         if let Ok(mut guard) = self.cache.lock() {
-            *guard = Some(CachedMarketIndex {
-                doc: snapshot.clone(),
-                source: "snapshot",
-                fetched_at: Instant::now(),
+            let preserve_valid_remote = guard.as_ref().is_some_and(|existing| {
+                existing.source == "remote"
+                    && existing.fetched_at.elapsed() < MARKET_INDEX_CACHE_TTL
             });
+            if !preserve_valid_remote {
+                *guard = Some(CachedMarketIndex {
+                    doc: snapshot.clone(),
+                    source: "snapshot",
+                    fetched_at: Instant::now(),
+                });
+            }
         }
         (snapshot, "snapshot")
     }

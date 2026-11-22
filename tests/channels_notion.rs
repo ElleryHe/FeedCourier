@@ -157,6 +157,7 @@ fn sample_fixtures(data_source_id: &str) -> SampleFixtures {
         name: "Inbox DB".to_string(),
         encrypted_config: Vec::new(),
         enabled: true,
+        auto_paused: false,
         created_at: 1_700_000_000,
         updated_at: 1_700_000_000,
     };
@@ -1677,4 +1678,113 @@ async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_4
             other => panic!("expected Notion DestinationConfig writeback, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn qa08_notion_default_mapping_atomic_writeback_and_fail_closed_proxy() {
+    use feedcourier::crypto::MasterKey;
+    use feedcourier::db::Database;
+    use feedcourier::db::models::{NewChannel, NewDestination};
+    use tempfile::TempDir;
+
+    // 1. `NotionColumnMapping::default()` leaves `short_url` as `None` (backward compatible with
+    //    legacy 7-column databases), while `NotionColumnMapping::standard()` includes `"Short URL"`.
+    let default_map = NotionColumnMapping::default();
+    assert_eq!(default_map.short_url, None);
+    assert_eq!(default_map.title, "Title");
+    assert_eq!(default_map.fc_id, "FC-ID");
+    assert_eq!(
+        NotionColumnMapping::standard().short_url.as_deref(),
+        Some("Short URL")
+    );
+
+    // 2. Atomic Notion `data_source_id` writeback updates ONLY `data_source_id`/`database_id` on
+    //    the latest DB row without overwriting concurrent user edits to `column_mapping`.
+    let tmp = TempDir::new().unwrap();
+    let db = Database::connect(&tmp.path().join("notion_qa08.db"), 2)
+        .await
+        .unwrap();
+    let key = MasterKey::generate();
+    let ch_cfg = ChannelConfig::Notion(NotionChannelConfig {
+        integration_secret: "ntn_atomic_test".to_string(),
+    });
+    let ch = db
+        .create_channel(&NewChannel {
+            name: "Notion Atomic".to_string(),
+            kind: ChannelKind::Notion,
+            encrypted_config: key.encrypt_json(&ch_cfg).unwrap(),
+            credential_group_key: ch_cfg.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let db_id = "11111111-1111-1111-1111-111111111111";
+    let real_ds_id = "22222222-2222-2222-2222-222222222222";
+    let mut initial_dest = NotionDestinationConfig {
+        data_source_id: db_id.to_string(),
+        database_id: None,
+        parent_page_id: None,
+        column_mapping: NotionColumnMapping::default(),
+    };
+    let dest = db
+        .create_destination(&NewDestination {
+            channel_id: ch.id,
+            name: "Inbox".to_string(),
+            encrypted_config: key
+                .encrypt_json(&DestinationConfig::Notion(initial_dest.clone()))
+                .unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    // Simulate user concurrently editing `column_mapping` BEFORE the lazy writeback fires!
+    initial_dest.column_mapping.title = "Custom Headline".to_string();
+    initial_dest.column_mapping.short_url = Some("Tracked Link".to_string());
+    let user_enc = key
+        .encrypt_json(&DestinationConfig::Notion(initial_dest))
+        .unwrap();
+    db.update_destination_encrypted_config(dest.id, &user_enc)
+        .await
+        .unwrap();
+
+    // Now the background lazy writeback resolves `db_id` -> `real_ds_id` atomically.
+    let updated = db
+        .update_notion_destination_ids_atomic(dest.id, &key, real_ds_id, Some(db_id))
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let reloaded = db.get_destination(dest.id).await.unwrap().unwrap();
+    let decrypted: DestinationConfig = key.decrypt_json(&reloaded.encrypted_config).unwrap();
+    match decrypted {
+        DestinationConfig::Notion(cfg) => {
+            assert_eq!(cfg.data_source_id, real_ds_id);
+            assert_eq!(cfg.database_id.as_deref(), Some(db_id));
+            assert_eq!(
+                cfg.column_mapping.title, "Custom Headline",
+                "concurrent user column_mapping edit must NOT be overwritten"
+            );
+            assert_eq!(
+                cfg.column_mapping.short_url.as_deref(),
+                Some("Tracked Link")
+            );
+        }
+        other => panic!("expected Notion config, got {other:?}"),
+    }
+
+    // 3. Q4: NotionSender with `use_proxy = true` and no global proxy fails closed.
+    let sender = NotionSender::with_base_url("http://127.0.0.1:9", None).unwrap();
+    let err = sender
+        .get_bot_name("ntn_secret", true)
+        .await
+        .expect_err("use_proxy=true with no global proxy must fail closed");
+    assert!(matches!(err, feedcourier::error::AppError::Validation(_)));
 }

@@ -160,9 +160,12 @@ sequenceDiagram
 - **严格的 `api_base_url` 语法校验**：仅允许 `http://` 与 `https://` 协议，禁止携带 userinfo（`user:pass@`）、查询字符串（`?…`）或片段（`#…`）；创建、编辑或探测时触发 SSRF 拦截统一返回 HTTP `403`（`ssrf_blocked`）。
 - **存量内网地址不自动放行**：升级至 `v0.2.0` 时，已配置的内网/私网 Local Bot API 地址不会被自动加入白名单，运维人员需手动将其主机名或 IP/CIDR 添加至 `SSRF_ALLOWLIST`。
 
+### 6. 出站代理失败关闭（Fail-Closed `use_proxy`）
+当任意订阅源、HTTP 类通道账号（Telegram / Notion）、预览请求或插件服务商实例显式开启 `use_proxy = true` 但全局未配置 `OUTBOUND_PROXY`（或 WebUI 代理地址）时，`ProtectedHttpClient` 与插件 HTTP 调用方会**直接报错拦截（Fail-Closed）**，绝不静默回退直连而暴露宿主机真实出口 IP。SMTP 账号仅走原生 TCP/TLS 直连，不适用 HTTP/SOCKS 出站代理。
+
 ---
 
-## 5. 公开 SMTP 合规端点与 HMAC 令牌（`src/api/public.rs`、`src/crypto.rs`）
+## 5. 公开 SMTP 合规端点、邮件模板转义与零 PII 脱敏（`src/api/public.rs`、`src/channels/smtp.rs`、`src/crypto.rs`）
 
 配置 `PUBLIC_URL` 后，FeedCourier 仅对外提供两个免登录合规路由（`/u/{token}` 与 `/v/{token}`），注册于 SPA 回退之前，便于反向代理**仅对外暴露 `/u/` 与 `/v/`**，将 `/api/v1/*`、`/mcp` 与 WebUI 留在内网：
 
@@ -171,28 +174,33 @@ sequenceDiagram
 
 | 用途 | HKDF `info` 上下文 | 编码布局与安全属性 |
 | :--- | :--- | :--- |
-| **收件人地址摘要**（`smtp_recipients.address_hmac`） | `fc-smtp-addr-v1` | `hex(HMAC-SHA256(subkey, lowercase(email)))`，无需在 `smtp_recipients` 中保存明文邮箱即可按地址追踪状态。 |
-| **退订令牌**（`/u/{token}`） | `fc-unsub-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| HMAC-SHA256[..16])`（32 字节）。不设过期时间（确保历史邮件长期可退订）、**不含任何明文 PII**，并采用常量时间校验。 |
-| **验证令牌**（`/v/{token}`） | `fc-verify-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| expires_at_be_8 \|\| code_sha256[..8] \|\| HMAC-SHA256[..16])`（48 字节）。30 分钟有效期且绑定当前激活验证码哈希前 8 字节，重新发送验证邮件后旧链接立即失效（`410 Gone`）。 |
+| **收件人地址摘要**（`smtp_recipients.address_hmac`） | `fc-smtp-addr-v1` | `hex(HMAC-SHA256(subkey, normalize(email)))`（域名部分做 ASCII 小写 + IDNA Punycode 归一化），无需在 `smtp_recipients` 中保存明文邮箱即可按地址追踪状态。 |
+| **退订令牌**（`/u/{token}`） | `fc-unsub-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| HMAC-SHA256[..16])`（32 字节）。不设过期时间（确保历史邮件长期可退订）、**不含任何明文 PII**，并经 `std::hint::black_box` 执行常量时间校验。 |
+| **验证令牌**（`/v/{token}`） | `fc-verify-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| expires_at_be_8 \|\| code_sha256[..8] \|\| HMAC-SHA256[..16])`（48 字节）。30 分钟有效期且绑定当前激活验证码哈希前 8 字节，重新发送或输错 5 次（原子清空 `code_sha256` 与 `code_expires_at`）后旧链接立即失效（`410 Gone`）。 |
 
 ### 2. 严格 `GET` 只读 / `POST` 变更不变量
 - 企业邮件安全网关（Safe Links、Proofpoint、Mimecast 等）会自动通过 `GET` 预抓取邮件中的链接。
-- **`GET /u/{token}`** 与 **`GET /v/{token}`** 严格保持**只读**，仅渲染最小化的本地化确认页面（只显示打码后的邮箱如 `a***e@example.com` 与表单按钮），绝不修改数据库状态。
+- **`GET /u/{token}`** 与 **`GET /v/{token}`** 严格保持**只读**，仅渲染最小化的本地化确认页面（只显示打码后的邮箱如 `a***e@example.com` 与相对路径 `action=""` 表单按钮，兼容子路径 `PUBLIC_URL` 部署），绝不修改数据库状态。
 - 状态变更仅在 **`POST /u/{token}`**（兼容浏览器表单提交及免登录幂等 RFC 8058 `List-Unsubscribe=One-Click` POST）与 **`POST /v/{token}`** 时执行。
 
-### 3. 按 IP 限流与响应头加固
-- 所有 `/u/*` 与 `/v/*` 请求均受进程内按 IP 滑动窗口限流器约束（**每 IP 每 `60` 秒最多 `30` 次请求**，识别反向代理传入的 `X-Forwarded-For` / `X-Real-IP`，并定期惰性回收防止内存膨胀），超限返回 `429`。
-- 令牌篡改或无效统一返回通用 `404` 页面，不泄露任何管理信息或收件人存在性。
-- 响应强制附加安全头：
+### 3. `ConnectInfo<SocketAddr>` / `TRUST_PROXY` 防伪造限流、请求体上限与响应头加固
+- **防伪造客户端 IP 识别**：默认配置下（**`TRUST_PROXY=false`**），`/u/*` 与 `/v/*` 的限流键严格取自底层 TCP 对端地址（`ConnectInfo<SocketAddr>`），忽略客户端自带的 `X-Forwarded-For` / `X-Real-IP`，彻底杜绝攻击者随机伪造头部绕过限流。仅当部署在可信反向代理后并显式设置 **`TRUST_PROXY=true`** 时，才读取 `X-Real-IP` 或 `X-Forwarded-For` **最右侧**由代理追加的一跳（抵御客户端伪造左侧条目）。
+- **硬上限限流桶与 `4 KiB` 请求体限制**：内存按 IP 滑动窗口限流器（**每 IP 每 `60` 秒最多 `30` 次请求**）实施 **`8,192` 桶硬容量上限**（超限时先清理过期桶，仍满则淘汰最旧活跃桶），防止海量源 IP 造成内存膨胀。`/u/{token}` 与 `/v/{token}` 均挂载 **`DefaultBodyLimit::max(4096)`（`4 KiB`）**。
+- **公开 404 隔离与安全响应头**：空路径 `/u`、`/u/`、`/v`、`/v/` 显式返回公开 `404` HTML 页面而绝不穿透至 WebUI SPA；篡改或无效令牌统一返回通用 `404` 页面，不泄露任何管理信息或收件人存在性。所有公开响应强制附加安全头：
   - `X-Robots-Tag: noindex, nofollow`
   - `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`
   - `Referrer-Policy: no-referrer`
   - `Cache-Control: no-store`
 
+### 4. `minijinja` 严格自动 HTML 转义与全链路零 PII 脱敏
+- **邮件模板强制 `AutoEscape::Html`**：`template_env()` 将模板注册为 `"email.html"` 并显式配置 `minijinja::AutoEscape::Html`。仅经 `ammonia` 消毒的正文 HTML 片段 `body_html` 走 `| safe`，其余所有不可信元数据（`subject`、`entry_title`、`feed_title`、`meta_line`、`original_url`、`continue_url`、`unsubscribe_url`、`route_name`、`destination_name`、`sender_identity`）在正式邮件、验证邮件与测试邮件中均由引擎统一 HTML 转义，杜绝注入与二次转义。
+- **诊断日志与默认名称零明文邮箱**：`delivery_tasks.diagnostic_log`、`smtp_recipients.bounce_diagnostic`（正则脱敏尖括号或响应正文中的邮箱地址）以及留空名称自动派生的 SMTP 目的地名称（`derive_default_destination_name`）一律经 `mask_email_address` 脱敏（如 `a***e@example.com`），确保未加密 SQLite 列与只读 MCP 工具输出零收件人明文邮箱泄露。
+
 ---
 
-## 6. 插件防 SSRF 与凭据脱敏（`src/plugins/`）
+## 6. 插件防 SSRF、外链协议校验与凭据脱敏（`src/plugins/`）
 
-- **强制 `ProtectedHttpClient` 出站校验**：插件发起的全部外部请求——包括 YOURLS `action=shorturl` 调用（`64 KiB` 响应上限、`5s` 超时、`4` 并发）以及市场索引拉取（`PLUGIN_INDEX_URL`，`1 MiB` 上限、`8s` 超时、6 小时缓存）——均强制走 `ProtectedHttpClient` 连接期 `SsrfDnsResolver` 校验并受 `SSRF_ALLOWLIST` 约束；内网或 Docker 部署的 YOURLS 在显式加入白名单前一律拦截。
-- **服务商凭据加密与脱敏**：`plugin_instances.encrypted_config` 使用与渠道相同的 256 位 `MasterKey` ChaCha20-Poly1305 AEAD 加密保存；`/api/v1/plugins*` 响应自动掩码化密钥（`has_signature`、`signature_hint`、`has_password`），`PATCH` 留空自动保留原密文；MCP `list_plugins` 严格只返回 `{ id, name, enabled }`，零凭据泄露。
-- **安全 HTML 属性改写**：`link-rewrite` 仅解析 `<a ...>` 开始标签（采用完整 HTML5 命名实体解码）并仅改写 `http://` / `https://` 的 `href` 属性，绝不触碰媒体 `src`、`mailto:` 或退订/验证链接。
+- **强制 `ProtectedHttpClient` 与 Fail-Closed `use_proxy`**：插件发起的全部外部请求——包括 YOURLS `action=shorturl` 调用（`64 KiB` 响应上限、`5s` 超时、`4` 并发）以及市场索引拉取（`PLUGIN_INDEX_URL`，`1 MiB` 上限、`8s` 超时）——均强制走 `ProtectedHttpClient` 连接期 `SsrfDnsResolver` 校验并受 `SSRF_ALLOWLIST` 约束；内网或 Docker 部署的 YOURLS 在显式加入白名单前一律拦截；当插件实例开启 `use_proxy = true` 但全局未配置 `OUTBOUND_PROXY` 时直接报错拦截，绝不静默直连。
+- **市场外链 `http(s)://` 强校验与缓存容错**：前后端双重限制市场插件条目的 `homepage` 与 `repository` 仅允许 `http://` 或 `https://` URL（剥离 `javascript:`、`data:` 等危险协议）。`MarketIndexCache` 在远端刷新失败时不覆盖已有有效远程缓存；无远程缓存回退编译内置快照时，负缓存 TTL 缩短为 **`60s`**（正常远端缓存保持 `6h`）。
+- **服务商凭据加密与脱敏**：`plugin_instances.encrypted_config` 使用与渠道相同的 256 位 `MasterKey` ChaCha20-Poly1305 AEAD 加密保存；`/api/v1/plugins*` 响应自动掩码化密钥（`has_signature`、`signature_hint`、`has_password`），`PATCH` 留空自动保留原密文（切换 `auth_mode` 时自动清空旧模式残留凭据）；MCP `list_plugins` 严格只返回 `{ id, name, enabled }`，零凭据泄露。
+- **HTML5 状态机安全属性改写**：`link-rewrite` 按 HTML5 属性状态机解析 `<a ...>` 开始标签（跳过 `<script>` 与 `<style>` 原始文本区间、正确处理无引号属性值内的撇号与末尾 `/`，并复用分号感知 HTML5 实体解码），仅改写 `http://` / `https://` 的 `href` 属性，绝不触碰媒体 `src`、`mailto:` 或退订/验证链接。

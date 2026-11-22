@@ -6,6 +6,7 @@ import {
   ChevronUp,
   Database,
   Globe,
+  Info,
   Lock,
   Mail,
   MessageSquare,
@@ -22,8 +23,8 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { type FormEvent, useMemo, useState } from "react";
-import { api, getReferencingRoutesConflict } from "@/api/client";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { ApiError, api, getReferencingRoutesConflict } from "@/api/client";
 import {
   type ChannelAccountCreate,
   type ChannelAccountPatch,
@@ -211,6 +212,10 @@ export function ChannelsView() {
   const [deletingChannel, setDeletingChannel] = useState<ChannelDto | null>(
     null,
   );
+  const [channelConflict, setChannelConflict] = useState<{
+    channel: ChannelDto;
+    routes: RouteReferenceDto[];
+  } | null>(null);
   const [testingChannelId, setTestingChannelId] = useState<number | null>(null);
 
   const [destModalState, setDestModalState] = useState<{
@@ -285,16 +290,31 @@ export function ChannelsView() {
   });
 
   const deleteAccountMutation = useMutation({
-    mutationFn: (id: number) => api.channels.remove(id),
+    mutationFn: ({
+      channel,
+      cascade,
+    }: {
+      channel: ChannelDto;
+      cascade: boolean;
+    }) => api.channels.remove(channel.id, cascade),
     onSuccess: () => {
       toast.success(m.channels.toastDeleted);
       setDeletingChannel(null);
+      setChannelConflict(null);
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
       void queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
-    onError: (err) => {
+    onError: (err, variables) => {
+      if (!variables.cascade) {
+        const refs = getReferencingRoutesConflict(err);
+        if (refs) {
+          setDeletingChannel(null);
+          setChannelConflict({ channel: variables.channel, routes: refs });
+          return;
+        }
+      }
       toast.error(m.channels.toastDeleteFailed, errorMessage(err));
     },
   });
@@ -415,6 +435,26 @@ export function ChannelsView() {
         <Card className="p-8 text-center text-xs text-zinc-500">
           {m.channels.loading}
         </Card>
+      ) : channelsQuery.isError ? (
+        <Card className="border-rose-200 bg-rose-50/50 p-4 dark:border-rose-900/60 dark:bg-rose-950/20">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs text-rose-700 dark:text-rose-300">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>
+                {m.channels.loadError} {errorMessage(channelsQuery.error)}
+              </span>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void channelsQuery.refetch()}
+              loading={channelsQuery.isFetching}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              {m.common.retry}
+            </Button>
+          </div>
+        </Card>
       ) : allChannels.length === 0 ? (
         <EmptyState
           icon={Radio}
@@ -464,7 +504,7 @@ export function ChannelsView() {
                           {!ch.enabled && (
                             <Badge variant="default">{m.common.disabled}</Badge>
                           )}
-                          {ch.use_proxy && (
+                          {ch.kind !== "smtp" && ch.use_proxy && (
                             <Badge variant="outline">
                               <Globe className="h-3 w-3" />
                               {m.common.proxy}
@@ -700,6 +740,20 @@ export function ChannelsView() {
                                       {m.common.disabled}
                                     </Badge>
                                   )}
+                                  {isSmtp && dest.auto_paused && (
+                                    <Badge
+                                      variant="warning"
+                                      title={
+                                        m.channels.smtpCompliance.autoPausedHint
+                                      }
+                                    >
+                                      <AlertTriangle className="h-3 w-3 shrink-0" />
+                                      {
+                                        m.channels.smtpCompliance
+                                          .autoPausedBadge
+                                      }
+                                    </Badge>
+                                  )}
                                   {isSmtp && dest.smtp_summary && (
                                     <Badge
                                       variant={smtpSummaryVariant(
@@ -764,6 +818,11 @@ export function ChannelsView() {
                                     </>
                                   )}
                                 </div>
+                                {isSmtp && dest.auto_paused && (
+                                  <p className="text-[11px] text-amber-700 dark:text-amber-400">
+                                    {m.channels.smtpCompliance.autoPausedHint}
+                                  </p>
+                                )}
                               </div>
 
                               <div className="flex shrink-0 flex-wrap items-center gap-1.5">
@@ -874,13 +933,85 @@ export function ChannelsView() {
         open={deletingChannel !== null}
         onClose={() => setDeletingChannel(null)}
         onConfirm={() => {
-          if (deletingChannel) deleteAccountMutation.mutate(deletingChannel.id);
+          if (deletingChannel) {
+            deleteAccountMutation.mutate({
+              channel: deletingChannel,
+              cascade: false,
+            });
+          }
         }}
         title={m.channels.deleteModalTitle}
         description={m.channels.deleteModalDesc(deletingChannel?.name ?? "")}
         confirmLabel={m.channels.deleteModalConfirm}
         loading={deleteAccountMutation.isPending}
       />
+
+      {/* Delete Account 409 Cascade Conflict Modal */}
+      <Modal
+        open={channelConflict !== null}
+        onClose={() => setChannelConflict(null)}
+        title={m.channels.deleteAccountConflict.title}
+        size="sm"
+        footer={
+          <>
+            <Button
+              variant="outline"
+              onClick={() => setChannelConflict(null)}
+              disabled={deleteAccountMutation.isPending}
+            >
+              {m.common.cancel}
+            </Button>
+            <Button
+              variant="destructive"
+              loading={deleteAccountMutation.isPending}
+              onClick={() => {
+                if (channelConflict) {
+                  deleteAccountMutation.mutate({
+                    channel: channelConflict.channel,
+                    cascade: true,
+                  });
+                }
+              }}
+            >
+              {m.channels.deleteAccountConflict.confirmCascade(
+                channelConflict?.routes.length ?? 0,
+              )}
+            </Button>
+          </>
+        }
+      >
+        {channelConflict && (
+          <div className="space-y-3 text-xs">
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50/80 p-3 text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-200">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+              <p className="leading-relaxed">
+                {m.channels.deleteAccountConflict.desc(
+                  channelConflict.channel.name,
+                  channelConflict.routes.length,
+                )}
+              </p>
+            </div>
+            <div>
+              <div className="mb-1.5 font-semibold text-zinc-700 dark:text-zinc-300">
+                {m.channels.deleteAccountConflict.affectedRoutesLabel}
+              </div>
+              <ul className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 bg-zinc-50/50 dark:divide-zinc-800 dark:border-zinc-800 dark:bg-zinc-950/60">
+                {channelConflict.routes.map((r) => (
+                  <li
+                    key={r.id}
+                    className="flex items-center justify-between px-3 py-2"
+                  >
+                    <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                      {r.name}
+                    </span>
+                    <Badge variant="mono">#{r.id}</Badge>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </Modal>
 
       {/* Delete Destination Confirmation */}
       <ConfirmDialog
@@ -971,6 +1102,30 @@ export function ChannelsView() {
 // Expandable SMTP Recipients & Compliance Panel
 // ---------------------------------------------------------------------------
 
+const SMTP_RESEND_COOLDOWN_SECS = 60;
+
+function parseTimestampMs(
+  val: string | number | null | undefined,
+): number | null {
+  if (val === null || val === undefined || val === "") return null;
+  if (typeof val === "number") {
+    return val < 1e12 ? val * 1000 : val;
+  }
+  const trimmed = val.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const num = Number(trimmed);
+    return Number.isFinite(num) ? (num < 1e12 ? num * 1000 : num) : null;
+  }
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatCooldownDuration(secs: number): string {
+  return secs <= SMTP_RESEND_COOLDOWN_SECS
+    ? `${secs}s`
+    : formatDurationSecs(secs);
+}
+
 function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
   const { m } = useI18n();
   const toast = useToast();
@@ -978,11 +1133,21 @@ function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
 
   const [codeInputs, setCodeInputs] = useState<Record<number, string>>({});
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [cooldownUntilMs, setCooldownUntilMs] = useState<
+    Record<number, number>
+  >({});
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   const recipientsQuery = useQuery({
     queryKey: ["destination-recipients", destinationId],
     queryFn: () => api.destinations.listRecipients(destinationId),
   });
+
+  useEffect(() => {
+    if (recipientsQuery.dataUpdatedAt > 0) {
+      setNowMs(Date.now());
+    }
+  }, [recipientsQuery.dataUpdatedAt]);
 
   const invalidate = () => {
     void queryClient.invalidateQueries({
@@ -999,14 +1164,43 @@ function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
         recipient.id,
       );
     },
-    onSuccess: (res) => {
+    onSuccess: (res, recipient) => {
+      const now = Date.now();
+      setNowMs(now);
+      setCooldownUntilMs((prev) => ({
+        ...prev,
+        [recipient.id]: now + SMTP_RESEND_COOLDOWN_SECS * 1000,
+      }));
       toast.success(
         m.channels.smtpCompliance.toastVerificationSentTitle,
         res.message,
       );
       invalidate();
     },
-    onError: (err) => {
+    onError: (err, recipient) => {
+      if (err instanceof ApiError && err.status === 429) {
+        const retrySecs = err.retry_after_secs;
+        if (retrySecs && retrySecs > 0) {
+          const now = Date.now();
+          setNowMs(now);
+          setCooldownUntilMs((prev) => ({
+            ...prev,
+            [recipient.id]: now + retrySecs * 1000,
+          }));
+          toast.warning(
+            m.channels.smtpCompliance.toastCooldownTitle,
+            m.channels.smtpCompliance.toastCooldownDesc(
+              formatCooldownDuration(retrySecs),
+            ),
+          );
+        } else {
+          toast.warning(
+            m.channels.smtpCompliance.toastCooldownTitle,
+            m.channels.smtpCompliance.toastRateLimitedDesc,
+          );
+        }
+        return;
+      }
       toast.error(m.channels.smtpCompliance.toastActionFailed, errorMessage(err));
     },
     onSettled: () => setBusyKey(null),
@@ -1099,11 +1293,67 @@ function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
 
   const recipients = recipientsQuery.data ?? [];
 
+  const getCooldownRemainingSecs = (r: SmtpRecipientDto): number => {
+    let remaining = 0;
+    const sentMs = parseTimestampMs(r.last_code_sent_at);
+    if (sentMs !== null) {
+      const serverRem = Math.ceil(
+        (sentMs + SMTP_RESEND_COOLDOWN_SECS * 1000 - nowMs) / 1000,
+      );
+      if (serverRem > 0) {
+        remaining = Math.max(
+          remaining,
+          Math.min(SMTP_RESEND_COOLDOWN_SECS, serverRem),
+        );
+      }
+    }
+    const localUntil = cooldownUntilMs[r.id];
+    if (localUntil !== undefined) {
+      const localRem = Math.ceil((localUntil - nowMs) / 1000);
+      if (localRem > 0) {
+        remaining = Math.max(remaining, localRem);
+      }
+    }
+    return remaining;
+  };
+
+  const hasActiveCooldown =
+    recipients.some((r) => getCooldownRemainingSecs(r) > 0) ||
+    Object.values(cooldownUntilMs).some((until) => until > nowMs);
+
+  useEffect(() => {
+    if (!hasActiveCooldown) return;
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveCooldown]);
+
   return (
     <div className="border-t border-zinc-100 bg-zinc-50/60 px-3.5 py-3 dark:border-zinc-800 dark:bg-zinc-950/40">
       {recipientsQuery.isLoading ? (
         <div className="py-2 text-xs text-zinc-500">
           {m.channels.smtpCompliance.loading}
+        </div>
+      ) : recipientsQuery.isError ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-rose-200 bg-rose-50/70 px-3 py-2 text-xs text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-300">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span>
+              {m.channels.smtpCompliance.loadError}{" "}
+              {errorMessage(recipientsQuery.error)}
+            </span>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => void recipientsQuery.refetch()}
+            loading={recipientsQuery.isFetching}
+          >
+            <RefreshCw className="h-3 w-3" />
+            {m.common.retry}
+          </Button>
         </div>
       ) : recipients.length === 0 ? (
         <div className="py-2 text-xs text-zinc-500">
@@ -1121,6 +1371,11 @@ function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
               r.status === "unverified";
             const canReactivate =
               r.status === "unsubscribed" || r.status === "bounced";
+            const cooldownSecs = getCooldownRemainingSecs(r);
+            const inCooldown = cooldownSecs > 0;
+            const cooldownText = inCooldown
+              ? formatCooldownDuration(cooldownSecs)
+              : "";
 
             return (
               <div
@@ -1213,13 +1468,20 @@ function SmtpRecipientsPanel({ destinationId }: { destinationId: number }) {
                       variant="outline"
                       size="sm"
                       className="h-7 px-2 text-xs"
+                      disabled={inCooldown}
                       loading={busyKey === `send-${r.id}`}
                       onClick={() => sendCodeMutation.mutate(r)}
                     >
                       <Mail className="h-3 w-3" />
-                      {isPending
-                        ? m.channels.smtpCompliance.resendVerification
-                        : m.channels.smtpCompliance.sendVerification}
+                      {inCooldown
+                        ? isPending
+                          ? m.channels.smtpCompliance.resendCooldown(
+                              cooldownText,
+                            )
+                          : m.channels.smtpCompliance.sendCooldown(cooldownText)
+                        : isPending
+                          ? m.channels.smtpCompliance.resendVerification
+                          : m.channels.smtpCompliance.sendVerification}
                     </Button>
                   )}
 
@@ -1737,7 +1999,7 @@ function ChannelAccountModal({
       : "",
   );
   const [useProxy, setUseProxy] = useState<boolean>(
-    channel?.use_proxy ?? false,
+    channel?.kind === "smtp" ? false : (channel?.use_proxy ?? false),
   );
   const [enabled, setEnabled] = useState<boolean>(channel?.enabled ?? true);
 
@@ -1796,6 +2058,9 @@ function ChannelAccountModal({
     const defaults = kindDefaults(nextKind);
     setMinIntervalSecs(defaults.defaultInterval);
     setJitterMaxSecs(defaults.defaultJitter);
+    if (nextKind === "smtp") {
+      setUseProxy(false);
+    }
     setFormError(null);
   };
 
@@ -1845,7 +2110,7 @@ function ChannelAccountModal({
           jitter_max_secs: jitterMaxSecs,
           hourly_quota: parsedHourly,
           daily_quota: parsedDaily,
-          use_proxy: useProxy,
+          use_proxy: kind === "smtp" ? false : useProxy,
           enabled,
         };
         return api.channels.update(channel.id, payload);
@@ -1921,7 +2186,7 @@ function ChannelAccountModal({
         jitter_max_secs: jitterMaxSecs,
         hourly_quota: parsedHourly,
         daily_quota: parsedDaily,
-        use_proxy: useProxy,
+        use_proxy: kind === "smtp" ? false : useProxy,
         enabled,
       };
       return api.channels.create(payload);
@@ -2306,22 +2571,38 @@ function ChannelAccountModal({
             </div>
           </div>
 
-          <div className="grid gap-3 pt-1 sm:grid-cols-2">
-            <Switch
-              id="ch-proxy"
-              checked={useProxy}
-              onCheckedChange={setUseProxy}
-              label={m.channels.wizard.pacing.proxyLabel}
-              description={m.channels.wizard.pacing.proxyDesc}
-            />
-            <Switch
-              id="ch-enabled"
-              checked={enabled}
-              onCheckedChange={setEnabled}
-              label={m.channels.wizard.pacing.enabledLabel}
-              description={m.channels.wizard.pacing.enabledDesc}
-            />
-          </div>
+          {kind === "smtp" ? (
+            <div className="space-y-3 pt-1">
+              <div className="flex items-start gap-2 rounded-lg border border-zinc-200/80 bg-zinc-50/70 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
+                <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                <span>{m.channels.wizard.pacing.smtpNoProxyNote}</span>
+              </div>
+              <Switch
+                id="ch-enabled"
+                checked={enabled}
+                onCheckedChange={setEnabled}
+                label={m.channels.wizard.pacing.enabledLabel}
+                description={m.channels.wizard.pacing.enabledDesc}
+              />
+            </div>
+          ) : (
+            <div className="grid gap-3 pt-1 sm:grid-cols-2">
+              <Switch
+                id="ch-proxy"
+                checked={useProxy}
+                onCheckedChange={setUseProxy}
+                label={m.channels.wizard.pacing.proxyLabel}
+                description={m.channels.wizard.pacing.proxyDesc}
+              />
+              <Switch
+                id="ch-enabled"
+                checked={enabled}
+                onCheckedChange={setEnabled}
+                label={m.channels.wizard.pacing.enabledLabel}
+                description={m.channels.wizard.pacing.enabledDesc}
+              />
+            </div>
+          )}
         </div>
 
         {/* Optional Initial Destination (Create mode only) */}

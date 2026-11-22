@@ -348,6 +348,8 @@ export const zhCN: Messages = {
       pushThisItem: "推送此条",
       debugPushedTitle: "调试推送已送达",
       debugFailedTitle: "调试推送失败",
+      debugPluginsLabel: "插件（可选）",
+      debugPluginNoProviders: "尚未配置服务商",
     },
     opml: {
       title: "导入 OPML 订阅列表",
@@ -372,6 +374,7 @@ export const zhCN: Messages = {
       "管理投递账号（凭据、代理与共享限速），并在账号下挂载一个或多个目的地。所有密钥与目标均采用 ChaCha20-Poly1305 加密存储，不对 MCP 客户端暴露。",
     newChannel: "新建账号",
     loading: "正在加载投递账号…",
+    loadError: "无法加载投递账号：",
     emptyTitle: "尚未配置任何投递账号",
     emptyDesc:
       "在创建路由规则前，请先配置至少一个 SMTP 发信账号、Telegram 机器人或 Notion 集成，并添加目标目的地。",
@@ -441,12 +444,18 @@ export const zhCN: Messages = {
     toastDestDeleteFailed: "删除目的地失败",
     deleteModalTitle: "删除投递账号",
     deleteModalDesc: (name: string) =>
-      `确认删除账号「${name}」？该账号下的所有目的地、绑定路由规则与待投递任务也将一并移除。`,
+      `确认删除投递账号「${name}」及其下属的所有目的地？`,
     deleteModalConfirm: "确认删除",
     deleteDestModalTitle: "删除目的地",
-    deleteDestModalDesc: (name: string) =>
-      `确认删除目的地「${name}」？绑定到该目的地的路由规则与待投递任务也将一并移除。`,
+    deleteDestModalDesc: (name: string) => `确认删除目的地「${name}」？`,
     deleteDestModalConfirm: "确认删除",
+    deleteAccountConflict: {
+      title: "账号正被活跃路由引用",
+      desc: (accountName: string, count: number) =>
+        `账号「${accountName}」当前正被 ${count} 条路由引用。确认级联删除将同时永久删除其下属目的地、以下路由及其待投递任务。`,
+      affectedRoutesLabel: "受影响的路由",
+      confirmCascade: (count: number) => `删除账号及 ${count} 条路由`,
+    },
     deleteConflict: {
       title: "目的地正被活跃路由引用",
       desc: (destName: string, count: number) =>
@@ -457,8 +466,12 @@ export const zhCN: Messages = {
     smtpCompliance: {
       verifiedCountBadge: (verified: number, total: number) =>
         `${verified}/${total} 已验证`,
+      autoPausedBadge: "已自动暂停",
+      autoPausedHint:
+        "所有收件人均已退订或硬退信，投递已自动暂停；任一收件人重新完成验证后将自动恢复。",
       recipientsToggle: "收件人与合规",
       loading: "正在加载收件人合规状态…",
+      loadError: "无法加载收件人列表：",
       empty: "该目的地暂未配置收件人。",
       status: {
         unverified: "未验证",
@@ -484,12 +497,18 @@ export const zhCN: Messages = {
       bounceTooltipPrefix: "退信诊断：",
       sendVerification: "发送验证邮件",
       resendVerification: "重新发送",
+      sendCooldown: (remaining: string) => `发送 (${remaining})`,
+      resendCooldown: (remaining: string) => `重发 (${remaining})`,
       codePlaceholder: "6 位验证码",
       verifyBtn: "验证",
       unsubscribeBtn: "退订",
       reactivateBtn: "重新激活",
       errCodeInvalid: "请输入 6 位数字验证码。",
       toastVerificationSentTitle: "验证邮件已发送",
+      toastCooldownTitle: "请稍后再试",
+      toastCooldownDesc: (remaining: string) =>
+        `验证邮件发送冷却中，请在 ${remaining} 后重试。`,
+      toastRateLimitedDesc: "验证邮件请求过于频繁，请稍后再试。",
       toastVerifiedTitle: "收件人验证成功",
       toastVerifiedDesc: (email: string) => `${email} 已通过验证，可正常接收投递。`,
       toastUnsubscribedTitle: "已将收件人设为退订",
@@ -617,7 +636,10 @@ export const zhCN: Messages = {
         hourlyQuotaLabel: "每小时配额（可选）",
         dailyQuotaLabel: "每日配额（可选）",
         proxyLabel: "使用出站代理",
-        proxyDesc: "该账号下所有目的地的请求均通过全局 HTTP / SOCKS5 代理发送。",
+        proxyDesc:
+          "该账号下所有目的地（Telegram / Notion）的 API 请求均通过全局 HTTP / SOCKS5 代理发送。",
+        smtpNoProxyNote:
+          "SMTP 仅通过原生 TCP/TLS 直连发信，不支持经过 HTTP / SOCKS 出站代理。",
         enabledLabel: "启用该账号",
         enabledDesc: "关闭后可暂停向该账号下全部目的地投递，无需删除已有路由。",
       },
@@ -802,6 +824,7 @@ export const zhCN: Messages = {
       marketplace: "插件市场",
     },
     loading: "正在加载插件列表…",
+    loadError: "无法加载插件列表：",
     emptyInstalledTitle: "暂无已安装插件",
     emptyInstalledDesc: "内置插件会在服务端同步完成后自动展示在此处。",
     providerCount: (count: number) => `${count} 个服务商`,
@@ -818,7 +841,11 @@ export const zhCN: Messages = {
       emptyProvidersTitle: "尚未配置服务商实例",
       emptyProvidersDesc:
         "点击下方添加 YOURLS 短链接服务商实例，随后即可在路由规则中按需选用。",
+      emptyProvidersGenericDesc:
+        "点击下方添加服务商实例，随后即可在路由规则中按需选用。",
       colName: "实例名称",
+      colConfig: "配置概览",
+      noConfigSummary: "默认配置",
       colApiUrl: "API 地址",
       colAuth: "认证方式",
       colBehavior: "模式与选项",
@@ -909,6 +936,17 @@ export const zhCN: Messages = {
       errInvalidApiUrl: "请输入以 http:// 或 https:// 开头的有效 YOURLS API 地址。",
       errSignatureRequired: "签名认证方式必须填写 Signature 令牌。",
       errPasswordAuthRequired: "密码认证方式必须同时填写用户名与密码。",
+      genericAddTitle: (pluginName: string) => `添加 ${pluginName} 服务商`,
+      genericNoSchemaHint: "该插件未定义额外的配置字段。",
+      genericSecretPlaceholder: "输入密钥…",
+      genericSecretStoredPlaceholder: "已加密保存 — 留空保持不变",
+      genericArrayHint: "多个值可使用逗号或换行分隔。",
+      genericSelectPlaceholder: "— 请选择 —",
+      errFieldRequired: (field: string) => `请填写 ${field}。`,
+      errFieldInvalidUrl: (field: string) =>
+        `${field} 必须是以 http:// 或 https:// 开头的有效地址。`,
+      errFieldInvalidNumber: (field: string) => `${field} 必须是有效的数字。`,
+      errFieldInvalidInteger: (field: string) => `${field} 必须是整数。`,
     },
     market: {
       searchPlaceholder: "按名称、分类或描述搜索插件…",
@@ -919,8 +957,11 @@ export const zhCN: Messages = {
         `索引来源：${url}${generatedAt ? ` · 生成于 ${generatedAt}` : ""}`,
       refreshBtn: "刷新索引",
       toastRefreshed: "插件市场索引已刷新",
+      toastRefreshSnapshotTitle: "无法连接远程插件市场",
+      toastRefreshSnapshotDesc: "当前已回退展示内置离线快照，请稍后重试刷新。",
       toastRefreshFailed: "刷新插件市场索引失败",
       loading: "正在加载插件市场…",
+      loadError: "无法加载插件市场：",
       emptyTitle: "未找到匹配的插件",
       emptyDesc: "请尝试调整搜索关键词或切换分类筛选。",
       kindBuiltin: "官方内置",

@@ -114,6 +114,7 @@ fn sample_destination() -> ChannelDestination {
         name: "Test Destination".to_owned(),
         encrypted_config: Vec::new(),
         enabled: true,
+        auto_paused: false,
         created_at: 1_770_000_000,
         updated_at: 1_770_000_000,
     }
@@ -2579,8 +2580,9 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         cleaned.content_html
     );
 
-    // 2. SMTP responsive image rewriter preserves integer AND fractional percentage widths
-    //    (`width="50%"`, `width="33.3%"`) instead of forcing 592px.
+    // 2. SMTP responsive image rewriter preserves integer AND fractional percentage widths in
+    //    inline CSS (`width:50%`, `width:33.3%`) while emitting `592px`-scaled integer pixel HTML
+    //    `width` attributes (`296`, `197`) for HTML5 & Outlook compliance.
     let smtp_cfg = SmtpChannelConfig {
         host: "smtp.verified.example.com".to_owned(),
         port: 587,
@@ -2601,13 +2603,13 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
     let built = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 1, None)
         .expect("build email");
     assert!(
-        built.html_body.contains("width=\"50%\""),
-        "relative percentage width must be preserved in email HTML:\n{}",
+        built.html_body.contains("width=\"296\"") && built.html_body.contains("width:50%;"),
+        "50% image must emit 592px-scaled integer width=296 + CSS width:50%:\n{}",
         built.html_body
     );
     assert!(
-        built.html_body.contains("width=\"33.3%\""),
-        "R2-08: fractional percentage width (33.3%) must be preserved in email HTML:\n{}",
+        built.html_body.contains("width=\"197\"") && built.html_body.contains("width:33.3%;"),
+        "33.3% image must emit 592px-scaled integer width=197 + CSS width:33.3%:\n{}",
         built.html_body
     );
     assert!(
@@ -2732,4 +2734,179 @@ async fn telegram_proxied_client_allows_local_proxy_host_while_blocking_ssrf_tar
     ));
 
     let _ = proxy_handle.await;
+}
+
+#[tokio::test]
+async fn qa07_and_qa09_telegram_entities_budget_zwj_fallback_and_smtp_percent_edge_cases() {
+    use feedcourier::channels::smtp::rewrite_body_html_for_email;
+    use feedcourier::channels::telegram::{
+        format_compact_card_html, suppress_telegram_auto_entities,
+    };
+
+    // 1. QA-07: `suppress_telegram_auto_entities` preserves inline CJK/Markdown URLs, emails, and
+    //    bare domains like `notion.so`, while still neutralizing `/cmd`, `@handle`, and code filenames.
+    let sample = "详见https://example.com/docs/v1 链接：https://a.com/x。 [原文](https://example.com/a/b) 联系 alice@corp.it 与 notion.so，查看 README.fr.md、sku.go、libssl.so、/firewall 和 @astrojs/starlight";
+    let suppressed = suppress_telegram_auto_entities(sample);
+    assert!(
+        suppressed.contains("详见https://example.com/docs/v1"),
+        "CJK-prefixed URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("链接：https://a.com/x。"),
+        "URL followed by CJK punctuation must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("[原文](https://example.com/a/b)"),
+        "Markdown-wrapped URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("alice@corp.it"),
+        "email with ccTLD `.it` must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("notion.so"),
+        "bare website domain `notion.so` must not be broken: {suppressed}"
+    );
+    assert!(suppressed.contains("README.\u{200C}fr.\u{200C}md"));
+    assert!(suppressed.contains("sku.\u{200C}go"));
+    assert!(suppressed.contains("libssl.\u{200C}so"));
+    assert!(suppressed.contains("/\u{200C}firewall"));
+    assert!(suppressed.contains("@\u{200C}astrojs/\u{200C}starlight"));
+
+    // 2. QA-07: High-density `&` / `<` characters in title + summary shrink budget smoothly
+    //    without zeroing out the entire blockquote summary.
+    let feed = sample_feed(9, "Entity Stress");
+    let mut dense_entry = sample_entry("qa07-dense", Vec::new());
+    dense_entry.title = Some("&".repeat(280));
+    dense_entry.summary_text = Some("&<".repeat(450));
+    let compact = format_compact_card_html(&feed, &dense_entry);
+    assert!(
+        compact.encode_utf16().count() <= 4096,
+        "compact card must stay <= 4096 UTF-16 units (got {})",
+        compact.encode_utf16().count()
+    );
+    assert!(
+        compact.contains("<blockquote"),
+        "high-density escaped summary must shrink smoothly instead of dropping the blockquote:\n{compact}"
+    );
+
+    // 3. QA-07: ZWJ compound emoji truncation never splits mid-grapheme cluster.
+    let mut zwj_entry = sample_entry("qa07-zwj", Vec::new());
+    let family = "👨‍👩‍👧‍👦"; // 11 UTF-16 units per grapheme
+    zwj_entry.title = Some(family.repeat(35)); // 385 UTF-16 units -> truncated to <= 300
+    let zwj_card = format_compact_card_html(&feed, &zwj_entry);
+    let title_part = zwj_card
+        .strip_prefix("<b>")
+        .and_then(|s| s.split("</b>").next())
+        .expect("bold title");
+    let stripped_title = title_part.trim_end_matches('…');
+    assert!(!stripped_title.is_empty());
+    assert!(
+        !stripped_title.ends_with('\u{200D}'),
+        "truncation must never leave a dangling ZWJ: {title_part:?}"
+    );
+    assert_eq!(
+        stripped_title.len() % family.len(),
+        0,
+        "truncated ZWJ emoji sequence must preserve whole grapheme clusters: {title_part:?}"
+    );
+
+    // 4. QA-07: `sendRichMessage` 400 content error falls back once to `CompactCard` WITHOUT
+    //    permanently flipping `supports_rich_message = false`.
+    let mock_tg = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_QA07/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: RICH_MESSAGE_ENTITIES_TOO_DEEP"
+        })))
+        .expect(1)
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_QA07/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 7007 }
+        })))
+        .expect(1)
+        .mount(&mock_tg)
+        .await;
+
+    let tg_sender = TelegramSender::with_media_fetcher(Arc::new(DefaultMediaStreamFetcher::new()))
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .unwrap();
+    let tg_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+        bot_token: "TOK_QA07".to_owned(),
+        api_base_url: Some(mock_tg.uri()),
+    });
+    let tg_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
+        chat_id: "-100777".to_owned(),
+        message_thread_id: None,
+    });
+    let tg_ch = sample_channel(
+        ChannelKind::Telegram,
+        &json!({ "supports_rich_message": true }).to_string(),
+    );
+    let dest_row = sample_destination();
+    let opts = RouteOptions {
+        telegram_mode: TelegramDeliveryMode::RichMessage,
+        ..RouteOptions::default()
+    };
+    let route = sample_route(77, opts.clone());
+    let task = sample_task(77);
+    let entry = sample_entry("qa07-rich-400", Vec::new());
+    let ctx = DeliveryContext {
+        task: &task,
+        entry: &entry,
+        feed: &feed,
+        route: &route,
+        route_options: opts,
+        channel: &tg_ch,
+        channel_config: &tg_cfg,
+        destination: &dest_row,
+        destination_config: &tg_dest,
+        timezone: chrono_tz::UTC,
+        checkpoint: None,
+        checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
+    };
+    match tg_sender.send(&ctx).await.expect("fallback delivery") {
+        DeliveryOutcome::Delivered {
+            updated_capabilities,
+            checkpoint:
+                Some(DeliveryCheckpoint::Telegram {
+                    degraded_to_compact,
+                    sent_message_ids,
+                    ..
+                }),
+            ..
+        } => {
+            assert!(degraded_to_compact);
+            assert_eq!(sent_message_ids, vec![7007]);
+            assert!(
+                updated_capabilities.is_none(),
+                "content 400 fallback must NOT permanently disable supports_rich_message"
+            );
+        }
+        other => panic!("expected one-shot compact_card fallback Delivered, got {other:?}"),
+    }
+
+    // 5. QA-09: SMTP percentage image width edge cases (`0%`, `0.004%`, `33.3%`).
+    let edge_html = r#"<img src="https://cdn.example.com/a.png" width="0%"><img src="https://cdn.example.com/b.png" width="0.004%"><img src="https://cdn.example.com/c.png" width="33.3%">"#;
+    let rewritten = rewrite_body_html_for_email(edge_html);
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/a.png" width="0" style="display:block;max-width:100%;width:0;"#),
+        "0% image must remain 0 without stretching to 592px:\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/b.png" width="6" style="display:block;max-width:100%;width:1%;"#),
+        "0.004% positive image must clamp up to 1% (width=6), never 0%:\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/c.png" width="197" style="display:block;max-width:100%;width:33.3%;"#),
+        "33.3% image must emit integer width=197 and exact CSS width:33.3%:\n{rewritten}"
+    );
 }

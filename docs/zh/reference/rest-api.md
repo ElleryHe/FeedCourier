@@ -145,7 +145,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 ### 调试推送（`POST /api/v1/feeds/preview/push`）
 
-将单条订阅源文章投递到指定授信目的地用于测试。该接口是**无状态**的：不写入指纹、不进入发件箱，也不应用路由过滤、时间窗口与配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。
+将单条订阅源文章投递到指定授信目的地用于测试。该接口是**无状态**的：不写入指纹、不进入发件箱，也不应用路由过滤、时间窗口与配额；Notion 页面的 `FC-ID` 带 `test-` 前缀。针对 SMTP 目的地，调试推送严格**仅向 `verified` 收件人**按单 `To:` 隔离信封附带 RFC 8058 合规头逐人发送（0 位已验证收件人时返回错误提示）。
 
 ```json
 {
@@ -175,16 +175,16 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/channels` | 获取全部授信通道账号列表（`ChannelDto[]`，敏感密码/Token 自动脱敏为 `has_password` / `bot_token_hint` / `secret_hint`，并内嵌 `destinations: ChannelDestinationDto[]`，SMTP 目的地附带 `smtp_summary` 收件人验证计数，详见[安全与防注入机制](/zh/reference/security)）。 |
-| `POST` | `/api/v1/channels` | 返回 **`201 Created`**。创建新通道账号（`smtp` / `telegram` / `notion`，SMTP 支持可选 `sender_identity`，`name` 可省略以自动获取，可选传入 `initial_destination` 一并创建首个目的地）；Telegram 账号创建时自动执行 `probe_capabilities` 探测（`api_base_url` 强制走 SSRF 校验，命中禁止目标时返回 `403 ssrf_blocked`）。 |
-| `PATCH` | `/api/v1/channels/{id}` | 更新账号凭据、`sender_identity`、代理、共享步进间隔或配额（**密钥保留语义**：当 `password` / `bot_token` / `integration_secret` 省略或留空时，后端自动保留原加密密钥不变；对于 SMTP 账号，显式传入 `"password": null` 可清空可选的 SMTP 密码；将 `hourly_quota` 或 `daily_quota` 显式传 `null` 可清空配额限制）。 |
-| `DELETE` | `/api/v1/channels/{id}` | 删除指定通道账号（级联删除其所有目的地、路由与任务）。 |
-| `POST` | `/api/v1/channels/{id}/test` | 未传 `destination_id` 时，校验账号级凭据（SMTP `EHLO`/`AUTH`、Telegram `getMe` + `sendRichMessage` 探测、Notion `GET /v1/users/me`），不发送测试文章；传入 `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` 时向该目的地发送实时测试消息。 |
-| `GET` | `/api/v1/channels/{id}/destinations` | 列出通道账号 `{id}` 下的全部目的地（`ChannelDestinationDto[]`，SMTP 目的地附带 `smtp_summary`）。 |
-| `POST` | `/api/v1/channels/{id}/destinations` | 返回 **`201 Created`**。在通道账号 `{id}` 下新增目的地（`CreateDestinationRequest`；省略 `name` 时自动取 Telegram `getChat`、SMTP 首个非空收件人或 Notion 数据库标题）。 |
-| `PATCH` | `/api/v1/destinations/{id}` | 局部更新目的地备注名、目标配置（`DestinationPatch`）或启用状态（`enabled`）。修改 SMTP `to_addresses` 时自动同步 `smtp_recipients`（新地址初始为 `unverified`，已移除地址同步删除，保留地址维持原状态）。 |
-| `DELETE` | `/api/v1/destinations/{id}` | 删除指定目的地。若仍有路由引用该目的地且未传 `?cascade=true`，返回 **`409 Conflict`** 及 `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`；显式传入 **`?cascade=true`** 才会连同关联路由与任务一起删除。 |
-| `POST` | `/api/v1/destinations/{id}/test` | 向指定目的地发送实时连通性测试邮件/消息/页面。可选请求体 `{ "locale"?: "en" \| "zh-CN" }` 指定测试消息语言。 |
+| `GET` | `/api/v1/channels` | 获取全部授信通道账号列表（`ChannelDto[]`，敏感密码/Token 自动脱敏为 `has_password` / `bot_token_hint` / `secret_hint`，并内嵌 `destinations: ChannelDestinationDto[]`，每个目的地包含 `enabled` 与 `auto_paused: bool`，SMTP 目的地另附带 `smtp_summary` 收件人验证计数，详见[安全与防注入机制](/zh/reference/security)）。 |
+| `POST` | `/api/v1/channels` | 返回 **`201 Created`**。创建新通道账号（`smtp` / `telegram` / `notion`，SMTP 支持可选 `sender_identity` 且使用原生 TCP/TLS 直连，不适用 HTTP/SOCKS 代理；`name` 可省略以自动获取，可选传入 `initial_destination` 一并创建首个目的地）；Telegram 账号创建时自动执行 `probe_capabilities` 探测（`api_base_url` 强制走 SSRF 校验，命中禁止目标时返回 `403 ssrf_blocked`）。 |
+| `PATCH` | `/api/v1/channels/{id}` | 更新账号凭据、`sender_identity`、代理（HTTP 类通道）、共享步进间隔或配额（**密钥保留语义**：当 `password` / `bot_token` / `integration_secret` 省略或留空时，后端自动保留原加密密钥不变；对于 SMTP 账号，显式传入 `"password": null` 可清空可选的 SMTP 密码；将 `hourly_quota` 或 `daily_quota` 显式传 `null` 可清空配额限制）。 |
+| `DELETE` | `/api/v1/channels/{id}` | 在单事务内原子删除通道账号。若其下目的地仍被任意路由引用且未传 `?cascade=true`，返回 **`409 Conflict`** 及 `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`（与 `DELETE /api/v1/destinations/{id}` 对齐）；显式传入 **`?cascade=true`** 才会连同所有目的地、关联路由与任务一并删除。 |
+| `POST` | `/api/v1/channels/{id}/test` | 未传 `destination_id` 时，校验账号级凭据（SMTP 校验连通性与认证并**仅向自身 `from_address`** 发送自检邮件；Telegram 执行 `getMe` + `sendRichMessage` 探测；Notion 调用 `GET /v1/users/me`）；传入 `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` 时执行目的地级测试（规则同 `POST /api/v1/destinations/{id}/test`）。 |
+| `GET` | `/api/v1/channels/{id}/destinations` | 列出通道账号 `{id}` 下的全部目的地（`ChannelDestinationDto[]`，含 `auto_paused: bool`，SMTP 目的地附带 `smtp_summary`）。 |
+| `POST` | `/api/v1/channels/{id}/destinations` | 返回 **`201 Created`**。在通道账号 `{id}` 下新增目的地（`CreateDestinationRequest`；省略 `name` 时自动取 Telegram `getChat`、打码后的 SMTP 首个非空收件人如 `a***e@example.com` 或 Notion 数据库标题）。 |
+| `PATCH` | `/api/v1/destinations/{id}` | 局部更新目的地备注名、目标配置（`DestinationPatch`）或启用状态（`enabled`；手动修改 `enabled` 时自动清零 `auto_paused = false`）。修改 SMTP `to_addresses` 时自动同步 `smtp_recipients`（新地址初始为 `unverified`，已移除地址同步删除，保留地址维持原状态）。 |
+| `DELETE` | `/api/v1/destinations/{id}` | 在单事务内原子删除指定目的地。若仍有路由引用该目的地且未传 `?cascade=true`，返回 **`409 Conflict`** 及 `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`；显式传入 **`?cascade=true`** 才会连同关联路由与任务一起删除。 |
+| `POST` | `/api/v1/destinations/{id}/test` | 向指定目的地发送实时连通性测试邮件/消息/页面。可选请求体 `{ "locale"?: "en" \| "zh-CN" }` 指定测试消息语言。针对 SMTP 目的地，严格**仅向 `verified` 收件人**按单 `To:` 隔离信封附带 RFC 8058 合规头逐人发送，0 位已验证收件人时返回明确错误。 |
 | `POST` | `/api/v1/channels/notion/init-db` | 在授权父页面下创建包含 8 个标准属性列（含可选 `Short URL`）的 Notion 数据库（`Notion-Version: 2026-03-11`，`initial_data_source.properties`）。 |
 | `POST` | `/api/v1/channels/notion/inspect-schema` | 检查已有 Notion 数据源属性列匹配情况，并在 `patch_missing: true` 时自动补齐缺失列。 |
 
@@ -192,9 +192,9 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/destinations/{id}/recipients` | 解密 SMTP 目的地配置并返回各收件人状态与审计信息（`SmtpRecipientDto[]`：含 `email`、`status`、`code_expires_at`、`code_attempts`、`last_code_sent_at`、`consent_method`/`consented_at`、`revoked_method`/`revoked_at`、`bounce_diagnostic`）。 |
-| `POST` | `/api/v1/destinations/{id}/recipients/{rid}/send-verification` | 立即发送验证邮件（不入发件箱、不占配额），内含 6 位验证码（30 分钟有效、最多输错 5 次），配置 `PUBLIC_URL` 时附带 `/v/{token}` 确认链接。受 60 秒冷却与每小时 5 封上限保护（超限返回 `429` 与 `Retry-After`）。 |
-| `POST` | `/api/v1/destinations/{id}/recipients/{rid}/verify` | 请求体 `{ "code": "123456" }`。常量时间校验 6 位验证码，将收件人标记为 `verified`（`consent_method: "code"`）并立即唤醒该目的地下处于 `deferred` 的任务。 |
+| `GET` | `/api/v1/destinations/{id}/recipients` | 解密 SMTP 目的地配置并返回各收件人状态与审计信息（`SmtpRecipientDto[]`：含 `email`、`status`、`code_expires_at`、`code_attempts`、`last_code_sent_at`、`consent_method`/`consented_at`、`revoked_method`/`revoked_at`、已脱敏的 `bounce_diagnostic`）。 |
+| `POST` | `/api/v1/destinations/{id}/recipients/{rid}/send-verification` | 先在 `write_pool` 事务内原子检查并预占限流槽位，再立即发送验证邮件（不入发件箱、不占配额；若发信失败自动回滚预占），内含 6 位验证码（30 分钟有效、最多输错 5 次），配置 `PUBLIC_URL` 时附带 `/v/{token}` 确认链接。受 60 秒冷却与每小时 5 封上限保护，超限时返回 **`429 Too Many Requests`** 并附带 **`Retry-After`** 响应头（剩余秒数）。 |
+| `POST` | `/api/v1/destinations/{id}/recipients/{rid}/verify` | 请求体 `{ "code": "123456" }`。常量时间校验 6 位验证码，将收件人标记为 `verified`（`consent_method: "code"`），若目的地处于 `auto_paused = true` 则同事务自动恢复 `enabled = true, auto_paused = false`，并立即唤醒该目的地下处于 `deferred` 的任务。累计输错 5 次时自动清空当前验证码（旧 `/v/{token}` 链接立即返回 `410 Gone`）。 |
 | `POST` | `/api/v1/destinations/{id}/recipients/{rid}/reactivate` | 将 `unsubscribed` 或 `bounced` 状态的收件人重置为 `unverified`，须重新完成验证后才会恢复投递。 |
 | `POST` | `/api/v1/destinations/{id}/recipients/{rid}/unsubscribe` | 管理员手动退订该收件人（`status: "unsubscribed"`，`revoked_method: "admin"`）。 |
 
@@ -212,7 +212,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 | `DELETE` | `/api/v1/plugins/{id}/instances/{iid}` | 删除服务商实例；若仍被路由 `options.plugins` 引用，返回 **`409 Conflict`** 并列出 `referencing_routes: [{ "id", "name" }]`。 |
 | `POST` | `/api/v1/plugins/{id}/instances/{iid}/test` | 执行连通性测试（`link-rewrite` 经由 `ProtectedHttpClient` 实际缩短 `https://feedcourier.ellery.me/`）。返回 `{ "ok": true, "message": "..." }`。 |
 | `DELETE` | `/api/v1/plugins/{id}/instances/{iid}/cache` | 清空服务商 `{iid}` 在 `plugin_link_cache` 中的全部短链缓存，返回 `{ "cleared_entries": N }`。 |
-| `GET` | `/api/v1/plugins/market` | 后端通过防 SSRF 客户端拉取插件市场索引（6 小时内存缓存 + 编译内置快照兜底；传 `?refresh=true` 强制刷新），返回 `{ "source": "remote" \| "snapshot", "index_url", "generated_at", "plugins": MarketPluginItemDto[] }` 并标注 `kind`、`installed` 与 `enabled`。 |
+| `GET` | `/api/v1/plugins/market` | 后端通过防 SSRF 客户端拉取插件市场索引（6 小时内存缓存；回退编译内置快照时负缓存 TTL 缩短为 60 秒，拉取瞬时失败时不覆盖已有有效远端缓存；传 `?refresh=true` 强制刷新），返回 `{ "source": "remote" \| "snapshot", "index_url", "generated_at", "plugins": MarketPluginItemDto[] }` 并标注 `kind`、`installed` 与 `enabled`（`homepage`/`repository` 严格限制为 `http://` 或 `https://` URL）。 |
 
 ### 创建通道账号请求结构（`POST /api/v1/channels`）
 
@@ -324,11 +324,11 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 ## 七、公开 SMTP 合规端点（`/u/{token}`、`/v/{token}`）
 
-挂载在根路径且注册于 SPA 回退路由之前，**无需登录**，按 IP 实施内存限流（**`30` 次 / `60` 秒**），统一返回 `X-Robots-Tag: noindex, nofollow`、严格 CSP、`Referrer-Policy: no-referrer` 与 `Cache-Control: no-store`：
+挂载在根路径且注册于 SPA 回退路由之前（并对空路径 `/u`、`/u/`、`/v`、`/v/` 显式返回公开 `404` 而绝不穿透至 WebUI SPA），**无需登录**，请求体大小限制为 **`4 KiB`（`4,096` 字节）**，按 IP 实施内存限流（**`30` 次 / `60` 秒**，最大 **`8,192` 桶硬容量上限**；默认 `TRUST_PROXY=false` 仅取 `ConnectInfo<SocketAddr>` 对端 IP，开启 `TRUST_PROXY=true` 时取 `X-Real-IP` 或 `X-Forwarded-For` 最右侧一跳），统一返回 `X-Robots-Tag: noindex, nofollow`、严格 CSP、`Referrer-Policy: no-referrer` 与 `Cache-Control: no-store`：
 
 | 方法 | 路径 | 行为说明 |
 | :---: | :--- | :--- |
-| `GET` | `/u/{token}` | **严格只读**的本地化退订确认页，仅展示目的地名称与打码邮箱（`a***e@example.com`）及 `POST` 表单按钮；无效或篡改的令牌返回 `404`。 |
-| `POST` | `/u/{token}` | 幂等执行退订并标记 `unsubscribed`（请求体含 `List-Unsubscribe=One-Click` 时记为 `revoked_method: "one_click"`，否则记为 `"link"`）；兼容 RFC 8058 一键 POST。 |
-| `GET` | `/v/{token}` | **严格只读**的双重确认订阅页，展示打码邮箱与 `POST` 确认按钮（防止安全网关预抓取误确认）；篡改令牌返回 `404`，过期或被新验证码取代返回 `410 Gone`。 |
-| `POST` | `/v/{token}` | 将收件人标记为 `verified`（`consent_method: "link"`）并立即唤醒该目的地下处于 `deferred` 的投递任务；已过期或被取代时返回 `410 Gone`。 |
+| `GET` | `/u/{token}` | **严格只读**的本地化退订确认页，仅展示目的地名称与打码邮箱（`a***e@example.com`）及相对路径 `action=""` 的 `POST` 表单按钮（兼容子路径 `PUBLIC_URL`）；无效或篡改的令牌返回 `404`。 |
+| `POST` | `/u/{token}` | 幂等执行退订并标记 `unsubscribed`（请求体含 `List-Unsubscribe=One-Click` 时记为 `revoked_method: "one_click"`，否则记为 `"link"`）；若该目的地下全部收件人均转为 `unsubscribed` 或 `bounced`，自动将目的地置为 `enabled = false, auto_paused = true`。兼容 RFC 8058 一键 POST。 |
+| `GET` | `/v/{token}` | **严格只读**的双重确认订阅页，展示打码邮箱与相对路径 `action=""` 的 `POST` 确认按钮（防止安全网关预抓取误确认）；篡改令牌返回 `404`，过期、输错 5 次锁定或被新验证码取代返回 `410 Gone`。 |
+| `POST` | `/v/{token}` | 将收件人标记为 `verified`（`consent_method: "link"`），若目的地处于 `auto_paused = true` 则自动恢复 `enabled = true, auto_paused = false`，并立即唤醒该目的地下处于 `deferred` 的投递任务；已过期、锁定或被取代时返回 `410 Gone`。 |

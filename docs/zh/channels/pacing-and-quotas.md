@@ -14,7 +14,7 @@ FeedCourier 采用**双层投递通道模型（通道账号 + 多个目的地）
 
 投递目标分为两层管理：
 
-- **通道账号（Channel Account）**：在 **Channels** 页面配置一次，统一保存加密凭据、出站代理开关（`use_proxy`）、发送流速与抖动（`min_interval_secs`、`jitter_max_secs`）、滚动配额（`hourly_quota`、`daily_quota`）与冷却状态（`cooldown_until`）。
+- **通道账号（Channel Account）**：在 **Channels** 页面配置一次，统一保存加密凭据、出站代理开关（`use_proxy`，仅适用于 Telegram 与 Notion 等 HTTP 通道；SMTP 使用原生 TCP/TLS 直连）、发送流速与抖动（`min_interval_secs`、`jitter_max_secs`）、滚动配额（`hourly_quota`、`daily_quota`）与冷却状态（`cooldown_until`）。
 - **目的地（Destination）**：挂在通道账号下，可添加多个（例如同一 Telegram Bot 推送至不同群组/话题、同一 SMTP 账号发送至不同收件人组、同一 Notion 集成同步至不同数据库）。每个目的地都可以单独启用/停用，也可以单独发送测试。
 
 每当订阅源拉取到一篇新文章，系统会检查所有启用中的路由规则；每命中一条指向某个目的地的路由，就生成一条独立的投递任务（`1 Task = 1 Entry × 1 Route`）：
@@ -153,9 +153,9 @@ flowchart LR
 
 ## 8. 在订阅源预览中调试推送 {#debug-push-from-the-feed-preview}
 
-想在不订阅、不影响队列的情况下查看文章在某个目的地中的实际效果，可打开某个 URL（或已有订阅源）的**订阅源预览**，使用 **Debug push** 栏：选择目标**目的地**、（Telegram 还可选择）投递模式与链接预览、投递语言以及可选的时区覆盖，然后在具体预览条目上点击 **Push latest** 或 **Push this item**。
+想在不订阅、不影响队列的情况下查看文章在某个目的地中的实际效果，可打开某个 URL（或已有订阅源）的**订阅源预览**，使用 **Debug push** 栏：选择目标**目的地**、（Telegram 还可选择）投递模式与链接预览、投递语言、可选的时区覆盖以及可选插件（如链接替换），然后在具体预览条目上点击 **Push latest** 或 **Push this item**。
 
-调试推送是**无状态**的：不写入指纹、不进入队列，也不应用路由过滤、时间窗口与配额，不占用账号额度。通过它在 Notion 创建的页面，`FC-ID` 会带 `test-` 前缀，不会与真实投递冲突。失败时会在结果消息中返回诊断信息。对应的 MCP 工具为 [`test_push_feed_entry`](/zh/mcp/tools#9-test-push-feed-entry)。
+调试推送是**无状态**的：不写入指纹、不进入队列，也不应用路由过滤、时间窗口与配额，不占用账号额度。针对 SMTP 目的地，调试推送严格仅向 **`verified`**（已验证）收件人按单 `To:` 隔离信封附带合规头发送（0 位已验证收件人时返回错误提示）。通过它在 Notion 创建的页面，`FC-ID` 会带 `test-` 前缀，不会与真实投递冲突。失败时会在结果消息中返回诊断信息。对应的 MCP 工具为 [`test_push_feed_entry`](/zh/mcp/tools#9-test-push-feed-entry)。
 
 ---
 

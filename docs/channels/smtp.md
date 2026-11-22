@@ -6,7 +6,7 @@ description: "Deliver RSS, Atom, and JSON Feed articles via SMTP Email with per-
 
 The SMTP channel delivers each matched feed entry as an individual email with a responsive single-column HTML layout, a plain-text fallback, localized timestamps, per-recipient double opt-in consent tracking, and RFC 8058 one-click unsubscribe headers.
 
-Under FeedCourier's two-layer channel model, you configure your **SMTP Account** once (server, credentials, sender address, optional CAN-SPAM sender identity, proxy, pacing, and quotas) and attach one or more **Destinations** (each with its own recipient list and optional `Reply-To`).
+Under FeedCourier's two-layer channel model, you configure your **SMTP Account** once (server, credentials, sender address, optional CAN-SPAM sender identity, pacing, and quotas) and attach one or more **Destinations** (each with its own recipient list and optional `Reply-To`). SMTP uses native TCP/TLS direct connections; global HTTP/SOCKS outbound proxies (`OUTBOUND_PROXY` / `use_proxy`) do not apply to SMTP accounts.
 
 ---
 
@@ -44,17 +44,17 @@ Go to **Channels → New Channel → SMTP** to configure the account and its fir
 
 | Field | Required | Default | Description |
 | :--- | :---: | :--- | :--- |
-| `name` | No | *Auto-filled* | Destination label. If left blank, automatically populated from the **first recipient address** in `to_addresses`. |
+| `name` | No | *Auto-filled* | Destination label. If left blank, automatically populated from the **masked first recipient address** in `to_addresses` (e.g. `a***e@example.com`, keeping plaintext emails out of unencrypted metadata columns). |
 | `to_addresses` | Yes | — | One or more recipient email addresses for this destination group. Newly added addresses start as `unverified` and require explicit verification before receiving deliveries (see below). |
 | `reply_to` | No | — | Optional `Reply-To` email address. |
 | `enabled` | No | `true` | Independently enable or pause deliveries to this recipient group without affecting sibling destinations. |
 
 ### Account vs. Destination Testing, Referential Delete Guard & Shared Limits
 
-- **Test Account**: Verifies SMTP server connectivity and authentication (`EHLO`/`AUTH`) without sending an email.
-- **Test Destination**: Sends a live verification email (in your current WebUI language) to that destination's `to_addresses`.
-- **Shared Rate Limits & Password-Digest Isolation**: All destinations attached to the same SMTP account share `min_interval_secs`, per-delivery random jitter, `hourly_quota`, `daily_quota`, `use_proxy`, and temporary throttling cooldowns. For cross-account rate-limit grouping, SMTP `credential_group_key` includes a SHA-256 digest of the password (never storing plaintext), so separate API keys sharing a generic username (such as SendGrid's `apikey` username with different keys) remain isolated. See [Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas).
-- **Destination Delete Guard (`409 Conflict`)**: Deleting a destination that is still referenced by one or more routes returns **`409 Conflict`** listing the referencing routes; confirm cascading deletion (or pass `?cascade=true` on `DELETE /api/v1/destinations/{id}`) to remove the destination along with its routes.
+- **Test Account (`POST /api/v1/channels/{id}/test` without `destination_id`)**: Verifies SMTP server connectivity and authentication and sends a self-test email **only to `from_address`** (never emailing destination recipients).
+- **Test Destination (`POST /api/v1/destinations/{id}/test`) & Feed Preview Debug Push**: Strictly deliver **only to `verified` recipients** via isolated single-`To:` envelopes with RFC 8058 compliance headers (in your selected language). If a destination has **`0` verified recipients**, both endpoints return an explicit error instead of sending unsolicited mail.
+- **Direct TCP/TLS & Shared Rate Limits**: SMTP uses native TCP/TLS direct connections (HTTP/SOCKS outbound proxies / `OUTBOUND_PROXY` do not apply to SMTP, and the WebUI hides the proxy toggle for SMTP accounts). All destinations attached to the same SMTP account share `min_interval_secs`, per-delivery random jitter, `hourly_quota`, `daily_quota`, and temporary throttling cooldowns. For cross-account rate-limit grouping, SMTP `credential_group_key` includes a SHA-256 digest of the password (never storing plaintext), so separate API keys sharing a generic username (such as SendGrid's `apikey` username with different keys) remain isolated. See [Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas).
+- **Account & Destination Delete Guard (`409 Conflict`)**: Deleting a channel account or destination that is still referenced by one or more routes returns **`409 Conflict`** listing `referencing_routes`; confirm cascading deletion (or pass `?cascade=true` on `DELETE /api/v1/channels/{id}` / `DELETE /api/v1/destinations/{id}`) to remove it along with its referencing routes.
 
 ---
 
@@ -103,11 +103,16 @@ Configure **`PUBLIC_URL`** (via environment variable or **Settings → Public Ba
 
 ### Reverse Proxy: Exposing Only `/u/` and `/v/` Publicly
 
-You do **not** need to expose FeedCourier's WebUI, `/api/v1/*`, or `/mcp` to the public internet to support RFC 8058 one-click unsubscribe and verification links. Put Nginx or Caddy in front of `PUBLIC_URL` and proxy **only `/u/` and `/v/`** while keeping management interfaces private on LAN/VPN:
+You do **not** need to expose FeedCourier's WebUI, `/api/v1/*`, or `/mcp` to the public internet to support RFC 8058 one-click unsubscribe and verification links. Put Nginx or Caddy in front of `PUBLIC_URL` and proxy **only `/u/` and `/v/`** while keeping management interfaces private on LAN/VPN.
+
+::: warning Configure `TRUST_PROXY=true` Behind a Reverse Proxy
+By default (`TRUST_PROXY=false`), FeedCourier rate-limits `/u/` and `/v/` using only the direct TCP peer address (`ConnectInfo<SocketAddr>`) and ignores client-supplied proxy headers so callers cannot bypass limits by spoofing `X-Forwarded-For`. When deploying behind Nginx or Caddy, set **`TRUST_PROXY=true`** in FeedCourier's environment and ensure your proxy overwrites `X-Real-IP` (`$remote_addr`) or appends the client IP to `X-Forwarded-For`. With `TRUST_PROXY=true`, FeedCourier reads `X-Real-IP` or the **rightmost** proxy-appended `X-Forwarded-For` entry—resisting client-spoofed leftmost entries. Confirmation pages use relative `action=""` form targets so subpath `PUBLIC_URL` mounts work cleanly, and bare `/u/` or `/v/` paths return a public `404` rather than the WebUI SPA.
+:::
 
 #### Nginx Example
 
 ```nginx
+# Also set TRUST_PROXY=true on the FeedCourier container/process
 server {
     listen 443 ssl http2;
     server_name feeds.example.com;
@@ -118,8 +123,8 @@ server {
     location ~ ^/(u|v)/ {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
@@ -133,10 +138,13 @@ server {
 #### Caddy Example
 
 ```text
+# Also set TRUST_PROXY=true on the FeedCourier container/process
 feeds.example.com {
     @public_smtp path /u/* /v/*
     handle @public_smtp {
-        reverse_proxy 127.0.0.1:8080
+        reverse_proxy 127.0.0.1:8080 {
+            header_up X-Real-IP {remote_host}
+        }
     }
 
     handle {
@@ -145,17 +153,20 @@ feeds.example.com {
 }
 ```
 
-### Hard Bounce Handling, Deferral, Auto-Pause & Re-Activation
+### Hard Bounce Handling, Deferral, Auto-Pause & Auto-Resume
 
-- **Synchronous 5xx Hard Bounce**: If the SMTP server rejects a recipient with a permanent `5xx` error, that recipient is immediately marked **`bounced`** (`revoked_method = "hard_bounce"`) with the SMTP diagnostic stored in `bounce_diagnostic`.
-  - If other recipients in the same destination succeeded, the task finishes as **`delivered`** with a warning note in `diagnostic_log`.
-  - If **all** verified recipients hard-bounce, the task transitions to **`dead_letter`**.
+- **Recipient-Level 5xx Hard Bounces vs. Channel/Content 5xx**:
+  - **Recipient Hard Bounce**: Only when the SMTP server returns a recipient-level permanent rejection—enhanced status codes `5.1.1`, `5.1.2`, `5.1.3`, `5.1.6`, `5.1.10`, or recipient-unknown `550`/`551`/`553` responses—does FeedCourier mark that specific recipient **`bounced`** (`revoked_method = "hard_bounce"`, with any email addresses masked in `bounce_diagnostic` and `diagnostic_log`) and continue delivering to remaining verified recipients.
+    - If other recipients in the same destination succeeded, the task finishes as **`delivered`** with a redacted warning note in `diagnostic_log`.
+    - If **all** verified recipients hard-bounce, the task transitions to **`dead_letter`**.
+  - **Account / Quota / Auth / Content 5xx (`530`, `535`, `552`, `554`, `5.4.5`, `5.7.*`)**: Errors caused by authentication failures, message size/quota limits, or SPF/DKIM/DMARC/content policy immediately abort delivery as channel-level errors (preserving already-delivered recipients in `checkpoint_json.sent_recipients`) **without** marking verified subscribers as `bounced`.
   - Temporary `4xx` errors continue using normal exponential backoff retries and skip already-delivered recipients via checkpointing.
-- **No Deliverable Recipients**:
+- **No Deliverable Recipients & `auto_paused` Automatic Recovery**:
   - If `0` recipients are `verified` while at least one is `unverified` or `pending`, tasks enter **`deferred`** (*"Awaiting SMTP recipient verification"*, re-checked in 1 hour, and woken immediately when a recipient verifies).
-  - If **all** recipients are `unsubscribed` or `bounced`, FeedCourier automatically **disables the destination** and defers remaining tasks so it stops attempting unwanted deliveries.
-- **Re-Enabling Revoked/Bounced Addresses**: Administrators can click **Reactivate** (`POST .../reactivate`) on an `unsubscribed` or `bounced` recipient; its status resets to **`unverified`** and it must complete verification again before receiving mail.
-- **Upgrading from `v0.2.x` (Legacy Backfill)**: On first startup after upgrading to `v0.3.0`, `Database::connect` captures a pre-DDL `VACUUM INTO` snapshot at `<DATA_DIR>/pre-v0.3.0-backup.db` before running migration `0003`. Then `backfill_legacy_smtp_recipients` marks every existing SMTP recipient as `status = 'verified', consent_method = 'legacy'` (guarded idempotently by `system_settings.smtp_recipient_model_version = 1`) so existing personal setups keep delivering without disruption.
+  - If **all** recipients are `unsubscribed` or `bounced`, FeedCourier automatically pauses the destination with **`enabled = false, auto_paused = true`** and defers remaining tasks so it stops attempting unwanted deliveries.
+  - Once any recipient later completes re-verification (via 6-digit code or `/v/{token}`), a destination with **`auto_paused = true`** **automatically resumes** (`enabled = true, auto_paused = false`) and wakes deferred tasks. Manually toggling `enabled` clears `auto_paused = false`, so manually disabled destinations remain paused until an administrator re-enables them.
+- **Re-Enabling Revoked/Bounced Addresses**: Administrators can click **Reactivate** (`POST .../reactivate`) on an `unsubscribed` or `bounced` recipient; its status resets to **`unverified`** and it must complete verification again before receiving mail. Reaching 5 failed verification code attempts atomically clears the active code so any prior `/v/{token}` link immediately returns `410 Gone`.
+- **Upgrading from `v0.2.x` (Legacy Backfill)**: On first startup after upgrading to `v0.3.0`, whenever an existing database has migration `0002` applied and any business table (`feeds`, `channels`, or `channel_destinations`) is non-empty, `Database::connect` captures a pre-DDL `VACUUM INTO` snapshot at `<DATA_DIR>/pre-v0.3.0-backup.db` before running migration `0003`. Then `backfill_legacy_smtp_recipients` marks every existing SMTP recipient as `status = 'verified', consent_method = 'legacy'` (guarded idempotently by `system_settings.smtp_recipient_model_version = 1`) so existing personal setups keep delivering without disruption.
 
 ---
 
@@ -180,7 +191,7 @@ List-Unsubscribe-Post: List-Unsubscribe=One-Click
 ## 5. What Delivered Emails Look Like
 
 - **Responsive Single-Column HTML + Plain Text**: Each email includes a `640px` single-column HTML card alongside a 78-column plain-text version (`multipart/alternative`), showing the feed title, article title, author, localized publication date (using the **route timezone**, e.g. `2026-11-08 11:00 (UTC+08:00)`), a link to the original article, and the compliance footer.
-- **Responsive Images, Figures, Tables & Code Blocks**: Upstream feed images carrying large fixed pixel widths (such as `<img width="1200" height="630">`) are automatically rewritten to fit the `592px` inner card width (`width="592"` for Outlook compatibility while preserving explicitly narrower widths and relative/fractional percentage widths such as `width="33.3%"`, stripping fixed `height`, and adding inline `max-width:100%;height:auto`), with full HTML5 named entity decoding on attributes, clean `<figure>`/`<figcaption>` spacing, and `max-width:100%` wrapping/scrolling on wide `<table>` and `<pre>` blocks.
+- **Responsive Images, Figures, Tables & Code Blocks**: Upstream feed images carrying large fixed pixel widths (such as `<img width="1200" height="630">`) are automatically rewritten to fit the `592px` inner card width (`width="592"` for Outlook compatibility while preserving explicitly narrower widths, stripping fixed `height`, and adding inline `max-width:100%;height:auto`). For percentage widths, fractional values remain in inline CSS (e.g., `style="width:33.3%;max-width:100%;height:auto;..."`) while the HTML `width` attribute carries the integer pixel equivalent scaled to `592px` (e.g., `width="197"`), `0%` stays `0`, and positive sub-1% widths clamp to `1%` so images never vanish. Attributes use semicolon-aware HTML5 entity decoding, alongside clean `<figure>`/`<figcaption>` spacing and `max-width:100%` wrapping/scrolling on wide `<table>` and `<pre>` blocks.
 - **Protection Against Email Clipping**: Very long articles are automatically shortened before exceeding email client size limits (such as Gmail's 102 KB clipping threshold), with a **"Continue reading original article →"** link at the bottom.
 - **Easy Inbox Filtering (`List-Id`)**: Every email includes a standard `List-Id` header so you can filter automated digests cleanly in Gmail, Fastmail, Apple Mail, or Thunderbird.
 

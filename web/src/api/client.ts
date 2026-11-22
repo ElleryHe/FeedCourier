@@ -75,19 +75,38 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
   readonly referencing_routes?: RouteReferenceDto[];
+  readonly retry_after_secs?: number;
 
   constructor(
     status: number,
     message: string,
     code?: string,
     referencingRoutes?: RouteReferenceDto[],
+    retryAfterSecs?: number,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.referencing_routes = referencingRoutes;
+    this.retry_after_secs = retryAfterSecs;
   }
+}
+
+function parseRetryAfterSecs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    const secs = Number(trimmed);
+    return Number.isFinite(secs) && secs > 0 ? secs : undefined;
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (Number.isFinite(parsedDate)) {
+    const delta = Math.ceil((parsedDate - Date.now()) / 1000);
+    return delta > 0 ? delta : undefined;
+  }
+  return undefined;
 }
 
 /** Extract referencing routes from a structured HTTP 409 Conflict `ApiError`, if present. */
@@ -122,6 +141,7 @@ function notifyUnauthorized(): void {
 }
 
 async function parseErrorResponse(res: Response): Promise<ApiError> {
+  const retryAfterSecs = parseRetryAfterSecs(res.headers.get("retry-after"));
   const contentType = res.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     try {
@@ -139,7 +159,13 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
               typeof r.name === "string",
           )
         : undefined;
-      return new ApiError(res.status, message, data.code, referencingRoutes);
+      return new ApiError(
+        res.status,
+        message,
+        data.code,
+        referencingRoutes,
+        retryAfterSecs,
+      );
     } catch {
       // Fall through to text fallback
     }
@@ -150,6 +176,9 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
     text.length > 0 && text.length < 300
       ? text
       : getMessages().common.requestFailedHttp(res.status),
+    undefined,
+    undefined,
+    retryAfterSecs,
   );
 }
 
@@ -394,10 +423,13 @@ export const api = {
       request<ChannelDto>("/channels", { method: "POST", body: payload }),
     update: (id: number, payload: UpdateChannelRequest) =>
       request<ChannelDto>(`/channels/${id}`, { method: "PATCH", body: payload }),
-    remove: (id: number) =>
-      request<ActionAckResponse | undefined>(`/channels/${id}`, {
-        method: "DELETE",
-      }),
+    remove: (id: number, cascade = false) =>
+      request<ActionAckResponse | undefined>(
+        `/channels/${id}${cascade ? "?cascade=true" : ""}`,
+        {
+          method: "DELETE",
+        },
+      ),
     test: (id: number, payload?: TestChannelRequest) =>
       request<TestChannelResponse>(`/channels/${id}/test`, {
         method: "POST",
@@ -602,6 +634,7 @@ export const api = {
 };
 
 // Convenience named exports for v0.3.0 endpoints
+export const deleteChannel = api.channels.remove;
 export const deleteDestination = api.destinations.remove;
 export const listDestinationRecipients = api.destinations.listRecipients;
 export const sendRecipientVerification =

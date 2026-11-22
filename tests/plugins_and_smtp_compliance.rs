@@ -66,8 +66,18 @@ impl V3Harness {
         notion_base_url: Option<String>,
         plugin_index_url: Option<String>,
     ) -> Self {
+        Self::new_with_options(allow_loopback, notion_base_url, plugin_index_url, false).await
+    }
+
+    async fn new_with_options(
+        allow_loopback: bool,
+        notion_base_url: Option<String>,
+        plugin_index_url: Option<String>,
+        trust_proxy: bool,
+    ) -> Self {
         let temp_dir = TempDir::new().expect("tempdir");
         let mut config = AppConfig::with_data_dir(temp_dir.path());
+        config.trust_proxy = trust_proxy;
         if allow_loopback {
             config.ssrf_allowlist = vec!["127.0.0.1/32".to_string()];
         }
@@ -2289,4 +2299,1269 @@ async fn r2_07_notion_lazy_data_source_id_writeback_persists_on_send_and_test() 
         "only the FIRST delivery should hit 404 fallback; 2nd delivery must use persisted data_source_id!"
     );
     let _ = (NetSettings::default(), ProtectedHttpClient::with_defaults());
+}
+
+// =============================================================================
+// 6. QA v0.3.0 Security, Concurrency, State Machine & Parser Regression Suite
+// =============================================================================
+
+async fn spawn_custom_reply_smtp_server(
+    rcpt_reply: &'static str,
+    data_reply: &'static str,
+) -> (
+    u16,
+    Arc<Mutex<Vec<CapturedMail>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let captured: Arc<Mutex<Vec<CapturedMail>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap_clone = Arc::clone(&captured);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let cap = Arc::clone(&cap_clone);
+            tokio::spawn(async move {
+                let (r, mut w) = stream.into_split();
+                let mut reader = BufReader::new(r);
+                let _ = w.write_all(b"220 mock.smtp.qa ESMTP Ready\r\n").await;
+                let mut mail = CapturedMail::default();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let Ok(n) = reader.read_line(&mut line).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    let cmd = line.trim_end_matches(['\r', '\n']).to_string();
+                    let upper = cmd.to_ascii_uppercase();
+                    if upper.starts_with("EHLO") || upper.starts_with("HELO") {
+                        let _ = w.write_all(b"250-mock.smtp.qa\r\n250 8BITMIME\r\n").await;
+                    } else if upper.starts_with("MAIL FROM:") {
+                        mail = CapturedMail::default();
+                        let _ = w.write_all(b"250 2.1.0 OK\r\n").await;
+                    } else if upper.starts_with("RCPT TO:") {
+                        mail.rcpt_to.push(cmd.clone());
+                        let _ = w.write_all(rcpt_reply.as_bytes()).await;
+                    } else if upper == "DATA" {
+                        let _ = w.write_all(b"354 Start mail input\r\n").await;
+                        loop {
+                            line.clear();
+                            let Ok(dn) = reader.read_line(&mut line).await else {
+                                break;
+                            };
+                            if dn == 0 || line == ".\r\n" || line == ".\n" {
+                                break;
+                            }
+                            mail.raw_data.push_str(&line);
+                        }
+                        cap.lock().unwrap().push(mail.clone());
+                        let _ = w.write_all(data_reply.as_bytes()).await;
+                    } else if upper == "RSET" {
+                        mail = CapturedMail::default();
+                        let _ = w.write_all(b"250 2.0.0 Reset\r\n").await;
+                    } else if upper == "QUIT" {
+                        let _ = w.write_all(b"221 2.0.0 Bye\r\n").await;
+                        break;
+                    } else {
+                        let _ = w.write_all(b"250 OK\r\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    (port, captured, handle)
+}
+
+#[tokio::test]
+async fn qa01_qa02_qa05_smtp_autoescape_bounce_classification_and_zero_pii_diagnostics() {
+    use feedcourier::channels::smtp::{SmtpSender, is_recipient_hard_bounce_parts};
+    use feedcourier::db::models::{Entry, Feed, FeedHealthStatus};
+
+    // 1. QA-01: RSS title, feed title, author, and sender_identity are strictly HTML-escaped in
+    //    rendered emails and verification emails (while valid `https://` links remain intact).
+    let xss = r#"<img src=x onerror=alert(1)>"#;
+    let smtp_cfg = SmtpChannelConfig {
+        host: "127.0.0.1".to_string(),
+        port: 2525,
+        username: None,
+        password: None,
+        security: SmtpSecurity::Plain,
+        from_address: "alerts@verified.example.com".to_string(),
+        sender_identity: Some(format!("Corp {xss}")),
+    };
+    let smtp_dest = SmtpDestinationConfig {
+        to_addresses: vec!["reader@example.org".to_string()],
+        reply_to: None,
+    };
+    let feed = Feed {
+        id: 1,
+        url: "https://evil.example/rss".to_string(),
+        title: format!("Feed {xss}"),
+        site_url: Some("https://evil.example".to_string()),
+        favicon_url: None,
+        tags_json: "[]".to_string(),
+        poll_interval_secs: 1800,
+        fetch_full_content: false,
+        use_proxy: false,
+        etag: None,
+        last_modified: None,
+        health_status: FeedHealthStatus::Active,
+        consecutive_failures: 0,
+        next_poll_at: None,
+        last_error: None,
+        silent_init: false,
+        created_at: now_unix(),
+        updated_at: now_unix(),
+    };
+    let entry = Entry {
+        id: 1,
+        feed_id: 1,
+        fingerprint_sha256: sha256_hex(b"xss-entry"),
+        published_at: Some(now_unix()),
+        discovered_at: now_unix(),
+        title: Some(format!("Headline {xss}")),
+        canonical_url: Some("https://evil.example/post?a=1&b=2".to_string()),
+        author: Some(format!("Author {xss}")),
+        content_html: Some("<p>Safe sanitized body</p>".to_string()),
+        first_sentence: None,
+        summary_text: None,
+        media_json: None,
+        payload_purged_at: None,
+    };
+    let built = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 1, None)
+        .expect("build email");
+    assert!(
+        !built.html_body.contains("<img src=x onerror=alert(1)>"),
+        "raw XSS payload must NEVER appear unescaped in email HTML:\n{}",
+        built.html_body
+    );
+    assert!(
+        built
+            .html_body
+            .contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "XSS payload must be HTML-escaped in email HTML:\n{}",
+        built.html_body
+    );
+    assert!(
+        built
+            .html_body
+            .contains("href=\"https://evil.example/post?a=1&amp;b=2\""),
+        "URL slashes must remain valid while `&` is escaped in href:\n{}",
+        built.html_body
+    );
+
+    // Verification email also auto-escapes destination name and sender_identity.
+    let (v_port, v_captured, v_handle) = spawn_multi_smtp_server(None).await;
+    let mut v_cfg = smtp_cfg.clone();
+    v_cfg.port = v_port;
+    SmtpSender::new()
+        .send_verification_email(
+            &v_cfg,
+            "victim@example.org",
+            &format!("Dest {xss}"),
+            "123456",
+            Some("https://fc.example.com/v/tok?a=1&b=2"),
+            feedcourier::db::models::AppLocale::En,
+        )
+        .await
+        .expect("verification email");
+    let raw_verify = v_captured.lock().unwrap()[0].raw_data.clone();
+    let unfolded_verify = raw_verify.replace("=\r\n", "").replace("=\n", "");
+    assert!(
+        !unfolded_verify.contains("<img src=x onerror=alert(1)>"),
+        "verification email must escape destination_name and sender_identity"
+    );
+    v_handle.abort();
+
+    // 2. QA-02: Pure bounce classifier rejects auth/quota/content/policy 5xx and accepts 5.1.1 etc.
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(535),
+        "535 5.7.8 Authentication credentials invalid"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(552),
+        "552 5.3.4 Message size exceeds fixed limit"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(554),
+        "554 5.7.1 Message rejected as spam"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 5.4.5 Daily user sending limit exceeded"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 5.7.1 DMARC policy rejected"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 5.1.7 Bad sender mailbox"
+    ));
+    assert!(is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 5.1.1 <bad@example.com>: Recipient address rejected: User unknown"
+    ));
+    assert!(is_recipient_hard_bounce_parts(
+        Some(553),
+        "553 5.1.3 Invalid recipient address"
+    ));
+
+    // 3. QA-02 + QA-05 live SMTP test: 552 size-limit error MUST NOT bounce verified recipients!
+    let (err552_port, _cap552, err552_handle) =
+        spawn_custom_reply_smtp_server("250 2.1.5 OK\r\n", "552 5.3.4 Message too large\r\n").await;
+    let h = V3Harness::new_with_allowlist(true, None, None).await;
+    let ch552_cfg = ChannelConfig::Smtp(SmtpChannelConfig {
+        host: "127.0.0.1".to_string(),
+        port: err552_port,
+        username: None,
+        password: None,
+        security: SmtpSecurity::Plain,
+        from_address: "alerts@fc.test".to_string(),
+        sender_identity: None,
+    });
+    let ch552 =
+        h.db.create_channel(&NewChannel {
+            name: "SMTP 552".to_string(),
+            kind: ChannelKind::Smtp,
+            encrypted_config: h.master_key.encrypt_json(&ch552_cfg).unwrap(),
+            credential_group_key: ch552_cfg.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let dest552 =
+        h.db.create_destination(&NewDestination {
+            channel_id: ch552.id,
+            name: "Verified List".to_string(),
+            encrypted_config: h
+                .master_key
+                .encrypt_json(&DestinationConfig::Smtp(SmtpDestinationConfig {
+                    to_addresses: vec!["vip@example.org".to_string()],
+                    reply_to: None,
+                }))
+                .unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let hmac_vip = h.master_key.smtp_recipient_hmac("vip@example.org");
+    let recips =
+        h.db.sync_smtp_recipients_for_destination(
+            dest552.id,
+            &[hmac_vip],
+            SmtpRecipientStatus::Verified,
+            Some("code"),
+        )
+        .await
+        .unwrap();
+    let feed_row =
+        h.db.create_feed(&NewFeed::new("https://qa02.example/rss"))
+            .await
+            .unwrap();
+    let route_row =
+        h.db.create_route(&NewRoute {
+            name: "QA02 Route".to_string(),
+            feed_ids: vec![feed_row.id],
+            match_tags: Vec::new(),
+            channel_id: ch552.id,
+            destination_id: dest552.id,
+            include_keywords: Vec::new(),
+            exclude_keywords: Vec::new(),
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions::default(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let entry_row = match h
+        .db
+        .insert_entry_if_new(&NewEntry {
+            feed_id: feed_row.id,
+            fingerprint_sha256: sha256_hex(b"qa02-552-entry"),
+            published_at: Some(now_unix()),
+            discovered_at: now_unix(),
+            title: Some("Huge Post".to_string()),
+            canonical_url: Some("https://qa02.example/huge".to_string()),
+            author: None,
+            content_html: Some("<p>Body</p>".to_string()),
+            first_sentence: None,
+            summary_text: None,
+            media: Vec::new(),
+        })
+        .await
+        .unwrap()
+    {
+        feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+        _ => unreachable!(),
+    };
+    let task552 =
+        h.db.enqueue_delivery_task(
+            route_row.id,
+            ch552.id,
+            dest552.id,
+            entry_row.id,
+            now_unix() - 1,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    assert_eq!(
+        h.db.get_delivery_task(task552.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryTaskStatus::DeadLetter
+    );
+    assert_eq!(
+        h.db.get_smtp_recipient(recips[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        SmtpRecipientStatus::Verified,
+        "552 content/size error must NEVER mark a verified recipient as bounced!"
+    );
+    assert!(
+        h.db.get_destination(dest552.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "destination must remain enabled after a 552 size error"
+    );
+    err552_handle.abort();
+
+    // 4. QA-05: True 550 5.1.1 hard bounce masks plaintext email in BOTH `bounce_diagnostic` and `diagnostic_log`.
+    let (b_port, _b_cap, b_handle) = spawn_custom_reply_smtp_server(
+        "550 5.1.1 <secret-bounce@example.org>: User unknown\r\n",
+        "250 OK\r\n",
+    )
+    .await;
+    let ch_b_cfg = ChannelConfig::Smtp(SmtpChannelConfig {
+        host: "127.0.0.1".to_string(),
+        port: b_port,
+        username: None,
+        password: None,
+        security: SmtpSecurity::Plain,
+        from_address: "alerts@fc.test".to_string(),
+        sender_identity: None,
+    });
+    let ch_b =
+        h.db.create_channel(&NewChannel {
+            name: "SMTP Bounce Mask".to_string(),
+            kind: ChannelKind::Smtp,
+            encrypted_config: h.master_key.encrypt_json(&ch_b_cfg).unwrap(),
+            credential_group_key: ch_b_cfg.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let dest_b =
+        h.db.create_destination(&NewDestination {
+            channel_id: ch_b.id,
+            name: "Bounce Mask Dest".to_string(),
+            encrypted_config: h
+                .master_key
+                .encrypt_json(&DestinationConfig::Smtp(SmtpDestinationConfig {
+                    to_addresses: vec!["secret-bounce@example.org".to_string()],
+                    reply_to: None,
+                }))
+                .unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let hmac_b = h
+        .master_key
+        .smtp_recipient_hmac("secret-bounce@example.org");
+    let recips_b =
+        h.db.sync_smtp_recipients_for_destination(
+            dest_b.id,
+            &[hmac_b],
+            SmtpRecipientStatus::Verified,
+            Some("code"),
+        )
+        .await
+        .unwrap();
+    let route_b =
+        h.db.create_route(&NewRoute {
+            name: "Bounce Route".to_string(),
+            feed_ids: vec![feed_row.id],
+            match_tags: Vec::new(),
+            channel_id: ch_b.id,
+            destination_id: dest_b.id,
+            include_keywords: Vec::new(),
+            exclude_keywords: Vec::new(),
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions::default(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let t_b =
+        h.db.enqueue_delivery_task(route_b.id, ch_b.id, dest_b.id, entry_row.id, now_unix() - 1)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let task_b_after = h.db.get_delivery_task(t_b.id).await.unwrap().unwrap();
+    let recip_b_after =
+        h.db.get_smtp_recipient(recips_b[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(recip_b_after.status, SmtpRecipientStatus::Bounced);
+    let task_diag = task_b_after.diagnostic_log.unwrap_or_default();
+    let bounce_diag = recip_b_after.bounce_diagnostic.unwrap_or_default();
+    assert!(
+        !task_diag.contains("secret-bounce@example.org")
+            && !bounce_diag.contains("secret-bounce@example.org"),
+        "plaintext email MUST be masked in diagnostics! task={task_diag:?} bounce={bounce_diag:?}"
+    );
+    assert!(
+        task_diag.contains("s***e@example.org") && bounce_diag.contains("s***e@example.org"),
+        "masked email must be present in diagnostics! task={task_diag:?} bounce={bounce_diag:?}"
+    );
+    b_handle.abort();
+}
+
+#[tokio::test]
+async fn qa03_public_rate_limit_connect_info_trust_proxy_404_and_relative_form() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    // 1. Default `trust_proxy = false`: spoofing 31 distinct `X-Forwarded-For` values from the
+    //    same real peer `ConnectInfo<SocketAddr>` MUST hit 429 on request #31!
+    let h_direct = V3Harness::new_with_options(true, None, None, false).await;
+    let peer = SocketAddr::from(([203, 0, 113, 77], 43210));
+    for i in 1..=31u32 {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/u/nonexistent-token")
+            .header(HOST, "localhost:8080")
+            .header("x-forwarded-for", format!("198.51.100.{i}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = h_direct.router.clone().oneshot(req).await.unwrap();
+        if i <= 30 {
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "req #{i} should not be limited"
+            );
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "req #31 with spoofed X-Forwarded-For must be rate-limited when trust_proxy=false"
+            );
+        }
+    }
+
+    // 2. Bare `/u`, `/u/`, `/v`, `/v/` return public 404 HTML (never SPA `index.html`).
+    for bare in ["/u", "/u/", "/v", "/v/"] {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(bare)
+            .header(HOST, "localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 78], 1000))));
+        let resp = h_direct.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "bare path {bare} must return 404"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(
+            !html.contains("<div id=\"root\">"),
+            "bare path {bare} must NOT fall through to SPA index.html"
+        );
+    }
+
+    // 3. `trust_proxy = true`: uses RIGHTMOST hop of `X-Forwarded-For`, immune to prepended spoofs.
+    let h_proxy = V3Harness::new_with_options(true, None, None, true).await;
+    let proxy_peer = SocketAddr::from(([10, 0, 0, 1], 8080));
+    for i in 1..=31u32 {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/v/nonexistent-token")
+            .header(HOST, "localhost:8080")
+            .header("x-forwarded-for", format!("1.2.3.{i}, 198.51.100.42"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(proxy_peer));
+        let resp = h_proxy.router.clone().oneshot(req).await.unwrap();
+        if i <= 30 {
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "rightmost XFF hop must govern rate limit when trust_proxy=true"
+            );
+        }
+    }
+    // A different rightmost hop behind the same reverse proxy is NOT blocked.
+    let mut other_req = Request::builder()
+        .method(Method::GET)
+        .uri("/v/nonexistent-token")
+        .header(HOST, "localhost:8080")
+        .header("x-forwarded-for", "1.2.3.4, 198.51.100.99")
+        .body(Body::empty())
+        .unwrap();
+    other_req.extensions_mut().insert(ConnectInfo(proxy_peer));
+    let other_resp = h_proxy.router.clone().oneshot(other_req).await.unwrap();
+    assert_eq!(other_resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn qa05_qa06_auto_paused_recovery_lockout_v_token_smtp_test_debug_push_and_channel_409() {
+    let (smtp_port, captured, smtp_handle) = spawn_multi_smtp_server(None).await;
+    let h = V3Harness::new_with_allowlist(true, None, None).await;
+    let cookie = h.setup_admin().await;
+    h.db.set_setting_typed(
+        SETTING_PUBLIC_URL,
+        &"https://fc.example.com/subpath".to_string(),
+    )
+    .await
+    .unwrap();
+
+    // 1. SMTP channel rejects `use_proxy: true` on create.
+    let (st, _, _) = h
+        .send_json(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "smtp",
+                "config": {
+                    "kind": "smtp",
+                    "host": "127.0.0.1",
+                    "port": smtp_port,
+                    "security": "plain",
+                    "from_address": "bot@fc.test"
+                },
+                "use_proxy": true,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "SMTP channel must reject use_proxy=true"
+    );
+
+    // Create valid SMTP channel with 2 recipients (`alice@example.org`, `bob@example.org`).
+    let (st, _, ch_body) = h
+        .send_json(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "name": "Compliance SMTP",
+                "kind": "smtp",
+                "config": {
+                    "kind": "smtp",
+                    "host": "127.0.0.1",
+                    "port": smtp_port,
+                    "security": "plain",
+                    "from_address": "bot@fc.test"
+                },
+                "initial_destination": {
+                    "config": {
+                        "kind": "smtp",
+                        "to_addresses": ["alice@example.org", "bob@example.org"]
+                    },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_json = parse_json(&ch_body);
+    let ch_id = ch_json["id"].as_i64().unwrap();
+    let dest_id = ch_json["destinations"][0]["id"].as_i64().unwrap();
+    assert_eq!(
+        ch_json["destinations"][0]["name"], "a***e@example.org",
+        "auto-named SMTP destination must be masked"
+    );
+
+    // PATCH SMTP channel with `use_proxy: true` is also rejected.
+    let (st, _, _) = h
+        .send_json(
+            Method::PATCH,
+            &format!("/api/v1/channels/{ch_id}"),
+            Some(&cookie),
+            Some(json!({ "use_proxy": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 2. Q3: Account-level `POST /api/v1/channels/{id}/test` sends self-test ONLY to `from_address`!
+    captured.lock().unwrap().clear();
+    let (st, _, _) = h
+        .send_json(
+            Method::POST,
+            &format!("/api/v1/channels/{ch_id}/test"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    {
+        let sent = captured.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].rcpt_to.len(), 1);
+        assert!(sent[0].rcpt_to[0].contains("bot@fc.test"));
+    }
+
+    // 3. Q3: Destination-level `test` & `debug_push` fail with 400 when 0 recipients are verified!
+    let (st, _, _) = h
+        .send_json(
+            Method::POST,
+            &format!("/api/v1/destinations/{dest_id}/test"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "SMTP destination test must reject when 0 verified recipients exist"
+    );
+
+    let feed_srv = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rss.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<?xml version="1.0"?><rss version="2.0"><channel><title>QA Feed</title><item><title>Item 1</title><link>https://qa.example/1</link><description>Hello</description></item></channel></rss>"#,
+        ))
+        .mount(&feed_srv)
+        .await;
+    let (st, _, _) = h
+        .send_json(
+            Method::POST,
+            "/api/v1/feeds/preview/push",
+            Some(&cookie),
+            Some(json!({
+                "url": format!("{}/rss.xml", feed_srv.uri()),
+                "destination_id": dest_id
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "SMTP debug_push must reject when 0 verified recipients exist"
+    );
+
+    // 4. QA-06: 5 wrong code guesses atomically clear `code_sha256` -> old `/v/{token}` returns 410 Gone!
+    let (st, _, recips_bytes) = h
+        .send_json(
+            Method::GET,
+            &format!("/api/v1/destinations/{dest_id}/recipients"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let recips = parse_json(&recips_bytes);
+    let alice_id = recips[0]["id"].as_i64().unwrap();
+    let bob_id = recips[1]["id"].as_i64().unwrap();
+
+    captured.lock().unwrap().clear();
+    let (st, _, _) = h
+        .send_json(
+            Method::POST,
+            &format!("/api/v1/destinations/{dest_id}/recipients/{alice_id}/send-verification"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let verify_raw = captured.lock().unwrap()[0].raw_data.clone();
+    let v_path = extract_public_token_path(&verify_raw, "https://fc.example.com/subpath/v/");
+    let v_route = v_path
+        .strip_prefix("/subpath")
+        .expect("subpath prefix in verify URL");
+
+    // Relative `<form method="POST" action="">` on GET /v/{token}!
+    let (v_get_st, _, v_get_html) = h
+        .send_public(Method::GET, v_route, "198.51.100.11", None, None)
+        .await;
+    assert_eq!(v_get_st, StatusCode::OK);
+    assert!(
+        v_get_html.contains(r#"<form method="POST" action="">"#),
+        "verify form must use relative action=\"\" for subpath PUBLIC_URL compatibility:\n{v_get_html}"
+    );
+
+    // Guess 5 wrong codes -> locks out BOTH code verification AND `/v/{token}` link!
+    for _ in 0..5 {
+        let (wst, _, _) = h
+            .send_json(
+                Method::POST,
+                &format!("/api/v1/destinations/{dest_id}/recipients/{alice_id}/verify"),
+                Some(&cookie),
+                Some(json!({ "code": "000000" })),
+            )
+            .await;
+        assert_eq!(wst, StatusCode::BAD_REQUEST);
+    }
+    let (gone_st, _, _) = h
+        .send_public(Method::POST, v_route, "198.51.100.11", None, None)
+        .await;
+    assert_eq!(
+        gone_st,
+        StatusCode::GONE,
+        "after 5 failed code guesses, old /v/{{token}} link MUST immediately return 410 Gone"
+    );
+
+    // 5. Verify Alice ONLY (Bob stays unverified); destination `test` and `debug_push` deliver
+    //    ONLY 1 isolated single-`To` email (to Alice, NEVER Bob) with RFC 8058 headers!
+    h.db.mark_smtp_recipient_verified(alice_id, "code", now_unix())
+        .await
+        .unwrap();
+    captured.lock().unwrap().clear();
+    let (st, _, _) = h
+        .send_json(
+            Method::POST,
+            &format!("/api/v1/destinations/{dest_id}/test"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    {
+        let sent = captured.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only verified recipient Alice should receive test"
+        );
+        assert!(sent[0].rcpt_to[0].contains("alice@example.org"));
+        assert!(
+            sent[0]
+                .raw_data
+                .contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click")
+        );
+    }
+
+    captured.lock().unwrap().clear();
+    let (st, _, dp_body) = h
+        .send_json(
+            Method::POST,
+            "/api/v1/feeds/preview/push",
+            Some(&cookie),
+            Some(json!({
+                "url": format!("{}/rss.xml", feed_srv.uri()),
+                "destination_id": dest_id
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&dp_body));
+    {
+        let sent = captured.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            1,
+            "debug_push must deliver ONLY to verified Alice"
+        );
+        assert!(sent[0].rcpt_to[0].contains("alice@example.org"));
+        assert!(
+            sent[0]
+                .raw_data
+                .contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click")
+        );
+    }
+
+    // 6. QA-06: All-unsubscribed sets `enabled = false, auto_paused = true`; reactivate + verify
+    //    automatically restores `enabled = true, auto_paused = false`!
+    h.db.mark_smtp_recipient_unsubscribed(bob_id, "link", now_unix())
+        .await
+        .unwrap();
+    let (_, paused) =
+        h.db.mark_smtp_recipient_unsubscribed(alice_id, "link", now_unix())
+            .await
+            .unwrap();
+    assert!(paused);
+    let dest_paused = h.db.get_destination(dest_id).await.unwrap().unwrap();
+    assert!(!dest_paused.enabled);
+    assert!(dest_paused.auto_paused);
+
+    // Check `/u/{token}` confirmation page uses relative `action=""`.
+    h.db.reactivate_smtp_recipient(alice_id, now_unix())
+        .await
+        .unwrap();
+    let unsub_tok = h.master_key.sign_unsubscribe_token(dest_id, alice_id);
+    let (u_get_st, _, u_get_html) = h
+        .send_public(
+            Method::GET,
+            &format!("/u/{unsub_tok}"),
+            "198.51.100.12",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(u_get_st, StatusCode::OK);
+    assert!(u_get_html.contains(r#"<form method="POST" action="">"#));
+
+    // Re-verifying Alice auto-resumes `enabled = true, auto_paused = false`!
+    h.db.mark_smtp_recipient_verified(alice_id, "link", now_unix())
+        .await
+        .unwrap();
+    let dest_resumed = h.db.get_destination(dest_id).await.unwrap().unwrap();
+    assert!(
+        dest_resumed.enabled,
+        "auto_paused destination must auto-resume on re-verification"
+    );
+    assert!(!dest_resumed.auto_paused);
+
+    // Manual disable clears `auto_paused = false` so verifying Bob does NOT re-enable it.
+    let (st, _, _) = h
+        .send_json(
+            Method::PATCH,
+            &format!("/api/v1/destinations/{dest_id}"),
+            Some(&cookie),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    h.db.mark_smtp_recipient_verified(bob_id, "code", now_unix())
+        .await
+        .unwrap();
+    assert!(
+        !h.db
+            .get_destination(dest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "manually disabled destination must stay disabled when a recipient verifies"
+    );
+
+    // 7. QA-08: `DELETE /api/v1/channels/{id}` returns `409 Conflict` with `referencing_routes`
+    //    unless `?cascade=true` is passed!
+    let route_row =
+        h.db.create_route(&NewRoute {
+            name: "Blocking Route".to_string(),
+            feed_ids: Vec::new(),
+            match_tags: Vec::new(),
+            channel_id: ch_id,
+            destination_id: dest_id,
+            include_keywords: Vec::new(),
+            exclude_keywords: Vec::new(),
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions::default(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let (st, _, conflict_body) = h
+        .send_json(
+            Method::DELETE,
+            &format!("/api/v1/channels/{ch_id}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    let conflict_json = parse_json(&conflict_body);
+    assert_eq!(conflict_json["referencing_routes"][0]["id"], route_row.id);
+
+    let (st, _, _) = h
+        .send_json(
+            Method::DELETE,
+            &format!("/api/v1/channels/{ch_id}?cascade=true"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(h.db.get_channel(ch_id).await.unwrap().is_none());
+
+    smtp_handle.abort();
+}
+
+#[tokio::test]
+async fn qa04_qa10_link_rewrite_parser_cache_before_cap_trailing_dot_cache_clear_and_market_safety()
+{
+    use feedcourier::plugins::link_rewrite::{
+        LINK_REWRITE_PLUGIN_ID, YourlsAuthMode, YourlsProviderConfig, extract_anchor_hrefs,
+        is_eligible_rewrite_url, rewrite_anchor_hrefs,
+    };
+    use feedcourier::plugins::{MarketIndexCache, PluginRegistry, RenderOverrides};
+    use std::collections::HashMap;
+
+    // 1. QA-04: Unquoted `href=.../`, apostrophe `title=Bob's`, and `<script>`/`<style>` skipping.
+    let tricky_html = concat!(
+        r#"<p><span title=Bob's><a href=https://example.com/blog/>Blog</a></span>"#,
+        r#"<script>const s = '<a href="https://script.example/x">x</a>';</script>"#,
+        r#"<style>/* <a href="https://style.example/y">y</a> */</style></p>"#
+    );
+    let hrefs = extract_anchor_hrefs(tricky_html);
+    assert_eq!(
+        hrefs,
+        vec!["https://example.com/blog/".to_string()],
+        "must extract full unquoted URL with trailing slash and skip <script>/<style>"
+    );
+    let mut repl = HashMap::new();
+    repl.insert(
+        "https://example.com/blog/".to_string(),
+        "https://sho.rt/b1".to_string(),
+    );
+    let rewritten = rewrite_anchor_hrefs(tricky_html, &repl);
+    assert!(
+        rewritten.contains(r#"<a href="https://sho.rt/b1">Blog</a>"#),
+        "<a> must NEVER be emitted as self-closing `<a ... />`: {rewritten}"
+    );
+    assert!(
+        rewritten
+            .contains(r#"<script>const s = '<a href="https://script.example/x">x</a>';</script>"#)
+    );
+    assert!(rewritten.contains(r#"<style>/* <a href="https://style.example/y">y</a> */</style>"#));
+
+    // 2. QA-10: Trailing dot FQDN domain normalization + inactive auth secret cleanup.
+    assert!(!is_eligible_rewrite_url(
+        "https://skip.example.com./article",
+        Some("sho.rt."),
+        &["skip.example.com".to_string()]
+    ));
+    assert!(!is_eligible_rewrite_url(
+        "https://sho.rt./abc",
+        Some("sho.rt"),
+        &[]
+    ));
+    let switched = YourlsProviderConfig {
+        api_url: "https://sho.rt/yourls-api.php".to_string(),
+        auth_mode: YourlsAuthMode::Signature,
+        signature: Some("sig_tok".to_string()),
+        username: Some("old_user".to_string()),
+        password: Some("old_pass".to_string()),
+        exclude_domains: vec!["Skip.Example.COM.".to_string()],
+        strict_mode: false,
+        pass_title: true,
+        use_proxy: false,
+    }
+    .validate_and_normalize()
+    .unwrap();
+    assert_eq!(switched.username, None);
+    assert_eq!(switched.password, None);
+    assert_eq!(
+        switched.exclude_domains,
+        vec!["skip.example.com".to_string()]
+    );
+
+    // 3. QA-10: 50 already-cached URLs + 51st uncached URL -> 51st URL MUST still be shortened!
+    let yourls_srv = MockServer::start().await;
+    let api_calls = Arc::new(AtomicUsize::new(0));
+    let api_calls_c = Arc::clone(&api_calls);
+    Mock::given(method("POST"))
+        .and(path("/yourls-api.php"))
+        .respond_with(move |_req: &MockRequest| {
+            let n = api_calls_c.fetch_add(1, Ordering::SeqCst) + 1;
+            ResponseTemplate::new(200).set_body_json(json!({
+                "status": "success",
+                "shorturl": format!("https://sho.rt/new{n}")
+            }))
+        })
+        .mount(&yourls_srv)
+        .await;
+
+    let h = V3Harness::new_with_allowlist(true, None, None).await;
+    let cookie = h.setup_admin().await;
+    h.db.update_plugin(LINK_REWRITE_PLUGIN_ID, Some(true), None)
+        .await
+        .unwrap();
+
+    // Check GET /api/v1/plugins does NOT bump `plugins.updated_at` (read-only path).
+    let ts_before =
+        h.db.get_plugin(LINK_REWRITE_PLUGIN_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at;
+    let (st, _, _) = h
+        .send_json(Method::GET, "/api/v1/plugins", Some(&cookie), None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        h.db.get_plugin(LINK_REWRITE_PLUGIN_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        ts_before,
+        "GET /api/v1/plugins must not write to plugins table"
+    );
+
+    let (st, _, inst_body) = h
+        .send_json(
+            Method::POST,
+            "/api/v1/plugins/link-rewrite/instances",
+            Some(&cookie),
+            Some(json!({
+                "name": "YOURLS Cap Test",
+                "config": {
+                    "api_url": format!("{}/yourls-api.php", yourls_srv.uri()),
+                    "auth_mode": "signature",
+                    "signature": "sig123"
+                },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let inst_id = parse_json(&inst_body)["id"].as_i64().unwrap();
+
+    // Pre-populate 50 cached URLs.
+    let mut pairs = Vec::new();
+    let mut html_51 = String::from("<p>");
+    for i in 1..=50 {
+        let u = format!("https://cached.example/p/{i}");
+        pairs.push((sha256_hex(u.as_bytes()), format!("https://sho.rt/c{i}")));
+        html_51.push_str(&format!("<a href=\"{u}\">{i}</a> "));
+    }
+    let url_51 = "https://uncached.example/p/51";
+    html_51.push_str(&format!("<a href=\"{url_51}\">51</a></p>"));
+    h.db.put_plugin_link_cache_batch(inst_id, &pairs, now_unix())
+        .await
+        .unwrap();
+
+    // Run LinkRewritePlugin::on_render directly via PluginRegistry!
+    let ch =
+        h.db.create_channel(&NewChannel {
+            name: "Dummy TG".to_string(),
+            kind: ChannelKind::Telegram,
+            encrypted_config: h
+                .master_key
+                .encrypt_json(&ChannelConfig::Telegram(TelegramChannelConfig {
+                    bot_token: "123:ABC".to_string(),
+                    api_base_url: None,
+                }))
+                .unwrap(),
+            credential_group_key: "tg:dummy".to_string(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let dest =
+        h.db.create_destination(&NewDestination {
+            channel_id: ch.id,
+            name: "Dummy Dest".to_string(),
+            encrypted_config: h
+                .master_key
+                .encrypt_json(&DestinationConfig::Telegram(TelegramDestinationConfig {
+                    chat_id: "-1001".to_string(),
+                    message_thread_id: None,
+                }))
+                .unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let feed =
+        h.db.create_feed(&NewFeed::new("https://cap.example/rss"))
+            .await
+            .unwrap();
+    let mut plugins_map = BTreeMap::new();
+    plugins_map.insert(
+        LINK_REWRITE_PLUGIN_ID.to_string(),
+        json!({ "provider_id": inst_id }),
+    );
+    let route_opts = RouteOptions {
+        plugins: plugins_map,
+        ..RouteOptions::default()
+    };
+    let route =
+        h.db.create_route(&NewRoute {
+            name: "Cap Route".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: Vec::new(),
+            channel_id: ch.id,
+            destination_id: dest.id,
+            include_keywords: Vec::new(),
+            exclude_keywords: Vec::new(),
+            include_regex: None,
+            exclude_regex: None,
+            options: route_opts.clone(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let entry = match h
+        .db
+        .insert_entry_if_new(&NewEntry {
+            feed_id: feed.id,
+            fingerprint_sha256: sha256_hex(b"cap-51-entry"),
+            published_at: Some(now_unix()),
+            discovered_at: now_unix(),
+            title: Some("51 Links".to_string()),
+            canonical_url: None,
+            author: None,
+            content_html: Some(html_51),
+            first_sentence: None,
+            summary_text: None,
+            media: Vec::new(),
+        })
+        .await
+        .unwrap()
+    {
+        feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+        _ => unreachable!(),
+    };
+    let registry = PluginRegistry::with_builtins();
+    let http = ProtectedHttpClient::new(NetSettings {
+        outbound_proxy_url: None,
+        ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+    })
+    .unwrap();
+    let (overrides, retry): (RenderOverrides, _) = registry
+        .run_on_render(
+            &h.db,
+            &h.master_key,
+            &http,
+            &entry,
+            &feed,
+            &route,
+            &route_opts,
+            &ch,
+            &dest,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(retry.is_none());
+    assert_eq!(
+        api_calls.load(Ordering::SeqCst),
+        1,
+        "only the 51st uncached link should hit YOURLS API"
+    );
+    let rendered = overrides.content_html.unwrap();
+    assert!(rendered.contains("https://sho.rt/c1"));
+    assert!(rendered.contains("https://sho.rt/c50"));
+    assert!(
+        rendered.contains("https://sho.rt/new1"),
+        "51st uncached URL must still be shortened when first 50 hit SQLite cache"
+    );
+
+    // 4. QA-10: Changing YOURLS `api_url` via PATCH automatically clears `plugin_link_cache`!
+    assert_eq!(
+        h.db.count_plugin_link_cache_by_instance(inst_id)
+            .await
+            .unwrap(),
+        51
+    );
+    let (st, _, _) = h
+        .send_json(
+            Method::PATCH,
+            &format!("/api/v1/plugins/link-rewrite/instances/{inst_id}"),
+            Some(&cookie),
+            Some(json!({
+                "config": {
+                    "api_url": format!("{}/yourls-api-v2.php", yourls_srv.uri())
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        h.db.count_plugin_link_cache_by_instance(inst_id)
+            .await
+            .unwrap(),
+        0,
+        "changing api_url must automatically invalidate stale plugin_link_cache rows"
+    );
+
+    // 5. QA-10: Marketplace strips non-`http(s)` URLs and preserves valid remote cache on failed refresh!
+    let market_srv = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": 1,
+            "generated_at": "2026-11-23T00:00:00Z",
+            "plugins": [{
+                "id": "xss-plugin",
+                "name": "XSS Test",
+                "version": "1.0.0",
+                "homepage": "javascript:alert(1)",
+                "repository": "https://github.com/ElleryHe/FeedCourier-Plugins"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&market_srv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/index.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&market_srv)
+        .await;
+
+    let cache = MarketIndexCache::new(Some(format!("{}/index.json", market_srv.uri())));
+    let (doc1, src1) = cache.get_index(&http, false).await;
+    assert_eq!(src1, "remote");
+    assert_eq!(
+        doc1.plugins[0].homepage, None,
+        "javascript: homepage URL must be stripped to None"
+    );
+    assert_eq!(
+        doc1.plugins[0].repository.as_deref(),
+        Some("https://github.com/ElleryHe/FeedCourier-Plugins")
+    );
+
+    // Forced refresh hits 503 -> returns snapshot for this call, WITHOUT clobbering the valid remote cache!
+    let (_doc2, src2) = cache.get_index(&http, true).await;
+    assert_eq!(src2, "snapshot");
+    let (doc3, src3) = cache.get_index(&http, false).await;
+    assert_eq!(
+        src3, "remote",
+        "failed forced refresh must NOT overwrite an existing valid remote cache entry"
+    );
+    assert_eq!(doc3.plugins[0].id, "xss-plugin");
+
+    // Ensure `Plugin` trait is exercised without unused-import warnings.
+    assert_eq!(
+        registry.get(LINK_REWRITE_PLUGIN_ID).unwrap().manifest().id,
+        LINK_REWRITE_PLUGIN_ID
+    );
 }

@@ -8,7 +8,7 @@ FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<
 
 对存量数据库执行重大 DDL 迁移前，`Database::connect` 会**先于 SQL 迁移执行** `VACUUM INTO` 生成在线热备快照，并在检测目标文件或伴生 `-wal` / `-shm` 文件冲突时自动追加 UTC 时间戳与序号后缀、备份完成后清理残留 sidecar 文件：
 - 升级 `v0.1.x` → `v0.2.0+`：先生成 `<DATA_DIR>/pre-v0.2.0-backup.db`，再执行 `0002_channel_destinations.sql` 与单事务迁移钩子 `Database::migrate_channels_to_v2`。
-- 升级 `v0.2.x` → `v0.3.0`：先生成 `<DATA_DIR>/pre-v0.3.0-backup.db`，再执行 `0003_plugins_and_smtp_compliance.sql` 与幂等启动回填 `Database::backfill_legacy_smtp_recipients`。
+- 升级 `v0.2.x` → `v0.3.0`：只要存量数据库已应用迁移 `0002`、待执行 `0003` 且**任意业务表（`feeds`、`channels` 或 `channel_destinations`）非空**，先生成 `<DATA_DIR>/pre-v0.3.0-backup.db`（若 `VACUUM INTO` 失败则主动清理半截备份文件与 `-wal`/`-shm` sidecar），再执行 `0003_plugins_and_smtp_compliance.sql` 与幂等启动回填 `Database::backfill_legacy_smtp_recipients`。
 
 所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，业务表外键关联均启用 **`ON DELETE CASCADE`** 级联清理（`delivery_quota_ledger` 刻意不设外键，确保删除操作不会清空配额计数）。
 
@@ -75,6 +75,7 @@ erDiagram
         TEXT name
         BLOB encrypted_config
         INTEGER enabled
+        INTEGER auto_paused
     }
 
     routes {
@@ -177,7 +178,7 @@ erDiagram
 | `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10 CHECK (>= 0)` | 每次投递后独立抽取的随机抖动上限秒数（仅存内存）。 |
 | `hourly_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每小时最大投递篇数上限（账号下全部目的地共享）。 |
 | `daily_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每日最大投递篇数上限（账号下全部目的地共享）。 |
-| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 该账号及其所有目的地的出站请求是否经由全局代理转发。 |
+| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 该账号及其所有目的地的 HTTP 出站请求是否经由全局代理转发（适用于 Telegram 与 Notion；SMTP 使用原生 TCP/TLS 直连）。 |
 | `cooldown_until` | `INTEGER` | `NULL` | 触发下游 `429` / `Retry-After` 时的账号及同组冷却截止时间戳。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 账号启用开关。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
@@ -194,9 +195,10 @@ erDiagram
 | :--- | :--- | :--- | :--- |
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 授信目的地主键 ID（`routes` 与 MCP `configure_route`/`test_push_feed_entry` 的主要目标标识）。 |
 | `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 所属父通道账号 ID。 |
-| `name` | `TEXT` | `NOT NULL` | 目的地备注名（留空时自动取 Telegram `getChat` 群/频道名、SMTP 首个收件人或 Notion 数据库标题）。 |
+| `name` | `TEXT` | `NOT NULL` | 目的地备注名（留空时自动取 Telegram `getChat` 群/频道名、打码后的 SMTP 首个收件人如 `a***e@example.com` 或 Notion 数据库标题）。 |
 | `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的 `DestinationConfig` JSON 密文（Telegram `chat_id`/`message_thread_id`、SMTP `to_addresses`/`reply_to` 或 Notion `data_source_id`/`column_mapping`）。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 该目的地的独立启用开关。 |
+| `auto_paused` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 于 `0003_plugins_and_smtp_compliance.sql` 新增。当 SMTP 目的地下全部收件人均转为 `unsubscribed` 或 `bounced` 时同步置为 `enabled = 0, auto_paused = 1`；后续有任一收件人重新完成验证且 `auto_paused = 1` 时自动恢复为 `enabled = 1, auto_paused = 0` 并唤醒延迟任务。管理员手动切换 `enabled` 时会清零 `auto_paused = 0`，因此手动停用的目的地不会被自动恢复。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
 - **索引**：`idx_channel_destinations_channel_id ON channel_destinations (channel_id)`
@@ -244,7 +246,7 @@ erDiagram
 | `attempt_count` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (>= 0)` | 已尝试发送次数（默认达到 6 次临时错误后转入 `'dead_letter'`）。 |
 | `next_attempt_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 下次可被调度领取的时间戳。 |
 | `last_status_code` | `INTEGER` | `NULL` | 下游最近一次返回的 HTTP 状态码或 SMTP 响应码。 |
-| `diagnostic_log` | `TEXT` | `NULL` | 最近一次投递结果或错误诊断摘要。 |
+| `diagnostic_log` | `TEXT` | `NULL` | 最近一次投递结果或错误诊断摘要（收件人邮箱自动脱敏，防止明文 PII 落盘）。 |
 | `completed_at` | `INTEGER` | `NULL` | 任务进入 `'delivered'` 或 `'dead_letter'` 终态的时间戳。 |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 任务入队时间戳。 |
 
@@ -369,7 +371,7 @@ erDiagram
 | `consented_at` | `INTEGER` | `NULL` | 完成验证的时间戳。 |
 | `revoked_method` | `TEXT` | `NULL` | 撤销原因：`'one_click'`、`'link'`、`'admin'` 或 `'hard_bounce'`。 |
 | `revoked_at` | `INTEGER` | `NULL` | 退订或硬退信时间戳。 |
-| `bounce_diagnostic` | `TEXT` | `NULL` | 同步 SMTP 5xx 硬退信诊断原文。 |
+| `bounce_diagnostic` | `TEXT` | `NULL` | 同步 SMTP 5xx 收件人级硬退信诊断摘要（其中的邮箱地址均已脱敏）。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
 - **唯一约束**：`UNIQUE (destination_id, address_hmac)`

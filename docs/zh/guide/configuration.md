@@ -22,7 +22,8 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 | `OUTBOUND_PROXY` | *（未设置）* | URL（`http://`、`https://`、`socks5://`、`socks5h://`） | 初始全局出站代理地址。当 `OUTBOUND_PROXY` 未设置时，依次回退读取 `ALL_PROXY`、`HTTPS_PROXY`、`HTTP_PROXY`。仅当数据库尚未保存代理配置时作为初始值写入。 |
 | `SSRF_ALLOWLIST` | *（空）* | 逗号分隔的 CIDR 或主机名 | 初始内网 SSRF 放行白名单（如 `10.0.0.5/32,rsshub.internal,yourls,*.lan`）。对订阅源抓取、自建 Local Telegram Bot API、插件出站请求（如内网/Docker YOURLS）及远端插件索引拉取统一生效。 |
 | `PUBLIC_URL` | *（未设置）* | 绝对 URL（如 `https://feeds.example.com`） | 可选的公网访问根地址（禁止携带查询参数、片段或内嵌凭据，末尾 `/` 自动去除），用于开启 SMTP RFC 8058 一键退订（`/u/{token}`）与双重确认链接（`/v/{token}`）。环境变量优先于 WebUI 设置；使用明文 `http://` 时界面会给出警示。 |
-| `PLUGIN_INDEX_URL` | `https://raw.githubusercontent.com/ElleryHe/FeedCourier-Plugins/main/index.json` | `http://` 或 `https://` URL | 可选的自定义插件市场 `index.json` 地址。经由防 SSRF 客户端拉取并缓存 6 小时；远端不可达时自动回退至编译内置快照。 |
+| `TRUST_PROXY` | `false` | 布尔值（`true` / `false`） | 仅当部署在可信反向代理（如 Nginx、Caddy）之后且代理会覆写 `X-Real-IP` 或追加 `X-Forwarded-For` 时设为 `true`。默认 `false` 仅信任底层 TCP 对端地址（`ConnectInfo<SocketAddr>`）对公开 `/u/`、`/v/` 限流，防止客户端伪造 `X-Forwarded-For`；设为 `true` 后仅读取 `X-Real-IP` 或 `X-Forwarded-For` **最右侧**一跳。 |
+| `PLUGIN_INDEX_URL` | `https://raw.githubusercontent.com/ElleryHe/FeedCourier-Plugins/main/index.json` | `http://` 或 `https://` URL | 可选的自定义插件市场 `index.json` 地址。经由防 SSRF 客户端拉取并缓存 6 小时（回退快照时负缓存缩短为 60 秒）；远端不可达时自动回退至编译内置快照。 |
 | `LOCALE` | *（未设置）* | `en` 或 `zh-CN` | 旧版兼容的回退推送语言：仅用于尚未设置自身投递语言的旧路由。新路由各自保存投递语言；WebUI 界面语言只是浏览器本地偏好，不再同步到服务端。 |
 | `RETENTION_HOURS` | `24` | 无符号整数（`u64`） | 已完成投递或未命中路由的文章正文与媒体元数据保留小时数，到期后由后台定时任务清理。 |
 | `DB_READ_MAX_CONNECTIONS` | `8` | 正整数（`u32 >= 1`） | SQLite WAL 只读连接池的最大连接数（写连接池固定为 `1`）。 |
@@ -31,7 +32,7 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 > [!NOTE]
 > `TIMEZONE`/`TZ`、`OUTBOUND_PROXY` 与 `SSRF_ALLOWLIST` 会在首次启动时写入数据库的 `system_settings` 表。此后在 WebUI **Settings** 页面修改时区、代理与白名单时，新配置会立即生效并持久化保存，无需重启服务。
 >
-> `PUBLIC_URL` 在通过环境变量注入时始终优先于数据库设置（WebUI **设置** 页面会将其标记为「由环境变量管理」并拒绝通过接口修改）；未设置环境变量时，可在 WebUI **设置** 中自由配置或清空。`PLUGIN_INDEX_URL` 在启动时读取，用于覆盖官方插件市场索引地址。
+> `PUBLIC_URL` 在通过环境变量注入时始终优先于数据库设置（WebUI **设置** 页面会将其标记为「由环境变量管理」并拒绝通过接口修改）；未设置环境变量时，可在 WebUI **设置** 中自由配置或清空。`TRUST_PROXY`（默认 `false`）与 `PLUGIN_INDEX_URL` 在启动时读取。
 >
 > `ADMIN_USERNAME` 与 `ADMIN_PASSWORD` 则会在**每次启动**时覆盖已保存的值；设置了 `ADMIN_USERNAME` 时，WebUI 会提示用户名由环境变量管理。`RESET_2FA=true` 只应使用一次，否则每次启动都会清除两步验证。
 
@@ -50,9 +51,14 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 2. **按订阅源独立开关（`feeds.use_proxy`）**：
    - 每个订阅源都有独立的 `use_proxy` 开关（默认关闭）。
    - 开启后，该订阅源的 Feed 拉取、站点图标获取以及网页全文抓取均会通过代理发出。
-3. **按通道账号独立开关（`channels.use_proxy`）**：
-   - 每个通道账号都有独立的 `use_proxy` 开关（默认关闭），对其下挂载的**所有目的地**统一生效。
-   - 开启后，该账号及其所有目的地的 Telegram 接口调用、媒体防盗链中转拉取、Notion 接口调用及连通性测试均会通过代理转发。
+3. **按 HTTP 通道账号独立开关（`channels.use_proxy`）**：
+   - 每个 **Telegram** 与 **Notion** 通道账号都有独立的 `use_proxy` 开关（默认关闭），对其下挂载的**所有目的地**统一生效。开启后，该账号及其所有目的地的 Telegram 接口调用、媒体防盗链中转拉取、Notion 接口调用及连通性测试均会通过代理转发。
+   - **SMTP 通道不适用出站代理**：SMTP 仅使用原生 TCP/TLS 直连，HTTP/SOCKS 代理对其不生效（WebUI 也会隐藏 SMTP 代理开关）。
+4. **按插件服务商与预览请求独立开关**：
+   - 插件服务商实例（如 Link Rewrite / YOURLS）以及订阅源预览请求均支持独立开启 `use_proxy`。
+
+> [!WARNING]
+> **`use_proxy: true` 失败关闭（Fail-Closed）保证**：当订阅源、通道账号、预览请求或插件实例显式开启 `use_proxy: true` 但全局未配置任何 `OUTBOUND_PROXY`（或 WebUI 设置中的代理地址）时，FeedCourier 会**直接报错拦截**，绝不静默回退为直连而暴露宿主机真实出口 IP。
 
 ---
 

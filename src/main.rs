@@ -62,9 +62,12 @@ async fn main() -> AppResult<()> {
         "starting FeedCourier full-stack server"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(mcp_cancel))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(mcp_cancel))
+    .await?;
 
     tracing::info!("HTTP server drained; stopping background scheduler");
     scheduler_handle.shutdown().await;

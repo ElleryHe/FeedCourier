@@ -9,6 +9,7 @@ pub mod public;
 pub mod spa;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{delete, get, patch, post};
 use http as _;
@@ -91,14 +92,35 @@ pub fn build_api_only_router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth::auth_login))
         .route("/api/v1/auth/login/2fa", post(auth::auth_login_2fa))
         .route("/api/v1/auth/logout", post(auth::auth_logout))
-        // Public SMTP compliance endpoints (RFC 8058 unsubscribe + double opt-in confirmation)
+        // Public SMTP compliance endpoints (RFC 8058 unsubscribe + double opt-in confirmation).
+        // Empty `/u/` and `/v/` paths return a clean public 404 rather than falling through to SPA.
+        .route(
+            "/u",
+            get(public::public_not_found).post(public::public_not_found),
+        )
+        .route(
+            "/u/",
+            get(public::public_not_found).post(public::public_not_found),
+        )
+        .route(
+            "/v",
+            get(public::public_not_found).post(public::public_not_found),
+        )
+        .route(
+            "/v/",
+            get(public::public_not_found).post(public::public_not_found),
+        )
         .route(
             "/u/{token}",
-            get(public::get_unsubscribe_page).post(public::post_unsubscribe),
+            get(public::get_unsubscribe_page)
+                .post(public::post_unsubscribe)
+                .layer(DefaultBodyLimit::max(4096)),
         )
         .route(
             "/v/{token}",
-            get(public::get_verify_page).post(public::post_verify),
+            get(public::get_verify_page)
+                .post(public::post_verify)
+                .layer(DefaultBodyLimit::max(4096)),
         );
 
     let protected_routes = Router::new()

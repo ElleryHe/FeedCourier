@@ -31,7 +31,7 @@ use crate::db::Database;
 use crate::db::models::{
     AppLocale, Channel, DeliveryTask, DeliveryTaskStatus, Feed, FeedHealthStatus, Route,
     SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SmtpRecipientStatus,
-    UpdateDestination, now_unix,
+    now_unix,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
@@ -1000,68 +1000,9 @@ impl DeliveryDispatcher {
         // 3b. SMTP per-recipient compliance gate: only deliver to `verified` addresses, defer
         //     while awaiting recipient verification, or auto-pause when all recipients revoked/bounced.
         let smtp_delivery = if let DestinationConfig::Smtp(ref smtp_dest) = destination_config {
-            let mut hmacs: Vec<String> = Vec::new();
-            let mut hmac_to_email: HashMap<String, String> = HashMap::new();
-            for raw in &smtp_dest.to_addresses {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let h = self.inner.master_key.smtp_recipient_hmac(trimmed);
-                if hmac_to_email
-                    .entry(h.clone())
-                    .or_insert_with(|| trimmed.to_string())
-                    == trimmed
-                    && !hmacs.contains(&h)
-                {
-                    hmacs.push(h);
-                }
-            }
-
-            let rows = self
-                .inner
-                .db
-                .sync_smtp_recipients_for_destination(
-                    destination.id,
-                    &hmacs,
-                    SmtpRecipientStatus::Unverified,
-                    None,
-                )
+            let (verified_recipients, awaiting_verification) = self
+                .build_smtp_verified_recipients(destination.id, smtp_dest)
                 .await?;
-
-            let (public_url, _) = self
-                .inner
-                .db
-                .get_effective_public_url(&self.inner.config)
-                .await?;
-
-            let mut verified_recipients = Vec::new();
-            let mut awaiting_verification = false;
-            for row in rows {
-                match row.status {
-                    SmtpRecipientStatus::Verified => {
-                        if let Some(email) = hmac_to_email.get(&row.address_hmac) {
-                            let unsubscribe_url = public_url.as_deref().map(|base| {
-                                let tok = self
-                                    .inner
-                                    .master_key
-                                    .sign_unsubscribe_token(destination.id, row.id);
-                                format!("{base}/u/{tok}")
-                            });
-                            verified_recipients.push(SmtpDeliveryRecipient {
-                                recipient_id: row.id,
-                                email: email.clone(),
-                                address_hmac: row.address_hmac,
-                                unsubscribe_url,
-                            });
-                        }
-                    }
-                    SmtpRecipientStatus::Unverified | SmtpRecipientStatus::Pending => {
-                        awaiting_verification = true;
-                    }
-                    SmtpRecipientStatus::Unsubscribed | SmtpRecipientStatus::Bounced => {}
-                }
-            }
 
             if verified_recipients.is_empty() {
                 if awaiting_verification {
@@ -1086,13 +1027,7 @@ impl DeliveryDispatcher {
                     let _ = self
                         .inner
                         .db
-                        .update_destination(
-                            destination.id,
-                            &UpdateDestination {
-                                enabled: Some(false),
-                                ..UpdateDestination::default()
-                            },
-                        )
+                        .auto_pause_destination(destination.id, now)
                         .await;
                     let diag = format_deferral_diagnostic(
                         "All SMTP recipients are unsubscribed or bounced; destination paused",
@@ -1217,10 +1152,82 @@ impl DeliveryDispatcher {
         Ok(true)
     }
 
+    async fn build_smtp_verified_recipients(
+        &self,
+        destination_id: i64,
+        smtp_dest: &crate::channels::SmtpDestinationConfig,
+    ) -> AppResult<(Vec<SmtpDeliveryRecipient>, bool)> {
+        let mut hmacs: Vec<String> = Vec::new();
+        let mut hmac_to_email: HashMap<String, String> = HashMap::new();
+        for raw in &smtp_dest.to_addresses {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let h = self.inner.master_key.smtp_recipient_hmac(trimmed);
+            if hmac_to_email
+                .entry(h.clone())
+                .or_insert_with(|| trimmed.to_string())
+                == trimmed
+                && !hmacs.contains(&h)
+            {
+                hmacs.push(h);
+            }
+        }
+
+        let rows = self
+            .inner
+            .db
+            .sync_smtp_recipients_for_destination(
+                destination_id,
+                &hmacs,
+                SmtpRecipientStatus::Unverified,
+                None,
+            )
+            .await?;
+
+        let (public_url, _) = self
+            .inner
+            .db
+            .get_effective_public_url(&self.inner.config)
+            .await?;
+
+        let mut verified_recipients = Vec::new();
+        let mut awaiting_verification = false;
+        for row in rows {
+            match row.status {
+                SmtpRecipientStatus::Verified => {
+                    if let Some(email) = hmac_to_email.get(&row.address_hmac) {
+                        let unsubscribe_url = public_url.as_deref().map(|base| {
+                            let tok = self
+                                .inner
+                                .master_key
+                                .sign_unsubscribe_token(destination_id, row.id);
+                            format!("{base}/u/{tok}")
+                        });
+                        verified_recipients.push(SmtpDeliveryRecipient {
+                            recipient_id: row.id,
+                            email: email.clone(),
+                            address_hmac: row.address_hmac,
+                            unsubscribe_url,
+                        });
+                    }
+                }
+                SmtpRecipientStatus::Unverified | SmtpRecipientStatus::Pending => {
+                    awaiting_verification = true;
+                }
+                SmtpRecipientStatus::Unsubscribed | SmtpRecipientStatus::Bounced => {}
+            }
+        }
+
+        Ok((verified_recipients, awaiting_verification))
+    }
+
     /// Stateless debug push: fetch the live feed item, render it for the resolved destination with
     /// the requested route options, and send it immediately through the channel adapter. Nothing is
     /// persisted (no entries, fingerprints, tasks or quota usage); Notion pages carry a
-    /// `test-` prefixed `FC-ID`.
+    /// `test-` prefixed `FC-ID`, and SMTP debug pushes strictly deliver only to verified recipients
+    /// via isolated single-`To` envelopes with compliance headers.
     pub async fn debug_push(&self, params: DebugPushParams) -> AppResult<DebugPushResult> {
         let (channel, destination) = self
             .inner
@@ -1235,6 +1242,24 @@ impl DeliveryDispatcher {
             .inner
             .master_key
             .decrypt_json(&destination.encrypted_config)?;
+
+        let smtp_delivery = if let DestinationConfig::Smtp(ref smtp_dest) = destination_config {
+            let (verified_recipients, _) = self
+                .build_smtp_verified_recipients(destination.id, smtp_dest)
+                .await?;
+            if verified_recipients.is_empty() {
+                return Err(AppError::Validation(
+                    "No verified SMTP recipients on this destination; verify at least one recipient before debug pushing."
+                        .to_string(),
+                ));
+            }
+            Some(SmtpDeliveryPlan {
+                recipients: verified_recipients,
+                per_recipient_delay: Duration::ZERO,
+            })
+        } else {
+            None
+        };
 
         let system_tz = self.inner.db.get_timezone().await;
         let route_tz = resolve_route_timezone(&params.options, system_tz);
@@ -1359,7 +1384,7 @@ impl DeliveryDispatcher {
             checkpoint: None,
             checkpoint_sink: None,
             overrides,
-            smtp_delivery: None,
+            smtp_delivery,
         };
 
         let send_result = match channel.kind {

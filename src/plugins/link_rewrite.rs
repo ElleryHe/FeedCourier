@@ -25,6 +25,10 @@ use crate::crypto::{md5_hex, sha256_hex};
 use crate::db::Database;
 use crate::db::models::now_unix;
 use crate::error::{AppError, AppResult};
+use crate::ingest::html::{
+    ParsedTagAttr, find_ascii_case_insensitive, find_html_tag_end,
+    parse_tag_attrs_and_self_closing, split_tag_name_and_attrs,
+};
 use crate::net::ProtectedHttpClient;
 
 use super::{
@@ -122,6 +126,9 @@ impl YourlsProviderConfig {
                             .to_string(),
                     ));
                 }
+                // Clear inactive password credentials so old secrets are never retained on disk.
+                self.username = None;
+                self.password = None;
             }
             YourlsAuthMode::Password => {
                 if self.username.is_none() || self.password.is_none() {
@@ -129,12 +136,14 @@ impl YourlsProviderConfig {
                         "YOURLS username and password are required for password auth".to_string(),
                     ));
                 }
+                // Clear inactive signature token when switching to username/password auth.
+                self.signature = None;
             }
         }
 
         let mut normalized_domains = Vec::with_capacity(self.exclude_domains.len());
         for d in self.exclude_domains {
-            let clean = d.trim().to_ascii_lowercase();
+            let clean = d.trim().trim_end_matches('.').to_ascii_lowercase();
             if !clean.is_empty() && !normalized_domains.contains(&clean) {
                 normalized_domains.push(clean);
             }
@@ -162,7 +171,11 @@ impl YourlsProviderConfig {
     pub fn api_host(&self) -> Option<String> {
         Url::parse(&self.api_url)
             .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+            .and_then(|u| {
+                u.host_str()
+                    .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+            })
+            .filter(|h| !h.is_empty())
     }
 }
 
@@ -412,11 +425,11 @@ impl Plugin for LinkRewritePlugin {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        // 1. Collect unique eligible URLs in document order (primary link first, then `<a href>`),
-        //    capped at `MAX_REWRITE_URLS_PER_ENTRY` (50).
+        // 1. Collect all unique eligible URLs in document order (primary link first, then `<a href>`).
+        //    We look up the SQLite cache BEFORE applying `MAX_REWRITE_URLS_PER_ENTRY` so cached links
+        //    never crowd out uncached links from being shortened.
         let mut candidate_urls: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut truncated_cap = false;
 
         if let Some(p_url) = primary_url
             && is_eligible_rewrite_url(p_url, self_host.as_deref(), &provider_cfg.exclude_domains)
@@ -434,15 +447,9 @@ impl Plugin for LinkRewritePlugin {
                 ) {
                     continue;
                 }
-                if seen.contains(&href) {
-                    continue;
+                if seen.insert(href.clone()) {
+                    candidate_urls.push(href);
                 }
-                if candidate_urls.len() >= MAX_REWRITE_URLS_PER_ENTRY {
-                    truncated_cap = true;
-                    break;
-                }
-                seen.insert(href.clone());
-                candidate_urls.push(href);
             }
         }
 
@@ -450,7 +457,7 @@ impl Plugin for LinkRewritePlugin {
             return Ok(PluginResult::Continue);
         }
 
-        // 2. Check SQLite cache (`plugin_link_cache`).
+        // 2. Check SQLite cache (`plugin_link_cache`) in a single batch query.
         let hash_to_url: Vec<(String, String)> = candidate_urls
             .iter()
             .map(|u| (sha256_hex(u.as_bytes()), u.clone()))
@@ -475,6 +482,12 @@ impl Plugin for LinkRewritePlugin {
             }
         }
 
+        let mut truncated_cap = false;
+        if misses.len() > MAX_REWRITE_URLS_PER_ENTRY {
+            misses.truncate(MAX_REWRITE_URLS_PER_ENTRY);
+            truncated_cap = true;
+        }
+
         if ctx.write_cache && !cache_hit_hashes.is_empty() {
             let _ = ctx
                 .db
@@ -492,6 +505,7 @@ impl Plugin for LinkRewritePlugin {
 
         let mut failed_count = 0usize;
         let mut first_error: Option<String> = None;
+        let mut max_retry_after_secs: Option<u64> = None;
 
         if !misses.is_empty() {
             let http = ctx.http.clone();
@@ -526,6 +540,14 @@ impl Plugin for LinkRewritePlugin {
                     }
                     Err(err) => {
                         failed_count += 1;
+                        if let AppError::RateLimited {
+                            retry_after_secs: Some(secs),
+                            ..
+                        } = &err
+                        {
+                            max_retry_after_secs =
+                                Some(max_retry_after_secs.map_or(*secs, |cur| cur.max(*secs)));
+                        }
                         if first_error.is_none() {
                             first_error = Some(err.to_string());
                         }
@@ -550,7 +572,7 @@ impl Plugin for LinkRewritePlugin {
                     instance.name,
                     candidate_urls.len()
                 ),
-                retry_after_secs: None,
+                retry_after_secs: max_retry_after_secs,
             });
         }
 
@@ -563,7 +585,7 @@ impl Plugin for LinkRewritePlugin {
             ));
         } else if truncated_cap {
             out.warnings.push(format!(
-                "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} unique links; remaining links kept original"
+                "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} new uncached links; remaining uncached links kept original"
             ));
         }
 
@@ -603,11 +625,15 @@ pub fn is_eligible_rewrite_url(
     if !matches!(parsed.scheme(), "http" | "https") {
         return false;
     }
-    let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+    let Some(host) = parsed
+        .host_str()
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+    else {
         return false;
     };
     if let Some(self_h) = provider_host
-        && host == self_h.to_ascii_lowercase()
+        && host == self_h.trim_end_matches('.').to_ascii_lowercase()
     {
         return false;
     }
@@ -620,14 +646,15 @@ pub fn is_eligible_rewrite_url(
 }
 
 fn domain_matches_pattern(host: &str, pattern: &str) -> bool {
-    let p = pattern.trim().to_ascii_lowercase();
-    if p.is_empty() {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let p = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() || p.is_empty() {
         return false;
     }
     if let Some(suffix) = p.strip_prefix("*.") {
-        host == suffix || host.ends_with(&format!(".{suffix}"))
+        !suffix.is_empty() && (h == suffix || h.ends_with(&format!(".{suffix}")))
     } else {
-        host == p
+        h == p
     }
 }
 
@@ -681,8 +708,16 @@ async fn shorten_single_url(
         )
         .await?;
 
-    // Note: YOURLS returns HTTP 200 for both success and `code: "error:url"` (already shortened),
-    // and some reverse proxies return HTTP 400 with JSON containing `shorturl` on duplicate URL.
+    if resp.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::RateLimited {
+            message: "YOURLS API rate-limited (HTTP 429)".to_string(),
+            retry_after_secs: resp.retry_after_secs,
+        });
+    }
+
+    // YOURLS returns HTTP 200 for success and duplicate URLs (`code: "error:url"`), and some
+    // reverse proxies emit HTTP 400 with `code: "error:url"` + `shorturl` for duplicates. All
+    // other non-2xx statuses are rejected even if a proxy/gateway returned a JSON body.
     let body: Value = serde_json::from_slice(&resp.bytes).map_err(|err| {
         AppError::Upstream(format!(
             "YOURLS returned non-JSON response (HTTP {}): {err}",
@@ -690,11 +725,18 @@ async fn shorten_single_url(
         ))
     })?;
 
-    if let Some(short) = body
-        .get("shorturl")
+    let code = body
+        .get("code")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let is_duplicate_400 = resp.status == reqwest::StatusCode::BAD_REQUEST && code == "error:url";
+
+    if (resp.status.is_success() || is_duplicate_400)
+        && let Some(short) = body
+            .get("shorturl")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     {
         let parsed = Url::parse(short).map_err(|err| {
             AppError::Upstream(format!("YOURLS returned invalid shorturl '{short}': {err}"))
@@ -704,10 +746,6 @@ async fn shorten_single_url(
         }
     }
 
-    let code = body
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
     let message = body
         .get("message")
         .and_then(Value::as_str)
@@ -722,7 +760,53 @@ async fn shorten_single_url(
 // HTML `<a href>` Extractor & Rewriter (strictly touches ONLY `<a href>`)
 // =============================================================================
 
-/// Extract decoded `href` attribute values from all `<a ...>` opening tags in `html`.
+/// Detect if an opening tag starts a `<script>` or `<style>` raw-text block so we skip its body.
+fn raw_text_block_tag(full_tag: &str) -> Option<&'static str> {
+    let inner = full_tag.strip_prefix('<')?.strip_suffix('>')?.trim_start();
+    if inner.is_empty()
+        || inner.starts_with('/')
+        || inner.starts_with('!')
+        || inner.starts_with('?')
+    {
+        return None;
+    }
+    let (name, attr_tail) = split_tag_name_and_attrs(inner);
+    let (_, self_closing) = parse_tag_attrs_and_self_closing(attr_tail);
+    if self_closing {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("script") {
+        Some("script")
+    } else if name.eq_ignore_ascii_case("style") {
+        Some("style")
+    } else {
+        None
+    }
+}
+
+/// Find the byte offset immediately after `</script...>` or `</style...>` within `html[from..]`.
+fn find_raw_text_close_end(html: &str, from: usize, tag: &str) -> usize {
+    let needle = format!("</{tag}");
+    let mut search = from;
+    while let Some(rel) = find_ascii_case_insensitive(&html[search..], &needle) {
+        let close_start = search + rel;
+        let after_name = close_start + needle.len();
+        let next_byte = html.as_bytes().get(after_name).copied();
+        if matches!(next_byte, Some(b'>' | b'/') | None)
+            || next_byte.is_some_and(|b| b.is_ascii_whitespace())
+        {
+            if let Some(gt_rel) = html[close_start..].find('>') {
+                return close_start + gt_rel + 1;
+            }
+            return html.len();
+        }
+        search = after_name;
+    }
+    html.len()
+}
+
+/// Extract decoded `href` attribute values from all `<a ...>` opening tags in `html`, skipping
+/// HTML comments and `<script>` / `<style>` raw-text blocks.
 pub fn extract_anchor_hrefs(html: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = html.as_bytes();
@@ -740,13 +824,18 @@ pub fn extract_anchor_hrefs(html: &str) -> Vec<String> {
             }
             break;
         }
-        let Some(tag_end) = find_tag_end(&html[lt..]) else {
+        let Some(tag_end) = find_html_tag_end(&html[lt..]) else {
             break;
         };
         let full_tag = &html[lt..=lt + tag_end];
         idx = lt + tag_end + 1;
 
-        if let Some((_, attrs, _)) = parse_anchor_tag(full_tag) {
+        if let Some(raw_tag) = raw_text_block_tag(full_tag) {
+            idx = find_raw_text_close_end(html, idx, raw_tag);
+            continue;
+        }
+
+        if let Some((_, attrs)) = parse_anchor_tag(full_tag) {
             for attr in attrs {
                 if attr.name.eq_ignore_ascii_case("href")
                     && let Some(val) = attr.value
@@ -763,7 +852,8 @@ pub fn extract_anchor_hrefs(html: &str) -> Vec<String> {
 }
 
 /// Rewrite matching `<a href="...">` attributes in `html` according to `replacements`, leaving
-/// every other tag (`<img>`, `<video>`, `<audio>`, `<source>`, text, comments) byte-for-byte intact.
+/// every other tag (`<img>`, `<video>`, `<audio>`, `<source>`, `<script>`, `<style>`, text,
+/// comments) byte-for-byte intact.
 pub fn rewrite_anchor_hrefs(html: &str, replacements: &HashMap<String, String>) -> String {
     if replacements.is_empty() {
         return html.to_string();
@@ -792,14 +882,21 @@ pub fn rewrite_anchor_hrefs(html: &str, replacements: &HashMap<String, String>) 
             break;
         }
 
-        let Some(tag_end) = find_tag_end(&html[lt..]) else {
+        let Some(tag_end) = find_html_tag_end(&html[lt..]) else {
             out.push_str(&html[lt..]);
             break;
         };
         let full_tag = &html[lt..=lt + tag_end];
         idx = lt + tag_end + 1;
 
-        let Some((tag_name, mut attrs, self_closing)) = parse_anchor_tag(full_tag) else {
+        if let Some(raw_tag) = raw_text_block_tag(full_tag) {
+            let block_end = find_raw_text_close_end(html, idx, raw_tag);
+            out.push_str(&html[lt..block_end]);
+            idx = block_end;
+            continue;
+        }
+
+        let Some((tag_name, mut attrs)) = parse_anchor_tag(full_tag) else {
             out.push_str(full_tag);
             continue;
         };
@@ -831,39 +928,14 @@ pub fn rewrite_anchor_hrefs(html: &str, replacements: &HashMap<String, String>) 
                 out.push('"');
             }
         }
-        if self_closing {
-            out.push_str(" />");
-        } else {
-            out.push('>');
-        }
+        // `<a>` is a non-void HTML element; never emit `<a ... />`.
+        out.push('>');
     }
 
     out
 }
 
-#[derive(Debug, Clone)]
-struct TagAttr {
-    name: String,
-    value: Option<String>,
-}
-
-fn find_tag_end(slice_from_lt: &str) -> Option<usize> {
-    let mut quote: Option<u8> = None;
-    for (i, b) in slice_from_lt.bytes().enumerate().skip(1) {
-        if let Some(q) = quote {
-            if b == q {
-                quote = None;
-            }
-        } else if b == b'"' || b == b'\'' {
-            quote = Some(b);
-        } else if b == b'>' {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn parse_anchor_tag(tag_str: &str) -> Option<(String, Vec<TagAttr>, bool)> {
+fn parse_anchor_tag(tag_str: &str) -> Option<(String, Vec<ParsedTagAttr>)> {
     let inner = tag_str.strip_prefix('<')?.strip_suffix('>')?;
     let trimmed = inner.trim_start();
     if trimmed.is_empty()
@@ -874,93 +946,13 @@ fn parse_anchor_tag(tag_str: &str) -> Option<(String, Vec<TagAttr>, bool)> {
         return None;
     }
 
-    let self_closing = inner.trim_end().ends_with('/');
-    let body = if self_closing {
-        inner.trim_end().strip_suffix('/').unwrap_or(inner)
-    } else {
-        inner
-    };
-    let name_end = body
-        .find(|c: char| c.is_ascii_whitespace() || c == '/')
-        .unwrap_or(body.len());
-    let tag_name = &body[..name_end];
+    let (tag_name, attr_tail) = split_tag_name_and_attrs(trimmed);
     if !tag_name.eq_ignore_ascii_case("a") {
         return None;
     }
 
-    let attrs = parse_attrs(&body[name_end..]);
-    Some((tag_name.to_ascii_lowercase(), attrs, self_closing))
-}
-
-fn parse_attrs(s: &str) -> Vec<TagAttr> {
-    let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let name_start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && bytes[i] != b'='
-            && bytes[i] != b'/'
-        {
-            i += 1;
-        }
-        if i == name_start {
-            i += 1;
-            continue;
-        }
-        let name = s[name_start..i].to_string();
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'=' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                out.push(TagAttr {
-                    name,
-                    value: Some(String::new()),
-                });
-                break;
-            }
-            let raw_val = if bytes[i] == b'"' || bytes[i] == b'\'' {
-                let q = bytes[i];
-                i += 1;
-                let val_start = i;
-                while i < bytes.len() && bytes[i] != q {
-                    i += 1;
-                }
-                let extracted = &s[val_start..i];
-                if i < bytes.len() && bytes[i] == q {
-                    i += 1;
-                }
-                extracted
-            } else {
-                let val_start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                &s[val_start..i]
-            };
-            let decoded = html_escape::decode_html_entities(raw_val).into_owned();
-            out.push(TagAttr {
-                name,
-                value: Some(decoded),
-            });
-        } else {
-            out.push(TagAttr { name, value: None });
-        }
-    }
-    out
+    let (attrs, _self_closing) = parse_tag_attrs_and_self_closing(attr_tail);
+    Some((tag_name.to_ascii_lowercase(), attrs))
 }
 
 fn push_escaped_attr(out: &mut String, val: &str) {

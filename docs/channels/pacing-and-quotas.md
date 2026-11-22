@@ -14,7 +14,7 @@ FeedCourier uses a **two-layer Delivery Channel model** (**Channel Account** + m
 
 Every delivery target is organized into two layers:
 
-- **Channel Account** (configured once under **Channels**): stores encrypted credentials, outbound proxy toggle (`use_proxy`), pacing (`min_interval_secs`, `jitter_max_secs`), rolling quotas (`hourly_quota`, `daily_quota`), and downstream rate-limit cooldowns (`cooldown_until`).
+- **Channel Account** (configured once under **Channels**): stores encrypted credentials, outbound proxy toggle (`use_proxy`, for HTTP-based Telegram and Notion accounts; SMTP uses native TCP/TLS direct connections), pacing (`min_interval_secs`, `jitter_max_secs`), rolling quotas (`hourly_quota`, `daily_quota`), and downstream rate-limit cooldowns (`cooldown_until`).
 - **Destinations** (one or more attached to each account): stores target-specific routing settings (Telegram `chat_id` + `message_thread_id`, SMTP `to_addresses` + `reply_to`, or Notion `data_source_id` + `column_mapping`). Each destination can be enabled, disabled, or tested independently.
 
 Instead of combining multiple articles into a digest, FeedCourier creates one delivery task for each new article and each matching route (pointing to a specific **Destination**):
@@ -147,9 +147,9 @@ Localized article timestamps are formatted with an explicit UTC offset—for exa
 
 ## 8. Debug Push from the Feed Preview {#debug-push-from-the-feed-preview}
 
-To check how an article will look in a destination without subscribing or touching the queue, open the **Feed Preview** for a URL (or for an existing feed) and use the **Debug push** bar: choose a target **Destination**, (for Telegram) the delivery mode and link preview, the delivery language, and an optional timezone override, then click **Push latest** or **Push this item** on a specific preview item.
+To check how an article will look in a destination without subscribing or touching the queue, open the **Feed Preview** for a URL (or for an existing feed) and use the **Debug push** bar: choose a target **Destination**, (for Telegram) the delivery mode and link preview, the delivery language, an optional timezone override, and optional route plugins (such as Link Rewrite), then click **Push latest** or **Push this item** on a specific preview item.
 
-A debug push is **stateless**: it does not create fingerprints, does not enter the queue, ignores route filters, time windows, and quotas, and does not count against account limits. Notion pages created this way use a `test-` prefixed `FC-ID`, so they never collide with real deliveries. Failures are reported in the result message. The MCP equivalent is [`test_push_feed_entry`](/mcp/tools#9-test-push-feed-entry).
+A debug push is **stateless**: it does not create fingerprints, does not enter the queue, ignores route filters, time windows, and quotas, and does not count against account limits. For SMTP destinations, debug push strictly delivers only to **`verified`** recipients via isolated single-`To:` envelopes with compliance headers (returning an error when 0 verified recipients exist). Notion pages created this way use a `test-` prefixed `FC-ID`, so they never collide with real deliveries. Failures are reported in the result message. The MCP equivalent is [`test_push_feed_entry`](/mcp/tools#9-test-push-feed-entry).
 
 ---
 

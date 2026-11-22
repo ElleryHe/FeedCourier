@@ -49,6 +49,7 @@ const DELIVERED_WARNING_MARKERS = [
   "Link Rewrite partial",
   "hard-bounced",
   "is disabled; kept original",
+  "not found; kept original URLs",
   "capped at",
 ] as const;
 

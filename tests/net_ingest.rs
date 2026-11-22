@@ -1313,3 +1313,87 @@ async fn redirect_hop_limit_and_conditional_last_modified_and_atom_json_feed() {
     let err = bad_filter.compile().expect_err("invalid regex must fail");
     assert!(matches!(err, AppError::Validation(_)));
 }
+
+#[tokio::test]
+async fn qa09_html5_single_pass_attr_entity_decoding_idna_and_fail_closed_proxy() {
+    use feedcourier::crypto::normalize_email_address;
+    use feedcourier::ingest::html::{decode_html_attr_entities, extract_inline_media_from_html};
+
+    // 1. HTML5 §13.2.5.72 attribute entity decoding:
+    //    - `&amp;lt;` decodes in a single pass to `&lt;`, NEVER `<`
+    //    - semicolon-less `&copy=2` / `&reg=us` followed by `=` stay verbatim (not `©`/`®`)
+    //    - unknown `&notanentity;` stays verbatim (no `&not` prefix corruption to `¬anentity;`)
+    assert_eq!(decode_html_attr_entities("&amp;lt;"), "&lt;");
+    assert_eq!(
+        decode_html_attr_entities("https://example.com/item?a=1&copy=2&reg=us&notanentity=3"),
+        "https://example.com/item?a=1&copy=2&reg=us&notanentity=3"
+    );
+    assert_eq!(
+        decode_html_attr_entities("&notanentity; &copy2 &amp; &copy;"),
+        "&notanentity; &copy2 & ©"
+    );
+
+    // 2. Full `sanitize_and_extract_html` preserves query params and single-pass entities without double-decoding.
+    let base = Url::parse("https://blog.example.com/posts/1").unwrap();
+    let raw = r#"<p><a href="https://example.com/search?a=1&copy=2&reg=us">Q</a><img src="/img.png?a=1&copy=2&reg=us" alt="&amp;lt;tag&amp;gt;"><span title=Bob's><a href="/next/">Next</a></span></p>"#;
+    let out = sanitize_and_extract_html(raw, Some(&base));
+    assert!(
+        out.content_html.contains("?a=1&amp;copy=2&amp;reg=us"),
+        "query params must not be corrupted into ©/®: {}",
+        out.content_html
+    );
+    assert!(
+        !out.content_html.contains('©') && !out.content_html.contains('®'),
+        "semicolon-less query params must not decode to symbols: {}",
+        out.content_html
+    );
+    assert!(
+        out.content_html
+            .contains("href=\"https://blog.example.com/next/\""),
+        "apostrophe in unquoted attribute `title=Bob's` must not swallow following <a>: {}",
+        out.content_html
+    );
+    let media = extract_inline_media_from_html(&out.content_html);
+    assert_eq!(media.len(), 1);
+    assert_eq!(
+        media[0].url,
+        "https://blog.example.com/img.png?a=1&copy=2&reg=us"
+    );
+    assert_eq!(media[0].caption.as_deref(), Some("&lt;tag&gt;"));
+
+    // 3. UTS-46 IDNA Punycode normalization for internationalized email domains.
+    assert_eq!(
+        normalize_email_address("  Alice@Bücher.DE "),
+        "alice@xn--bcher-kva.de"
+    );
+    assert_eq!(
+        normalize_email_address("alice@XN--BCHER-KVA.de"),
+        "alice@xn--bcher-kva.de"
+    );
+
+    // 4. Q4 fail-closed proxy contract: `use_proxy = true` with no global OUTBOUND_PROXY MUST error.
+    let client = ProtectedHttpClient::new(NetSettings {
+        outbound_proxy_url: None,
+        ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+    })
+    .unwrap();
+    let err = client
+        .get_bytes(OutboundRequest::new("https://example.com/feed.xml").use_proxy(true))
+        .await
+        .expect_err("use_proxy=true without global OUTBOUND_PROXY must fail closed");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "expected AppError::Validation, got {err:?}"
+    );
+    let post_err = client
+        .post_form_bytes(
+            "https://example.com/yourls-api.php",
+            &[("action".to_string(), "shorturl".to_string())],
+            true,
+            std::time::Duration::from_secs(5),
+            1024,
+        )
+        .await
+        .expect_err("post_form_bytes with use_proxy=true and no global proxy must fail closed");
+    assert!(matches!(post_err, AppError::Validation(_)));
+}

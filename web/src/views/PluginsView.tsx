@@ -52,6 +52,90 @@ import { errorMessage, isValidHttpUrl } from "@/lib/utils";
 
 type PluginsTab = "installed" | "marketplace";
 
+function isSafeHttpUrl(raw?: string | null): boolean {
+  if (!raw) return false;
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+interface InstanceSchemaProperty {
+  type?: string;
+  title?: string;
+  description?: string;
+  placeholder?: string;
+  enum?: Array<string | number>;
+  format?: string;
+  default?: unknown;
+  items?: { type?: string };
+}
+
+interface ParsedInstanceSchema {
+  properties: Array<[string, InstanceSchemaProperty]>;
+  required: ReadonlySet<string>;
+}
+
+function isPlainRecord(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
+function parseInstanceSchema(
+  raw: Record<string, unknown> | null | undefined,
+): ParsedInstanceSchema {
+  if (!isPlainRecord(raw)) {
+    return { properties: [], required: new Set() };
+  }
+  const required = new Set<string>(
+    Array.isArray(raw.required)
+      ? raw.required.filter((x): x is string => typeof x === "string")
+      : [],
+  );
+  const properties: Array<[string, InstanceSchemaProperty]> = [];
+  if (isPlainRecord(raw.properties)) {
+    for (const [key, propVal] of Object.entries(raw.properties)) {
+      if (!isPlainRecord(propVal)) continue;
+      properties.push([key, propVal as InstanceSchemaProperty]);
+    }
+  }
+  return { properties, required };
+}
+
+function formatGenericConfigEntries(
+  config: Record<string, unknown>,
+): Array<{ key: string; value: string; isSecretHint?: boolean }> {
+  const entries: Array<{ key: string; value: string; isSecretHint?: boolean }> =
+    [];
+  for (const [key, val] of Object.entries(config)) {
+    if (val === null || val === undefined || val === "") continue;
+    if (key.startsWith("has_") && typeof val === "boolean") continue;
+    if (key.endsWith("_hint") && typeof val === "string") {
+      entries.push({
+        key: key.slice(0, -5),
+        value: val,
+        isSecretHint: true,
+      });
+      continue;
+    }
+    if (typeof val === "boolean") {
+      entries.push({ key, value: val ? "true" : "false" });
+    } else if (typeof val === "number") {
+      entries.push({ key, value: String(val) });
+    } else if (typeof val === "string") {
+      entries.push({ key, value: val });
+    } else if (Array.isArray(val)) {
+      if (val.length > 0) {
+        entries.push({ key, value: val.map((v) => String(v)).join(", ") });
+      }
+    }
+  }
+  return entries;
+}
+
 function parseYourlsConfig(
   raw: Record<string, unknown>,
 ): YourlsProviderConfigView {
@@ -108,7 +192,14 @@ export function PluginsView() {
     mutationFn: () => api.plugins.market(true),
     onSuccess: (res) => {
       queryClient.setQueryData(["plugins-market"], res);
-      toast.success(m.plugins.market.toastRefreshed);
+      if (res.source === "snapshot") {
+        toast.warning(
+          m.plugins.market.toastRefreshSnapshotTitle,
+          m.plugins.market.toastRefreshSnapshotDesc,
+        );
+      } else {
+        toast.success(m.plugins.market.toastRefreshed);
+      }
     },
     onError: (err) => {
       toast.error(m.plugins.market.toastRefreshFailed, errorMessage(err));
@@ -252,6 +343,26 @@ export function PluginsView() {
           {pluginsQuery.isLoading ? (
             <Card className="p-8 text-center text-xs text-zinc-500">
               {m.plugins.loading}
+            </Card>
+          ) : pluginsQuery.isError ? (
+            <Card className="border-rose-200 bg-rose-50/50 p-4 dark:border-rose-900/60 dark:bg-rose-950/20">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 text-xs text-rose-700 dark:text-rose-300">
+                  <AlertTriangle className="h-4 w-4 shrink-0" />
+                  <span>
+                    {m.plugins.loadError} {errorMessage(pluginsQuery.error)}
+                  </span>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void pluginsQuery.refetch()}
+                  loading={pluginsQuery.isFetching}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {m.common.retry}
+                </Button>
+              </div>
             </Card>
           ) : plugins.length === 0 ? (
             <EmptyState
@@ -447,6 +558,27 @@ export function PluginsView() {
             <Card className="p-8 text-center text-xs text-zinc-500">
               {m.plugins.market.loading}
             </Card>
+          ) : marketQuery.isError ? (
+            <Card className="border-rose-200 bg-rose-50/50 p-4 dark:border-rose-900/60 dark:bg-rose-950/20">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 text-xs text-rose-700 dark:text-rose-300">
+                  <AlertTriangle className="h-4 w-4 shrink-0" />
+                  <span>
+                    {m.plugins.market.loadError}{" "}
+                    {errorMessage(marketQuery.error)}
+                  </span>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void marketQuery.refetch()}
+                  loading={marketQuery.isFetching}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {m.common.retry}
+                </Button>
+              </div>
+            </Card>
           ) : filteredMarketPlugins.length === 0 ? (
             <EmptyState
               icon={Store}
@@ -530,7 +662,7 @@ export function PluginsView() {
 
                     <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-3 dark:border-zinc-800/80">
                       <div className="flex flex-wrap items-center gap-2">
-                        {item.homepage && (
+                        {isSafeHttpUrl(item.homepage) && item.homepage && (
                           <a
                             href={item.homepage}
                             target="_blank"
@@ -541,7 +673,7 @@ export function PluginsView() {
                             {m.plugins.market.homepageBtn}
                           </a>
                         )}
-                        {item.repository && (
+                        {isSafeHttpUrl(item.repository) && item.repository && (
                           <a
                             href={item.repository}
                             target="_blank"
@@ -738,17 +870,18 @@ function PluginDetailView({
                     </Badge>
                   ))}
                 </span>
-                {plugin.manifest.homepage && (
-                  <a
-                    href={plugin.manifest.homepage}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-                  >
-                    <ExternalLink className="h-3 w-3" />
-                    {m.plugins.homepageLink}
-                  </a>
-                )}
+                {isSafeHttpUrl(plugin.manifest.homepage) &&
+                  plugin.manifest.homepage && (
+                    <a
+                      href={plugin.manifest.homepage}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      {m.plugins.homepageLink}
+                    </a>
+                  )}
               </div>
             </div>
           </div>
@@ -792,7 +925,11 @@ function PluginDetailView({
           <EmptyState
             icon={Puzzle}
             title={m.plugins.detail.emptyProvidersTitle}
-            description={m.plugins.detail.emptyProvidersDesc}
+            description={
+              plugin.id === "link-rewrite"
+                ? m.plugins.detail.emptyProvidersDesc
+                : m.plugins.detail.emptyProvidersGenericDesc
+            }
             action={
               <Button
                 size="sm"
@@ -806,7 +943,7 @@ function PluginDetailView({
               </Button>
             }
           />
-        ) : (
+        ) : plugin.id === "link-rewrite" ? (
           <Card className="overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
@@ -976,18 +1113,163 @@ function PluginDetailView({
               </table>
             </div>
           </Card>
+        ) : (
+          <Card className="overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-zinc-200 bg-zinc-50/80 text-[11px] text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-950/60">
+                  <tr>
+                    <th className="px-3.5 py-2.5 font-medium">
+                      {m.plugins.detail.colName}
+                    </th>
+                    <th className="px-3.5 py-2.5 font-medium">
+                      {m.plugins.detail.colConfig}
+                    </th>
+                    <th className="px-3.5 py-2.5 font-medium">
+                      {m.plugins.detail.colCache}
+                    </th>
+                    <th className="px-3.5 py-2.5 text-right font-medium">
+                      {m.plugins.detail.colActions}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/80">
+                  {plugin.instances.map((inst) => {
+                    const summaryEntries = formatGenericConfigEntries(
+                      inst.config,
+                    );
+                    return (
+                      <tr
+                        key={inst.id}
+                        className="hover:bg-zinc-50/70 dark:hover:bg-zinc-950/40"
+                      >
+                        <td className="px-3.5 py-3">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                              {inst.name}
+                            </span>
+                            {!inst.enabled && (
+                              <Badge variant="default">
+                                {m.common.disabled}
+                              </Badge>
+                            )}
+                          </div>
+                        </td>
+                        <td className="max-w-md px-3.5 py-3">
+                          {summaryEntries.length === 0 ? (
+                            <span className="text-zinc-400">
+                              {m.plugins.detail.noConfigSummary}
+                            </span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-1">
+                              {summaryEntries.slice(0, 5).map((entry) => (
+                                <Badge
+                                  key={entry.key}
+                                  variant="outline"
+                                  title={`${entry.key}: ${entry.value}`}
+                                  className="max-w-[220px] truncate font-mono text-[10px]"
+                                >
+                                  {entry.isSecretHint && (
+                                    <Lock className="h-2.5 w-2.5 shrink-0" />
+                                  )}
+                                  <span className="truncate">
+                                    {entry.key}: {entry.value}
+                                  </span>
+                                </Badge>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-3.5 py-3">
+                          <Badge variant="mono">
+                            {m.plugins.detail.cachedLinksCount(
+                              inst.cache_entries,
+                            )}
+                          </Badge>
+                        </td>
+                        <td className="px-3.5 py-3 text-right">
+                          <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
+                            <Switch
+                              checked={inst.enabled}
+                              onCheckedChange={(enabled) =>
+                                toggleInstanceMutation.mutate({
+                                  iid: inst.id,
+                                  enabled,
+                                })
+                              }
+                            />
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                testInstanceMutation.mutate(inst.id)
+                              }
+                              loading={testingInstanceId === inst.id}
+                            >
+                              <FlaskConical className="h-3 w-3" />
+                              {m.plugins.detail.testBtn}
+                            </Button>
+                            {inst.cache_entries > 0 && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setClearingCacheInstance(inst)}
+                              >
+                                <Eraser className="h-3 w-3" />
+                                {m.plugins.detail.clearCacheBtn}
+                              </Button>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => {
+                                setEditingInstance(inst);
+                                setProviderModalOpen(true);
+                              }}
+                              title={m.plugins.detail.editTitle}
+                              aria-label={m.plugins.detail.editTitle}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => setDeletingInstance(inst)}
+                              className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                              title={m.plugins.detail.deleteTitle}
+                              aria-label={m.plugins.detail.deleteTitle}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
         )}
       </div>
 
       {/* Add / Edit Provider Modal */}
-      {providerModalOpen && (
-        <YourlsProviderModal
-          open={providerModalOpen}
-          onClose={() => setProviderModalOpen(false)}
-          pluginId={plugin.id}
-          instance={editingInstance}
-        />
-      )}
+      {providerModalOpen &&
+        (plugin.id === "link-rewrite" ? (
+          <YourlsProviderModal
+            open={providerModalOpen}
+            onClose={() => setProviderModalOpen(false)}
+            pluginId={plugin.id}
+            instance={editingInstance}
+          />
+        ) : (
+          <SchemaProviderModal
+            open={providerModalOpen}
+            onClose={() => setProviderModalOpen(false)}
+            plugin={plugin}
+            instance={editingInstance}
+          />
+        ))}
 
       {/* Clear Cache Confirmation */}
       <ConfirmDialog
@@ -1396,6 +1678,485 @@ function YourlsProviderModal({
             {m.plugins.providerModal.ssrfLanNotice}
           </span>
         </div>
+
+        <FieldError message={formError} />
+      </form>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Generic JSON-Schema Driven Provider Modal (Third-Party / Future Plugins)
+// ---------------------------------------------------------------------------
+
+function SchemaProviderModal({
+  open,
+  onClose,
+  plugin,
+  instance,
+}: {
+  open: boolean;
+  onClose: () => void;
+  plugin: PluginDto;
+  instance: PluginInstanceDto | null;
+}) {
+  const { m } = useI18n();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+  const isEdit = instance !== null;
+
+  const parsedSchema = useMemo(
+    () => parseInstanceSchema(plugin.manifest.instance_schema),
+    [plugin.manifest.instance_schema],
+  );
+
+  const [name, setName] = useState(instance?.name ?? "");
+  const [enabled, setEnabled] = useState(instance?.enabled ?? true);
+  const [fieldValues, setFieldValues] = useState<
+    Record<string, string | boolean>
+  >(() => {
+    const initial: Record<string, string | boolean> = {};
+    for (const [key, prop] of parsedSchema.properties) {
+      const isSecret = prop.format === "password";
+      if (isSecret) {
+        initial[key] = "";
+        continue;
+      }
+      const existingVal =
+        isEdit && instance && key in instance.config
+          ? instance.config[key]
+          : undefined;
+
+      if (existingVal !== undefined && existingVal !== null) {
+        if (prop.type === "boolean") {
+          initial[key] = Boolean(existingVal);
+        } else if (prop.type === "array") {
+          initial[key] = Array.isArray(existingVal)
+            ? existingVal.map((item) => String(item)).join("\n")
+            : String(existingVal);
+        } else {
+          initial[key] = String(existingVal);
+        }
+      } else if (prop.default !== undefined && prop.default !== null) {
+        if (prop.type === "boolean") {
+          initial[key] = Boolean(prop.default);
+        } else if (prop.type === "array" && Array.isArray(prop.default)) {
+          initial[key] = prop.default.map((item) => String(item)).join("\n");
+        } else {
+          initial[key] = String(prop.default);
+        }
+      } else if (
+        parsedSchema.required.has(key) &&
+        Array.isArray(prop.enum) &&
+        prop.enum.length > 0
+      ) {
+        initial[key] = String(prop.enum[0]);
+      } else {
+        initial[key] = prop.type === "boolean" ? false : "";
+      }
+    }
+    return initial;
+  });
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const hasStoredSecretFor = (key: string): boolean => {
+    if (!isEdit || !instance) return false;
+    return Boolean(
+      instance.config[`has_${key}`] ||
+        (typeof instance.config[`${key}_hint`] === "string" &&
+          instance.config[`${key}_hint`]),
+    );
+  };
+
+  const secretHintFor = (key: string): string | null => {
+    if (!isEdit || !instance) return null;
+    const hint = instance.config[`${key}_hint`];
+    return typeof hint === "string" && hint ? hint : null;
+  };
+
+  const buildValidatedConfig = (): {
+    config: Record<string, unknown> | null;
+    error: string | null;
+  } => {
+    const config: Record<string, unknown> = {};
+
+    for (const [key, prop] of parsedSchema.properties) {
+      const label = prop.title || key;
+      const isRequired = parsedSchema.required.has(key);
+      const isSecret = prop.format === "password";
+      const raw = fieldValues[key];
+
+      if (prop.type === "boolean") {
+        config[key] = Boolean(raw);
+        continue;
+      }
+
+      const strVal = typeof raw === "string" ? raw : "";
+
+      if (prop.type === "array") {
+        const items = strVal
+          .split(/[\n,]+/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        if (isRequired && items.length === 0) {
+          return {
+            config: null,
+            error: m.plugins.providerModal.errFieldRequired(label),
+          };
+        }
+        config[key] = items;
+        continue;
+      }
+
+      if (Array.isArray(prop.enum) && prop.enum.length > 0) {
+        if (!strVal) {
+          if (isRequired) {
+            return {
+              config: null,
+              error: m.plugins.providerModal.errFieldRequired(label),
+            };
+          }
+          continue;
+        }
+        const matched = prop.enum.find((opt) => String(opt) === strVal);
+        config[key] = matched !== undefined ? matched : strVal;
+        continue;
+      }
+
+      if (prop.type === "number" || prop.type === "integer") {
+        const trimmed = strVal.trim();
+        if (!trimmed) {
+          if (isRequired) {
+            return {
+              config: null,
+              error: m.plugins.providerModal.errFieldRequired(label),
+            };
+          }
+          continue;
+        }
+        const num = Number(trimmed);
+        if (!Number.isFinite(num)) {
+          return {
+            config: null,
+            error: m.plugins.providerModal.errFieldInvalidNumber(label),
+          };
+        }
+        if (prop.type === "integer" && !Number.isInteger(num)) {
+          return {
+            config: null,
+            error: m.plugins.providerModal.errFieldInvalidInteger(label),
+          };
+        }
+        config[key] = num;
+        continue;
+      }
+
+      if (isSecret) {
+        if (strVal.length > 0) {
+          config[key] = strVal;
+        } else if (isRequired && !hasStoredSecretFor(key)) {
+          return {
+            config: null,
+            error: m.plugins.providerModal.errFieldRequired(label),
+          };
+        }
+        continue;
+      }
+
+      const trimmed = strVal.trim();
+      if (!trimmed) {
+        if (isRequired) {
+          return {
+            config: null,
+            error: m.plugins.providerModal.errFieldRequired(label),
+          };
+        }
+        continue;
+      }
+      if (prop.format === "uri" && !isSafeHttpUrl(trimmed)) {
+        return {
+          config: null,
+          error: m.plugins.providerModal.errFieldInvalidUrl(label),
+        };
+      }
+      config[key] = trimmed;
+    }
+
+    return { config, error: null };
+  };
+
+  const saveMutation = useMutation({
+    mutationFn: async (config: Record<string, unknown>) => {
+      if (isEdit && instance) {
+        return api.plugins.updateInstance(plugin.id, instance.id, {
+          name: name.trim(),
+          config,
+          enabled,
+        });
+      }
+      return api.plugins.createInstance(plugin.id, {
+        name: name.trim(),
+        config,
+        enabled,
+      });
+    },
+    onSuccess: () => {
+      toast.success(
+        isEdit
+          ? m.plugins.detail.toastProviderUpdated
+          : m.plugins.detail.toastProviderCreated,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+      onClose();
+    },
+    onError: (err) => {
+      setFormError(errorMessage(err));
+    },
+  });
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    setFormError(null);
+
+    if (!name.trim()) {
+      setFormError(m.plugins.providerModal.errEmptyName);
+      return;
+    }
+
+    const { config, error } = buildValidatedConfig();
+    if (error || !config) {
+      setFormError(error);
+      return;
+    }
+
+    saveMutation.mutate(config);
+  };
+
+  const booleanProps = parsedSchema.properties.filter(
+    ([, prop]) => prop.type === "boolean",
+  );
+  const nonBooleanProps = parsedSchema.properties.filter(
+    ([, prop]) => prop.type !== "boolean",
+  );
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={
+        isEdit
+          ? m.plugins.providerModal.editTitle(instance?.name ?? "")
+          : m.plugins.providerModal.genericAddTitle(plugin.manifest.name)
+      }
+      description={m.plugins.providerModal.desc}
+      size="lg"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>
+            {m.common.cancel}
+          </Button>
+          <Button onClick={handleSubmit} loading={saveMutation.isPending}>
+            {isEdit
+              ? m.plugins.providerModal.saveBtn
+              : m.plugins.providerModal.createBtn}
+          </Button>
+        </>
+      }
+    >
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <Label htmlFor="schema-provider-name">
+            {m.plugins.providerModal.nameLabel}
+          </Label>
+          <Input
+            id="schema-provider-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={m.plugins.providerModal.namePlaceholder}
+            className="mt-1"
+          />
+        </div>
+
+        {parsedSchema.properties.length === 0 ? (
+          <p className="text-xs text-zinc-500 dark:text-zinc-400">
+            {m.plugins.providerModal.genericNoSchemaHint}
+          </p>
+        ) : (
+          <>
+            {nonBooleanProps.length > 0 && (
+              <div className="space-y-3">
+                {nonBooleanProps.map(([key, prop]) => {
+                  const fieldId = `schema-provider-field-${key}`;
+                  const label = prop.title || key;
+                  const isRequired = parsedSchema.required.has(key);
+                  const isSecret = prop.format === "password";
+                  const storedSecret = hasStoredSecretFor(key);
+                  const hint = secretHintFor(key);
+                  const strVal =
+                    typeof fieldValues[key] === "string"
+                      ? fieldValues[key]
+                      : "";
+
+                  if (Array.isArray(prop.enum) && prop.enum.length > 0) {
+                    return (
+                      <div key={key}>
+                        <Label htmlFor={fieldId}>
+                          {label}
+                          {isRequired && (
+                            <span className="ml-1 text-rose-500">*</span>
+                          )}
+                        </Label>
+                        <Select
+                          id={fieldId}
+                          value={strVal}
+                          onChange={(e) =>
+                            setFieldValues((prev) => ({
+                              ...prev,
+                              [key]: e.target.value,
+                            }))
+                          }
+                          className="mt-1"
+                        >
+                          {(!isRequired || !strVal) && (
+                            <option value="">
+                              {m.plugins.providerModal.genericSelectPlaceholder}
+                            </option>
+                          )}
+                          {prop.enum.map((opt) => (
+                            <option key={String(opt)} value={String(opt)}>
+                              {String(opt)}
+                            </option>
+                          ))}
+                        </Select>
+                        {prop.description && (
+                          <FieldHint>{prop.description}</FieldHint>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  if (prop.type === "array") {
+                    return (
+                      <div key={key}>
+                        <Label htmlFor={fieldId}>
+                          {label}
+                          {isRequired && (
+                            <span className="ml-1 text-rose-500">*</span>
+                          )}
+                        </Label>
+                        <Textarea
+                          id={fieldId}
+                          value={strVal}
+                          onChange={(e) =>
+                            setFieldValues((prev) => ({
+                              ...prev,
+                              [key]: e.target.value,
+                            }))
+                          }
+                          placeholder={prop.placeholder}
+                          className="mt-1 min-h-[72px] font-mono text-xs"
+                        />
+                        <FieldHint>
+                          {prop.description ||
+                            m.plugins.providerModal.genericArrayHint}
+                        </FieldHint>
+                      </div>
+                    );
+                  }
+
+                  const inputType = isSecret
+                    ? "password"
+                    : prop.type === "number" || prop.type === "integer"
+                      ? "number"
+                      : prop.format === "uri"
+                        ? "url"
+                        : "text";
+
+                  const placeholder = isSecret
+                    ? storedSecret
+                      ? hint
+                        ? m.plugins.providerModal.signatureStoredPlaceholder(
+                            hint,
+                          )
+                        : m.plugins.providerModal.genericSecretStoredPlaceholder
+                      : prop.placeholder ||
+                        m.plugins.providerModal.genericSecretPlaceholder
+                    : prop.placeholder;
+
+                  return (
+                    <div key={key}>
+                      <Label htmlFor={fieldId}>
+                        {label}
+                        {isRequired && (
+                          <span className="ml-1 text-rose-500">*</span>
+                        )}
+                      </Label>
+                      <Input
+                        id={fieldId}
+                        type={inputType}
+                        step={prop.type === "integer" ? 1 : "any"}
+                        value={strVal}
+                        onChange={(e) =>
+                          setFieldValues((prev) => ({
+                            ...prev,
+                            [key]: e.target.value,
+                          }))
+                        }
+                        placeholder={placeholder}
+                        className="mt-1 font-mono text-xs"
+                      />
+                      {isSecret && storedSecret ? (
+                        <FieldHint>
+                          {prop.description
+                            ? `${prop.description} ${m.plugins.providerModal.secretPreserveHint}`
+                            : m.plugins.providerModal.secretPreserveHint}
+                        </FieldHint>
+                      ) : (
+                        prop.description && (
+                          <FieldHint>{prop.description}</FieldHint>
+                        )
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+              {booleanProps.map(([key, prop]) => (
+                <Switch
+                  key={key}
+                  id={`schema-provider-bool-${key}`}
+                  checked={Boolean(fieldValues[key])}
+                  onCheckedChange={(checked) =>
+                    setFieldValues((prev) => ({ ...prev, [key]: checked }))
+                  }
+                  label={prop.title || key}
+                  description={prop.description}
+                />
+              ))}
+              <Switch
+                id="schema-provider-enabled"
+                checked={enabled}
+                onCheckedChange={setEnabled}
+                label={m.plugins.providerModal.enabledLabel}
+                description={m.plugins.providerModal.enabledDesc}
+              />
+            </div>
+          </>
+        )}
+
+        {parsedSchema.properties.length === 0 && (
+          <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+            <Switch
+              id="schema-provider-enabled-only"
+              checked={enabled}
+              onCheckedChange={setEnabled}
+              label={m.plugins.providerModal.enabledLabel}
+              description={m.plugins.providerModal.enabledDesc}
+            />
+          </div>
+        )}
 
         <FieldError message={formError} />
       </form>

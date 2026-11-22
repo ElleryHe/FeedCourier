@@ -16,7 +16,7 @@ description: "FeedCourier 通道协议与投递实现细节：SMTP、Telegram Bo
 
 | 枚举变体 | 序列化 JSON 字段 | 投递语义与恢复机制 |
 | :--- | :--- | :--- |
-| `DeliveryCheckpoint::Smtp` | `{"kind": "smtp", "message_id": "<...>"}` | **至少一次（客户端去重）**：首次构建邮件时生成确定性 RFC 5322 `Message-ID` 并持久化；后续重试复用同一 `Message-ID`，由收件箱客户端按标准头部去重。 |
+| `DeliveryCheckpoint::Smtp` | `{"kind": "smtp", "message_id": "<...>", "sent_recipients": ["<address_hmac>", ...]}` | **至少一次（逐收件人续传且客户端可去重）**：为每位已验证收件人生成确定性 RFC 5322 `Message-ID`（`<fc-{fp[..24]}-r{route_id}-{hmac[..8]}@{from_domain}>`），并在每封送达后将其 `address_hmac` 追加至 `sent_recipients`，重试时自动跳过已送达收件人（即便落盘断点遇瞬时写库异常，内存中的 `sent_recipients` 也会随 `DeliveryOutcome::Retry` 保留）。 |
 | `DeliveryCheckpoint::Telegram` | `{"kind": "telegram", "next_batch_offset": 10, "sent_message_ids": [...], "degraded_to_compact": false}` | **至少一次（按批次推进）**：`media_mode` 每完成一组（最多 10 项）`sendMediaGroup` 即通过 `CheckpointSink` 落盘 `next_batch_offset`；重试时跳过已发送批次。 |
 | `DeliveryCheckpoint::Notion` | `{"kind": "notion", "create_initiated": true, "async_task_id": "...", "page_id": "..."}` | **有效一次（Effective-once）**：发起创建前标记 `create_initiated = true`；重试时先按 `FC-ID == fingerprint_sha256` 反查数据源或轮询 `async_task_id`，若页面已存在则直接回填 `page_id` 闭环。 |
 
@@ -25,30 +25,34 @@ description: "FeedCourier 通道协议与投递实现细节：SMTP、Telegram Bo
 ## 2. SMTP 邮件通道实现（`src/channels/smtp.rs`）
 
 ### 1. `lettre` 异步传输与连接池
-- `SmtpSender` 基于 `lettre::AsyncSmtpTransport<Tokio1Executor>` 实现，支持三种传输加密模式（`SmtpSecurity`）：
+- `SmtpSender` 基于 `lettre::AsyncSmtpTransport<Tokio1Executor>` 通过**原生 TCP/TLS 直连**发送（HTTP/SOCKS 出站代理与 `OUTBOUND_PROXY` 不适用于 SMTP），支持三种传输加密模式（`SmtpSecurity`）：
   - `StartTls`（默认端口 `587`）：显式 STARTTLS 升级；
   - `Tls`（默认端口 `465`）：隐式 TLS / Wrapper 模式；
   - `Plain`（默认端口 `25`）：仅用于受控内网中继的明文连接。
 - 内部按 `(host, port, security, username, password)` 的 SHA-256 摘要缓存连接池（`PoolConfig::new().max_size(2).idle_timeout(60s)`），单次 SMTP 指令默认超时为 `DEFAULT_SMTP_TIMEOUT = 30s`。
-- 账号级测试（未传 `destination_id` 调用 `POST /api/v1/channels/{id}/test`）通过 `SmtpSender::test_account` 校验连通性与认证（`EHLO`/`AUTH`）而不发送邮件；目的地级测试（`POST /api/v1/destinations/{id}/test`）调用 `send_test` 向 `SmtpDestinationConfig.to_addresses` 发送验证邮件。
+- 账号级测试（未传 `destination_id` 调用 `POST /api/v1/channels/{id}/test`）校验连通性与认证并**仅向自身 `from_address`** 发送自检邮件；目的地级测试（`POST /api/v1/destinations/{id}/test`）与预览 `debug_push` 均严格**只向 `verified` 收件人**按单 `To:` 隔离信封附带 RFC 8058 合规头逐人发送（0 位已验证收件人时直接报错拦截）。
 
-### 2. `minijinja` 单栏内联 CSS 渲染、响应式 HTML 改写与 `< 95 KiB` 体积预算
+### 2. `minijinja` 自动转义单栏渲染、响应式 HTML 改写与 `< 95 KiB` 体积预算
 - 每封邮件组装为 `multipart/alternative`（`MultiPart::alternative_plain_html`），同时包含：
-  1. **`text/html` 主体**：由 `minijinja` 渲染内置的 `EMAIL_HTML_TEMPLATE`（最大宽度 `640px`、内容可用宽度 `EMAIL_CARD_INNER_WIDTH_PX = 592px` 的单栏卡片布局，搭配内联 `style="..."` 与 `<head>` 兜底样式，兼容 Gmail、Apple Mail 与 Outlook.com）。元信息行中的发布时间按**路由时区**经 `format_local_timestamp` 格式化为 `YYYY-MM-DD HH:MM (UTC±HH:MM)`；
+  1. **`text/html` 主体**：由 `minijinja` 以 `"email.html"` 注册并强制启用 **`AutoEscape::Html`** 渲染内置 `EMAIL_HTML_TEMPLATE`（最大宽度 `640px`、内容可用宽度 `EMAIL_CARD_INNER_WIDTH_PX = 592px` 的单栏卡片布局，搭配内联 `style="..."` 与 `<head>` 兜底样式，兼容 Gmail、Apple Mail 与 Outlook.com）。仅经 `ammonia` 消毒的正文片段 `body_html` 使用 `| safe`，其余所有元数据（`subject`、`entry_title`、`feed_title`、`meta_line`、`sender_identity`、目的地/路由名称及链接）均由模板引擎统一 HTML 转义。元信息行中的发布时间按**路由时区**经 `format_local_timestamp` 格式化为 `YYYY-MM-DD HH:MM (UTC±HH:MM)`；
   2. **`text/plain` 回退体**：由 `html2text` 按 `PLAIN_TEXT_WRAP_WIDTH = 78` 列宽转换生成，确保纯文本客户端与终端阅读器正常显示。
-- **响应式正文 HTML 改写**：模板插值前统一规范可能撑破 `640px` 卡片的外部标签：
-  - `<img>`：移除固定 `height` 属性，设置兼容 Outlook 的 `width="592"`（若原图显式宽度小于 `592px` 则保留原宽度），并内联响应式 `style="display:block;max-width:100%;width:100%;height:auto;..."`（小图不强制拉伸）；
+- **响应式正文 HTML 改写**：模板插值前统一规范可能撑破 `640px` 卡片的外部标签（属性采用分号感知的 HTML5 实体解码）：
+  - `<img>`：移除固定 `height` 属性，设置兼容 Outlook 的 `width="592"`（若原图显式宽度小于 `592px` 则保留原宽度），并内联响应式 `style="display:block;max-width:100%;width:100%;height:auto;..."`（小图不强制拉伸）。对于百分比宽度（`parse_percent_dimension`），小数百分比保留在内联 CSS 中（`style="width:33.3%;max-width:100%;height:auto;..."`），同时 HTML `width` 属性输出按 `592px` 折算的整数像素（如 `width="197"`）；`0%` 保持 `0` 不拉伸，正数且小于 `1%` 的宽度下限钳制为 `1%`；
   - `<figure>` / `<figcaption>`：清零水平外边距并设置小号灰字图注样式；
   - `<table>` / `<pre>`：添加 `max-width:100%` 并允许横向滚动或自动换行。
 - **防 Gmail 折叠截断（`MAX_EMAIL_HTML_BYTES = 95 KiB`）**：Gmail 网页端与客户端会对总大小超过约 `102 KB` 的邮件正文执行 `[Message clipped]` 折叠。`render_entry_html` 将渲染后的 UTF-8 HTML 字节数严格控制在 **`95 KiB`（`97,280` 字节）** 以内；若原文超出预算，则在闭合标签边界处安全截断，并在邮件底部插入带原文链接的截断提示框（`Continue reading original article →`）。
 
-### 3. `Force-From` 反伪造对齐与确定性信头
+### 3. `Force-From`、逐收件人确定性信头、RFC 8058 合规头与硬退信分类
 - **`Force-From`（SPF / DKIM / DMARC 合规）**：无论上游 RSS 条目中声明的 `<author>` 为何，`From` 头部始终固定使用通道配置的授信发件邮箱 `from_address`，仅将显示名称格式化为 `"<Feed Title> via FeedCourier" <from_address>`。若配置了 `reply_to`，则单独写入 `Reply-To` 头部。
-- **确定性 `Message-ID`**：按条目指纹前 32 位十六进制字符、路由 ID 与发件域名计算：
+- **逐收件人隔离信封与确定性 `Message-ID`**：发件箱为每位 `verified` 收件人独立发送单 `To:` 邮件（收件人之间间隔 `1` 秒并自动续租），并将已接受收件人的 `address_hmac` 持久化至 `DeliveryCheckpoint::Smtp.sent_recipients`。每位收件人的 `Message-ID` 由条目指纹前 24 位十六进制字符、`route_id`、`address_hmac` 前 8 位十六进制字符与发件域名组成（任务级回退格式为 `<fc-{fp[..24]}-r{route_id}@{from_domain}>`）：
   ```text
-  <fc-entry-{fingerprint_sha256[..32]}-r{route_id}@{from_domain}>
+  <fc-{fingerprint_sha256[..24]}-r{route_id}-{address_hmac[..8]}@{from_domain}>
   ```
-- **邮件列表归档头（`List-Id` & `Auto-Submitted`）**：每封邮件自动附带 `Auto-Submitted: auto-generated` 与按源隔离的 `List-Id: <feed-{feed_id}.feedcourier.{from_domain}>`，便于收件箱按订阅源建立自动归档过滤规则。
+- **RFC 8058 合规头与 `List-Id`**：附带 `Auto-Submitted: auto-generated`、`List-Id: <dest-{destination_id}.{from_domain}>`（无目的地 ID 时回退 `<feed-{feed_id}.{from_domain}>`）、`List-Unsubscribe: <{PUBLIC_URL}/u/{token}>, <mailto:{from_address}?subject=unsubscribe>`（未配置 `PUBLIC_URL` 时仅含 `mailto:`）以及配置 `PUBLIC_URL` 时的 `List-Unsubscribe-Post: List-Unsubscribe=One-Click`，并在邮件页脚渲染 CAN-SPAM 订阅说明与可选 `sender_identity`。
+- **收件人级硬退信判定（`is_recipient_hard_bounce`）与 `auto_paused`**：
+  - 仅当增强状态码命中收件人永久拒收（`5.1.1`、`5.1.2`、`5.1.3`、`5.1.6`、`5.1.10`）或明确指向收件人邮箱不存在/拒收的 `550`/`551`/`553` 时，才将该收件人标为 `bounced`（`revoked_method = "hard_bounce"`，`bounce_diagnostic` 与 `diagnostic_log` 中的邮箱均脱敏）并继续发送给其余已验证收件人；
+  - 账号认证、配额、体积、内容反垃圾或策略拒信 5xx（`530`、`535`、`552`、`554`、`5.4.5`、`5.7.*`）立即中止投递循环，携带当前 `sent_recipients` 断点返回通道级错误，**绝不误标已验证订阅者为 `bounced`**；
+  - 当目的地下全部收件人均转为 `unsubscribed` 或 `bounced` 时，`channel_destinations` 置为 `enabled = 0, auto_paused = 1`；后续有任一收件人重新完成验证时，`auto_paused` 目的地自动恢复 `enabled = 1, auto_paused = 0`。
 
 ---
 
@@ -90,7 +94,13 @@ flowchart TD
   - 若服务端返回 `400 Bad Request`（提示缺少 `chat_id` 参数），表明目标服务端支持 Bot API `10.2+` / `10.4` 的 `sendRichMessage` 方法，记录 `supports_rich_message: true` 与 `bot_api_version: "10.4"`；
   - 若自建 Local Bot API Server 版本低于 `10.2` 并返回 `404 Not Found`（或未知方法描述），则记录 `supports_rich_message: false` 与 `bot_api_version: "<10.2"`，持久化至 `channels.capabilities_json`。
 - 创建目的地时留空备注名会自动调用 `getChat` 获取群组/频道标题；`POST /api/v1/destinations/{id}/test` 向具体目的地的 `chat_id`（及可选 `message_thread_id`）发送验证消息。
-- 当 `supports_rich_message` 为 `false`，或运行期调用 `sendRichMessage` 遭遇方法不支持错误时，`TelegramSender` 自动降级调用 `CompactCard`（`sendMessage`，`parse_mode: "HTML"`，受 `MAX_MESSAGE_UTF16_UNITS = 4,096` UTF-16 代码单元限制，并通过 `link_preview_options` 控制链接预览）。
+- 当 `supports_rich_message` 为 `false`，或运行期调用 `sendRichMessage` 遭遇方法不支持错误或正文实体语法类 `400 Bad Request`（排除 `chat_id` 与权限类错误）时，`TelegramSender` 自动降级调用 `CompactCard`（`sendMessage`，`parse_mode: "HTML"`）。
+
+### 2b. `CompactCard` 编辑卡片、ZWNJ 防误高亮与字素簇截断
+- **编辑卡片排版**：顶部为加粗文章标题，主体为 `<blockquote>` 摘要（超过 `300` UTF-16 代码单元自动升级为可折叠 `<blockquote expandable>`，按词/句边界安全截断至 `<= 800` 单元，摘要与标题重复时自动省略），底部以斜体展示路由时区下的「来源 · 作者 · `YYYY-MM-DD HH:MM`」，并附带原生内联外链按钮（`reply_markup`），同时将 `link_preview_options.url` 校验为合法 `http://`/`https://` 后保留在原始文章链接上。
+- **实体转义膨胀平滑预算回退**：当高频 `&`/`<` 等 HTML 实体转义导致渲染结果超过 `MAX_MESSAGE_UTF16_UNITS = 4,096` 时，`format_compact_card_html_with_options` 按膨胀比例平滑缩减摘要预算，绝不一次性清零预算丢弃整段摘要。
+- **ZWNJ 自动实体抑制（`suppress_telegram_auto_entities`）**：插入不可见零宽非连接符（`\u{200C}`）防止 Telegram 将 `/commands`、`@scoped/packages` 以及显式代码/文档文件名（如 `README.md`、`sku.go`）误识别为蓝色可点击链接，同时完整豁免行内 `http://`/`https://` URL（即使紧邻中文、全角标点或 Markdown 链接如 `详见https://...`、`[原文](https://...)`）、含 `@` 的邮箱地址以及 `notion.so` 等常见裸域名。
+- **Unicode 字素簇截断**：`truncate_utf16` 与 `truncate_utf16_word_boundary` 基于 `unicode_segmentation::UnicodeSegmentation::graphemes(true)` 按完整扩展字素簇切分，确保 ZWJ 复合 Emoji 与组合字符永不被劈裂。
 
 ### 3. `MediaMode` 三行超链接文案、按类型智能分流与 10 项分批断点
 - **三行精简 HTML 文案（`MAX_CAPTION_UTF16_UNITS = 1,024`，`parse_mode: "HTML"`）**：
@@ -113,8 +123,8 @@ flowchart TD
 ### 1. 固定 `Notion-Version: 2026-03-11` 协议契约
 `NotionSender` 对所有出站请求强制附加 `Notion-Version: 2026-03-11` 头部（`NOTION_API_VERSION`），遵循 `2026-03-11` 版本的 Data Source 数据模型。在双层通道模型下，`channels.encrypted_config` 存储账号凭据 `NotionChannelConfig`（`integration_secret`，账号测试调用 `GET /v1/users/me`），而 `channel_destinations.encrypted_config` 存储各目的地的 `NotionDestinationConfig`（`data_source_id`、可选 `database_id`/`parent_page_id` 与 `column_mapping`）：
 - **父级容器（`data_source_id`）**：创建页面（`POST /v1/pages`）时使用 `parent: { "type": "data_source_id", "data_source_id": "<uuid>" }`，而非旧版的 `database_id`；
-- **建库属性声明（`initial_data_source.properties`）**：通过 `POST /api/v1/channels/notion/init-db` 调用 `POST /v1/databases` 初始化 7 列标准收件箱（`Title`、`FC-ID`、`Link`、`Source`、`Published`、`State`、`Tag`）时，属性定义挂载于 `initial_data_source.properties`，并从响应的 `data_sources[0].id` 提取 `data_source_id`；
-- **表结构自检与补齐（`inspect-schema`）**：通过 `GET /v1/data_sources/{id}` 检查现有列类型，当 `patch_missing: true` 时调用 `PATCH /v1/data_sources/{id}` 自动创建缺失的标准列（若用户传入的是旧式数据库 URL/ID，客户端会自动先查询 `GET /v1/databases/{id}` 解析其关联的 `data_source_id`）；
+- **建库属性声明（`initial_data_source.properties`）**：通过 `POST /api/v1/channels/notion/init-db` 调用 `POST /v1/databases` 初始化 8 列标准收件箱（`Title`、`FC-ID`、`Link`、`Short URL`、`Source`、`Published`、`State`、`Tag`，对应 `NotionColumnMapping::standard_8_column()`）时，属性定义挂载于 `initial_data_source.properties`，并从响应的 `data_sources[0].id` 提取 `data_source_id`；而 `NotionColumnMapping::default()` 将 `short_url` 默认置为 `None`，保持对省略 `column_mapping` 的存量 7 列库兼容；
+- **表结构自检、自动补齐与单事务 `data_source_id` 懒回写**：通过 `GET /v1/data_sources/{id}` 检查现有列类型，当 `patch_missing: true` 时调用 `PATCH /v1/data_sources/{id}` 自动创建缺失的标准列（若用户传入旧式数据库 URL/ID，客户端会先查询 `GET /v1/databases/{id}` 解析关联的 `data_source_id`）。投递遇 `404 object_not_found` 触发懒解析回写时，会在 `write_pool` 单事务内重读最新 `channel_destinations.encrypted_config` 仅更新 `data_source_id`，避免覆盖用户并发保存的列映射；
 - **回收站状态字段（`in_trash`）**：页面与数据源状态判断统一使用 `in_trash: bool`，替代已移除的 `archived` 字段。
 
 ### 2. HTML 转 Markdown v2 与动态代码围栏扩展（`normalize_markdown_v2`）

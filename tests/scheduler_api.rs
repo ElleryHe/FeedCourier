@@ -2358,8 +2358,8 @@ async fn qa_hardening_quota_ledger_route_sync_status_codes_channel_validation_an
     let smtp_id = smtp_ch["id"].as_i64().unwrap();
     assert_eq!(smtp_ch["config"]["has_password"], true);
     assert_eq!(
-        smtp_ch["destinations"][0]["name"], "ops@example.com",
-        "auto-naming must pick the first non-empty trimmed SMTP recipient"
+        smtp_ch["destinations"][0]["name"], "o***s@example.com",
+        "auto-naming must pick and mask the first non-empty trimmed SMTP recipient (zero plaintext PII)"
     );
 
     // PATCH omitting `password` preserves stored password.

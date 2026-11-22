@@ -421,6 +421,8 @@ pub struct ChannelDestinationDto {
     pub kind: ChannelKind,
     pub config: Value,
     pub enabled: bool,
+    #[serde(default)]
+    pub auto_paused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smtp_summary: Option<SmtpRecipientSummary>,
     pub created_at: String,
@@ -450,6 +452,7 @@ impl ChannelDestinationDto {
             kind,
             config: decrypted.view(),
             enabled: dest.enabled,
+            auto_paused: dest.auto_paused,
             smtp_summary,
             created_at: unix_to_rfc3339(dest.created_at),
             updated_at: unix_to_rfc3339(dest.updated_at),

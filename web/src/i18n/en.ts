@@ -356,6 +356,8 @@ export const en = {
       pushThisItem: "Push This Item",
       debugPushedTitle: "Debug push delivered",
       debugFailedTitle: "Debug push failed",
+      debugPluginsLabel: "Plugins (Optional)",
+      debugPluginNoProviders: "No providers configured",
     },
     opml: {
       title: "Import OPML Subscriptions",
@@ -381,6 +383,7 @@ export const en = {
       "Configure accounts (credentials, proxy, shared rate limits) and attach one or more destinations per account. Secrets and destination targets are encrypted with ChaCha20-Poly1305 and never exposed to MCP clients.",
     newChannel: "New Account",
     loading: "Loading delivery accounts…",
+    loadError: "Unable to load delivery accounts:",
     emptyTitle: "No delivery accounts configured",
     emptyDesc:
       "Configure an SMTP email account, a Telegram bot, or a Notion integration — and attach one or more destinations — before creating delivery routes.",
@@ -451,12 +454,19 @@ export const en = {
     toastDestDeleteFailed: "Failed to delete destination",
     deleteModalTitle: "Delete Delivery Account",
     deleteModalDesc: (name: string) =>
-      `Delete account "${name}"? All destinations under this account, along with any bound routes and pending delivery tasks, will also be removed.`,
+      `Delete delivery account "${name}" and all destinations under it?`,
     deleteModalConfirm: "Delete Account",
     deleteDestModalTitle: "Delete Destination",
-    deleteDestModalDesc: (name: string) =>
-      `Delete destination "${name}"? Any routes and pending delivery tasks bound to this destination will also be removed.`,
+    deleteDestModalDesc: (name: string) => `Delete destination "${name}"?`,
     deleteDestModalConfirm: "Delete Destination",
+    deleteAccountConflict: {
+      title: "Account Referenced by Active Routes",
+      desc: (accountName: string, count: number) =>
+        `Account "${accountName}" is currently used by ${count} ${count === 1 ? "route" : "routes"}. Deleting it with cascade enabled will also permanently delete its destinations, the routes below, and their pending delivery tasks.`,
+      affectedRoutesLabel: "Affected Routes",
+      confirmCascade: (count: number) =>
+        `Delete Account & ${count} ${count === 1 ? "Route" : "Routes"}`,
+    },
     deleteConflict: {
       title: "Destination Referenced by Active Routes",
       desc: (destName: string, count: number) =>
@@ -468,8 +478,12 @@ export const en = {
     smtpCompliance: {
       verifiedCountBadge: (verified: number, total: number) =>
         `${verified}/${total} verified`,
+      autoPausedBadge: "Auto-paused",
+      autoPausedHint:
+        "All recipients unsubscribed or bounced. Delivery is paused and will automatically resume once any recipient re-verifies.",
       recipientsToggle: "Recipients & Compliance",
       loading: "Loading recipient compliance status…",
+      loadError: "Unable to load recipients:",
       empty: "No recipients configured for this destination.",
       status: {
         unverified: "Unverified",
@@ -495,12 +509,19 @@ export const en = {
       bounceTooltipPrefix: "Bounce diagnostic: ",
       sendVerification: "Send Verification",
       resendVerification: "Resend Code",
+      sendCooldown: (remaining: string) => `Send (${remaining})`,
+      resendCooldown: (remaining: string) => `Resend (${remaining})`,
       codePlaceholder: "6-digit code",
       verifyBtn: "Verify",
       unsubscribeBtn: "Unsubscribe",
       reactivateBtn: "Reactivate",
       errCodeInvalid: "Enter the 6-digit verification code.",
       toastVerificationSentTitle: "Verification email sent",
+      toastCooldownTitle: "Please wait before resending",
+      toastCooldownDesc: (remaining: string) =>
+        `Verification email cooldown active. Try again in ${remaining}.`,
+      toastRateLimitedDesc:
+        "Too many verification emails requested. Please wait before trying again.",
       toastVerifiedTitle: "Recipient verified",
       toastVerifiedDesc: (email: string) =>
         `${email} is now verified and eligible for delivery.`,
@@ -631,7 +652,9 @@ export const en = {
         dailyQuotaLabel: "Daily Quota (Opt)",
         proxyLabel: "Use Outbound Proxy",
         proxyDesc:
-          "Route SMTP or API requests for all destinations of this account through the global outbound proxy.",
+          "Route API requests (Telegram / Notion) for all destinations of this account through the global outbound proxy.",
+        smtpNoProxyNote:
+          "SMTP connects directly over native TCP/TLS and does not use HTTP/SOCKS outbound proxies.",
         enabledLabel: "Account Enabled",
         enabledDesc:
           "Pause delivery for all destinations under this account without deleting routes.",
@@ -832,6 +855,7 @@ export const en = {
       marketplace: "Marketplace",
     },
     loading: "Loading plugins…",
+    loadError: "Unable to load plugins:",
     emptyInstalledTitle: "No plugins installed",
     emptyInstalledDesc:
       "Built-in plugins appear here automatically once synchronized with the server.",
@@ -850,7 +874,11 @@ export const en = {
       emptyProvidersTitle: "No provider instances configured",
       emptyProvidersDesc:
         "Add a YOURLS short-link provider instance below, then assign it to individual routes.",
+      emptyProvidersGenericDesc:
+        "Add a provider instance below, then assign it to individual routes.",
       colName: "Provider",
+      colConfig: "Configuration",
+      noConfigSummary: "Default settings",
       colApiUrl: "API Endpoint",
       colAuth: "Auth Mode",
       colBehavior: "Mode & Options",
@@ -949,6 +977,21 @@ export const en = {
         "Signature token is required for signature authentication.",
       errPasswordAuthRequired:
         "Both username and password are required for password authentication.",
+      genericAddTitle: (pluginName: string) => `Add ${pluginName} Provider`,
+      genericNoSchemaHint:
+        "This plugin does not define additional configuration fields.",
+      genericSecretPlaceholder: "Enter secret value…",
+      genericSecretStoredPlaceholder: "Stored — leave blank to keep",
+      genericArrayHint:
+        "Separate multiple values with commas or new lines.",
+      genericSelectPlaceholder: "— Select an option —",
+      errFieldRequired: (field: string) => `${field} is required.`,
+      errFieldInvalidUrl: (field: string) =>
+        `${field} must be a valid http:// or https:// URL.`,
+      errFieldInvalidNumber: (field: string) =>
+        `${field} must be a valid number.`,
+      errFieldInvalidInteger: (field: string) =>
+        `${field} must be a whole number.`,
     },
     market: {
       searchPlaceholder: "Search plugins by name, category, or description…",
@@ -959,8 +1002,12 @@ export const en = {
         `Index: ${url}${generatedAt ? ` · Generated ${generatedAt}` : ""}`,
       refreshBtn: "Refresh Index",
       toastRefreshed: "Marketplace index refreshed",
+      toastRefreshSnapshotTitle: "Remote marketplace unreachable",
+      toastRefreshSnapshotDesc:
+        "Returned the bundled offline snapshot instead. Try refreshing again later.",
       toastRefreshFailed: "Failed to refresh marketplace index",
       loading: "Loading plugin marketplace…",
+      loadError: "Unable to load plugin marketplace:",
       emptyTitle: "No matching plugins found",
       emptyDesc:
         "Try adjusting your search query or switching the category filter.",

@@ -137,7 +137,7 @@ pub fn resolve_relative_urls_in_html(raw_html: &str, base_url: Option<&Url>) -> 
             }
         }
 
-        let Some(tag_end) = find_tag_end(&raw_html[lt..]) else {
+        let Some(tag_end) = find_html_tag_end(&raw_html[lt..]) else {
             out.push_str(&raw_html[lt..]);
             break;
         };
@@ -154,27 +154,231 @@ pub fn resolve_relative_urls_in_html(raw_html: &str, base_url: Option<&Url>) -> 
     out
 }
 
-/// Locate the closing `>` of an HTML tag while respecting single- and double-quoted attribute values.
-fn find_tag_end(slice_from_lt: &str) -> Option<usize> {
-    let mut quote: Option<u8> = None;
-    for (i, b) in slice_from_lt.bytes().enumerate().skip(1) {
-        if let Some(q) = quote {
-            if b == q {
-                quote = None;
+/// Parsed HTML tag attribute name + optional HTML5-decoded value.
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedTagAttr {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+/// Locate the closing `>` of an HTML tag using an HTML5 attribute-value quote state machine:
+/// single (`'`) and double (`"`) quotes only open a quoted attribute value immediately after
+/// `=` (with optional whitespace), so apostrophes inside unquoted attributes (e.g. `title=Bob's`)
+/// never swallow subsequent tags.
+pub(crate) fn find_html_tag_end(slice_from_lt: &str) -> Option<usize> {
+    let bytes = slice_from_lt.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'<' {
+        return None;
+    }
+
+    #[derive(Clone, Copy)]
+    enum State {
+        TagName,
+        BeforeAttrName,
+        AttrName,
+        AfterAttrName,
+        BeforeAttrValue,
+        QuotedValue(u8),
+        UnquotedValue,
+    }
+
+    // Closing tags (`</...>`) and declarations (`<!...>`, `<?...>`) scan straightforwardly.
+    if matches!(bytes[1], b'/' | b'!' | b'?') {
+        let mut quote: Option<u8> = None;
+        for (i, &b) in bytes.iter().enumerate().skip(1) {
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+            } else if bytes[1] != b'/' && (b == b'"' || b == b'\'') {
+                quote = Some(b);
+            } else if b == b'>' {
+                return Some(i);
             }
-        } else if b == b'"' || b == b'\'' {
-            quote = Some(b);
-        } else if b == b'>' {
-            return Some(i);
+        }
+        return None;
+    }
+
+    let mut state = State::TagName;
+    let mut i = 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::TagName => {
+                if b == b'>' {
+                    return Some(i);
+                } else if b.is_ascii_whitespace() || b == b'/' {
+                    state = State::BeforeAttrName;
+                }
+                i += 1;
+            }
+            State::BeforeAttrName => {
+                if b == b'>' {
+                    return Some(i);
+                } else if !b.is_ascii_whitespace() && b != b'/' {
+                    state = State::AttrName;
+                }
+                i += 1;
+            }
+            State::AttrName => {
+                if b == b'>' {
+                    return Some(i);
+                } else if b == b'=' {
+                    state = State::BeforeAttrValue;
+                } else if b.is_ascii_whitespace() {
+                    state = State::AfterAttrName;
+                } else if b == b'/' {
+                    state = State::BeforeAttrName;
+                }
+                i += 1;
+            }
+            State::AfterAttrName => {
+                if b == b'>' {
+                    return Some(i);
+                } else if b == b'=' {
+                    state = State::BeforeAttrValue;
+                    i += 1;
+                } else if b == b'/' {
+                    state = State::BeforeAttrName;
+                    i += 1;
+                } else if b.is_ascii_whitespace() {
+                    i += 1;
+                } else {
+                    state = State::AttrName;
+                }
+            }
+            State::BeforeAttrValue => {
+                if b == b'>' {
+                    return Some(i);
+                } else if b.is_ascii_whitespace() {
+                    i += 1;
+                } else if b == b'"' || b == b'\'' {
+                    state = State::QuotedValue(b);
+                    i += 1;
+                } else {
+                    state = State::UnquotedValue;
+                    i += 1;
+                }
+            }
+            State::QuotedValue(q) => {
+                if b == q {
+                    state = State::BeforeAttrName;
+                }
+                i += 1;
+            }
+            State::UnquotedValue => {
+                if b == b'>' {
+                    return Some(i);
+                } else if b.is_ascii_whitespace() {
+                    state = State::BeforeAttrName;
+                }
+                i += 1;
+            }
         }
     }
     None
 }
 
-#[derive(Debug, Clone)]
-struct ParsedAttr {
-    name: String,
-    value: Option<String>,
+/// Split an opening tag's inner contents (between `<` and `>`, already trimmed at start) into
+/// `(tag_name, raw_attr_tail)`. Does NOT strip trailing `/` so unquoted URLs ending in `/`
+/// (e.g. `<a href=https://example.com/blog/>`) remain intact for [`parse_tag_attrs_and_self_closing`].
+pub(crate) fn split_tag_name_and_attrs(trimmed_inner: &str) -> (&str, &str) {
+    let name_end = trimmed_inner
+        .find(|c: char| c.is_ascii_whitespace() || c == '/')
+        .unwrap_or(trimmed_inner.len());
+    (&trimmed_inner[..name_end], &trimmed_inner[name_end..])
+}
+
+/// Parse HTML tag attributes and determine whether a standalone trailing `/` (strictly OUTSIDE any
+/// attribute value) marks the tag as self-closing.
+pub(crate) fn parse_tag_attrs_and_self_closing(attr_str: &str) -> (Vec<ParsedTagAttr>, bool) {
+    let mut out = Vec::new();
+    let bytes = attr_str.as_bytes();
+    let mut i = 0;
+    let mut self_closing = false;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        if bytes[i] == b'/' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b'/') {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                self_closing = true;
+                break;
+            }
+            i += 1;
+            continue;
+        }
+
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1;
+            continue;
+        }
+        let name = attr_str[name_start..i].to_string();
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                out.push(ParsedTagAttr {
+                    name,
+                    value: Some(String::new()),
+                });
+                break;
+            }
+
+            let raw_val = if bytes[i] == b'"' || bytes[i] == b'\'' {
+                let q = bytes[i];
+                i += 1;
+                let val_start = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                let extracted = &attr_str[val_start..i];
+                if i < bytes.len() && bytes[i] == q {
+                    i += 1;
+                }
+                extracted
+            } else {
+                let val_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                &attr_str[val_start..i]
+            };
+
+            out.push(ParsedTagAttr {
+                name,
+                value: Some(decode_html_attr_entities(raw_val)),
+            });
+        } else {
+            out.push(ParsedTagAttr { name, value: None });
+        }
+    }
+
+    (out, self_closing)
 }
 
 /// Parse an opening tag `<tag attr="val" ...>`; returns `Some(rewritten)` or `None` to drop the tag.
@@ -189,17 +393,7 @@ fn rewrite_start_tag(tag_str: &str, base_url: Option<&Url>) -> Option<String> {
         return Some(tag_str.to_string());
     }
 
-    let self_closing = inner.trim_end().ends_with('/');
-    let body_without_slash = if self_closing {
-        inner.trim_end().strip_suffix('/').unwrap_or(inner)
-    } else {
-        inner
-    };
-
-    let name_end = body_without_slash
-        .find(|c: char| c.is_ascii_whitespace() || c == '/')
-        .unwrap_or(body_without_slash.len());
-    let tag_name = &body_without_slash[..name_end];
+    let (tag_name, attr_str) = split_tag_name_and_attrs(trimmed);
     let tag_lower = tag_name.to_ascii_lowercase();
 
     if !matches!(
@@ -209,8 +403,7 @@ fn rewrite_start_tag(tag_str: &str, base_url: Option<&Url>) -> Option<String> {
         return Some(tag_str.to_string());
     }
 
-    let attr_str = &body_without_slash[name_end..];
-    let mut attrs = parse_html_attrs(attr_str);
+    let (mut attrs, self_closing) = parse_tag_attrs_and_self_closing(attr_str);
 
     if tag_lower == "img" {
         if is_tracking_pixel_img(&attrs) {
@@ -239,7 +432,7 @@ fn rewrite_start_tag(tag_str: &str, base_url: Option<&Url>) -> Option<String> {
             } else {
                 attrs.insert(
                     0,
-                    ParsedAttr {
+                    ParsedTagAttr {
                         name: "src".to_string(),
                         value: Some(data_src),
                     },
@@ -289,7 +482,7 @@ fn rewrite_start_tag(tag_str: &str, base_url: Option<&Url>) -> Option<String> {
             rebuilt.push('"');
         }
     }
-    if self_closing {
+    if self_closing && matches!(tag_lower.as_str(), "img" | "source") {
         rebuilt.push_str(" />");
     } else {
         rebuilt.push('>');
@@ -297,7 +490,7 @@ fn rewrite_start_tag(tag_str: &str, base_url: Option<&Url>) -> Option<String> {
     Some(rebuilt)
 }
 
-fn is_tracking_pixel_img(attrs: &[ParsedAttr]) -> bool {
+fn is_tracking_pixel_img(attrs: &[ParsedTagAttr]) -> bool {
     let get_attr = |name: &str| -> Option<&str> {
         attrs
             .iter()
@@ -335,9 +528,8 @@ fn is_tracking_pixel_img(attrs: &[ParsedAttr]) -> bool {
     false
 }
 
-fn resolve_url_value(raw_val: &str, base: Option<&Url>) -> Option<String> {
-    let decoded = decode_basic_html_entities(raw_val);
-    let trimmed = decoded.trim();
+fn resolve_url_value(already_decoded_val: &str, base: Option<&Url>) -> Option<String> {
+    let trimmed = already_decoded_val.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -379,82 +571,6 @@ fn resolve_srcset_value(raw_srcset: &str, base: &Url) -> String {
     parts.join(", ")
 }
 
-fn parse_html_attrs(s: &str) -> Vec<ParsedAttr> {
-    let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-
-        let name_start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && bytes[i] != b'='
-            && bytes[i] != b'/'
-        {
-            i += 1;
-        }
-        if i == name_start {
-            i += 1;
-            continue;
-        }
-        let name = s[name_start..i].to_string();
-
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-
-        if i < bytes.len() && bytes[i] == b'=' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                out.push(ParsedAttr {
-                    name,
-                    value: Some(String::new()),
-                });
-                break;
-            }
-
-            let raw_val = if bytes[i] == b'"' || bytes[i] == b'\'' {
-                let q = bytes[i];
-                i += 1;
-                let val_start = i;
-                while i < bytes.len() && bytes[i] != q {
-                    i += 1;
-                }
-                let extracted = &s[val_start..i];
-                if i < bytes.len() && bytes[i] == q {
-                    i += 1;
-                }
-                extracted
-            } else {
-                let val_start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                &s[val_start..i]
-            };
-
-            out.push(ParsedAttr {
-                name,
-                value: Some(decode_basic_html_entities(raw_val)),
-            });
-        } else {
-            out.push(ParsedAttr { name, value: None });
-        }
-    }
-
-    out
-}
-
 fn push_escaped_attr(out: &mut String, val: &str) {
     for ch in val.chars() {
         match ch {
@@ -481,13 +597,13 @@ pub fn extract_inline_media_from_html(sanitized_html: &str) -> Vec<MediaAttachme
             break;
         };
         let lt = idx + rel_lt;
-        let Some(tag_end) = find_tag_end(&sanitized_html[lt..]) else {
+        let Some(tag_end) = find_html_tag_end(&sanitized_html[lt..]) else {
             break;
         };
         let full_tag = &sanitized_html[lt + 1..lt + tag_end];
         idx = lt + tag_end + 1;
 
-        let trimmed = full_tag.trim();
+        let trimmed = full_tag.trim_start();
         if let Some(closing) = trimmed.strip_prefix('/') {
             let close_name = closing.trim().to_ascii_lowercase();
             if matches!(close_name.as_str(), "video" | "audio" | "picture") {
@@ -496,20 +612,15 @@ pub fn extract_inline_media_from_html(sanitized_html: &str) -> Vec<MediaAttachme
             continue;
         }
 
-        let self_closing = trimmed.ends_with('/');
-        let body = trimmed.strip_suffix('/').unwrap_or(trimmed);
-        let name_end = body
-            .find(|c: char| c.is_ascii_whitespace())
-            .unwrap_or(body.len());
-        let tag_lower = body[..name_end].to_ascii_lowercase();
-        let attrs = parse_html_attrs(&body[name_end..]);
+        let (tag_name, attr_str) = split_tag_name_and_attrs(trimmed);
+        let tag_lower = tag_name.to_ascii_lowercase();
+        let (attrs, self_closing) = parse_tag_attrs_and_self_closing(attr_str);
 
         let attr_val = |key: &str| -> Option<String> {
             attrs
                 .iter()
                 .find(|a| a.name.eq_ignore_ascii_case(key))
                 .and_then(|a| a.value.as_deref())
-                .map(decode_basic_html_entities)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
@@ -724,7 +835,7 @@ pub fn html_to_plain_text(html: &str) -> String {
             break;
         }
 
-        let Some(tag_end) = find_tag_end(&html[lt..]) else {
+        let Some(tag_end) = find_html_tag_end(&html[lt..]) else {
             break;
         };
         let tag_content = html[lt + 1..lt + tag_end].trim();
@@ -854,7 +965,7 @@ fn ends_with_common_abbreviation(s: &str) -> bool {
     )
 }
 
-fn find_ascii_case_insensitive(haystack: &str, needle_ascii: &str) -> Option<usize> {
+pub(crate) fn find_ascii_case_insensitive(haystack: &str, needle_ascii: &str) -> Option<usize> {
     let h_bytes = haystack.as_bytes();
     let n_bytes = needle_ascii.as_bytes();
     if n_bytes.is_empty() || h_bytes.len() < n_bytes.len() {
@@ -863,6 +974,108 @@ fn find_ascii_case_insensitive(haystack: &str, needle_ascii: &str) -> Option<usi
     h_bytes
         .windows(n_bytes.len())
         .position(|w| w.eq_ignore_ascii_case(n_bytes))
+}
+
+/// Decode HTML character references inside an attribute value per HTML5 §13.2.5.72:
+/// - Numeric references (`&#123;`, `&#x1F600;`) and semicolon-terminated named references
+///   (`&amp;`, `&quot;`, `&copy;`) are decoded in a single pass (so `&amp;lt;` becomes `&lt;`,
+///   never `<`).
+/// - Unknown semicolon-terminated names (`&notanentity;`) are left verbatim without prefix decoding.
+/// - Semicolon-less named references followed by `=` or ASCII alphanumerics (e.g. URL query params
+///   `?a=1&copy=2&reg=us` or `&copy2`) are left verbatim instead of being corrupted into `©`/`®`.
+pub fn decode_html_attr_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'&' {
+            let next_amp = input[i..].find('&').map_or(len, |rel| i + rel);
+            out.push_str(&input[i..next_amp]);
+            i = next_amp;
+            continue;
+        }
+
+        // 1. Numeric character references (`&#...` / `&#x...`).
+        if i + 2 < len && bytes[i + 1] == b'#' {
+            let is_hex = matches!(bytes[i + 2], b'x' | b'X');
+            let mut j = if is_hex { i + 3 } else { i + 2 };
+            let digits_start = j;
+            while j < len
+                && if is_hex {
+                    bytes[j].is_ascii_hexdigit()
+                } else {
+                    bytes[j].is_ascii_digit()
+                }
+            {
+                j += 1;
+            }
+            if j > digits_start {
+                let end = if j < len && bytes[j] == b';' {
+                    j + 1
+                } else {
+                    j
+                };
+                let cand = &input[i..end];
+                out.push_str(&html_escape::decode_html_entities(cand));
+                i = end;
+                continue;
+            }
+            out.push('&');
+            i += 1;
+            continue;
+        }
+
+        // 2. Named character references (`&Name;` or legacy semicolon-less `&Name`).
+        if i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
+            let mut j = i + 1;
+            while j < len && bytes[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+
+            if j < len && bytes[j] == b';' {
+                let cand = &input[i..=j];
+                let decoded = html_escape::decode_html_entities(cand);
+                if decoded.as_ref() != cand
+                    && (cand.eq_ignore_ascii_case("&semi;") || !decoded.ends_with(';'))
+                {
+                    out.push_str(&decoded);
+                } else {
+                    out.push_str(cand);
+                }
+                i = j + 1;
+                continue;
+            }
+
+            // HTML5 §13.2.5.72: in attribute values, a semicolon-less named reference immediately
+            // followed by `=` (e.g. `?a=1&copy=2&reg=us`) MUST NOT be decoded.
+            if j < len && bytes[j] == b'=' {
+                out.push_str(&input[i..j]);
+                i = j;
+                continue;
+            }
+
+            let cand = &input[i..j];
+            let decoded = html_escape::decode_html_entities(cand);
+            if decoded.as_ref() != cand && decoded.chars().count() == 1 {
+                out.push_str(&decoded);
+            } else {
+                out.push_str(cand);
+            }
+            i = j;
+            continue;
+        }
+
+        out.push('&');
+        i += 1;
+    }
+
+    out
 }
 
 fn decode_basic_html_entities(input: &str) -> String {

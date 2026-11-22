@@ -392,7 +392,7 @@ export const DEFAULT_NOTION_COLUMN_MAPPING: NotionColumnMapping = {
   title: "Title",
   fc_id: "FC-ID",
   link: "Link",
-  short_url: "Short URL",
+  short_url: null,
   source: "Source",
   published: "Published",
   state: "State",
@@ -595,6 +595,7 @@ export interface ChannelDestinationDto {
   kind: ChannelKind;
   config: DestinationConfigView;
   enabled: boolean;
+  auto_paused?: boolean;
   smtp_summary?: SmtpRecipientSummary;
   created_at: string;
   updated_at: string;

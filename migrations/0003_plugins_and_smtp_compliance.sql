@@ -57,3 +57,6 @@ CREATE TABLE IF NOT EXISTS smtp_recipients (
 
 CREATE INDEX IF NOT EXISTS idx_smtp_recipients_destination_status
     ON smtp_recipients (destination_id, status);
+
+ALTER TABLE channel_destinations
+    ADD COLUMN auto_paused INTEGER NOT NULL DEFAULT 0 CHECK (auto_paused IN (0, 1));

@@ -25,6 +25,7 @@ use telegram_rich::html::{ParseOptions, normalize, parse as parse_rich_html};
 use telegram_rich::types::InputRichMessage;
 use telegram_rich::{Block, Document, FitOptions, Inline};
 use tokio::sync::Semaphore;
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 use crate::channels::{
@@ -145,11 +146,19 @@ impl DefaultMediaStreamFetcher {
     }
 
     fn client_for(&self, use_proxy: bool) -> AppResult<reqwest::Client> {
-        if use_proxy
-            && let Some(ref raw_proxy) = self.proxy_url
-            && !raw_proxy.trim().is_empty()
-        {
-            let proxy = reqwest::Proxy::all(raw_proxy.trim())
+        if use_proxy {
+            let raw_proxy = self
+                .proxy_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured"
+                            .to_owned(),
+                    )
+                })?;
+            let proxy = reqwest::Proxy::all(raw_proxy)
                 .map_err(|err| AppError::Config(format!("invalid outbound proxy URL: {err}")))?;
             return reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -453,10 +462,18 @@ impl TelegramSender {
 
         let parsed = Url::parse(method_url)?;
         let active_proxy = if use_proxy {
-            self.proxy_url
+            let raw = self
+                .proxy_url
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured"
+                            .to_owned(),
+                    )
+                })?;
+            Some(raw)
         } else {
             None
         };
@@ -795,6 +812,14 @@ impl TelegramSender {
                 self.send_compact_mode(ctx, cfg, dest, true, Some(updated_val))
                     .await
             }
+            Err(api_err) if api_err.is_rich_content_error() => {
+                tracing::warn!(
+                    destination_id = ctx.destination.id,
+                    error = %api_err.description,
+                    "Telegram sendRichMessage returned 400 content error; falling back once to compact_card"
+                );
+                self.send_compact_mode(ctx, cfg, dest, true, None).await
+            }
             Err(api_err) => Ok(classify_telegram_error(
                 api_err,
                 Some(existing.into_checkpoint()),
@@ -841,7 +866,7 @@ impl TelegramSender {
             .canonical_url
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty());
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
 
         let mut link_preview_options = json!({
             "is_disabled": !ctx.route_options.link_preview,
@@ -1088,6 +1113,7 @@ impl TelegramSender {
                 batch_idx,
                 &degraded_urls,
                 self.locale,
+                &ctx.overrides,
             );
             let id = self
                 .send_plain_text_fallback(client, cfg, dest, ctx, &text)
@@ -1162,6 +1188,7 @@ impl TelegramSender {
                 batch_idx,
                 &degraded_urls,
                 self.locale,
+                &ctx.overrides,
             );
             let id = self
                 .send_plain_text_fallback(client, cfg, dest, ctx, &text)
@@ -1370,7 +1397,7 @@ impl TelegramSender {
             .canonical_url
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
         {
             link_preview_options["url"] = json!(url);
         }
@@ -1882,7 +1909,7 @@ pub fn format_compact_card_html_with_options(
     let max_fit_budget = MAX_MESSAGE_UTF16_UNITS.saturating_sub(fixed_units + 16);
     let mut summary_budget = COMPACT_SUMMARY_MAX_UNITS.min(max_fit_budget);
 
-    for _ in 0..8 {
+    for _ in 0..16 {
         if summary_budget == 0 {
             break;
         }
@@ -1905,7 +1932,13 @@ pub fn format_compact_card_html_with_options(
             return candidate;
         }
         let over = utf16_len(&candidate).saturating_sub(MAX_MESSAGE_UTF16_UNITS);
-        summary_budget = summary_budget.saturating_sub(over + 32);
+        // HTML entity escaping (`&` -> `&amp;`, `<` -> `&lt;`) expands up to 5x, so scale down the
+        // unescaped summary budget smoothly instead of wiping it to zero on a single overflow step.
+        let mut step = (over / 5).max(16);
+        if step >= summary_budget && summary_budget > 16 {
+            step = summary_budget / 2;
+        }
+        summary_budget = summary_budget.saturating_sub(step);
     }
 
     format!("{header}{meta_footer}")
@@ -2582,8 +2615,10 @@ fn append_degraded_links_to_caption(
         } else {
             "\n"
         };
-        let needed = utf16_len(sep) + utf16_len(&tag);
-        if overflow.is_empty() && utf16_len(&current) + needed <= MAX_CAPTION_UTF16_UNITS {
+        let needed_visible = visible_html_utf16_len(sep) + visible_html_utf16_len(&tag);
+        if overflow.is_empty()
+            && visible_html_utf16_len(&current) + needed_visible <= MAX_CAPTION_UTF16_UNITS
+        {
             current.push_str(sep);
             current.push_str(&tag);
             has_link_line = true;
@@ -2593,7 +2628,7 @@ fn append_degraded_links_to_caption(
         }
     }
 
-    if utf16_len(&current) > MAX_CAPTION_UTF16_UNITS {
+    if visible_html_utf16_len(&current) > MAX_CAPTION_UTF16_UNITS {
         current = clamp_caption_html_utf16(&current, MAX_CAPTION_UTF16_UNITS);
     }
 
@@ -2601,10 +2636,28 @@ fn append_degraded_links_to_caption(
     (opt, overflow, first_overflow_idx)
 }
 
-/// Safely clamp an HTML caption to at most `max_units` UTF-16 code units without splitting
+/// Count visible UTF-16 code units of a Telegram HTML snippet (ignoring HTML markup tags and
+/// counting common HTML entities `&amp;`, `&lt;`, `&gt;`, `&quot;` as 1 visible character each,
+/// matching Telegram Bot API's caption/message entity length accounting).
+fn visible_html_utf16_len(html: &str) -> usize {
+    let mut visible = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => visible.push(ch),
+            _ => {}
+        }
+    }
+    let decoded = crate::ingest::html::decode_html_attr_entities(&visible);
+    utf16_len(&decoded)
+}
+
+/// Safely clamp an HTML caption to at most `max_units` visible UTF-16 code units without splitting
 /// an `<a href="...">...</a>` tag or HTML entity in half.
 fn clamp_caption_html_utf16(html: &str, max_units: usize) -> String {
-    if utf16_len(html) <= max_units {
+    if visible_html_utf16_len(html) <= max_units {
         return html.to_owned();
     }
     let lines: Vec<&str> = html.lines().collect();
@@ -2612,7 +2665,7 @@ fn clamp_caption_html_utf16(html: &str, max_units: usize) -> String {
         && last_line.contains("<a href=")
         && !body_lines.is_empty()
     {
-        let link_units = utf16_len(last_line);
+        let link_units = visible_html_utf16_len(last_line);
         if link_units + 1 < max_units {
             let body_budget = max_units - link_units - 1;
             let body = body_lines.join("\n");
@@ -2623,7 +2676,7 @@ fn clamp_caption_html_utf16(html: &str, max_units: usize) -> String {
                 format!("{truncated_body}\n{last_line}")
             };
         }
-        // Link line alone exceeds budget: fall back to body text without breaking tags.
+        // Link line alone exceeds visible budget: fall back to body text without breaking tags.
         let body = body_lines.join("\n");
         return truncate_escaped_html_utf16(&body, max_units);
     }
@@ -2673,10 +2726,18 @@ fn compose_degraded_text_message(
     batch_idx: usize,
     degraded_urls: &[String],
     locale: AppLocale,
+    overrides: &crate::plugins::RenderOverrides,
 ) -> String {
     let canonical = entry.canonical_url.as_deref().map(str::trim);
+    let primary = overrides.effective_primary_link(entry);
     let mut out = if batch_idx == 0 {
-        format_media_mode_caption_with_locale(feed, entry, MAX_MESSAGE_UTF16_UNITS, locale)
+        format_media_mode_caption_with_overrides(
+            feed,
+            entry,
+            MAX_MESSAGE_UTF16_UNITS,
+            locale,
+            overrides,
+        )
     } else {
         String::new()
     };
@@ -2684,7 +2745,7 @@ fn compose_degraded_text_message(
     let mut media_idx = 0usize;
 
     for url in degraded_urls {
-        if batch_idx == 0 && canonical == Some(url.as_str()) {
+        if batch_idx == 0 && (canonical == Some(url.as_str()) || primary == Some(url.as_str())) {
             continue;
         }
         media_idx += 1;
@@ -2696,7 +2757,9 @@ fn compose_degraded_text_message(
         } else {
             "\n"
         };
-        if utf16_len(&out) + utf16_len(sep) + utf16_len(&tag) <= MAX_MESSAGE_UTF16_UNITS {
+        if visible_html_utf16_len(&out) + visible_html_utf16_len(sep) + visible_html_utf16_len(&tag)
+            <= MAX_MESSAGE_UTF16_UNITS
+        {
             out.push_str(sep);
             out.push_str(&tag);
             has_link_line = true;
@@ -2830,6 +2893,25 @@ impl TgCallError {
             Some(code) => is_rich_method_unsupported(code, &self.description),
             None => false,
         }
+    }
+
+    fn is_rich_content_error(&self) -> bool {
+        if self.status_code != Some(400) || self.is_rich_method_unsupported() {
+            return false;
+        }
+        let lower = self.description.to_ascii_lowercase();
+        // Exclude destination/permission/topic errors that CompactCard cannot resolve.
+        !(lower.contains("chat not found")
+            || lower.contains("chat_id is empty")
+            || lower.contains("user not found")
+            || lower.contains("bot was blocked")
+            || lower.contains("bot was kicked")
+            || lower.contains("have no rights")
+            || lower.contains("not enough rights")
+            || lower.contains("message thread not found")
+            || lower.contains("topic_deleted")
+            || lower.contains("topic_closed")
+            || lower.contains("group chat was upgraded"))
     }
 
     fn is_url_media_fetch_error(&self) -> bool {
@@ -3096,23 +3178,174 @@ fn format_telegram_meta_line(feed: &Feed, entry: &Entry, tz: Tz) -> String {
     parts.join(" · ")
 }
 
-/// File extensions commonly colliding with ICANN ccTLDs/gTLDs (such as `.md`, `.go`, `.rs`,
-/// `.sh`, `.py`, `.ts`, `.js`, `.zip`, `.mov`) that Telegram's `sendMessage` auto-linker
-/// mistakenly turns into clickable domain hyperlinks.
+/// Unambiguous code/document file extensions colliding with ICANN ccTLDs/gTLDs (such as `.md`,
+/// `.go`, `.rs`, `.sh`, `.py`, `.ts`, `.js`, `.zip`, `.mov`) that Telegram's `sendMessage`
+/// auto-linker mistakenly turns into clickable domain hyperlinks.
 const FILENAME_TLD_EXTENSIONS: &[&str] = &[
-    "md", "markdown", "go", "rs", "sh", "bash", "zsh", "py", "pl", "rb", "php", "so", "cc", "cpp",
-    "hpp", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "css", "html", "xml",
-    "yml", "yaml", "json", "jsonc", "toml", "sql", "lock", "mod", "sum", "txt", "log", "cfg",
-    "ini", "env", "zip", "mov", "tar", "gz", "png", "jpg", "jpeg", "svg", "pdf", "ml", "tf", "re",
-    "pm", "am", "is", "it", "in", "im", "java", "kt", "swift", "dart",
+    "md", "markdown", "go", "rs", "sh", "bash", "zsh", "py", "pl", "rb", "php", "cpp", "hpp", "ts",
+    "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "css", "html", "xml", "yml", "yaml",
+    "json", "jsonc", "toml", "sql", "lock", "mod", "sum", "txt", "log", "cfg", "ini", "env", "zip",
+    "mov", "tar", "gz", "png", "jpg", "jpeg", "svg", "pdf", "tf", "java", "kt", "swift", "dart",
 ];
+
+/// Extensions that are also very common website ccTLDs (e.g. `notion.so`, `italia.it`) and are
+/// therefore only treated as filenames when the stem carries clear file/path markers (`/`, `\`,
+/// `_`, uppercase letters, or a `lib` prefix like `libssl.so`).
+const AMBIGUOUS_FILENAME_TLD_EXTENSIONS: &[&str] =
+    &["so", "cc", "ml", "re", "pm", "am", "is", "it", "in", "im"];
+
+fn is_url_delimiter(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ')' | ']'
+                | '}'
+                | '>'
+                | '"'
+                | '\''
+                | '”'
+                | '’'
+                | '）'
+                | '」'
+                | '』'
+                | ','
+                | ';'
+                | '。'
+                | '，'
+                | '；'
+        )
+}
+
+fn find_next_http_scheme(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].len() >= 7 && bytes[i..i + 7].eq_ignore_ascii_case(b"http://") {
+            return Some(i);
+        }
+        if bytes[i..].len() >= 8 && bytes[i..i + 8].eq_ignore_ascii_case(b"https://") {
+            return Some(i);
+        }
+        let ch = s[i..].chars().next().expect("valid char boundary");
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn is_subtoken_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '、' | '，'
+            | '。'
+            | '；'
+            | '：'
+            | '（'
+            | '）'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+            | '《'
+            | '》'
+            | ','
+            | ';'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | '"'
+            | '“'
+            | '”'
+    )
+}
+
+fn suppress_non_url_segment(seg: &str, out: &mut String) {
+    if seg.is_empty() {
+        return;
+    }
+
+    // Split on CJK/list punctuation (`、`, `，`, `。`, parentheses, brackets, etc.) so lists like
+    // `README.fr.md、sku.go、libssl.so` are evaluated individually per filename/word atom.
+    let mut start = 0;
+    for (idx, ch) in seg.char_indices() {
+        if is_subtoken_separator(ch) {
+            if idx > start {
+                suppress_non_url_atom(&seg[start..idx], out);
+            }
+            out.push(ch);
+            start = idx + ch.len_utf8();
+        }
+    }
+    if start < seg.len() {
+        suppress_non_url_atom(&seg[start..], out);
+    }
+}
+
+fn suppress_non_url_atom(seg: &str, out: &mut String) {
+    const ZWNJ: char = '\u{200C}';
+    if seg.is_empty() {
+        return;
+    }
+
+    let trimmed_leading = seg.trim_start_matches(['\'', '‘', '`']);
+    let core = trimmed_leading.trim_end_matches(['.', ':', '!', '?', '\'', '’', '`']);
+
+    // Never apply filename-TLD splitting to email-like tokens (e.g. `alice@company.it`).
+    let is_filename_like = !core.contains('@')
+        && core.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && stem
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && (FILENAME_TLD_EXTENSIONS
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known))
+                    || (AMBIGUOUS_FILENAME_TLD_EXTENSIONS
+                        .iter()
+                        .any(|ambig| ext.eq_ignore_ascii_case(ambig))
+                        && (stem.contains('/')
+                            || stem.contains('\\')
+                            || stem.contains('_')
+                            || stem.starts_with("lib")
+                            || stem.chars().any(|c| c.is_ascii_uppercase()))))
+        });
+
+    let chars: Vec<char> = seg.chars().collect();
+    for (idx, &c) in chars.iter().enumerate() {
+        out.push(c);
+        let next = chars.get(idx + 1).copied();
+        let prev = idx.checked_sub(1).and_then(|p| chars.get(p).copied());
+        match c {
+            // Suppress `/cmd` false-positive bot commands (e.g. `/firewall`, `/vps`, `/api/v1`).
+            '/' if next.is_some_and(|n| n.is_ascii_alphabetic()) => {
+                out.push(ZWNJ);
+            }
+            // Suppress `@mention` false-positive handles (e.g. `@astrojs/starlight`, `@types/node`).
+            '@' if prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_')
+                && next.is_some_and(|n| n.is_ascii_alphabetic() || n == '_') =>
+            {
+                out.push(ZWNJ);
+            }
+            // Suppress filename ccTLD collisions across multi-dot names (`README.fr.md`, `sku.go`).
+            '.' if is_filename_like && next.is_some_and(|n| n.is_ascii_alphabetic()) => {
+                out.push(ZWNJ);
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Suppress false-positive Telegram `sendMessage` auto-detected entities in plain-text summaries
 /// (`/command`, `@mention`, and code/doc filenames like `README.md`, `README.fr.md`, `sku.go`)
 /// by inserting an invisible ZERO WIDTH NON-JOINER (`\u{200C}`) while leaving real `http://` and
-/// `https://` URLs untouched.
+/// `https://` URLs (including inline CJK-prefixed or Markdown-wrapped URLs), email addresses, and
+/// bare website domains like `notion.so` completely untouched.
 pub fn suppress_telegram_auto_entities(text: &str) -> String {
-    const ZWNJ: char = '\u{200C}';
     let mut out = String::with_capacity(text.len() + 16);
     let mut i = 0;
     let bytes = text.as_bytes();
@@ -3135,52 +3368,28 @@ pub fn suppress_telegram_auto_entities(text: &str) -> String {
             i += c.len_utf8();
         }
         let token = &text[start..i];
-        let trimmed_leading =
-            token.trim_start_matches(['(', '[', '{', '<', '"', '\'', '“', '‘', '「', '『', '（']);
-        let lower_leading = trimmed_leading.to_ascii_lowercase();
 
-        // Never alter genuine http(s):// URLs.
-        if lower_leading.starts_with("http://") || lower_leading.starts_with("https://") {
-            out.push_str(token);
-            continue;
-        }
+        // Scan token for embedded `http://` or `https://` substrings so URLs glued to CJK text
+        // (`详见https://...`, `链接：https://...`) or Markdown (`[原文](https://...)`) are copied
+        // verbatim while surrounding non-URL segments still get entity suppression.
+        let mut cursor = 0;
+        while cursor < token.len() {
+            if let Some(rel_url) = find_next_http_scheme(&token[cursor..]) {
+                let url_start = cursor + rel_url;
+                suppress_non_url_segment(&token[cursor..url_start], &mut out);
 
-        // Detect whether this token ends with a filename-like extension (e.g. `README.fr.md`, `sku.go`).
-        let core = trimmed_leading.trim_end_matches([
-            '.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"', '\'', '”', '’', '」', '』', '）',
-        ]);
-        let is_filename_like = core.rsplit_once('.').is_some_and(|(stem, ext)| {
-            !stem.is_empty()
-                && stem
-                    .chars()
-                    .last()
-                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-                && FILENAME_TLD_EXTENSIONS
-                    .iter()
-                    .any(|known| ext.eq_ignore_ascii_case(known))
-        });
-
-        let chars: Vec<char> = token.chars().collect();
-        for (idx, &c) in chars.iter().enumerate() {
-            out.push(c);
-            let next = chars.get(idx + 1).copied();
-            let prev = idx.checked_sub(1).and_then(|p| chars.get(p).copied());
-            match c {
-                // Suppress `/cmd` false-positive bot commands (e.g. `/firewall`, `/vps`, `/api/v1`).
-                '/' if next.is_some_and(|n| n.is_ascii_alphabetic()) => {
-                    out.push(ZWNJ);
+                let mut url_end = url_start;
+                for (offset, c) in token[url_start..].char_indices() {
+                    if is_url_delimiter(c) {
+                        break;
+                    }
+                    url_end = url_start + offset + c.len_utf8();
                 }
-                // Suppress `@mention` false-positive handles (e.g. `@astrojs/starlight`, `@types/node`).
-                '@' if prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '_')
-                    && next.is_some_and(|n| n.is_ascii_alphabetic() || n == '_') =>
-                {
-                    out.push(ZWNJ);
-                }
-                // Suppress filename ccTLD collisions across multi-dot names (`README.fr.md`, `sku.go`).
-                '.' if is_filename_like && next.is_some_and(|n| n.is_ascii_alphabetic()) => {
-                    out.push(ZWNJ);
-                }
-                _ => {}
+                out.push_str(&token[url_start..url_end]);
+                cursor = url_end;
+            } else {
+                suppress_non_url_segment(&token[cursor..], &mut out);
+                break;
             }
         }
     }
@@ -3285,12 +3494,12 @@ fn truncate_utf16(s: &str, max_units: usize, ellipsis: &str) -> String {
     if max_units <= ell_units {
         let mut out = String::new();
         let mut used = 0;
-        for ch in s.chars() {
-            let w = ch.len_utf16();
+        for grapheme in s.graphemes(true) {
+            let w = utf16_len(grapheme);
             if used + w > max_units {
                 break;
             }
-            out.push(ch);
+            out.push_str(grapheme);
             used += w;
         }
         return out;
@@ -3299,19 +3508,20 @@ fn truncate_utf16(s: &str, max_units: usize, ellipsis: &str) -> String {
     let target = max_units - ell_units;
     let mut out = String::new();
     let mut used = 0;
-    for ch in s.chars() {
-        let w = ch.len_utf16();
+    for grapheme in s.graphemes(true) {
+        let w = utf16_len(grapheme);
         if used + w > target {
             break;
         }
-        out.push(ch);
+        out.push_str(grapheme);
         used += w;
     }
     let trimmed = out.trim_end();
     format!("{trimmed}{ellipsis}")
 }
 
-/// Truncate `s` to at most `max_units` UTF-16 code units, preferring to step back cleanly to a
+/// Truncate `s` to at most `max_units` UTF-16 code units along Unicode grapheme-cluster
+/// boundaries (never splitting ZWJ emoji sequences), preferring to step back cleanly to a
 /// nearby sentence/word boundary instead of chopping an ASCII word mid-token (e.g. `ad…`).
 fn truncate_utf16_word_boundary(s: &str, max_units: usize, ellipsis: &str) -> String {
     if utf16_len(s) <= max_units {
@@ -3325,12 +3535,12 @@ fn truncate_utf16_word_boundary(s: &str, max_units: usize, ellipsis: &str) -> St
     let target = max_units - ell_units;
     let mut byte_end = 0;
     let mut used = 0;
-    for (idx, ch) in s.char_indices() {
-        let w = ch.len_utf16();
+    for (idx, grapheme) in s.grapheme_indices(true) {
+        let w = utf16_len(grapheme);
         if used + w > target {
             break;
         }
-        byte_end = idx + ch.len_utf8();
+        byte_end = idx + grapheme.len();
         used += w;
     }
 

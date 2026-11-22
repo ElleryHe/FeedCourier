@@ -8,7 +8,7 @@ FeedCourier stores all persistent state in a single SQLite `WAL` database at `<D
 
 Before applying major DDL migrations against an existing database, `Database::connect` captures a pure pre-DDL online `VACUUM INTO` snapshot without overwriting prior backups (appending a UTC timestamp and collision suffix if the file or companion `-wal`/`-shm` sidecars exist, and cleaning up residual sidecar files afterward):
 - Upgrading `v0.1.x` → `v0.2.0+`: writes `<DATA_DIR>/pre-v0.2.0-backup.db` before `0002_channel_destinations.sql`, followed by `Database::migrate_channels_to_v2`.
-- Upgrading `v0.2.x` → `v0.3.0`: writes `<DATA_DIR>/pre-v0.3.0-backup.db` before `0003_plugins_and_smtp_compliance.sql`, followed by the idempotent startup backfill `Database::backfill_legacy_smtp_recipients`.
+- Upgrading `v0.2.x` → `v0.3.0`: whenever an existing database has migration `0002` applied, `0003` pending, and **any business table (`feeds`, `channels`, or `channel_destinations`) is non-empty**, writes `<DATA_DIR>/pre-v0.3.0-backup.db` before `0003_plugins_and_smtp_compliance.sql` (and cleans up any partial backup file and `-wal`/`-shm` sidecars if `VACUUM INTO` fails), followed by the idempotent startup backfill `Database::backfill_legacy_smtp_recipients`.
 
 All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and relational business foreign keys enforce **`ON DELETE CASCADE`** (while `delivery_quota_ledger` intentionally omits foreign keys so deletions never clear quota usage).
 
@@ -108,7 +108,7 @@ Stores account-level ChaCha20-Poly1305 encrypted credentials (`ChannelConfig`), 
 | `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10` | Per-delivery random jitter ceiling in seconds (`0 ..= jitter_max_secs`, kept in memory). |
 | `hourly_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 1-hour window shared across all destinations of this account. |
 | `daily_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 24-hour window shared across all destinations of this account. |
-| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0` | `1` to route all requests for this account and its destinations through the global outbound proxy. |
+| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0` | `1` to route all HTTP requests for this account and its destinations through the global outbound proxy (Telegram and Notion; SMTP uses native TCP/TLS direct connections). |
 | `cooldown_until` | `INTEGER` | `NULL` | Downstream rate-limit cooldown expiration timestamp shared across all destinations. |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when paused. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
@@ -127,9 +127,10 @@ Stores one or more concrete delivery targets per parent Channel Account (`migrat
 | :--- | :--- | :--- | :--- |
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique destination ID (primary target for `routes` and MCP `configure_route` / `test_push_feed_entry`). |
 | `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to `channels(id) ON DELETE CASCADE`. |
-| `name` | `TEXT` | `NOT NULL` | Destination label shown in WebUI and redacted MCP summaries (auto-derived from Telegram `getChat`, SMTP first recipient, or Notion database title when omitted). |
+| `name` | `TEXT` | `NOT NULL` | Destination label shown in WebUI and redacted MCP summaries (auto-derived from Telegram `getChat`, masked SMTP first recipient such as `a***e@example.com`, or Notion database title when omitted). |
 | `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext of `DestinationConfig` (Telegram `chat_id`/`message_thread_id`, SMTP `to_addresses`/`reply_to`, or Notion `data_source_id`/`column_mapping`). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when paused independently of sibling destinations. |
+| `auto_paused` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | Added in `0003_plugins_and_smtp_compliance.sql`. Set to `1` alongside `enabled = 0` when all SMTP recipients become `unsubscribed` or `bounced`. When any recipient subsequently completes re-verification while `auto_paused = 1`, FeedCourier atomically restores `enabled = 1, auto_paused = 0` and wakes deferred tasks; manually toggling `enabled` clears `auto_paused = 0` so manually disabled destinations remain paused. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
 
@@ -181,7 +182,7 @@ Tracks every `Entry × Route` delivery lifecycle.
 | `attempt_count` | `INTEGER` | `NOT NULL DEFAULT 0` | Number of delivery attempts consumed (`dead_letter` at `6`). |
 | `next_attempt_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Earliest timestamp when the task may be claimed. |
 | `last_status_code` | `INTEGER` | `NULL` | Downstream HTTP or SMTP status code from the last attempt. |
-| `diagnostic_log` | `TEXT` | `NULL` | Diagnostic message or error reason from the last attempt. |
+| `diagnostic_log` | `TEXT` | `NULL` | Diagnostic message or error reason from the last attempt (recipient email addresses are masked to prevent plaintext PII leakage). |
 | `completed_at` | `INTEGER` | `NULL` | Completion timestamp when `status` reaches `'delivered'` or `'dead_letter'`. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Task creation timestamp. |
 
@@ -300,7 +301,7 @@ Tracks per-recipient double opt-in verification, consent audit, unsubscribe, and
 | `consented_at` | `INTEGER` | `NULL` | Timestamp when consent was recorded. |
 | `revoked_method` | `TEXT` | `NULL` | Revocation reason: `'one_click'`, `'link'`, `'admin'`, or `'hard_bounce'`. |
 | `revoked_at` | `INTEGER` | `NULL` | Timestamp when revoked or hard-bounced. |
-| `bounce_diagnostic` | `TEXT` | `NULL` | SMTP 5xx diagnostic text recorded on synchronous hard bounce. |
+| `bounce_diagnostic` | `TEXT` | `NULL` | Redacted SMTP 5xx recipient-level hard-bounce diagnostic text (any email addresses are masked). |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Timestamps. |
 
 - **Unique Constraint:** `UNIQUE (destination_id, address_hmac)`

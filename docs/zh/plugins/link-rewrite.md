@@ -44,7 +44,7 @@ services:
 | `exclude_domains` | 否 | `[]` | 不参与短链替换的域名列表，支持精确域名（`github.com`）与通配符子域名（`*.example.com`，同时匹配根域名 `example.com`）。**服务商自身域名会自动跳过**，防止递归缩短。 |
 | `strict_mode` | 否 | `false` | 失败策略：<br>• `false` *（默认）*：逐条降级——单条链接缩短失败时保留原始 URL，文章照常投递，并在任务 `diagnostic_log` 记录警告（发件箱队列显示**黄色**「部分替换」）。<br>• `true`：严格模式——任一链接失败即返回 `PluginResult::Retry`，使整个投递任务进入标准退避重试流程。 |
 | `pass_title` | 否 | `true` | 缩短文章主链接时附带文章标题（最多 200 字符）作为 `title` 参数传给 YOURLS，避免 YOURLS 服务器再反向回源抓取标题。 |
-| `use_proxy` | 否 | `false` | 调用 YOURLS API 时是否经由全局 `OUTBOUND_PROXY` 代理转发。 |
+| `use_proxy` | 否 | `false` | 调用 YOURLS API 时是否经由全局 `OUTBOUND_PROXY` 代理转发（若开启但全局未配置代理，将直接报错拦截而不静默直连）。 |
 
 4. 点击 **测试** 验证连通性：系统会实际缩短测试链接 `https://feedcourier.ellery.me/` 并返回生成的短链。
 5. 进入 **路由规则** 编辑某条路由，展开可折叠的 **插件** 分区，选择对应的 YOURLS 服务商即可生效。
@@ -59,12 +59,12 @@ services:
 
 为防止链接密集型周报拖慢发件箱吞吐或压垮自建 YOURLS 实例，插件内置以下保护与缓存机制：
 
-- **单篇链接数量上限**：单次投递最多缩短 **`50` 条唯一合法链接**（`MAX_REWRITE_URLS_PER_ENTRY = 50`，优先处理文章主链接，随后按文档顺序处理正文 `<a href>`）；超出上限的链接保持原样并记录告警。
+- **单篇未缓存新链接上限**：插件会先通过单条批量 SQL 查出 `plugin_link_cache` 中全部已命中短链（不消耗配额），仅对**未命中缓存的新链接**施加最多 **`50` 条**上限（`MAX_REWRITE_URLS_PER_ENTRY = 50`，优先处理文章主链接，随后按文档顺序处理正文 `<a href>`）；超出上限的新链接保持原样并记录告警。
 - **并发与超时限制**：缓存未命中时以最多 **`4` 路并发**（`REWRITE_CONCURRENCY = 4`）调用 YOURLS，单链接超时 **`5` 秒**（`REWRITE_REQUEST_TIMEOUT = 5s`），单响应体上限 `64 KiB`。
 - **SQLite 短链缓存（`plugin_link_cache`）**：
   - 按 `(instance_id, sha256(long_url))` 缓存短链映射，避免任务重试、多路由扇出或 SMTP 多收件人发送时重复请求 YOURLS。
   - 每次命中缓存都会更新 `last_used_at`；后台维护协程自动清理超过 **90 天**未被使用的缓存记录。
-  - 可在插件详情页随时手动清空单个服务商的缓存（对应 `DELETE /api/v1/plugins/{id}/instances/{iid}/cache`）。
+  - 修改服务商的 `api_url` 时会自动清空该实例的 `plugin_link_cache`，也可在插件详情页随时手动清空单个服务商的缓存（对应 `DELETE /api/v1/plugins/{id}/instances/{iid}/cache`）。
   - **调试推送（Debug Push）**会完整执行 `on_render` 钩子以预览替换效果，但不会向缓存写入记录。
 
 ---

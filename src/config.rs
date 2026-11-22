@@ -63,6 +63,9 @@ pub struct AppConfig {
     pub public_url: Option<String>,
     /// Optional custom plugin marketplace `index.json` URL (`PLUGIN_INDEX_URL`).
     pub plugin_index_url: Option<String>,
+    /// Whether to trust reverse-proxy client IP headers (`X-Real-IP` / rightmost `X-Forwarded-For`)
+    /// on public compliance endpoints (`/u/`, `/v/`). Defaults to `false` (use TCP `SocketAddr`).
+    pub trust_proxy: bool,
 }
 
 impl Default for AppConfig {
@@ -84,6 +87,7 @@ impl Default for AppConfig {
             reset_2fa: false,
             public_url: None,
             plugin_index_url: None,
+            trust_proxy: false,
         }
     }
 }
@@ -205,6 +209,13 @@ impl AppConfig {
             None => None,
         };
 
+        let trust_proxy = non_empty("TRUST_PROXY").is_some_and(|raw| {
+            matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+
         Ok(Self {
             data_dir,
             listen_addr,
@@ -220,6 +231,7 @@ impl AppConfig {
             reset_2fa,
             public_url,
             plugin_index_url,
+            trust_proxy,
         })
     }
 

@@ -168,7 +168,37 @@ async fn needs_pre_v3_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
     let (dest_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channel_destinations")
         .fetch_one(write_pool)
         .await?;
-    Ok(dest_count > 0)
+    if dest_count > 0 {
+        return Ok(true);
+    }
+
+    let (feed_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM feeds")
+        .fetch_one(write_pool)
+        .await
+        .unwrap_or((0,));
+    let (channel_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channels")
+        .fetch_one(write_pool)
+        .await
+        .unwrap_or((0,));
+    Ok(feed_count > 0 || channel_count > 0)
+}
+
+async fn vacuum_into_backup_cleanly(write_pool: &SqlitePool, backup_path: &Path) -> AppResult<()> {
+    let backup_str = backup_path.to_str().ok_or_else(|| {
+        crate::error::AppError::Validation("backup path must be valid UTF-8".to_string())
+    })?;
+    if let Err(err) = sqlx::query("VACUUM INTO ?1")
+        .bind(backup_str)
+        .execute(write_pool)
+        .await
+    {
+        // Clean up any partial/corrupt backup file and sidecars left behind by a failed VACUUM INTO.
+        let _ = fs::remove_file(backup_path);
+        remove_sqlite_sidecars(backup_path);
+        return Err(err.into());
+    }
+    remove_sqlite_sidecars(backup_path);
+    Ok(())
 }
 
 impl Database {
@@ -206,16 +236,7 @@ impl Database {
         // so downgrading back to v0.1.6 can restore the backup directly without schema mismatch.
         let pre_v2_backup_path = if needs_pre_v2_ddl_backup(&write_pool).await? {
             let backup_path = choose_pre_v2_backup_path(db_path);
-            let backup_str = backup_path.to_str().ok_or_else(|| {
-                crate::error::AppError::Validation(
-                    "pre-v0.2.0 backup path must be valid UTF-8".to_string(),
-                )
-            })?;
-            sqlx::query("VACUUM INTO ?1")
-                .bind(backup_str)
-                .execute(&write_pool)
-                .await?;
-            remove_sqlite_sidecars(&backup_path);
+            vacuum_into_backup_cleanly(&write_pool, &backup_path).await?;
             tracing::info!(
                 backup_path = %backup_path.display(),
                 "captured pre-v0.2.0 SQLite backup prior to applying 0002 schema migration"
@@ -229,16 +250,7 @@ impl Database {
         let pre_v3_backup_path =
             if pre_v2_backup_path.is_none() && needs_pre_v3_ddl_backup(&write_pool).await? {
                 let backup_path = choose_pre_ddl_backup_path(db_path, "pre-v0.3.0-backup");
-                let backup_str = backup_path.to_str().ok_or_else(|| {
-                    crate::error::AppError::Validation(
-                        "pre-v0.3.0 backup path must be valid UTF-8".to_string(),
-                    )
-                })?;
-                sqlx::query("VACUUM INTO ?1")
-                    .bind(backup_str)
-                    .execute(&write_pool)
-                    .await?;
-                remove_sqlite_sidecars(&backup_path);
+                vacuum_into_backup_cleanly(&write_pool, &backup_path).await?;
                 tracing::info!(
                     backup_path = %backup_path.display(),
                     "captured pre-v0.3.0 SQLite backup prior to applying 0003 schema migration"
@@ -352,10 +364,26 @@ impl CheckpointSink for DbCheckpointSink {
 
     async fn update_destination_config(&self, config: &DestinationConfig) -> AppResult<()> {
         if let (Some(dest_id), Some(key)) = (self.destination_id, self.master_key.as_ref()) {
-            let encrypted = key.encrypt_json(config)?;
-            self.db
-                .update_destination_encrypted_config(dest_id, &encrypted)
-                .await?;
+            match config {
+                DestinationConfig::Notion(n) => {
+                    // Transactional read-modify-write on `write_pool` so concurrent WebUI
+                    // `column_mapping` edits are NEVER clobbered by background 404 writebacks!
+                    self.db
+                        .update_notion_destination_ids_atomic(
+                            dest_id,
+                            key,
+                            &n.data_source_id,
+                            n.database_id.as_deref(),
+                        )
+                        .await?;
+                }
+                other => {
+                    let encrypted = key.encrypt_json(other)?;
+                    self.db
+                        .update_destination_encrypted_config(dest_id, &encrypted)
+                        .await?;
+                }
+            }
         }
         Ok(())
     }

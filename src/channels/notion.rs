@@ -1149,7 +1149,6 @@ fn parse_markdown_segments(markdown: &str) -> Vec<MarkdownSegment> {
 pub struct NotionSender {
     api_base_url: String,
     direct_client: reqwest::Client,
-    env_proxy_client: reqwest::Client,
     outbound_proxy: RwLock<Option<(String, reqwest::Client)>>,
     request_timeout: Duration,
     async_poll_delay: Duration,
@@ -1178,7 +1177,6 @@ impl NotionSender {
         }
 
         let direct_client = build_reqwest_client(DEFAULT_REQUEST_TIMEOUT, None, false)?;
-        let env_proxy_client = build_reqwest_client(DEFAULT_REQUEST_TIMEOUT, None, true)?;
         let proxy_pair = match outbound_proxy
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1194,7 +1192,6 @@ impl NotionSender {
         Ok(Self {
             api_base_url: base,
             direct_client,
-            env_proxy_client,
             outbound_proxy: RwLock::new(proxy_pair),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             async_poll_delay: DEFAULT_ASYNC_POLL_DELAY,
@@ -1236,16 +1233,18 @@ impl NotionSender {
         Ok(())
     }
 
-    fn client_for(&self, use_proxy: bool) -> reqwest::Client {
+    fn client_for(&self, use_proxy: bool) -> AppResult<reqwest::Client> {
         if !use_proxy {
-            return self.direct_client.clone();
+            return Ok(self.direct_client.clone());
         }
         if let Ok(guard) = self.outbound_proxy.read()
             && let Some((_, ref client)) = *guard
         {
-            return client.clone();
+            return Ok(client.clone());
         }
-        self.env_proxy_client.clone()
+        Err(AppError::Validation(
+            "use_proxy is enabled, but no global OUTBOUND_PROXY is configured".to_string(),
+        ))
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -1260,14 +1259,17 @@ impl NotionSender {
         secret: &str,
         use_proxy: bool,
         body: Option<&Value>,
-    ) -> Result<NotionRawResponse, reqwest::Error> {
+    ) -> AppResult<NotionRawResponse> {
         let headers = build_notion_headers(secret);
-        let client = self.client_for(use_proxy);
+        let client = self.client_for(use_proxy)?;
         let mut req = client.request(method, self.endpoint(path)).headers(headers);
         if let Some(payload) = body {
             req = req.json(payload);
         }
-        let resp = req.send().await?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
         let status = resp.status();
         let retry_after_secs = parse_retry_after_header(resp.headers());
         let raw_text = resp.text().await.unwrap_or_default();
@@ -1292,8 +1294,7 @@ impl NotionSender {
         }
         let resp = self
             .execute_json(Method::GET, "/v1/users/me", secret, use_proxy, None)
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
         if !resp.status.is_success() {
             return Err(resp.into_app_error("GET /v1/users/me"));
         }
@@ -1371,8 +1372,7 @@ impl NotionSender {
                 req.use_proxy,
                 Some(&payload),
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if !resp.status.is_success() {
             return Err(resp.into_app_error("POST /v1/databases"));
@@ -1406,12 +1406,7 @@ impl NotionSender {
                     req.use_proxy,
                     None,
                 )
-                .await
-                .map_err(|err| {
-                    AppError::Upstream(format!(
-                        "failed to fetch newly created Notion database '{database_id}': {err}"
-                    ))
-                })?;
+                .await?;
 
             if !get_db.status.is_success() {
                 return Err(get_db.into_app_error("GET /v1/databases/{id}"));
@@ -1481,13 +1476,7 @@ impl NotionSender {
                         req.use_proxy,
                         Some(&patch_payload),
                     )
-                    .await
-                    .map_err(|err| {
-                        AppError::Upstream(format!(
-                            "failed to PATCH Notion data source '{}': {err}",
-                            ds.data_source_id
-                        ))
-                    })?;
+                    .await?;
 
                 if !patch_resp.status.is_success() {
                     return Err(patch_resp.into_app_error("PATCH /v1/data_sources/{id}"));
@@ -1544,8 +1533,7 @@ impl NotionSender {
                 use_proxy,
                 None,
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if ds_resp.status.is_success() {
             return Ok(parse_data_source_object(&ds_resp.body, id, None, None));
@@ -1567,8 +1555,7 @@ impl NotionSender {
                 use_proxy,
                 None,
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if !db_resp.status.is_success() {
             return Err(db_resp.into_app_error("GET /v1/databases/{id}"));
@@ -1595,8 +1582,7 @@ impl NotionSender {
                 use_proxy,
                 None,
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if !resolved_ds.status.is_success() {
             return Err(resolved_ds.into_app_error("GET /v1/data_sources/{id}"));
@@ -1642,6 +1628,9 @@ impl NotionSender {
                 .await
             {
                 Ok(r) => r,
+                Err(AppError::Validation(msg)) => {
+                    return AsyncPollResolution::Failed(msg);
+                }
                 Err(err) => {
                     return AsyncPollResolution::TransientError {
                         status_code: None,
@@ -1778,6 +1767,13 @@ impl NotionSender {
             .await
         {
             Ok(r) => r,
+            Err(AppError::Validation(msg)) => {
+                return FcIdLookupOutcome::PermanentFailure(DeliveryOutcome::PermanentFailure {
+                    status_code: None,
+                    checkpoint,
+                    diagnostic: msg,
+                });
+            }
             Err(err) => {
                 return FcIdLookupOutcome::Retry(DeliveryOutcome::Retry {
                     retry_after_secs: None,
@@ -2099,6 +2095,7 @@ impl ChannelSender for NotionSender {
             .await
         {
             Ok(r) => r,
+            Err(err @ AppError::Validation(_)) => return Err(err),
             Err(err) => {
                 return Ok(DeliveryOutcome::Retry {
                     retry_after_secs: None,

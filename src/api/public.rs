@@ -14,13 +14,14 @@
 //!   `X-Robots-Tag: noindex, nofollow`, strict CSP, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store`.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::api::AppState;
@@ -30,65 +31,121 @@ use crate::db::models::{AppLocale, SmtpRecipientStatus, now_unix};
 
 const PUBLIC_RATE_LIMIT_MAX: usize = 30;
 const PUBLIC_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const PUBLIC_RATE_LIMIT_MAX_BUCKETS: usize = 8_192;
+const PUBLIC_RATE_LIMIT_MAX_KEY_BYTES: usize = 64;
 
-static PUBLIC_IP_LIMITER: LazyLock<Mutex<HashMap<String, VecDeque<Instant>>>> =
+struct RateBucket {
+    hits: VecDeque<Instant>,
+    last_seen: Instant,
+}
+
+static PUBLIC_IP_LIMITER: LazyLock<Mutex<HashMap<String, RateBucket>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    if let Some(xff) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|raw| raw.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return xff.to_string();
+fn sanitize_ip_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() <= PUBLIC_RATE_LIMIT_MAX_KEY_BYTES {
+        trimmed.to_string()
+    } else {
+        trimmed
+            .chars()
+            .take(PUBLIC_RATE_LIMIT_MAX_KEY_BYTES)
+            .collect()
     }
-    if let Some(real_ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return real_ip.to_string();
+}
+
+fn extract_client_ip(trust_proxy: bool, headers: &HeaderMap, peer_ip: Option<IpAddr>) -> String {
+    if trust_proxy {
+        if let Some(real_ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return sanitize_ip_key(real_ip);
+        }
+        // Take the RIGHTMOST hop appended by the trusted reverse proxy (never the spoofable leftmost!).
+        if let Some(xff_rightmost) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|raw| raw.rsplit(',').map(str::trim).find(|s| !s.is_empty()))
+        {
+            return sanitize_ip_key(xff_rightmost);
+        }
+    }
+    if let Some(ip) = peer_ip {
+        return ip.to_string();
     }
     "direct".to_string()
 }
 
-fn check_public_rate_limit(headers: &HeaderMap) -> bool {
-    let key = extract_client_ip(headers);
+fn check_public_rate_limit(
+    trust_proxy: bool,
+    headers: &HeaderMap,
+    extensions: &Extensions,
+) -> bool {
+    let peer_ip = extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let key = extract_client_ip(trust_proxy, headers, peer_ip);
     let now = Instant::now();
     let mut guard = PUBLIC_IP_LIMITER
         .lock()
         .expect("public rate limiter mutex poisoned");
 
-    // Periodic lazy prune to bound memory under IP churn.
-    if guard.len() > 2048 {
-        guard.retain(|_, q| {
-            while let Some(&front) = q.front() {
+    if !guard.contains_key(&key) && guard.len() >= PUBLIC_RATE_LIMIT_MAX_BUCKETS {
+        // First evict expired buckets.
+        guard.retain(|_, bucket| {
+            while let Some(&front) = bucket.hits.front() {
                 if now.duration_since(front) >= PUBLIC_RATE_LIMIT_WINDOW {
-                    q.pop_front();
+                    bucket.hits.pop_front();
                 } else {
                     break;
                 }
             }
-            !q.is_empty()
+            !bucket.hits.is_empty()
         });
+        // Hard capacity cap: if still at capacity inside the 60s window, evict the oldest bucket.
+        if guard.len() >= PUBLIC_RATE_LIMIT_MAX_BUCKETS
+            && let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, b)| b.last_seen)
+                .map(|(k, _)| k.clone())
+        {
+            guard.remove(&oldest_key);
+        }
     }
 
-    let queue = guard.entry(key).or_default();
-    while let Some(&front) = queue.front() {
+    let bucket = guard.entry(key).or_insert_with(|| RateBucket {
+        hits: VecDeque::new(),
+        last_seen: now,
+    });
+    while let Some(&front) = bucket.hits.front() {
         if now.duration_since(front) >= PUBLIC_RATE_LIMIT_WINDOW {
-            queue.pop_front();
+            bucket.hits.pop_front();
         } else {
             break;
         }
     }
-    if queue.len() >= PUBLIC_RATE_LIMIT_MAX {
+    bucket.last_seen = now;
+    if bucket.hits.len() >= PUBLIC_RATE_LIMIT_MAX {
         return false;
     }
-    queue.push_back(now);
+    bucket.hits.push_back(now);
     true
+}
+
+/// Public 404 handler for empty `/u`, `/u/`, `/v`, `/v/` paths so they never expose the admin SPA.
+pub async fn public_not_found(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    extensions: Extensions,
+) -> Response {
+    let locale = state.runtime().locale();
+    if !check_public_rate_limit(state.config().trust_proxy, &headers, &extensions) {
+        return rate_limited_response(locale);
+    }
+    not_found_response(locale)
 }
 
 /// Clear the in-memory public rate limiter state (test helper).
@@ -224,10 +281,11 @@ fn resolve_masked_recipient_email(
 pub async fn get_unsubscribe_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    extensions: Extensions,
     Path(token): Path<String>,
 ) -> Response {
     let locale = state.runtime().locale();
-    if !check_public_rate_limit(&headers) {
+    if !check_public_rate_limit(state.config().trust_proxy, &headers, &extensions) {
         return rate_limited_response(locale);
     }
 
@@ -248,7 +306,6 @@ pub async fn get_unsubscribe_page(
         resolve_masked_recipient_email(&state, &dest.encrypted_config, &recipient.address_hmac);
     let safe_dest = escape_html(&dest.name);
     let safe_masked = escape_html(&masked);
-    let safe_action = format!("/u/{}", escape_html(token.trim()));
 
     if recipient.status == SmtpRecipientStatus::Unsubscribed {
         let (title, body) = if locale.is_zh() {
@@ -277,7 +334,7 @@ pub async fn get_unsubscribe_page(
             "确认退订邮件",
             format!(
                 "<p>确认停止向 <span class=\"pill\">{safe_masked}</span> 发送来自 <strong>{safe_dest}</strong> 的订阅邮件吗？</p>\
-                 <form method=\"POST\" action=\"{safe_action}\"><button type=\"submit\" class=\"btn btn-danger\">确认退订</button></form>"
+                 <form method=\"POST\" action=\"\"><button type=\"submit\" class=\"btn btn-danger\">确认退订</button></form>"
             ),
         )
     } else {
@@ -285,7 +342,7 @@ pub async fn get_unsubscribe_page(
             "Confirm Unsubscribe",
             format!(
                 "<p>Stop delivering emails from <strong>{safe_dest}</strong> to <span class=\"pill\">{safe_masked}</span>?</p>\
-                 <form method=\"POST\" action=\"{safe_action}\"><button type=\"submit\" class=\"btn btn-danger\">Confirm Unsubscribe</button></form>"
+                 <form method=\"POST\" action=\"\"><button type=\"submit\" class=\"btn btn-danger\">Confirm Unsubscribe</button></form>"
             ),
         )
     };
@@ -301,11 +358,12 @@ pub async fn get_unsubscribe_page(
 pub async fn post_unsubscribe(
     State(state): State<AppState>,
     headers: HeaderMap,
+    extensions: Extensions,
     Path(token): Path<String>,
     body: Bytes,
 ) -> Response {
     let locale = state.runtime().locale();
-    if !check_public_rate_limit(&headers) {
+    if !check_public_rate_limit(state.config().trust_proxy, &headers, &extensions) {
         return rate_limited_response(locale);
     }
 
@@ -370,10 +428,11 @@ pub async fn post_unsubscribe(
 pub async fn get_verify_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    extensions: Extensions,
     Path(token): Path<String>,
 ) -> Response {
     let locale = state.runtime().locale();
-    if !check_public_rate_limit(&headers) {
+    if !check_public_rate_limit(state.config().trust_proxy, &headers, &extensions) {
         return rate_limited_response(locale);
     }
 
@@ -421,6 +480,7 @@ pub async fn get_verify_page(
 
     let now = now_unix();
     let code_matches = recipient.status == SmtpRecipientStatus::Pending
+        && recipient.code_attempts < 5
         && recipient.code_sha256.as_deref().is_some_and(|hex_hash| {
             constant_time_eq(&decode_first_8_hex_bytes(hex_hash), &code_prefix)
         });
@@ -442,13 +502,12 @@ pub async fn get_verify_page(
         );
     }
 
-    let safe_action = format!("/v/{}", escape_html(token.trim()));
     let (title, body) = if locale.is_zh() {
         (
             "确认接收订阅邮件",
             format!(
                 "<p>确认允许 <strong>{safe_dest}</strong> 向 <span class=\"pill\">{safe_masked}</span> 投递订阅邮件吗？</p>\
-                 <form method=\"POST\" action=\"{safe_action}\"><button type=\"submit\" class=\"btn\">确认订阅</button></form>"
+                 <form method=\"POST\" action=\"\"><button type=\"submit\" class=\"btn\">确认订阅</button></form>"
             ),
         )
     } else {
@@ -456,7 +515,7 @@ pub async fn get_verify_page(
             "Confirm Subscription",
             format!(
                 "<p>Confirm email deliveries from <strong>{safe_dest}</strong> to <span class=\"pill\">{safe_masked}</span>?</p>\
-                 <form method=\"POST\" action=\"{safe_action}\"><button type=\"submit\" class=\"btn\">Confirm Subscription</button></form>"
+                 <form method=\"POST\" action=\"\"><button type=\"submit\" class=\"btn\">Confirm Subscription</button></form>"
             ),
         )
     };
@@ -470,10 +529,11 @@ pub async fn get_verify_page(
 pub async fn post_verify(
     State(state): State<AppState>,
     headers: HeaderMap,
+    extensions: Extensions,
     Path(token): Path<String>,
 ) -> Response {
     let locale = state.runtime().locale();
-    if !check_public_rate_limit(&headers) {
+    if !check_public_rate_limit(state.config().trust_proxy, &headers, &extensions) {
         return rate_limited_response(locale);
     }
 
@@ -521,6 +581,7 @@ pub async fn post_verify(
 
     let now = now_unix();
     let code_matches = recipient.status == SmtpRecipientStatus::Pending
+        && recipient.code_attempts < 5
         && recipient.code_sha256.as_deref().is_some_and(|hex_hash| {
             constant_time_eq(&decode_first_8_hex_bytes(hex_hash), &code_prefix)
         });

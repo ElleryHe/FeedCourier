@@ -507,6 +507,8 @@ pub struct ChannelDestination {
     #[serde(skip_serializing)]
     pub encrypted_config: Vec<u8>,
     pub enabled: bool,
+    #[sqlx(default)]
+    pub auto_paused: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }

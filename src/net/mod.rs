@@ -343,10 +343,15 @@ impl ProtectedHttpClient {
                 .state
                 .read()
                 .expect("ProtectedHttpClient state RwLock poisoned");
-            if req.use_proxy
-                && let Some((proxied, mode)) = &guard.ssrf_proxied_client
-            {
-                (proxied.clone(), Some(*mode))
+            if req.use_proxy {
+                if let Some((proxied, mode)) = &guard.ssrf_proxied_client {
+                    (proxied.clone(), Some(*mode))
+                } else {
+                    return Err(AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                            .to_string(),
+                    ));
+                }
             } else {
                 (guard.ssrf_direct_client.clone(), None)
             }
@@ -525,8 +530,15 @@ impl ProtectedHttpClient {
                 .state
                 .read()
                 .expect("ProtectedHttpClient state RwLock poisoned");
-            if use_proxy && let Some((proxied, mode)) = &guard.ssrf_proxied_client {
-                (proxied.clone(), Some(*mode))
+            if use_proxy {
+                if let Some((proxied, mode)) = &guard.ssrf_proxied_client {
+                    (proxied.clone(), Some(*mode))
+                } else {
+                    return Err(AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                            .to_string(),
+                    ));
+                }
             } else {
                 (guard.ssrf_direct_client.clone(), None)
             }

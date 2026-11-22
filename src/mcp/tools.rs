@@ -661,9 +661,6 @@ impl McpServer {
 
         let db = self.state.db();
         let registry = crate::plugins::PluginRegistry::with_builtins();
-        if let Err(err) = registry.sync_builtin_rows(db).await {
-            return Ok(tool_error_from_app(err));
-        }
 
         let rows = match db.list_plugins().await {
             Ok(r) => r,

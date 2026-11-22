@@ -351,16 +351,17 @@ impl MasterKey {
     }
 }
 
-/// Constant-time byte-slice equality check (prevents timing oracles on HMAC/code digests).
+/// Constant-time byte-slice equality check with an optimization barrier
+/// (prevents timing oracles on HMAC/code digests).
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut diff = 0u8;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+        diff |= std::hint::black_box(x ^ y);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 /// Extract the first 8 raw bytes from a hex-encoded SHA-256 digest (zero-padded if malformed).
@@ -373,20 +374,34 @@ pub fn decode_first_8_hex_bytes(hex_str: &str) -> [u8; 8] {
     out
 }
 
-/// Normalize an SMTP mailbox/email address (`"Name <Alice@Example.COM>"` -> `"alice@example.com"`).
+/// Normalize an SMTP mailbox/email address (`"Name <Alice@Bücher.DE>"` -> `"alice@xn--bcher-kva.de"`),
+/// applying ASCII lowercasing and UTS-46 IDNA Punycode folding on the domain portion.
 pub fn normalize_email_address(raw: &str) -> String {
     let trimmed = raw.trim();
-    if let Some(start) = trimmed.rfind('<')
+    let addr = if let Some(start) = trimmed.rfind('<')
         && let Some(end) = trimmed[start + 1..].find('>')
     {
-        return trimmed[start + 1..start + 1 + end]
-            .trim()
-            .to_ascii_lowercase();
+        trimmed[start + 1..start + 1 + end].trim()
+    } else {
+        trimmed
+    };
+
+    if let Some((local, domain)) = addr.rsplit_once('@') {
+        let local_lower = local.trim().to_ascii_lowercase();
+        let domain_trimmed = domain.trim().trim_end_matches('.');
+        let domain_norm = match url::Host::parse(domain_trimmed) {
+            Ok(url::Host::Domain(ascii_domain)) => ascii_domain.to_ascii_lowercase(),
+            Ok(other) => other.to_string().to_ascii_lowercase(),
+            Err(_) => domain_trimmed.to_ascii_lowercase(),
+        };
+        format!("{local_lower}@{domain_norm}")
+    } else {
+        addr.to_ascii_lowercase()
     }
-    trimmed.to_ascii_lowercase()
 }
 
-/// Mask an email address for public confirmation pages (`alice@example.com` -> `a***e@example.com`).
+/// Mask an email address for public confirmation pages and diagnostics
+/// (`alice@example.com` -> `a***e@example.com`).
 pub fn mask_email_address(raw: &str) -> String {
     let norm = normalize_email_address(raw);
     let Some((local, domain)) = norm.split_once('@') else {
@@ -395,11 +410,66 @@ pub fn mask_email_address(raw: &str) -> String {
     let chars: Vec<char> = local.chars().collect();
     let masked_local = match chars.len() {
         0 => "***".to_string(),
-        1 => format!("{}***", chars[0]),
-        2 => format!("{}***", chars[0]),
+        1 | 2 => format!("{}***", chars[0]),
         _ => format!("{}***{}", chars[0], chars[chars.len() - 1]),
     };
     format!("{masked_local}@{domain}")
+}
+
+/// Redact any email addresses embedded in free-form SMTP server diagnostics (such as
+/// `550 5.1.1 <alice@example.com>: User unknown`) so plaintext recipient PII never reaches
+/// SQLite diagnostic columns or readonly MCP tools.
+pub fn mask_emails_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        let ch = text[i..].chars().next().expect("valid char boundary");
+        if ch.is_whitespace() {
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() {
+            let c = text[i..].chars().next().expect("valid char boundary");
+            if c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
+        }
+        let token = &text[start..i];
+        let leading_len = token
+            .bytes()
+            .take_while(|b| matches!(b, b'<' | b'(' | b'[' | b'"' | b'\''))
+            .count();
+        let after_lead = &token[leading_len..];
+        let trailing_len = after_lead
+            .bytes()
+            .rev()
+            .take_while(|b| {
+                matches!(
+                    b,
+                    b'>' | b')' | b']' | b'"' | b'\'' | b':' | b';' | b',' | b'.'
+                )
+            })
+            .count();
+        let core_end = after_lead.len().saturating_sub(trailing_len);
+        let core = &after_lead[..core_end];
+        if let Some((local, domain)) = core.rsplit_once('@')
+            && !local.is_empty()
+            && domain.contains('.')
+            && !domain.starts_with('.')
+            && !domain.ends_with('.')
+        {
+            out.push_str(&token[..leading_len]);
+            out.push_str(&mask_email_address(core));
+            out.push_str(&after_lead[core_end..]);
+        } else {
+            out.push_str(token);
+        }
+    }
+    out
 }
 
 /// Pure-Rust RFC 1321 MD5 lowercase hex digest (used exclusively for YOURLS `timed_signature`
