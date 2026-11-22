@@ -117,7 +117,7 @@ pub fn build_api_only_router(state: AppState) -> Router {
             "/api/v1/feeds/{id}/clear-cache",
             post(handlers::clear_feed_cache),
         )
-        // Trusted Channels & Notion Onboarding
+        // Trusted Channels (Accounts) & Destinations + Notion Onboarding
         .route(
             "/api/v1/channels",
             get(handlers::list_channels).post(handlers::create_channel),
@@ -135,6 +135,18 @@ pub fn build_api_only_router(state: AppState) -> Router {
             patch(handlers::update_channel).delete(handlers::delete_channel),
         )
         .route("/api/v1/channels/{id}/test", post(handlers::test_channel))
+        .route(
+            "/api/v1/channels/{id}/destinations",
+            get(handlers::list_channel_destinations).post(handlers::create_destination),
+        )
+        .route(
+            "/api/v1/destinations/{id}",
+            patch(handlers::update_destination).delete(handlers::delete_destination),
+        )
+        .route(
+            "/api/v1/destinations/{id}/test",
+            post(handlers::test_destination),
+        )
         // Routes
         .route(
             "/api/v1/routes",

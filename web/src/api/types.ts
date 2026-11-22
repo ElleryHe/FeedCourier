@@ -1,9 +1,11 @@
 /**
- * Canonical REST API Contract (`/api/v1`) for FeedCourier.
+ * Canonical REST API Contract (`/api/v1`) for FeedCourier v0.2.0.
  *
- * Aligned 1-to-1 with `src/channels/mod.rs` and `src/db/models.rs`:
- * - `ChannelTargetCreate` deserializes directly into `crate::channels::ChannelConfig`
- * - `ChannelTargetView` matches `ChannelConfig::redacted_view()`
+ * Aligned 1-to-1 with `src/channels/mod.rs`, `src/api/dto.rs`, and `src/db/models.rs`:
+ * - `ChannelAccountCreate` deserializes directly into `crate::channels::ChannelConfig`
+ * - `ChannelAccountView` matches `ChannelConfig::redacted_view()`
+ * - `DestinationConfigCreate` deserializes directly into `crate::channels::DestinationConfig`
+ * - `DestinationConfigView` matches `DestinationConfig::view()`
  * - `ChannelCapabilities` matches `crate::channels::TelegramCapabilities`
  * - `RouteOptions` matches `crate::channels::RouteOptions`
  * - `DeliveryCheckpoint` matches `crate::channels::DeliveryCheckpoint`
@@ -19,7 +21,7 @@
 export interface ApiErrorBody {
   error: string;
   code?: string;
-  details?: string;
+  message?: string;
 }
 
 export interface ActionAckResponse {
@@ -32,7 +34,7 @@ export interface ActionAckResponse {
 
 export const DEFAULT_REPO_URL = "https://github.com/ElleryHe/FeedCourier";
 export const DEFAULT_LICENSE = "AGPL-3.0";
-export const DEFAULT_VERSION = "0.1.6";
+export const DEFAULT_VERSION = "0.2.0";
 
 /** `GET /api/v1/auth/status` */
 export interface AuthStatusResponse {
@@ -40,7 +42,7 @@ export interface AuthStatusResponse {
   setup_required: boolean;
   /** True when the current HttpOnly session cookie is valid. */
   authenticated: boolean;
-  /** Build version (e.g. `"0.1.0"`). */
+  /** Build version (e.g. `"0.2.0"`). */
   version: string;
   /** Source repository URL (AGPLv3 Section 13 compliance). */
   repo_url: string;
@@ -295,6 +297,7 @@ export interface ClearFeedCacheRequest {
 export interface ClearFeedCacheResponse {
   deleted_entries: number;
   poll: PollFeedResponse | null;
+  poll_error?: string;
 }
 
 /** `POST /api/v1/feeds/preview/push` (stateless debug push). */
@@ -305,11 +308,13 @@ export interface FeedPreviewPushRequest {
   fingerprint_sha256?: string;
   fetch_full_content?: boolean;
   use_proxy?: boolean;
-  channel_id: number;
+  destination_id: number;
+  channel_id?: number;
   options?: {
     telegram_mode?: TelegramDeliveryMode;
     link_preview?: boolean;
     locale?: SystemLocale;
+    timezone?: string | null;
   };
 }
 
@@ -342,7 +347,7 @@ export interface OpmlImportResponse {
 // Note: `GET /api/v1/feeds/opml/export` returns OPML 2.0 XML (`application/xml`).
 
 // ---------------------------------------------------------------------------
-// 4. Trusted Channels (`/api/v1/channels*`)
+// 4. Trusted Channels (Accounts) & Destinations (`/api/v1/channels*`, `/api/v1/destinations*`)
 // ---------------------------------------------------------------------------
 
 /** Matches `crate::channels::SmtpSecurity` (`#[serde(rename_all = "snake_case")]`). */
@@ -380,11 +385,11 @@ export const DEFAULT_NOTION_COLUMN_MAPPING: NotionColumnMapping = {
 };
 
 /**
- * Masked, secret-safe channel target view returned on `GET /api/v1/channels`.
- * Matches `crate::channels::ChannelConfig::redacted_view()` 1-to-1!
+ * Masked, secret-safe account-level channel view returned on `GET /api/v1/channels`.
+ * Matches `crate::channels::ChannelConfig::redacted_view()` 1-to-1.
  * Raw secrets (`password`, `bot_token`, `integration_secret`) are NEVER returned.
  */
-export type ChannelTargetView =
+export type ChannelAccountView =
   | {
       kind: "smtp";
       host: string;
@@ -393,32 +398,24 @@ export type ChannelTargetView =
       has_password: boolean;
       security: SmtpSecurity;
       from_address: string;
-      to_addresses: string[];
-      reply_to: string | null;
     }
   | {
       kind: "telegram";
       /** Masked hint from `mask_secret(&cfg.bot_token)`, e.g. `"1234••••wxyz"`. */
       bot_token_hint: string;
-      chat_id: string;
-      message_thread_id: number | null;
       api_base_url: string | null;
     }
   | {
       kind: "notion";
       /** Masked hint from `mask_secret(&cfg.integration_secret)`, e.g. `"ntn_••••abcd"`. */
       secret_hint: string;
-      data_source_id: string;
-      database_id: string | null;
-      parent_page_id: string | null;
-      column_mapping: NotionColumnMapping;
     };
 
 /**
- * Create payload for channel target (`POST /api/v1/channels`).
- * Deserializes directly into `crate::channels::ChannelConfig` (`#[serde(tag = "kind", rename_all = "snake_case")]`)!
+ * Create payload for account-level channel credentials (`POST /api/v1/channels`).
+ * Deserializes directly into `crate::channels::ChannelConfig`.
  */
-export type ChannelTargetCreate =
+export type ChannelAccountCreate =
   | {
       kind: "smtp";
       host: string;
@@ -427,66 +424,145 @@ export type ChannelTargetCreate =
       password?: string | null;
       security: SmtpSecurity;
       from_address: string;
-      to_addresses: string[];
-      reply_to?: string | null;
     }
   | {
       kind: "telegram";
       bot_token: string;
-      chat_id: string;
-      message_thread_id?: number | null;
       api_base_url?: string | null;
     }
   | {
       kind: "notion";
       integration_secret: string;
-      data_source_id: string;
-      database_id?: string | null;
-      parent_page_id?: string | null;
-      column_mapping: NotionColumnMapping;
     };
 
 /**
- * Patch payload for channel target (`PATCH /api/v1/channels/:id`).
+ * Secret-preserving account-level patch payload (`PATCH /api/v1/channels/:id`).
  * Secret fields (`password`, `bot_token`, `integration_secret`) are optional:
- * when omitted or `null`/empty, the backend preserves the stored encrypted secret.
+ * - Omit (`undefined`) to preserve the stored encrypted secret.
+ * - For SMTP, pass explicit `null` for `password` to clear the stored password.
  */
-export type ChannelTargetPatch =
+export type ChannelAccountPatch =
   | {
       kind: "smtp";
       host?: string;
       port?: number;
       username?: string | null;
-      /** Omit or pass `null` to keep existing SMTP password. */
+      /** Omit to keep existing SMTP password; pass explicit `null` to clear it. */
       password?: string | null;
       security?: SmtpSecurity;
       from_address?: string;
-      to_addresses?: string[];
-      reply_to?: string | null;
     }
   | {
       kind: "telegram";
       /** Omit or pass `null` to keep existing Bot token. */
       bot_token?: string | null;
-      chat_id?: string;
-      message_thread_id?: number | null;
       api_base_url?: string | null;
     }
   | {
       kind: "notion";
       /** Omit or pass `null` to keep existing Notion integration secret. */
       integration_secret?: string | null;
+    };
+
+/**
+ * Destination target view returned inside `ChannelDto.destinations` and destination endpoints.
+ * Matches `crate::channels::DestinationConfig::view()` 1-to-1.
+ */
+export type DestinationConfigView =
+  | {
+      kind: "smtp";
+      to_addresses: string[];
+      reply_to: string | null;
+    }
+  | {
+      kind: "telegram";
+      chat_id: string;
+      message_thread_id: number | null;
+    }
+  | {
+      kind: "notion";
+      data_source_id: string;
+      database_id: string | null;
+      parent_page_id: string | null;
+      column_mapping: NotionColumnMapping;
+    };
+
+/**
+ * Destination target creation payload (`POST /api/v1/channels/:id/destinations` or
+ * `CreateChannelRequest.initial_destination`).
+ * Deserializes directly into `crate::channels::DestinationConfig`.
+ */
+export type DestinationConfigCreate =
+  | {
+      kind: "smtp";
+      to_addresses: string[];
+      reply_to?: string | null;
+    }
+  | {
+      kind: "telegram";
+      chat_id: string;
+      message_thread_id?: number | null;
+    }
+  | {
+      kind: "notion";
+      data_source_id: string;
+      database_id?: string | null;
+      parent_page_id?: string | null;
+      column_mapping: NotionColumnMapping;
+    };
+
+/** Partial destination patch (`PATCH /api/v1/destinations/:id`). */
+export type DestinationPatch =
+  | {
+      kind: "smtp";
+      to_addresses?: string[];
+      reply_to?: string | null;
+    }
+  | {
+      kind: "telegram";
+      chat_id?: string;
+      message_thread_id?: number | null;
+    }
+  | {
+      kind: "notion";
       data_source_id?: string;
       database_id?: string | null;
       parent_page_id?: string | null;
       column_mapping?: NotionColumnMapping;
     };
 
+export interface ChannelDestinationDto {
+  id: number;
+  channel_id: number;
+  name: string;
+  kind: ChannelKind;
+  config: DestinationConfigView;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `POST /api/v1/channels/:id/destinations` & `CreateChannelRequest.initial_destination` */
+export interface CreateDestinationRequest {
+  /** Optional label; auto-derived from Telegram `getChat`, SMTP first recipient, or Notion database title when omitted or blank. */
+  name?: string;
+  config: DestinationConfigCreate;
+  enabled?: boolean;
+}
+
+/** `PATCH /api/v1/destinations/:id` */
+export interface UpdateDestinationRequest {
+  name?: string;
+  config?: DestinationPatch;
+  enabled?: boolean;
+}
+
 /** Matches `crate::channels::TelegramCapabilities` stored in `channels.capabilities_json`. */
 export interface ChannelCapabilities {
   supports_rich_message?: boolean;
   bot_api_version?: string | null;
   bot_username?: string | null;
+  bot_first_name?: string | null;
   probed_at?: number | string | null;
   /** Populated when target Bot API lacks `sendRichMessage` and falls back to Compact Card. */
   fallback_reason?: string | null;
@@ -496,7 +572,7 @@ export interface ChannelDto {
   id: number;
   name: string;
   kind: ChannelKind;
-  config: ChannelTargetView;
+  config: ChannelAccountView;
   capabilities: ChannelCapabilities;
   min_interval_secs: number;
   jitter_max_secs: number;
@@ -505,15 +581,19 @@ export interface ChannelDto {
   use_proxy: boolean;
   cooldown_until: string | null;
   enabled: boolean;
+  destinations: ChannelDestinationDto[];
   created_at: string;
   updated_at: string;
 }
 
 /** `POST /api/v1/channels` */
 export interface CreateChannelRequest {
-  name: string;
+  /** Optional account display name; auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me` when omitted or blank. */
+  name?: string;
   kind: ChannelKind;
-  config: ChannelTargetCreate;
+  config: ChannelAccountCreate;
+  /** Optional first destination created alongside the account. */
+  initial_destination?: CreateDestinationRequest;
   min_interval_secs: number;
   jitter_max_secs: number;
   hourly_quota: number | null;
@@ -525,7 +605,7 @@ export interface CreateChannelRequest {
 /** `PATCH /api/v1/channels/:id` */
 export interface UpdateChannelRequest {
   name?: string;
-  config?: ChannelTargetPatch;
+  config?: ChannelAccountPatch;
   min_interval_secs?: number;
   jitter_max_secs?: number;
   hourly_quota?: number | null;
@@ -537,9 +617,15 @@ export interface UpdateChannelRequest {
 /** `POST /api/v1/channels/:id/test` request body (optional). */
 export interface TestChannelRequest {
   locale?: SystemLocale;
+  destination_id?: number;
 }
 
-/** `POST /api/v1/channels/:id/test` */
+/** `POST /api/v1/destinations/:id/test` request body (optional). */
+export interface TestDestinationRequest {
+  locale?: SystemLocale;
+}
+
+/** `POST /api/v1/channels/:id/test` & `POST /api/v1/destinations/:id/test` */
 export interface TestChannelResponse {
   ok: boolean;
   message: string;
@@ -550,12 +636,14 @@ export interface TestChannelResponse {
  * `POST /api/v1/channels/notion/init-db`
  * Auto-creates standard 7-column Notion database under `initial_data_source.properties`
  * (`Notion-Version: 2026-03-11`).
+ * Accepts either `secret` or `channel_id` (to reuse an existing Notion account's secret & proxy).
  */
 export interface NotionInitDbRequest {
-  secret: string;
+  secret?: string;
   parent_page_id: string;
   title?: string;
   use_proxy: boolean;
+  channel_id?: number;
 }
 
 export interface NotionInitDbResponse {
@@ -603,8 +691,8 @@ export interface NotionColumnCheckItem {
  * missing columns onto the Notion data source when `patch_missing: true`.
  */
 export interface NotionInspectSchemaRequest {
-  /** Integration secret (when empty during channel edit, `channel_id` may be supplied to reuse stored secret). */
-  secret: string;
+  /** Integration secret (optional when `channel_id` is supplied to reuse stored secret). */
+  secret?: string;
   data_source_or_db_id: string;
   patch_missing?: boolean;
   use_proxy: boolean;
@@ -641,7 +729,9 @@ export interface RouteOptions {
   link_preview?: boolean;
   /** Delivery language of this route. Legacy routes inherit `settings.locale`. */
   locale?: SystemLocale;
-  /** Daily windows (system timezone). `end < start` wraps midnight; `start == end` = whole day; empty = always. */
+  /** Optional per-route IANA timezone; `null`/omitted inherits the system timezone. */
+  timezone?: string | null;
+  /** Daily windows (route or system timezone). `end < start` wraps midnight; `start == end` = whole day; empty = always. */
   active_windows?: ActiveWindow[];
   /** 1=Mon..7=Sun; empty = every day. */
   active_weekdays?: number[];
@@ -660,6 +750,7 @@ export interface RouteDto {
   feed_ids: number[];
   match_tags: string[];
   channel_id: number;
+  destination_id: number;
   include_keywords: string[];
   exclude_keywords: string[];
   include_regex: string | null;
@@ -675,7 +766,8 @@ export interface CreateRouteRequest {
   name: string;
   feed_ids: number[];
   match_tags: string[];
-  channel_id: number;
+  destination_id: number;
+  channel_id?: number;
   include_keywords: string[];
   exclude_keywords: string[];
   include_regex: string | null;
@@ -689,6 +781,7 @@ export interface UpdateRouteRequest {
   name?: string;
   feed_ids?: number[];
   match_tags?: string[];
+  destination_id?: number;
   channel_id?: number;
   include_keywords?: string[];
   exclude_keywords?: string[];
@@ -732,6 +825,8 @@ export interface DeliveryTaskDto {
   channel_id: number;
   channel_name: string;
   channel_kind: ChannelKind;
+  destination_id: number;
+  destination_name: string;
   entry_id: number;
   /** May be `null` once entry payload has been purged by GC after retention window. */
   entry_title: string | null;
@@ -787,7 +882,7 @@ export interface SystemSettingsDto {
   outbound_proxy_url: string | null;
   /** CIDR ranges (e.g. `"10.0.0.0/8"`) or internal hostnames (e.g. `"rsshub.internal"`) allowed past SSRF private-IP block. */
   ssrf_allowlist: string[];
-  /** IANA timezone used for route active windows (e.g. `"Asia/Shanghai"`). */
+  /** IANA timezone used as default for route active windows and delivery timestamps (e.g. `"Asia/Shanghai"`). */
   timezone: string;
   /** LEGACY fallback delivery language for routes without `options.locale`. Never written by the WebUI. */
   locale?: SystemLocale | null;

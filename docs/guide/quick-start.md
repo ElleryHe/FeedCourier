@@ -21,7 +21,7 @@ docker run -d \
   -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
   # Or pin a specific release version:
-  # elleryhe/feedcourier:0.1.6
+  # elleryhe/feedcourier:0.2.0
 ```
 
 Once the container starts:
@@ -39,7 +39,7 @@ Create a `docker-compose.yml` file:
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.1.6
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.2.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -75,7 +75,7 @@ curl -s http://127.0.0.1:8080/api/v1/health
 {
   "status": "ok",
   "app": "FeedCourier",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "license": "AGPL-3.0",
   "repo_url": "https://github.com/ElleryHe/FeedCourier"
 }
@@ -98,7 +98,7 @@ Download, verify, and run:
 
 ```bash
 # Example for Linux x86_64 (replace VERSION as appropriate)
-VERSION="0.1.6"
+VERSION="0.2.0"
 TARGET="x86_64-unknown-linux-gnu"
 
 curl -LO "https://github.com/ElleryHe/FeedCourier/releases/download/v${VERSION}/feedcourier-${VERSION}-${TARGET}.tar.gz"
@@ -155,9 +155,9 @@ docker build -t feedcourier:local .
 
 After signing in to the WebUI at `http://127.0.0.1:8080`:
 
-1. **Create a Delivery Channel** — Go to **Channels** and configure [SMTP Email](/channels/smtp), [Telegram](/channels/telegram), or [Notion](/channels/notion). Click **Test** to send a verification message or page.
-2. **Add Feeds or Import OPML** — Go to **Feeds** to add an RSS, Atom, or JSON Feed URL (with **Silent Init** enabled by default so existing historical articles are not sent all at once), or import an OPML 2.0 file.
-3. **Create a Route** — Go to **Routes** and link specific feeds or tags (such as `rust` or `security`) to your target channel, optionally adding keyword or regex filters. Each route also has its own **delivery language** (defaults to your current WebUI language) and optional **delivery time windows** and **weekdays** (evaluated in the system timezone).
+1. **Create a Channel Account & Destination(s)** — Go to **Channels** and create an [SMTP Email](/channels/smtp), [Telegram](/channels/telegram), or [Notion](/channels/notion) account (display names are auto-fetched if left blank), then add one or more **Destinations** under that account (for example, multiple Telegram chats/topics, SMTP recipient lists, or Notion databases). Click **Test** on the account to verify credentials, or on a specific destination to send a live test message or page.
+2. **Add Feeds or Import OPML** — Go to **Feeds** to add an RSS, Atom, or JSON Feed URL (with **Silent Init** enabled by default so existing historical articles are not sent all at once), or import an OPML 2.0 file. As your subscription list grows, use the **Tag** dropdown, persistent **Sort** (added time or title), search (title/URL), and **15 / 30 / 50** pagination controls.
+3. **Create a Route** — Go to **Routes** and link specific feeds or tags (such as `rust` or `security`) to a target **Destination**, optionally adding keyword or regex filters. Each route has its own **delivery language** (defaults to your current WebUI language), optional **timezone** override (defaults to the system timezone, governing delivery windows and localized article timestamps), **delivery time windows**, and **weekdays**.
 4. **(Optional) Connect an MCP Client** — Go to **Settings → Native MCP Server (`/mcp`)** to generate a `readonly` or `admin` Bearer token for Claude Desktop, Cursor, or Windsurf. See [Client Setup & Security](/mcp/setup).
 
 ---

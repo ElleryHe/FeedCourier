@@ -20,14 +20,15 @@ use feedcourier::channels::notion::{
 };
 use feedcourier::channels::{
     ChannelConfig, ChannelKind, ChannelSender, CheckpointSink, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, NotionChannelConfig, NotionColumnMapping, RouteOptions,
+    DeliveryOutcome, DestinationConfig, NotionChannelConfig, NotionColumnMapping,
+    NotionDestinationConfig, RouteOptions,
 };
 use feedcourier::config::AppConfig;
 use feedcourier::crypto::{MasterKey, sha256_hex};
 use feedcourier::db::Database;
 use feedcourier::db::models::{
-    Channel, DeliveryTask, DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed, FeedHealthStatus,
-    NewChannel, NewEntry, NewFeed, NewRoute, Route,
+    Channel, ChannelDestination, DeliveryTask, DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed,
+    FeedHealthStatus, NewChannel, NewDestination, NewEntry, NewFeed, NewRoute, Route,
 };
 use feedcourier::error::AppResult;
 
@@ -58,6 +59,8 @@ struct SampleFixtures {
     entry: Entry,
     channel: Channel,
     channel_config: ChannelConfig,
+    destination: ChannelDestination,
+    destination_config: DestinationConfig,
     route: Route,
     task: DeliveryTask,
 }
@@ -65,6 +68,8 @@ struct SampleFixtures {
 fn sample_fixtures(data_source_id: &str) -> SampleFixtures {
     let cfg = ChannelConfig::Notion(NotionChannelConfig {
         integration_secret: "ntn_secret_test_token_123456".to_string(),
+    });
+    let dest_cfg = DestinationConfig::Notion(NotionDestinationConfig {
         data_source_id: data_source_id.to_string(),
         database_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
         parent_page_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
@@ -130,12 +135,23 @@ fn sample_fixtures(data_source_id: &str) -> SampleFixtures {
         updated_at: 1_700_000_000,
     };
 
+    let destination = ChannelDestination {
+        id: 50,
+        channel_id: 5,
+        name: "Inbox DB".to_string(),
+        encrypted_config: Vec::new(),
+        enabled: true,
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+    };
+
     let route = Route {
         id: 7,
         name: "Tech -> Notion".to_string(),
         feed_ids_json: "[1]".to_string(),
         match_tags_json: "[]".to_string(),
         channel_id: 5,
+        destination_id: 50,
         include_keywords_json: "[]".to_string(),
         exclude_keywords_json: "[]".to_string(),
         include_regex: None,
@@ -150,6 +166,7 @@ fn sample_fixtures(data_source_id: &str) -> SampleFixtures {
         id: 99,
         route_id: 7,
         channel_id: 5,
+        destination_id: 50,
         entry_id: 10,
         status: DeliveryTaskStatus::Delivering,
         lease_until: Some(1_762_992_300),
@@ -167,6 +184,8 @@ fn sample_fixtures(data_source_id: &str) -> SampleFixtures {
         entry,
         channel,
         channel_config: cfg,
+        destination,
+        destination_config: dest_cfg,
         route,
         task,
     }
@@ -400,6 +419,7 @@ async fn init_database_sends_2026_03_11_and_nests_7_columns_in_initial_data_sour
                     .to_string(),
             title: None,
             use_proxy: false,
+            channel_id: None,
         })
         .await
         .expect("init_database should succeed");
@@ -669,6 +689,9 @@ async fn send_creates_minimalist_v2_page_sanitizes_commas_and_flushes_checkpoint
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&sink),
     };
@@ -770,6 +793,9 @@ async fn crash_recovery_reconciles_fc_id_with_zero_duplicate_page_creates() {
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: Some(crashed_checkpoint),
         checkpoint_sink: Some(&sink),
     };
@@ -844,6 +870,8 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
 
     let ch_cfg = ChannelConfig::Notion(NotionChannelConfig {
         integration_secret: "ntn_async_secret".to_string(),
+    });
+    let dest_cfg = DestinationConfig::Notion(NotionDestinationConfig {
         data_source_id: ds_id.to_string(),
         database_id: None,
         parent_page_id: None,
@@ -868,6 +896,15 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
         })
         .await
         .expect("create channel");
+    let destination = db
+        .create_destination(&NewDestination {
+            channel_id: channel.id,
+            name: "Async DB".to_string(),
+            encrypted_config: key.encrypt_json(&dest_cfg).expect("encrypt dest"),
+            enabled: true,
+        })
+        .await
+        .expect("create destination");
 
     let route = db
         .create_route(&NewRoute {
@@ -875,6 +912,7 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
             feed_ids: vec![feed.id],
             match_tags: Vec::new(),
             channel_id: channel.id,
+            destination_id: destination.id,
             include_keywords: Vec::new(),
             exclude_keywords: Vec::new(),
             include_regex: None,
@@ -886,7 +924,13 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
         .expect("create route");
 
     let task = db
-        .enqueue_delivery_task(route.id, channel.id, entry.id, 1_762_992_010)
+        .enqueue_delivery_task(
+            route.id,
+            channel.id,
+            destination.id,
+            entry.id,
+            1_762_992_010,
+        )
         .await
         .expect("enqueue")
         .expect("new task");
@@ -952,6 +996,9 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
         route_options: RouteOptions::default(),
         channel: &channel,
         channel_config: &ch_cfg,
+        destination: &destination,
+        destination_config: &dest_cfg,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&db_sink),
     };
@@ -1005,6 +1052,9 @@ async fn async_202_accepted_persists_task_handle_to_sqlite_and_resolves_on_poll(
         route_options: RouteOptions::default(),
         channel: &channel,
         channel_config: &ch_cfg,
+        destination: &destination,
+        destination_config: &dest_cfg,
+        timezone: chrono_tz::UTC,
         checkpoint: Some(expected_mid_cp),
         checkpoint_sink: Some(&db_sink),
     };
@@ -1079,6 +1129,9 @@ async fn rate_limit_429_triggers_credential_group_cooldown_and_send_test_verifie
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
     };
@@ -1112,7 +1165,7 @@ async fn rate_limit_429_triggers_credential_group_cooldown_and_send_test_verifie
 
     // Verify non-destructive `send_test` against the same Notion data source.
     let test_msg = sender
-        .send_test(&fx.channel_config, false)
+        .send_test(&fx.channel_config, &fx.destination_config, false)
         .await
         .expect("send_test");
     assert!(test_msg.contains("FeedCourier Inbox"));
@@ -1136,6 +1189,9 @@ async fn in_trash_page_is_ignored_during_fc_id_reconcile_and_confirmed_page_id_s
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: Some(DeliveryCheckpoint::Notion {
             create_initiated: true,
             async_task_id: None,
@@ -1194,6 +1250,9 @@ async fn in_trash_page_is_ignored_during_fc_id_reconcile_and_confirmed_page_id_s
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: Some(DeliveryCheckpoint::Notion {
             create_initiated: true,
             async_task_id: None,
@@ -1247,6 +1306,9 @@ async fn send_classifies_5xx_as_retry_preserving_create_initiated_and_4xx_as_per
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
     };
@@ -1294,6 +1356,9 @@ async fn send_classifies_5xx_as_retry_preserving_create_initiated_and_4xx_as_per
         route_options: RouteOptions::default(),
         channel: &fx.channel,
         channel_config: &fx.channel_config,
+        destination: &fx.destination,
+        destination_config: &fx.destination_config,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
     };
@@ -1307,5 +1372,250 @@ async fn send_classifies_5xx_as_retry_preserving_create_initiated_and_4xx_as_per
             assert!(diagnostic.contains("unauthorized"));
         }
         other => panic!("expected PermanentFailure on 401, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_404() {
+    // 1. Inline `AsyncPollResolution::Failed` after 202 must clear `async_task_id` and return
+    //    `status_code: Some(502)` (NOT `202`) so the scheduler counts retry attempts instead of looping.
+    {
+        let server = MockServer::start().await;
+        let ds_id = "88888888-9999-aaaa-bbbb-cccccccccccc";
+        let fx = sample_fixtures(ds_id);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "object": "async_task",
+                "async_task_id": "ntask_fail_inline"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/async_tasks/ntask_fail_inline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "async_task",
+                "id": "ntask_fail_inline",
+                "status": "failed",
+                "error": { "message": "markdown conversion crashed" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sender = NotionSender::with_base_url(server.uri(), None)
+            .expect("sender")
+            .with_async_poll_policy(Duration::from_millis(1), 1, 1);
+        let sink = RecordingCheckpointSink::default();
+        let ctx = DeliveryContext {
+            task: &fx.task,
+            entry: &fx.entry,
+            feed: &fx.feed,
+            route: &fx.route,
+            route_options: RouteOptions::default(),
+            channel: &fx.channel,
+            channel_config: &fx.channel_config,
+            destination: &fx.destination,
+            destination_config: &fx.destination_config,
+            timezone: chrono_tz::UTC,
+            checkpoint: None,
+            checkpoint_sink: Some(&sink),
+        };
+        match sender.send(&ctx).await.expect("inline failed outcome") {
+            DeliveryOutcome::Retry {
+                status_code,
+                checkpoint,
+                diagnostic,
+                ..
+            } => {
+                assert_eq!(
+                    status_code,
+                    Some(502),
+                    "failed async task must not return 202"
+                );
+                assert_eq!(
+                    checkpoint,
+                    Some(DeliveryCheckpoint::Notion {
+                        create_initiated: true,
+                        async_task_id: None,
+                        page_id: None,
+                    })
+                );
+                assert!(diagnostic.contains("markdown conversion crashed"));
+            }
+            other => panic!("expected Retry(502), got {other:?}"),
+        }
+    }
+
+    // 2. Resumed `AsyncPollResolution::Failed` reconciles FC-ID, and when not found returns
+    //    Retry(502) WITHOUT issuing a duplicate `POST /v1/pages` in the same turn.
+    {
+        let server = MockServer::start().await;
+        let ds_id = "99999999-aaaa-bbbb-cccc-dddddddddddd";
+        let fx = sample_fixtures(ds_id);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/async_tasks/ntask_fail_resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "async_task",
+                "id": "ntask_fail_resume",
+                "status": "failed",
+                "error": { "message": "worker killed" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/data_sources/{ds_id}/query")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let sender = NotionSender::with_base_url(server.uri(), None)
+            .expect("sender")
+            .with_async_poll_policy(Duration::from_millis(1), 1, 1);
+        let ctx = DeliveryContext {
+            task: &fx.task,
+            entry: &fx.entry,
+            feed: &fx.feed,
+            route: &fx.route,
+            route_options: RouteOptions::default(),
+            channel: &fx.channel,
+            channel_config: &fx.channel_config,
+            destination: &fx.destination,
+            destination_config: &fx.destination_config,
+            timezone: chrono_tz::UTC,
+            checkpoint: Some(DeliveryCheckpoint::Notion {
+                create_initiated: true,
+                async_task_id: Some("ntask_fail_resume".to_string()),
+                page_id: None,
+            }),
+            checkpoint_sink: None,
+        };
+        match sender.send(&ctx).await.expect("resume failed outcome") {
+            DeliveryOutcome::Retry {
+                status_code,
+                checkpoint,
+                ..
+            } => {
+                assert_eq!(status_code, Some(502));
+                assert_eq!(
+                    checkpoint,
+                    Some(DeliveryCheckpoint::Notion {
+                        create_initiated: true,
+                        async_task_id: None,
+                        page_id: None,
+                    })
+                );
+            }
+            other => panic!("expected Retry(502) without recreating in same turn, got {other:?}"),
+        }
+    }
+
+    // 3. Lazy `database_id` -> `data_source_id` fallback on 404 object_not_found inside `send`.
+    {
+        let server = MockServer::start().await;
+        let db_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let real_ds_id = "12121212-3434-5656-7878-909090909090";
+        let fx = sample_fixtures(db_id);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .respond_with(move |req: &Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                if body["parent"]["data_source_id"] == db_id {
+                    ResponseTemplate::new(404).set_body_json(json!({
+                        "object": "error",
+                        "status": 404,
+                        "code": "object_not_found",
+                        "message": "Could not find data_source"
+                    }))
+                } else {
+                    assert_eq!(body["parent"]["data_source_id"], real_ds_id);
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "object": "page",
+                        "id": "resolved-ds-page-1"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/data_sources/{db_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "object": "error",
+                "status": 404,
+                "code": "object_not_found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/databases/{db_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "database",
+                "id": db_id,
+                "data_sources": [{ "id": real_ds_id }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/data_sources/{real_ds_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "data_source",
+                "id": real_ds_id,
+                "properties": {
+                    "Title": { "type": "title" },
+                    "FC-ID": { "type": "rich_text" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sender = NotionSender::with_base_url(server.uri(), None).expect("sender");
+        let ctx = DeliveryContext {
+            task: &fx.task,
+            entry: &fx.entry,
+            feed: &fx.feed,
+            route: &fx.route,
+            route_options: RouteOptions::default(),
+            channel: &fx.channel,
+            channel_config: &fx.channel_config,
+            destination: &fx.destination,
+            destination_config: &fx.destination_config,
+            timezone: chrono_tz::UTC,
+            checkpoint: None,
+            checkpoint_sink: None,
+        };
+        match sender.send(&ctx).await.expect("fallback send") {
+            DeliveryOutcome::Delivered {
+                checkpoint: Some(DeliveryCheckpoint::Notion { page_id, .. }),
+                ..
+            } => {
+                assert_eq!(page_id.as_deref(), Some("resolved-ds-page-1"));
+            }
+            other => panic!("expected Delivered via database_id fallback, got {other:?}"),
+        }
     }
 }

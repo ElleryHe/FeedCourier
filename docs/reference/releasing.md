@@ -61,14 +61,37 @@ Once all four `.tar.gz` archives and the multi-arch Docker Hub manifest succeed,
 In parallel, `docker-build` compiles `linux/amd64` natively on `ubuntu-24.04` and `linux/arm64` natively on `ubuntu-24.04-arm` (without QEMU emulation, caching external Cargo dependencies independently per architecture and pushing by digest), and `docker` combines both digests via `docker buildx imagetools create` to **[Docker Hub (`elleryhe/feedcourier`)](https://hub.docker.com/r/elleryhe/feedcourier)**:
 
 - **Published Image Tags**:
-  - `<version>` (e.g., `0.1.6`)
-  - `<major>.<minor>` (e.g., `0.1`)
+  - `<version>` (e.g., `0.2.0`)
+  - `<major>.<minor>` (e.g., `0.2`)
   - `<major>` (enabled from `1.0.0`+)
   - `latest` (for stable non-prerelease tags)
 - **Required GitHub Actions Secrets / Variables**:
   - `DOCKERHUB_USERNAME` *(Secret)* — Docker Hub account username.
   - `DOCKERHUB_TOKEN` *(Secret)* — Docker Hub Personal Access Token (`Read & Write` scope).
   - `DOCKERHUB_REPO` *(Optional Variable)* — Overrides the target repository name (defaults to `<DOCKERHUB_USERNAME>/feedcourier`).
+
+---
+
+## Release Checklist
+
+When preparing a new release (e.g., merging `develop` into `main`), keep all version references synchronized before opening the release PR:
+
+1. **Synchronize the release version across all files**:
+   - `Cargo.toml` (`[package].version`)
+   - `Cargo.lock` (`feedcourier` package entry)
+   - `web/package.json` (`version`)
+   - `docs/package.json` (`version`)
+   - `web/src/api/types.ts` (`DEFAULT_VERSION`)
+   - `CHANGELOG.md` (add the matching `## [<version>] - YYYY-MM-DD` section and comparison links)
+2. **Run local verification checks on `develop`**:
+   ```bash
+   pnpm --dir web exec tsc --noEmit && pnpm --dir web build
+   pnpm --dir docs build
+   cargo fmt --all -- --check
+   cargo clippy --all-targets --locked -- -D warnings
+   cargo test --all-targets --locked
+   ```
+3. **Open and merge the PR into `main`**: Once merged, GitHub Actions automatically tags `v<version>`, builds all four platform archives, publishes the multi-arch Docker Hub manifest, and creates the GitHub Release.
 
 ---
 

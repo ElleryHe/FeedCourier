@@ -67,6 +67,9 @@ pub struct OutboundRequest {
     pub headers: HeaderMap,
     pub timeout: Option<Duration>,
     pub max_redirects: usize,
+    /// When `true`, synthesizes a per-hop origin `Referer` header (`scheme://host[:port]/`)
+    /// matching the current hop URL instead of sending a static cross-origin `Referer`.
+    pub auto_origin_referer: bool,
 }
 
 impl OutboundRequest {
@@ -82,6 +85,7 @@ impl OutboundRequest {
             headers: HeaderMap::new(),
             timeout: None,
             max_redirects: DEFAULT_MAX_REDIRECT_HOPS,
+            auto_origin_referer: false,
         }
     }
 
@@ -117,6 +121,11 @@ impl OutboundRequest {
 
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.insert(name, value);
+        self
+    }
+
+    pub fn auto_origin_referer(mut self, enabled: bool) -> Self {
+        self.auto_origin_referer = enabled;
         self
     }
 }
@@ -221,6 +230,16 @@ impl ProtectedHttpClient {
                 state: RwLock::new(client_set),
             }),
         })
+    }
+
+    /// Shared live [`SsrfPolicy`] handle (hot-reloaded via [`Self::update_settings`]).
+    pub fn ssrf_policy(&self) -> Arc<RwLock<SsrfPolicy>> {
+        Arc::clone(&self.inner.policy)
+    }
+
+    /// Shared connect-time [`SsrfDnsResolver`] backed by [`Self::ssrf_policy`].
+    pub fn ssrf_dns_resolver(&self) -> SsrfDnsResolver {
+        self.inner.resolver.clone()
     }
 
     /// Snapshot current [`NetSettings`].
@@ -333,6 +352,8 @@ impl ProtectedHttpClient {
             }
         };
 
+        let initial_origin = url_origin_key(&current_url);
+
         for hop in 0..=req.max_redirects {
             // 1. Validate scheme, host, and any literal IP against current SSRF policy on EVERY hop.
             {
@@ -353,15 +374,27 @@ impl ProtectedHttpClient {
                 self.inner.resolver.resolve_and_validate(host_str).await?;
             }
 
-            // 2. Assemble GET request (only safe headers are carried across redirect hops).
+            // 2. Assemble GET request (strip sensitive headers on redirect; strip `Referer` across origins).
+            let same_origin = url_origin_key(&current_url) == initial_origin;
             let mut rb = client.get(current_url.clone());
             if let Some(timeout) = req.timeout {
                 rb = rb.timeout(timeout);
             }
             for (k, v) in &req.headers {
-                if hop == 0 || is_redirect_safe_header(k) {
+                if req.auto_origin_referer && *k == header::REFERER {
+                    continue;
+                }
+                if hop == 0
+                    || (is_redirect_safe_header(k) && (same_origin || *k != header::REFERER))
+                {
                     rb = rb.header(k, v);
                 }
+            }
+            if req.auto_origin_referer
+                && let Some(origin) = format_origin_referer(&current_url)
+                && let Ok(val) = HeaderValue::from_str(&origin)
+            {
+                rb = rb.header(header::REFERER, val);
             }
             if let Some(etag) = &req.if_none_match {
                 rb = rb.header(header::IF_NONE_MATCH, etag);
@@ -575,6 +608,22 @@ fn is_redirect_safe_header(name: &HeaderName) -> bool {
         *name,
         header::AUTHORIZATION | header::PROXY_AUTHORIZATION | header::COOKIE | header::HOST
     )
+}
+
+fn url_origin_key(url: &Url) -> (String, Option<String>, Option<u16>) {
+    (
+        url.scheme().to_ascii_lowercase(),
+        url.host_str().map(|h| h.to_ascii_lowercase()),
+        url.port_or_known_default(),
+    )
+}
+
+fn format_origin_referer(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{host}:{port}/", url.scheme()),
+        None => format!("{}://{host}/", url.scheme()),
+    })
 }
 
 fn header_string(headers: &HeaderMap, name: HeaderName) -> Option<String> {

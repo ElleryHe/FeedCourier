@@ -6,29 +6,21 @@ import type {
   AuthLoginRequest,
   AuthLoginResponse,
   AuthPasswordRequest,
+  AuthStatusResponse,
+  ChannelDestinationDto,
+  ChannelDto,
   ClearFeedCacheRequest,
   ClearFeedCacheResponse,
-  FeedPreviewPushRequest,
-  FeedPreviewPushResponse,
-  QueueStateDto,
-  RecoveryCodesResponse,
-  RegenerateRecoveryCodesRequest,
-  TestChannelRequest,
-  TotpDisableRequest,
-  TotpEnableRequest,
-  TotpSetupRequest,
-  TotpSetupResponse,
-  UpdateAccountRequest,
-  UpdateQueueRequest,
-  AuthStatusResponse,
-  ChannelDto,
   CreateChannelRequest,
+  CreateDestinationRequest,
   CreateFeedRequest,
   CreateMcpTokenRequest,
   CreateMcpTokenResponse,
   CreateRouteRequest,
   DeliveryTaskDto,
   FeedDto,
+  FeedPreviewPushRequest,
+  FeedPreviewPushResponse,
   FeedPreviewRequest,
   FeedPreviewResponse,
   GcResponse,
@@ -42,13 +34,25 @@ import type {
   OpmlImportResponse,
   OverviewResponse,
   PollFeedResponse,
+  QueueStateDto,
+  RecoveryCodesResponse,
+  RegenerateRecoveryCodesRequest,
   RetryTasksRequest,
   RetryTasksResponse,
   RouteDto,
   SystemSettingsDto,
+  TestChannelRequest,
   TestChannelResponse,
+  TestDestinationRequest,
+  TotpDisableRequest,
+  TotpEnableRequest,
+  TotpSetupRequest,
+  TotpSetupResponse,
+  UpdateAccountRequest,
   UpdateChannelRequest,
+  UpdateDestinationRequest,
   UpdateFeedRequest,
+  UpdateQueueRequest,
   UpdateRouteRequest,
   UpdateSystemSettingsRequest,
 } from "./types";
@@ -59,14 +63,12 @@ const API_BASE = "/api/v1";
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
-  readonly details?: string;
 
-  constructor(status: number, message: string, code?: string, details?: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
-    this.details = details;
   }
 }
 
@@ -90,14 +92,12 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
   const contentType = res.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     try {
-      const data = (await res.json()) as Partial<ApiErrorBody> & {
-        message?: string;
-      };
+      const data = (await res.json()) as Partial<ApiErrorBody>;
       const message =
-        data.error ??
-        data.message ??
+        data.message?.trim() ||
+        data.error?.trim() ||
         getMessages().common.requestFailedHttp(res.status);
-      return new ApiError(res.status, message, data.code, data.details);
+      return new ApiError(res.status, message, data.code);
     } catch {
       // Fall through to text fallback
     }
@@ -344,7 +344,7 @@ export const api = {
   },
 
   // -------------------------------------------------------------------------
-  // Trusted Channels
+  // Trusted Channels (Accounts) & Destinations
   // -------------------------------------------------------------------------
   channels: {
     list: () => request<ChannelDto[]>("/channels", { method: "GET" }),
@@ -361,6 +361,15 @@ export const api = {
         method: "POST",
         body: payload,
       }),
+    listDestinations: (channelId: number) =>
+      request<ChannelDestinationDto[]>(`/channels/${channelId}/destinations`, {
+        method: "GET",
+      }),
+    createDestination: (channelId: number, payload: CreateDestinationRequest) =>
+      request<ChannelDestinationDto>(`/channels/${channelId}/destinations`, {
+        method: "POST",
+        body: payload,
+      }),
     notionInitDb: (payload: NotionInitDbRequest) =>
       request<NotionInitDbResponse>("/channels/notion/init-db", {
         method: "POST",
@@ -368,6 +377,23 @@ export const api = {
       }),
     notionInspectSchema: (payload: NotionInspectSchemaRequest) =>
       request<NotionInspectSchemaResponse>("/channels/notion/inspect-schema", {
+        method: "POST",
+        body: payload,
+      }),
+  },
+
+  destinations: {
+    update: (id: number, payload: UpdateDestinationRequest) =>
+      request<ChannelDestinationDto>(`/destinations/${id}`, {
+        method: "PATCH",
+        body: payload,
+      }),
+    remove: (id: number) =>
+      request<ActionAckResponse | undefined>(`/destinations/${id}`, {
+        method: "DELETE",
+      }),
+    test: (id: number, payload?: TestDestinationRequest) =>
+      request<TestChannelResponse>(`/destinations/${id}/test`, {
         method: "POST",
         body: payload,
       }),

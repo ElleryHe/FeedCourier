@@ -1,6 +1,6 @@
 //! Built-in Model Context Protocol (`/mcp`) Streamable HTTP endpoint, dual-scope Bearer token
 //! guard (`readonly` / `admin`), AGPLv3 `ServerConfig` (`ServerInfo`) metadata, prompt-injection
-//! framing (`<untrusted_feed_content>`), and all 7 operational tools (`feedcourier.md` Section 六).
+//! framing (`<untrusted_feed_content>`), and all 9 operational tools (`feedcourier.md` Section 六).
 
 pub mod auth;
 pub mod sanitize;

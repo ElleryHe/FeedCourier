@@ -30,11 +30,16 @@ description: "FeedCourier 通道协议与投递实现细节：SMTP、Telegram Bo
   - `Tls`（默认端口 `465`）：隐式 TLS / Wrapper 模式；
   - `Plain`（默认端口 `25`）：仅用于受控内网中继的明文连接。
 - 内部按 `(host, port, security, username, password)` 的 SHA-256 摘要缓存连接池（`PoolConfig::new().max_size(2).idle_timeout(60s)`），单次 SMTP 指令默认超时为 `DEFAULT_SMTP_TIMEOUT = 30s`。
+- 账号级测试（未传 `destination_id` 调用 `POST /api/v1/channels/{id}/test`）通过 `SmtpSender::test_account` 校验连通性与认证（`EHLO`/`AUTH`）而不发送邮件；目的地级测试（`POST /api/v1/destinations/{id}/test`）调用 `send_test` 向 `SmtpDestinationConfig.to_addresses` 发送验证邮件。
 
-### 2. `minijinja` 单栏内联 CSS 渲染与 `< 95 KiB` 体积预算
+### 2. `minijinja` 单栏内联 CSS 渲染、响应式 HTML 改写与 `< 95 KiB` 体积预算
 - 每封邮件组装为 `multipart/alternative`（`MultiPart::alternative_plain_html`），同时包含：
-  1. **`text/html` 主体**：由 `minijinja` 渲染内置的 `EMAIL_HTML_TEMPLATE`（最大宽度 `640px` 的单栏卡片布局，所有排版样式均通过内联 `style="..."` 属性声明，兼容禁用外部样式表的邮件客户端）；
+  1. **`text/html` 主体**：由 `minijinja` 渲染内置的 `EMAIL_HTML_TEMPLATE`（最大宽度 `640px`、内容可用宽度 `EMAIL_CARD_INNER_WIDTH_PX = 592px` 的单栏卡片布局，搭配内联 `style="..."` 与 `<head>` 兜底样式，兼容 Gmail、Apple Mail 与 Outlook.com）。元信息行中的发布时间按**路由时区**经 `format_local_timestamp` 格式化为 `YYYY-MM-DD HH:MM (UTC±HH:MM)`；
   2. **`text/plain` 回退体**：由 `html2text` 按 `PLAIN_TEXT_WRAP_WIDTH = 78` 列宽转换生成，确保纯文本客户端与终端阅读器正常显示。
+- **响应式正文 HTML 改写**：模板插值前统一规范可能撑破 `640px` 卡片的外部标签：
+  - `<img>`：移除固定 `height` 属性，设置兼容 Outlook 的 `width="592"`（若原图显式宽度小于 `592px` 则保留原宽度），并内联响应式 `style="display:block;max-width:100%;width:100%;height:auto;..."`（小图不强制拉伸）；
+  - `<figure>` / `<figcaption>`：清零水平外边距并设置小号灰字图注样式；
+  - `<table>` / `<pre>`：添加 `max-width:100%` 并允许横向滚动或自动换行。
 - **防 Gmail 折叠截断（`MAX_EMAIL_HTML_BYTES = 95 KiB`）**：Gmail 网页端与客户端会对总大小超过约 `102 KB` 的邮件正文执行 `[Message clipped]` 折叠。`render_entry_html` 将渲染后的 UTF-8 HTML 字节数严格控制在 **`95 KiB`（`97,280` 字节）** 以内；若原文超出预算，则在闭合标签边界处安全截断，并在邮件底部插入带原文链接的截断提示框（`Continue reading original article →`）。
 
 ### 3. `Force-From` 反伪造对齐与确定性信头
@@ -70,19 +75,21 @@ flowchart TD
     BatchCP --> Done
 ```
 
-### 1. `RichMessage` 模式与 `telegram-rich` 结构化转换
-- 路由设为 `rich_message` 时，`build_rich_message_payload` 调用工作区子库 `telegram-rich`（`crates/telegram-rich`）：
-  1. **HTML 规范化（`telegram_rich::html::normalize`）**：将 `ammonia` 清洗后的正文转换为 Telegram 富文本结构块（`Block`），原生映射紧凑表格（`<table compact>`）、可展开引用块（`<blockquote expandable>`）、带语法高亮标识的代码块（`<pre><code class="language-...">`）、内嵌图片/视频以及底部直达按钮行（`<tg-button-row>` / `Block::link_button`）。
-  2. **配额自适应裁剪（`Document::fit` / `FitOptions`）**：在序列化为 `InputRichMessage` 前，自动将文档裁剪至 Bot API 10.4 的四项硬性限制以内：
+### 1. `RichMessage` 模式与 `telegram-rich 0.0.2` 结构化转换
+- 路由设为 `rich_message` 时，`build_rich_message_payload_with_options` 基于 [`telegram-rich 0.0.2`](https://crates.io/crates/telegram-rich) 构建 Bot API 10.4 富文本消息：
+  1. **头部块结构**：文章标题使用降级后的 **`<h2>`**（`Block::Heading { level: 2 }`，带原文超链接），下方以 Telegram 原生小号灰字 **`<footer>`**（`Block::Footer`）展示按**路由时区**格式化的「来源 · 作者 · `YYYY-MM-DD HH:MM (UTC±HH:MM)`」，并以水平分隔线（`Block::Divider` / `<hr>`）分隔头部与正文；
+  2. **HTML 结构解析（`parse_rich_html` + `ParseOptions`）**：传入 `heading_offset: 2`（原文标题统一降级为 `h1→h3`、`h2→h4` …，最低至 `h6`）与 `group_consecutive_media: true`（连续 2 张及以上内嵌图片自动合并为 `<tg-collage>`，超过 collage 上限时自动改用 `<tg-slideshow>`），同时保留紧凑表格（`<table compact>`）、可展开引用块（`<blockquote expandable>`）、带语法高亮标识的代码块（`<pre><code class="language-...">`）以及底部直达按钮行（`<tg-button-row>` / `Block::link_button`）；
+  3. **配额自适应裁剪（`Document::fit` / `FitOptions`）**：在序列化为 `InputRichMessage` 前，自动将文档裁剪至 Bot API 10.4 的四项硬性限制以内：
      - 正文总字符数 $\le 32,768$；
      - 结构块（`Block`）总数 $\le 500$；
      - 节点嵌套深度 $\le 16$；
      - 内嵌媒体项总数 $\le 50$。
 
 ### 2. 端点能力探测（`probe_capabilities`）与自动降级
-- 在创建通道或点击“测试”时，`probe_capabilities` 先调用 `getMe` 校验 Token 并读取 `bot_username`，随后向 `/bot<token>/sendRichMessage` 发送空负载 `{}` 进行无副作用探测：
+- 在创建或测试 Telegram **账号**（`POST /api/v1/channels` 或未传 `destination_id` 的 `POST /api/v1/channels/{id}/test`）时，`probe_capabilities` 先调用 `getMe` 校验 Token 并读取 `bot_username`（留空账号名时自动作为默认名称），随后向 `/bot<token>/sendRichMessage` 发送空负载 `{}` 进行无副作用探测：
   - 若服务端返回 `400 Bad Request`（提示缺少 `chat_id` 参数），表明目标服务端支持 Bot API `10.2+` / `10.4` 的 `sendRichMessage` 方法，记录 `supports_rich_message: true` 与 `bot_api_version: "10.4"`；
   - 若自建 Local Bot API Server 版本低于 `10.2` 并返回 `404 Not Found`（或未知方法描述），则记录 `supports_rich_message: false` 与 `bot_api_version: "<10.2"`，持久化至 `channels.capabilities_json`。
+- 创建目的地时留空备注名会自动调用 `getChat` 获取群组/频道标题；`POST /api/v1/destinations/{id}/test` 向具体目的地的 `chat_id`（及可选 `message_thread_id`）发送验证消息。
 - 当 `supports_rich_message` 为 `false`，或运行期调用 `sendRichMessage` 遭遇方法不支持错误时，`TelegramSender` 自动降级调用 `CompactCard`（`sendMessage`，`parse_mode: "HTML"`，受 `MAX_MESSAGE_UTF16_UNITS = 4,096` UTF-16 代码单元限制，并通过 `link_preview_options` 控制链接预览）。
 
 ### 3. `MediaMode` 三行超链接文案、按类型智能分流与 10 项分批断点
@@ -104,7 +111,7 @@ flowchart TD
 ## 4. Notion 通道实现（`src/channels/notion.rs`，`Notion-Version: 2026-03-11`）
 
 ### 1. 固定 `Notion-Version: 2026-03-11` 协议契约
-`NotionSender` 对所有出站请求强制附加 `Notion-Version: 2026-03-11` 头部（`NOTION_API_VERSION`），遵循 `2026-03-11` 版本的 Data Source 数据模型：
+`NotionSender` 对所有出站请求强制附加 `Notion-Version: 2026-03-11` 头部（`NOTION_API_VERSION`），遵循 `2026-03-11` 版本的 Data Source 数据模型。在双层通道模型下，`channels.encrypted_config` 存储账号凭据 `NotionChannelConfig`（`integration_secret`，账号测试调用 `GET /v1/users/me`），而 `channel_destinations.encrypted_config` 存储各目的地的 `NotionDestinationConfig`（`data_source_id`、可选 `database_id`/`parent_page_id` 与 `column_mapping`）：
 - **父级容器（`data_source_id`）**：创建页面（`POST /v1/pages`）时使用 `parent: { "type": "data_source_id", "data_source_id": "<uuid>" }`，而非旧版的 `database_id`；
 - **建库属性声明（`initial_data_source.properties`）**：通过 `POST /api/v1/channels/notion/init-db` 调用 `POST /v1/databases` 初始化 7 列标准收件箱（`Title`、`FC-ID`、`Link`、`Source`、`Published`、`State`、`Tag`）时，属性定义挂载于 `initial_data_source.properties`，并从响应的 `data_sources[0].id` 提取 `data_source_id`；
 - **表结构自检与补齐（`inspect-schema`）**：通过 `GET /v1/data_sources/{id}` 检查现有列类型，当 `patch_missing: true` 时调用 `PATCH /v1/data_sources/{id}` 自动创建缺失的标准列（若用户传入的是旧式数据库 URL/ID，客户端会自动先查询 `GET /v1/databases/{id}` 解析其关联的 `data_source_id`）；

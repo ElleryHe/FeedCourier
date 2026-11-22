@@ -18,8 +18,8 @@ description: "FeedCourier 安全与防注入机制：ChaCha20-Poly1305 凭据加
   2. 若未设置 `MASTER_KEY`，则从 `<DATA_DIR>/master.key`（或容器自定义路径如 `/data/secret.key`）读取；若文件不存在，则使用操作系统 CSPRNG（`ChaCha20Poly1305::generate_key`）生成 32 字节（256 位）随机密钥，以 **`0600`（仅属主可读写）** 权限原子写入磁盘。
 - **内存擦除**：`MasterKey` 实现自定义 `Drop` 与脱敏 `Debug`（输出 `MasterKey([REDACTED])`），销毁时将内存中的 32 字节数组清零并通过 `std::hint::black_box` 防止编译器优化消除。
 
-### 2. `channels.encrypted_config` AEAD 加密格式
-所有下游通道的完整配置（`ChannelConfig`：含 SMTP 密码与收件人、Telegram `bot_token` 与 `chat_id`、Notion `integration_secret` 与 `data_source_id`）在写入 SQLite `channels.encrypted_config`（`BLOB`）前，均通过 **ChaCha20-Poly1305** 认证加密：
+### 2. 账号与目的地双层 AEAD 加密存储
+在双层通道模型下，通道账号凭据（`channels.encrypted_config` 中的 `ChannelConfig`：SMTP 服务器/密码/`from_address`、Telegram `bot_token`/`api_base_url`、Notion `integration_secret`）与目的地配置（`channel_destinations.encrypted_config` 中的 `DestinationConfig`：SMTP `to_addresses`/`reply_to`、Telegram `chat_id`/`message_thread_id`、Notion `data_source_id`/`column_mapping`）在写入 SQLite 前，各自独立序列化为 JSON 并经 **ChaCha20-Poly1305** 认证加密：
 - 每次加密从 CSPRNG 生成独立的 12 字节（96 位）随机 Nonce（`NONCE_LEN = 12`）；
 - 存储二进制布局为：`[12-byte nonce || ciphertext || 16-byte Poly1305 tag]`；
 - 解密时若密文被篡改或 `MasterKey` 不匹配，Poly1305 认证标签校验立即失败并拒绝加载。
@@ -45,21 +45,21 @@ WebUI 管理员可选启用第二重验证（在 **Settings → 账号与安全*
 
 | 数据接口 | 返回结构体 | 凭据与目的地暴露策略 |
 | :--- | :--- | :--- |
-| **WebUI REST API**<br>（`GET /api/v1/channels`） | `ChannelDto`<br>（`src/api/dto.rs`） | 返回非敏感路由目标（如 `host`、`to_addresses`、`chat_id`、`data_source_id`），但将密钥字段替换为掩码提示：`has_password: bool`、`bot_token_hint: "123456...abcd"`、`secret_hint: "ntn_12...ef"`。`PATCH /api/v1/channels/{id}` 在密码/Token 留空时自动保留原密文。 |
-| **MCP 端点**<br>（`list_feeds_status`） | `McpChannelSummary`<br>（`src/mcp/tools.rs`） | **完全省略凭据与目的地标识**：仅返回 `{ id, name, kind, enabled, cooldown_until }`。AI 客户端无法读取任何 SMTP 密码/收件人邮箱、Telegram `bot_token`/`chat_id` 或 Notion `integration_secret`/`data_source_id`。 |
+| **WebUI REST API**<br>（`GET /api/v1/channels`、`/api/v1/channels/{id}/destinations`） | `ChannelDto`、`ChannelDestinationDto`<br>（`src/api/dto.rs`） | 返回非敏感账号信息（`host`、`from_address`、`api_base_url`）及内嵌目的地配置（`to_addresses`、`chat_id`、`data_source_id`），并将密钥字段替换为掩码提示：`has_password: bool`、`bot_token_hint: "123456...abcd"`、`secret_hint: "ntn_12...ef"`。`PATCH /api/v1/channels/{id}` 在密码/Token 留空时自动保留原密文。 |
+| **MCP 端点**<br>（`list_feeds_status`） | `McpChannelSummary`、`McpDestinationSummary`<br>（`src/mcp/tools.rs`） | **完全省略凭据与目的地标识**：返回脱敏 `channels`（`{ id, name, kind, enabled, cooldown_until, destinations }`）及顶层 `destinations`（`{ id, channel_id, name, kind, enabled }`）。AI 客户端无法读取任何 SMTP 密码/收件人邮箱、Telegram `bot_token`/`chat_id` 或 Notion `integration_secret`/`data_source_id`。 |
 
 ---
 
 ## 2. 投递目的地锁定（Destination Lock）
 
-在將 AI Agent 接入自动化网关时，核心风险之一是**数据外带（Data Exfiltration）**：若恶意文章通过提示词注入诱导 AI 创建一个指向攻击者邮箱或攻击者 Telegram 群组的投递通道，网关中的订阅内容或诊断信息将被转发至外部不可信地址。
+在将 AI Agent 接入自动化网关时，核心风险之一是**数据外带（Data Exfiltration）**：若恶意文章通过提示词注入诱导 AI 创建一个指向攻击者邮箱或攻击者 Telegram 群组的投递通道或目的地，网关中的订阅内容或诊断信息将被转发至外部不可信地址。
 
 FeedCourier 在架构层实施 **投递目的地锁定（Destination Lock）**：
-1. **`/mcp` 零通道写接口**：MCP 服务端点不提供任何用于创建、修改或删除投递通道的工具，也没有任何工具接受通道凭据或目的地址。所有 `channels` 表的变更必须由人类管理员通过受 `fc_session` 保护的 WebUI（`/api/v1/channels*`）完成。
-2. **`configure_route` 强校验整数 `channel_id`**：当持有 `admin` 权限令牌的 AI Agent 调用 `configure_route` 创建或修改路由时，目标通道参数仅接受整数 `channel_id`（`ConfigureRouteParams.channel_id: Option<i64>`），不接受任何原始邮箱地址、Webhook URL、`chat_id` 或 API 密钥。处理器在入库前调用 `db.get_channel(channel_id)` 验证该 ID 必须对应已存在的 WebUI 授信通道。
+1. **`/mcp` 零通道/目的地写接口**：MCP 服务端点不提供任何用于创建、修改或删除通道账号或目的地的工具，也没有任何工具接受凭据或目的地址。所有 `channels` 与 `channel_destinations` 表的变更必须由人类管理员通过受 `fc_session` 保护的 WebUI（`/api/v1/channels*`、`/api/v1/destinations*`）完成。
+2. **`configure_route` 与 `test_push_feed_entry` 强校验整数 `destination_id`**：当持有 `admin` 权限令牌的 AI Agent 调用 `configure_route` 或 `test_push_feed_entry` 时，目标参数仅接受整数 `destination_id`（或在账号仅含 1 个目的地时兼容旧版 `channel_id`），不接受任何原始邮箱地址、Webhook URL、`chat_id` 或 API 密钥。处理器在执行前统一调用 `db.resolve_destination_target(destination_id, channel_id)` 验证该目标必须对应已存在的 WebUI 授信目的地与通道账号。
 3. **双级令牌权限隔离（`readonly` vs `admin`）**：
    - `readonly` 令牌仅可调用只读工具（`list_feeds_status`、`inspect_failed_deliveries`、`preview_feed_latest`）；
-   - `admin` 令牌额外允许管理订阅源、编排指向既有 `channel_id` 的路由、复位熔断源、重投死信任务、暂停/恢复全局队列及调试推送（`manage_feed`（含 `clear_cache`）、`configure_route`、`reset_and_poll_feed`、`retry_dead_tasks`、`manage_outbox_queue`、`test_push_feed_entry`），仍无法突破 `channel_id` 边界；`test_push_feed_entry` 只会把文章发送到既有通道，无法更改目的地。
+   - `admin` 令牌额外允许管理订阅源、编排指向既有 `destination_id` 的路由、复位熔断源、重投死信任务、暂停/恢复全局队列及调试推送（`manage_feed`（含 `clear_cache`）、`configure_route`、`reset_and_poll_feed`、`retry_dead_tasks`、`manage_outbox_queue`、`test_push_feed_entry`），仍无法突破授信目的地边界；`test_push_feed_entry` 只会把文章发送到既有目的地，无法创建或修改目的地。
 
 ---
 
@@ -96,7 +96,7 @@ WebUI 内部预览接口（`POST /api/v1/feeds/preview`）会返回清洗后的 
 
 ## 4. 连接层防 SSRF 客户端（`src/net/ssrf.rs`、`src/net/mod.rs`）
 
-所有订阅源轮询、预览、Readability 全文提取以及 Telegram 防盗链媒体回退下载，均通过统一的 `ProtectedHttpClient` 与注入 `reqwest` 底层的 `SsrfDnsResolver`（实现 `reqwest::dns::Resolve`）执行。
+所有订阅源轮询、预览、Readability 全文提取、Telegram 防盗链媒体回退下载，以及**所有 Telegram Bot API 请求**（包括官方 `https://api.telegram.org` 与自定义 `api_base_url` / 自建 Local Bot API Server），均通过共享可热更新的 `Arc<RwLock<SsrfPolicy>>` 与注入 `reqwest` 底层的 `SsrfDnsResolver`（实现 `reqwest::dns::Resolve`）执行连接期防 SSRF 校验。
 
 ```mermaid
 sequenceDiagram
@@ -153,3 +153,9 @@ sequenceDiagram
 当通过 MCP `manage_feed(action = "add")` 或 REST API `POST /api/v1/feeds` 添加订阅源时，系统在插入 `feeds` 行后会立即执行一次初始拉取：
 - 若首次拉取返回普通临时网络错误（如上游超时），订阅源保留在库中并返回告警，交由后台指数退避重试；
 - 若首次拉取触发 **`AppError::SsrfBlocked`**，处理器会立即调用 `db.delete_feed(created.id)` **自动回滚删除刚创建的订阅源记录**，并返回 `ssrf_blocked` 错误，防止被拦截的内网探测地址残留在数据库中被后台调度器反复轮询。
+
+### 5. Telegram Bot API（`api_base_url`）防 SSRF 强校验
+`TelegramSender` 注入同一份共享的 `Arc<RwLock<SsrfPolicy>>`（当 `PUT /api/v1/settings` 热更新 `ssrf_allowlist` 时同步刷新）：
+- **连接期 DNS 校验与禁用重定向**：所有 Telegram Bot API 请求（官方地址与自定义 `api_base_url` / 自建 Local Bot API Server）均经过 `SsrfDnsResolver` 连接期解析校验，并禁用自动重定向（`redirect::Policy::none()`）；走 `OUTBOUND_PROXY` 代理时仍对字面量 IP 与 `localhost` 执行逐跳校验。
+- **严格的 `api_base_url` 语法校验**：仅允许 `http://` 与 `https://` 协议，禁止携带 userinfo（`user:pass@`）、查询字符串（`?…`）或片段（`#…`）；创建、编辑或探测时触发 SSRF 拦截统一返回 HTTP `403`（`ssrf_blocked`）。
+- **存量内网地址不自动放行**：升级至 `v0.2.0` 时，已配置的内网/私网 Local Bot API 地址不会被自动加入白名单，运维人员需手动将其主机名或 IP/CIDR 添加至 `SSRF_ALLOWLIST`。

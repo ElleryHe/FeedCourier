@@ -7,19 +7,23 @@ import {
   FileText,
   Filter,
   GitFork,
+  Globe,
   Image,
   Languages,
   MessageSquareText,
   Pencil,
   Plus,
+  RotateCcw,
   Trash2,
 } from "lucide-react";
 import { type FormEvent, useMemo, useState } from "react";
 import { api } from "@/api/client";
 import type {
-  ChannelDto,
-  CreateRouteRequest,
   ActiveWindow,
+  ChannelDestinationDto,
+  ChannelDto,
+  ChannelKind,
+  CreateRouteRequest,
   FeedDto,
   RouteDto,
   RouteOptions,
@@ -45,6 +49,12 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { type Locale, useI18n } from "@/i18n";
 import type { Messages } from "@/i18n/en";
+import {
+  browserTimeZone,
+  currentTimeIn,
+  listTimeZones,
+  utcOffsetLabel,
+} from "@/lib/timezone";
 import { errorMessage, validateRegex } from "@/lib/utils";
 
 function telegramModeLabel(
@@ -81,9 +91,11 @@ export function RoutesView() {
     queryKey: ["settings"],
     queryFn: () => api.settings.get(),
   });
-  const timezone = settingsQuery.data?.timezone ?? null;
+  const systemTimezone = settingsQuery.data?.timezone ?? "UTC";
   const legacyLocale: Locale | null = settingsQuery.data?.locale ?? null;
 
+  const [kindFilter, setKindFilter] = useState<ChannelKind | "all">("all");
+  const [accountFilter, setAccountFilter] = useState<number | "all">("all");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingRoute, setEditingRoute] = useState<RouteDto | null>(null);
   const [deletingRoute, setDeletingRoute] = useState<RouteDto | null>(null);
@@ -103,6 +115,8 @@ export function RoutesView() {
     queryFn: () => api.channels.list(),
   });
 
+  const channels = channelsQuery.data ?? [];
+
   const feedsById = useMemo(() => {
     const map = new Map<number, FeedDto>();
     for (const f of feedsQuery.data ?? []) map.set(f.id, f);
@@ -111,9 +125,48 @@ export function RoutesView() {
 
   const channelsById = useMemo(() => {
     const map = new Map<number, ChannelDto>();
-    for (const c of channelsQuery.data ?? []) map.set(c.id, c);
+    for (const c of channels) map.set(c.id, c);
     return map;
-  }, [channelsQuery.data]);
+  }, [channels]);
+
+  const destinationsById = useMemo(() => {
+    const map = new Map<
+      number,
+      { channel: ChannelDto; destination: ChannelDestinationDto }
+    >();
+    for (const c of channels) {
+      for (const d of c.destinations) {
+        map.set(d.id, { channel: c, destination: d });
+      }
+    }
+    return map;
+  }, [channels]);
+
+  const filteredAccounts = useMemo(
+    () =>
+      kindFilter === "all"
+        ? channels
+        : channels.filter((c) => c.kind === kindFilter),
+    [channels, kindFilter],
+  );
+
+  const allRoutes = routesQuery.data ?? [];
+  const filteredRoutes = useMemo(() => {
+    return allRoutes.filter((route) => {
+      const targetChannel =
+        destinationsById.get(route.destination_id)?.channel ??
+        channelsById.get(route.channel_id);
+      if (kindFilter !== "all" && targetChannel?.kind !== kindFilter) {
+        return false;
+      }
+      if (accountFilter !== "all" && route.channel_id !== accountFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [allRoutes, destinationsById, channelsById, kindFilter, accountFilter]);
+
+  const hasActiveFilter = kindFilter !== "all" || accountFilter !== "all";
 
   const allFeedTags = useMemo(() => {
     const tags = new Set<string>();
@@ -168,12 +221,78 @@ export function RoutesView() {
         </Button>
       </div>
 
+      {/* Cascading Filters: Channel Kind -> Account */}
+      <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex items-center gap-2">
+          <Label
+            htmlFor="routes-filter-kind"
+            className="whitespace-nowrap text-zinc-500 dark:text-zinc-400"
+          >
+            {m.routes.filterKindLabel}
+          </Label>
+          <Select
+            id="routes-filter-kind"
+            value={kindFilter}
+            onChange={(e) => {
+              setKindFilter(e.target.value as ChannelKind | "all");
+              setAccountFilter("all");
+            }}
+            className="h-8 w-44 text-xs"
+          >
+            <option value="all">{m.routes.allKinds}</option>
+            <option value="telegram">{m.channels.kindLabels.telegram}</option>
+            <option value="smtp">{m.channels.kindLabels.smtp}</option>
+            <option value="notion">{m.channels.kindLabels.notion}</option>
+          </Select>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Label
+            htmlFor="routes-filter-account"
+            className="whitespace-nowrap text-zinc-500 dark:text-zinc-400"
+          >
+            {m.routes.filterAccountLabel}
+          </Label>
+          <Select
+            id="routes-filter-account"
+            value={accountFilter === "all" ? "all" : String(accountFilter)}
+            onChange={(e) =>
+              setAccountFilter(
+                e.target.value === "all" ? "all" : Number(e.target.value),
+              )
+            }
+            className="h-8 w-52 text-xs"
+          >
+            <option value="all">{m.routes.allAccounts}</option>
+            {filteredAccounts.map((acc) => (
+              <option key={acc.id} value={acc.id}>
+                {acc.name} ({acc.kind.toUpperCase()})
+              </option>
+            ))}
+          </Select>
+        </div>
+
+        {hasActiveFilter && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setKindFilter("all");
+              setAccountFilter("all");
+            }}
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            {m.routes.clearFilters}
+          </Button>
+        )}
+      </div>
+
       {/* Routes List */}
       {routesQuery.isLoading ? (
         <Card className="p-8 text-center text-xs text-zinc-500">
           {m.routes.loading}
         </Card>
-      ) : (routesQuery.data?.length ?? 0) === 0 ? (
+      ) : allRoutes.length === 0 ? (
         <EmptyState
           icon={GitFork}
           title={m.routes.emptyTitle}
@@ -191,10 +310,39 @@ export function RoutesView() {
             </Button>
           }
         />
+      ) : filteredRoutes.length === 0 ? (
+        <EmptyState
+          icon={GitFork}
+          title={m.routes.emptyFilteredTitle}
+          description={m.routes.emptyFilteredDesc}
+          action={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setKindFilter("all");
+                setAccountFilter("all");
+              }}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              {m.routes.clearFilters}
+            </Button>
+          }
+        />
       ) : (
         <div className="space-y-3">
-          {(routesQuery.data ?? []).map((route) => {
-            const targetChannel = channelsById.get(route.channel_id);
+          {filteredRoutes.map((route) => {
+            const destEntry = destinationsById.get(route.destination_id);
+            const targetChannel =
+              destEntry?.channel ?? channelsById.get(route.channel_id);
+            const targetDest = destEntry?.destination;
+            const targetDisabled = Boolean(
+              targetChannel &&
+                targetDest &&
+                (!targetChannel.enabled || !targetDest.enabled),
+            );
+            const routeTz = route.options.timezone?.trim() || null;
+            const effectiveTz = routeTz ?? systemTimezone;
             const hasFilters =
               route.include_keywords.length > 0 ||
               route.exclude_keywords.length > 0 ||
@@ -205,7 +353,7 @@ export function RoutesView() {
               <Card key={route.id} className="p-4">
                 <div className="flex flex-col justify-between gap-3 lg:flex-row lg:items-center">
                   <div className="min-w-0 flex-1 space-y-2">
-                    {/* Title + Status */}
+                    {/* Title + Badges */}
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-semibold">
                         {route.name}
@@ -228,10 +376,20 @@ export function RoutesView() {
                           route.options.locale ?? legacyLocale ?? uiLocale,
                         )}
                       </Badge>
+                      <Badge
+                        variant={routeTz ? "mono" : "outline"}
+                        title={m.routes.routeTzBadgeTitle(
+                          effectiveTz,
+                          !routeTz,
+                        )}
+                      >
+                        <Globe className="h-3 w-3" />
+                        {routeTz ?? m.routes.inheritSystemTzBadge}
+                      </Badge>
                       {(route.options.active_windows ?? []).length > 0 && (
                         <Badge
                           variant="warning"
-                          title={m.routes.windowBadgeTitle(timezone ?? "")}
+                          title={m.routes.windowBadgeTitle(effectiveTz)}
                         >
                           <Clock className="h-3 w-3" />
                           {(route.options.active_windows ?? [])
@@ -251,7 +409,7 @@ export function RoutesView() {
                         )}
                     </div>
 
-                    {/* Source -> Destination Flow */}
+                    {/* Source -> Account -> Destination Flow */}
                     <div className="flex flex-wrap items-center gap-2 text-xs">
                       <div className="flex flex-wrap items-center gap-1">
                         {route.feed_ids.map((fid) => {
@@ -271,10 +429,22 @@ export function RoutesView() {
 
                       <ArrowRight className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
 
-                      <Badge variant={targetChannel ? "success" : "danger"}>
-                        {targetChannel
-                          ? `${targetChannel.name} (${targetChannel.kind.toUpperCase()})`
-                          : m.routes.channelFallback(route.channel_id)}
+                      <Badge
+                        variant={
+                          targetChannel && targetDest
+                            ? targetDisabled
+                              ? "warning"
+                              : "success"
+                            : "danger"
+                        }
+                      >
+                        {targetChannel && targetDest
+                          ? `${targetChannel.name} → ${targetDest.name} (${targetChannel.kind.toUpperCase()})${targetDisabled ? ` (${m.common.disabled})` : ""}`
+                          : targetChannel
+                            ? `${targetChannel.name} → ${m.routes.destinationFallback(route.destination_id)}`
+                            : m.routes.destinationFallback(
+                                route.destination_id,
+                              )}
                       </Badge>
                     </div>
 
@@ -362,9 +532,9 @@ export function RoutesView() {
           onClose={() => setEditorOpen(false)}
           route={editingRoute}
           feeds={feedsQuery.data ?? []}
-          channels={channelsQuery.data ?? []}
+          channels={channels}
           knownTags={allFeedTags}
-          timezone={timezone}
+          systemTimezone={systemTimezone}
           legacyLocale={legacyLocale}
         />
       )}
@@ -396,7 +566,7 @@ function RouteEditorModal({
   feeds,
   channels,
   knownTags,
-  timezone,
+  systemTimezone,
   legacyLocale,
 }: {
   open: boolean;
@@ -405,7 +575,7 @@ function RouteEditorModal({
   feeds: FeedDto[];
   channels: ChannelDto[];
   knownTags: string[];
-  timezone: string | null;
+  systemTimezone: string;
   legacyLocale: Locale | null;
 }) {
   const { m, locale: uiLocale } = useI18n();
@@ -413,14 +583,40 @@ function RouteEditorModal({
   const queryClient = useQueryClient();
   const isEdit = route !== null;
 
+  const timeZones = useMemo(() => listTimeZones(), []);
+  const detectedZone = useMemo(() => browserTimeZone(), []);
+
+  const channelsWithDestinations = useMemo(
+    () => channels.filter((c) => c.destinations.length > 0),
+    [channels],
+  );
+
+  const destinationsById = useMemo(() => {
+    const map = new Map<
+      number,
+      { channel: ChannelDto; destination: ChannelDestinationDto }
+    >();
+    for (const c of channels) {
+      for (const d of c.destinations) {
+        map.set(d.id, { channel: c, destination: d });
+      }
+    }
+    return map;
+  }, [channels]);
+
+  const firstDestinationId =
+    channelsWithDestinations[0]?.destinations[0]?.id ?? 0;
+
   const [name, setName] = useState(route?.name ?? "");
   const [feedIds, setFeedIds] = useState<number[]>(route?.feed_ids ?? []);
   const [matchTags, setMatchTags] = useState<string[]>(
     route?.match_tags ?? [],
   );
-  const [channelId, setChannelId] = useState<number>(
-    route?.channel_id ?? channels[0]?.id ?? 0,
+  const [destinationId, setDestinationId] = useState<number>(
+    route?.destination_id ?? firstDestinationId,
   );
+  const effectiveDestinationId =
+    destinationId || (!isEdit ? firstDestinationId : 0);
   const [includeKeywords, setIncludeKeywords] = useState<string[]>(
     route?.include_keywords ?? [],
   );
@@ -442,6 +638,9 @@ function RouteEditorModal({
   const [deliveryLocale, setDeliveryLocale] = useState<SystemLocale>(
     route ? (route.options.locale ?? legacyLocale ?? uiLocale) : uiLocale,
   );
+  const [routeTimezone, setRouteTimezone] = useState<string>(
+    route?.options.timezone ?? "",
+  );
   const [activeWindows, setActiveWindows] = useState<ActiveWindow[]>(
     route?.options.active_windows?.map((w) => ({ ...w })) ?? [],
   );
@@ -451,7 +650,13 @@ function RouteEditorModal({
   const [enabled, setEnabled] = useState<boolean>(route?.enabled ?? true);
   const [formError, setFormError] = useState<string | null>(null);
 
-  const selectedChannel = channels.find((c) => c.id === channelId);
+  const selectedChannel = destinationsById.get(effectiveDestinationId)?.channel;
+
+  const trimmedTz = routeTimezone.trim();
+  const effectiveTz = trimmedTz || systemTimezone;
+  const isEffectiveTzValid = timeZones.includes(effectiveTz);
+  const tzNow = isEffectiveTzValid ? currentTimeIn(effectiveTz) : null;
+  const tzOffset = isEffectiveTzValid ? utcOffsetLabel(effectiveTz) : null;
 
   const telegramModes: Array<{
     id: TelegramDeliveryMode;
@@ -496,6 +701,7 @@ function RouteEditorModal({
             }
           : {}),
         locale: deliveryLocale,
+        timezone: trimmedTz || null,
         active_windows: activeWindows,
         active_weekdays: [...activeWeekdays].sort((a, b) => a - b),
       };
@@ -505,7 +711,7 @@ function RouteEditorModal({
           name: name.trim(),
           feed_ids: feedIds,
           match_tags: matchTags,
-          channel_id: channelId,
+          destination_id: effectiveDestinationId,
           include_keywords: includeKeywords,
           exclude_keywords: excludeKeywords,
           include_regex: includeRegex.trim() || null,
@@ -520,7 +726,7 @@ function RouteEditorModal({
         name: name.trim(),
         feed_ids: feedIds,
         match_tags: matchTags,
-        channel_id: channelId,
+        destination_id: effectiveDestinationId,
         include_keywords: includeKeywords,
         exclude_keywords: excludeKeywords,
         include_regex: includeRegex.trim() || null,
@@ -548,12 +754,16 @@ function RouteEditorModal({
       setFormError(m.routes.editor.errEmptyName);
       return;
     }
-    if (!channelId) {
-      setFormError(m.routes.editor.errNoChannel);
+    if (!effectiveDestinationId) {
+      setFormError(m.routes.editor.errNoDestination);
       return;
     }
     if (feedIds.length === 0 && matchTags.length === 0) {
       setFormError(m.routes.editor.errNoSource);
+      return;
+    }
+    if (trimmedTz && !timeZones.includes(trimmedTz)) {
+      setFormError(m.routes.editor.errInvalidTimezone);
       return;
     }
     if (
@@ -612,20 +822,32 @@ function RouteEditorModal({
           </div>
 
           <div>
-            <Label htmlFor="route-channel">{m.routes.editor.channelLabel}</Label>
+            <Label htmlFor="route-destination">
+              {m.routes.editor.destinationLabel}
+            </Label>
             <Select
-              id="route-channel"
-              value={channelId || ""}
-              onChange={(e) => setChannelId(Number(e.target.value))}
+              id="route-destination"
+              value={effectiveDestinationId || ""}
+              onChange={(e) => setDestinationId(Number(e.target.value))}
               className="mt-1.5"
             >
-              {channels.length === 0 ? (
-                <option value="">{m.routes.editor.noChannelsOption}</option>
+              {channelsWithDestinations.length === 0 ? (
+                <option value="">{m.routes.editor.noDestinationsOption}</option>
               ) : (
-                channels.map((ch) => (
-                  <option key={ch.id} value={ch.id}>
-                    {ch.name} ({ch.kind.toUpperCase()})
-                  </option>
+                channelsWithDestinations.map((ch) => (
+                  <optgroup
+                    key={ch.id}
+                    label={`${ch.name} (${ch.kind.toUpperCase()})`}
+                  >
+                    {ch.destinations.map((dest) => (
+                      <option key={dest.id} value={dest.id}>
+                        {dest.name}
+                        {!ch.enabled || !dest.enabled
+                          ? ` (${m.common.disabled})`
+                          : ""}
+                      </option>
+                    ))}
+                  </optgroup>
                 ))
               )}
             </Select>
@@ -811,6 +1033,71 @@ function RouteEditorModal({
           <FieldHint>{m.routes.editor.languageHint}</FieldHint>
         </div>
 
+        {/* Route Timezone */}
+        <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+            <Globe className="h-3.5 w-3.5" />
+            {m.routes.editor.timezoneHeading}
+          </h3>
+          <div>
+            <Label htmlFor="route-timezone">
+              {m.routes.editor.timezoneLabel}
+            </Label>
+            <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              <Input
+                id="route-timezone"
+                list="fc-route-timezone-options"
+                value={routeTimezone}
+                onChange={(e) => {
+                  setRouteTimezone(e.target.value);
+                  setFormError(null);
+                }}
+                placeholder={m.routes.editor.timezonePlaceholder(
+                  systemTimezone,
+                )}
+                autoComplete="off"
+                spellCheck={false}
+                className="max-w-xs font-mono text-xs"
+              />
+              <datalist id="fc-route-timezone-options">
+                {timeZones.map((tz) => (
+                  <option key={tz} value={tz} />
+                ))}
+              </datalist>
+              {trimmedTz && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setRouteTimezone("");
+                    setFormError(null);
+                  }}
+                >
+                  {m.routes.editor.timezoneInheritBtn}
+                </Button>
+              )}
+              {detectedZone && detectedZone !== trimmedTz && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setRouteTimezone(detectedZone);
+                    setFormError(null);
+                  }}
+                >
+                  {m.settings.timezoneUseBrowser(detectedZone)}
+                </Button>
+              )}
+              {tzNow && (
+                <Badge variant="mono">
+                  {m.settings.timezoneNow(tzNow, tzOffset)}
+                </Badge>
+              )}
+            </div>
+            <FieldHint>{m.routes.editor.timezoneHint}</FieldHint>
+          </div>
+        </div>
+
         {/* Active Windows */}
         <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -819,11 +1106,11 @@ function RouteEditorModal({
               {m.routes.editor.windowsHeading}
             </h3>
             <Badge variant="mono">
-              {m.routes.editor.timezoneBadge(timezone ?? "—")}
+              {m.routes.editor.timezoneBadge(effectiveTz, !trimmedTz)}
             </Badge>
           </div>
           <FieldHint className="mt-0">
-            {m.routes.editor.windowsHint(timezone ?? "—")}
+            {m.routes.editor.windowsHint(effectiveTz)}
           </FieldHint>
 
           {activeWindows.length === 0 ? (

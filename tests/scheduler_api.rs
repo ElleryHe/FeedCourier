@@ -20,17 +20,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use feedcourier::api::{AppState, build_api_router};
 use feedcourier::channels::notion::NotionSender;
 use feedcourier::channels::{
-    ChannelConfig, ChannelKind, DeliveryCheckpoint, NotionChannelConfig, NotionColumnMapping,
-    RouteOptions, TelegramChannelConfig, TelegramDeliveryMode,
+    ChannelConfig, ChannelKind, DeliveryCheckpoint, DestinationConfig, NotionChannelConfig,
+    NotionColumnMapping, NotionDestinationConfig, RouteOptions, TelegramChannelConfig,
+    TelegramDeliveryMode, TelegramDestinationConfig,
 };
 use feedcourier::config::AppConfig;
 use feedcourier::crypto::{MasterKey, sha256_hex};
 use feedcourier::db::Database;
 use feedcourier::db::models::{
-    DeliveryTaskStatus, MediaAttachment, MediaAttachmentKind, NewChannel, NewEntry, NewFeed,
-    NewRoute, UpdateChannel, now_unix,
+    DeliveryTaskStatus, MediaAttachment, MediaAttachmentKind, NewChannel, NewDestination, NewEntry,
+    NewFeed, NewRoute, UpdateChannel, now_unix,
 };
-use feedcourier::net::ProtectedHttpClient;
+use feedcourier::net::{NetSettings, ProtectedHttpClient};
 use feedcourier::scheduler::{DeliveryDispatcher, ProtectedMediaFetcher};
 
 struct TestHarness {
@@ -542,7 +543,8 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
     assert_eq!(preview["feed_title"], "Rust Release Blog");
     assert_eq!(preview["items"].as_array().unwrap().len(), 2);
 
-    // 4. Create Telegram channel, verify secret masking & capability probing, then PATCH `chat_id` omitting `bot_token`.
+    // 4. Create Telegram channel account + initial destination, verify secret masking & capability
+    //    probing, then PATCH destination `chat_id` and PATCH account without losing `bot_token`.
     let (status, _, body) = h
         .send(
             Method::POST,
@@ -554,8 +556,15 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
                 "config": {
                     "kind": "telegram",
                     "bot_token": "123456789:ABCDEF_super_secret_token_WXYZ",
-                    "chat_id": "-100111222",
                     "api_base_url": mock_server.uri()
+                },
+                "initial_destination": {
+                    "name": "Primary Group",
+                    "config": {
+                        "kind": "telegram",
+                        "chat_id": "-100111222"
+                    },
+                    "enabled": true
                 },
                 "min_interval_secs": 0,
                 "jitter_max_secs": 0,
@@ -569,6 +578,7 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
     assert_eq!(status, StatusCode::CREATED);
     let created_ch = parse_json(&body);
     let channel_id = created_ch["id"].as_i64().unwrap();
+    let destination_id = created_ch["destinations"][0]["id"].as_i64().unwrap();
     assert_eq!(created_ch["capabilities"]["supports_rich_message"], true);
 
     let (status, _, list_body) = h
@@ -582,13 +592,34 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
     );
     let channels_json = parse_json(&list_body);
     assert_eq!(channels_json[0]["config"]["bot_token_hint"], "1234••••WXYZ");
-    assert_eq!(channels_json[0]["config"]["chat_id"], "-100111222");
+    assert_eq!(
+        channels_json[0]["destinations"][0]["config"]["chat_id"],
+        "-100111222"
+    );
 
-    // PATCH `chat_id` without supplying `bot_token` -> preserves encrypted `bot_token`!
-    let (status, _, patch_body) = h
+    // PATCH account name omitting `bot_token` -> preserves encrypted `bot_token`!
+    let (status, _, patch_acct_body) = h
         .send(
             Method::PATCH,
             &format!("/api/v1/channels/{channel_id}"),
+            Some(&cookie),
+            Some(json!({
+                "name": "TG Releases Account",
+                "config": {
+                    "kind": "telegram"
+                }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let patched_ch = parse_json(&patch_acct_body);
+    assert_eq!(patched_ch["config"]["bot_token_hint"], "1234••••WXYZ");
+
+    // PATCH destination `chat_id` -> updates target cleanly!
+    let (status, _, patch_dest_body) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/destinations/{destination_id}"),
             Some(&cookie),
             Some(json!({
                 "config": {
@@ -599,9 +630,8 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    let patched_ch = parse_json(&patch_body);
-    assert_eq!(patched_ch["config"]["chat_id"], "-100999888");
-    assert_eq!(patched_ch["config"]["bot_token_hint"], "1234••••WXYZ");
+    let patched_dest = parse_json(&patch_dest_body);
+    assert_eq!(patched_dest["config"]["chat_id"], "-100999888");
 
     // 5. Invalid regex on `POST /api/v1/routes` returns 400; valid route returns 201.
     let (status, _, _) = h
@@ -613,7 +643,7 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
                 "name": "Bad Regex Route",
                 "feed_ids": [],
                 "match_tags": ["rust"],
-                "channel_id": channel_id,
+                "destination_id": destination_id,
                 "include_keywords": [],
                 "exclude_keywords": [],
                 "include_regex": "[unclosed-group",
@@ -634,7 +664,7 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
                 "name": "Rust -> Telegram",
                 "feed_ids": [],
                 "match_tags": ["rust"],
-                "channel_id": channel_id,
+                "destination_id": destination_id,
                 "include_keywords": ["Rust"],
                 "exclude_keywords": [],
                 "include_regex": null,
@@ -645,7 +675,9 @@ async fn end_to_end_settings_hot_reload_telegram_pipeline_and_secret_masking() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
-    let route_id = parse_json(&route_body)["id"].as_i64().unwrap();
+    let route_json = parse_json(&route_body);
+    let route_id = route_json["id"].as_i64().unwrap();
+    assert_eq!(route_json["destination_id"], destination_id);
 
     // 6. `POST /api/v1/feeds` with `silent_init: true, push_latest_one: true` fingerprints both
     // items and enqueues exactly 1 task for the newest entry.
@@ -717,6 +749,8 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
     let ds_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     let cfg = ChannelConfig::Notion(NotionChannelConfig {
         integration_secret: "ntn_secret_reconcile_123456".to_string(),
+    });
+    let dest_cfg = DestinationConfig::Notion(NotionDestinationConfig {
         data_source_id: ds_id.to_string(),
         database_id: None,
         parent_page_id: None,
@@ -738,6 +772,15 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
         })
         .await
         .unwrap();
+    let destination =
+        h.db.create_destination(&NewDestination {
+            channel_id: channel.id,
+            name: "Inbox DB".to_string(),
+            encrypted_config: h.master_key.encrypt_json(&dest_cfg).unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
 
     let feed =
         h.db.create_feed(&NewFeed::new("https://example.com/feed.xml"))
@@ -749,6 +792,7 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
             feed_ids: vec![feed.id],
             match_tags: vec![],
             channel_id: channel.id,
+            destination_id: destination.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -783,10 +827,16 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
     };
 
     let task1 =
-        h.db.enqueue_delivery_task(route.id, channel.id, entry1.id, now_unix() - 120)
-            .await
-            .unwrap()
-            .unwrap();
+        h.db.enqueue_delivery_task(
+            route.id,
+            channel.id,
+            destination.id,
+            entry1.id,
+            now_unix() - 120,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
     // Simulate a worker that crashed mid-flight after persisting `create_initiated: true`
     // and whose `delivering` lease expired 60 seconds ago (`lease_until < now`).
@@ -867,7 +917,7 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
     };
 
     let task2 =
-        h.db.enqueue_delivery_task(route.id, channel.id, entry2.id, now_unix())
+        h.db.enqueue_delivery_task(route.id, channel.id, destination.id, entry2.id, now_unix())
             .await
             .unwrap()
             .unwrap();
@@ -884,6 +934,11 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
     assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
     let deferred_task2 = h.db.get_delivery_task(task2.id).await.unwrap().unwrap();
     assert_eq!(deferred_task2.status, DeliveryTaskStatus::Deferred);
+    assert_eq!(
+        deferred_task2.last_status_code,
+        Some(202),
+        "Notion 202 async deferral must persist status code 202"
+    );
     assert_eq!(
         deferred_task2.attempt_count, 0,
         "202 Accepted async poll must not consume retry budget"
@@ -902,6 +957,12 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
 async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
     let mock_tg = MockServer::start().await;
     let h = TestHarness::new().await;
+    h.dispatcher
+        .reload_network_settings(NetSettings {
+            outbound_proxy_url: None,
+            ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+        })
+        .unwrap();
 
     Mock::given(method("POST"))
         .and(path_regex(r"^/bot.*/sendMessage$"))
@@ -914,9 +975,11 @@ async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
 
     let tg_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "999888777:quota_test_token_123456".to_string(),
+        api_base_url: Some(mock_tg.uri()),
+    });
+    let tg_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-100555".to_string(),
         message_thread_id: None,
-        api_base_url: Some(mock_tg.uri()),
     });
 
     // `hourly_quota = 1`, zero pacing so the 2nd task specifically hits `hourly_quota`.
@@ -936,6 +999,15 @@ async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
         })
         .await
         .unwrap();
+    let destination =
+        h.db.create_destination(&NewDestination {
+            channel_id: channel.id,
+            name: "Quota Chat".to_string(),
+            encrypted_config: h.master_key.encrypt_json(&tg_dest).unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
 
     let feed =
         h.db.create_feed(&NewFeed::new("https://example.com/quota.xml"))
@@ -947,6 +1019,7 @@ async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
             feed_ids: vec![feed.id],
             match_tags: vec![],
             channel_id: channel.id,
+            destination_id: destination.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -992,7 +1065,7 @@ async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
             _ => unreachable!(),
         };
         let t =
-            h.db.enqueue_delivery_task(route.id, channel.id, entry.id, now_unix())
+            h.db.enqueue_delivery_task(route.id, channel.id, destination.id, entry.id, now_unix())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1062,6 +1135,12 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
     let mock_tg = MockServer::start().await;
     // Set `max_delivery_attempts = 2` so we can verify `retrying` -> `dead_letter` -> `POST /api/v1/tasks/retry`.
     let h = TestHarness::with_builder(|d| d.with_max_delivery_attempts(2)).await;
+    h.dispatcher
+        .reload_network_settings(NetSettings {
+            outbound_proxy_url: None,
+            ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+        })
+        .unwrap();
     let cookie = h.setup_admin_and_cookie().await;
 
     Mock::given(method("POST"))
@@ -1078,15 +1157,19 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
     // Two distinct channels sharing the exact same Telegram Bot token (`credential_group_key`).
     let cfg_a = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "555666777:shared_bot_token_for_group_lock".to_string(),
+        api_base_url: Some(mock_tg.uri()),
+    });
+    let dest_cfg_a = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-100111".to_string(),
         message_thread_id: None,
-        api_base_url: Some(mock_tg.uri()),
     });
     let cfg_b = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "555666777:shared_bot_token_for_group_lock".to_string(),
+        api_base_url: Some(mock_tg.uri()),
+    });
+    let dest_cfg_b = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-100222".to_string(),
         message_thread_id: None,
-        api_base_url: Some(mock_tg.uri()),
     });
     assert_eq!(cfg_a.credential_group_key(), cfg_b.credential_group_key());
 
@@ -1102,6 +1185,15 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
             hourly_quota: None,
             daily_quota: None,
             use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let dest_a =
+        h.db.create_destination(&NewDestination {
+            channel_id: ch_a.id,
+            name: "Dest A".to_string(),
+            encrypted_config: h.master_key.encrypt_json(&dest_cfg_a).unwrap(),
             enabled: true,
         })
         .await
@@ -1123,6 +1215,15 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
         })
         .await
         .unwrap();
+    let dest_b =
+        h.db.create_destination(&NewDestination {
+            channel_id: ch_b.id,
+            name: "Dest B".to_string(),
+            encrypted_config: h.master_key.encrypt_json(&dest_cfg_b).unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
 
     let feed =
         h.db.create_feed(&NewFeed::new("https://example.com/rate-limit.xml"))
@@ -1134,6 +1235,7 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
             feed_ids: vec![feed.id],
             match_tags: vec![],
             channel_id: ch_a.id,
+            destination_id: dest_a.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -1153,6 +1255,7 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
             feed_ids: vec![feed.id],
             match_tags: vec![],
             channel_id: ch_b.id,
+            destination_id: dest_b.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -1190,12 +1293,12 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
     };
 
     let task_a =
-        h.db.enqueue_delivery_task(route_a.id, ch_a.id, entry.id, now_unix())
+        h.db.enqueue_delivery_task(route_a.id, ch_a.id, dest_a.id, entry.id, now_unix())
             .await
             .unwrap()
             .unwrap();
     let _task_b =
-        h.db.enqueue_delivery_task(route_b.id, ch_b.id, entry.id, now_unix())
+        h.db.enqueue_delivery_task(route_b.id, ch_b.id, dest_b.id, entry.id, now_unix())
             .await
             .unwrap()
             .unwrap();
@@ -1356,9 +1459,16 @@ async fn maintenance_backup_gc_opml_mcp_tokens_and_scheduler_shutdown() {
                 "kind": "notion",
                 "config": {
                     "kind": "notion",
-                    "integration_secret": "ntn_stored_secret_abcdef123456",
-                    "data_source_id": ds_id,
-                    "column_mapping": NotionColumnMapping::standard()
+                    "integration_secret": "ntn_stored_secret_abcdef123456"
+                },
+                "initial_destination": {
+                    "name": "Reading List",
+                    "config": {
+                        "kind": "notion",
+                        "data_source_id": ds_id,
+                        "column_mapping": NotionColumnMapping::standard()
+                    },
+                    "enabled": true
                 },
                 "min_interval_secs": 5,
                 "jitter_max_secs": 2,
@@ -1370,7 +1480,9 @@ async fn maintenance_backup_gc_opml_mcp_tokens_and_scheduler_shutdown() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
-    let notion_ch_id = parse_json(&ch_body)["id"].as_i64().unwrap();
+    let notion_ch_json = parse_json(&ch_body);
+    let notion_ch_id = notion_ch_json["id"].as_i64().unwrap();
+    let notion_dest_id = notion_ch_json["destinations"][0]["id"].as_i64().unwrap();
 
     let (status, _, inspect_body) = h
         .send(
@@ -1479,6 +1591,7 @@ async fn maintenance_backup_gc_opml_mcp_tokens_and_scheduler_shutdown() {
             feed_ids: vec![feed_id],
             match_tags: vec![],
             channel_id: notion_ch_id,
+            destination_id: notion_dest_id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -1490,10 +1603,16 @@ async fn maintenance_backup_gc_opml_mcp_tokens_and_scheduler_shutdown() {
         .unwrap();
 
     let in_flight =
-        h.db.enqueue_delivery_task(route.id, notion_ch_id, protected_entry.id, now_unix() + 600)
-            .await
-            .unwrap()
-            .unwrap();
+        h.db.enqueue_delivery_task(
+            route.id,
+            notion_ch_id,
+            notion_dest_id,
+            protected_entry.id,
+            now_unix() + 600,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(in_flight.status, DeliveryTaskStatus::Queued);
 
     let (status, _, gc_body) = h
@@ -1657,8 +1776,15 @@ async fn poller_batch_channel_test_notion_init_db_and_crud_mutations() {
                 "config": {
                     "kind": "telegram",
                     "bot_token": "777:test_channel_secret_token",
-                    "chat_id": "-100333",
                     "api_base_url": base_uri
+                },
+                "initial_destination": {
+                    "name": "Test Chat",
+                    "config": {
+                        "kind": "telegram",
+                        "chat_id": "-100333"
+                    },
+                    "enabled": true
                 },
                 "min_interval_secs": 0,
                 "jitter_max_secs": 0,
@@ -1670,8 +1796,11 @@ async fn poller_batch_channel_test_notion_init_db_and_crud_mutations() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
-    let ch_id = parse_json(&tg_body)["id"].as_i64().unwrap();
+    let tg_json = parse_json(&tg_body);
+    let ch_id = tg_json["id"].as_i64().unwrap();
+    let dest_id = tg_json["destinations"][0]["id"].as_i64().unwrap();
 
+    // Account-level test (`POST /api/v1/channels/{id}/test`)
     let (status, _, test_resp_body) = h
         .send(
             Method::POST,
@@ -1684,6 +1813,18 @@ async fn poller_batch_channel_test_notion_init_db_and_crud_mutations() {
     let test_resp = parse_json(&test_resp_body);
     assert_eq!(test_resp["ok"], true);
     assert_eq!(test_resp["capabilities"]["supports_rich_message"], true);
+
+    // Destination-level test (`POST /api/v1/destinations/{id}/test`)
+    let (status, _, dest_test_body) = h
+        .send(
+            Method::POST,
+            &format!("/api/v1/destinations/{dest_id}/test"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&dest_test_body)["ok"], true);
 
     // 3. `poll_due_feeds_once` + `POST /api/v1/feeds/{id}/poll` + PATCH/DELETE lifecycle.
     Mock::given(method("GET"))
@@ -1806,4 +1947,1429 @@ async fn poller_batch_channel_test_notion_init_db_and_crud_mutations() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn multi_destination_channel_shares_quotas_pacing_and_auto_naming() {
+    let mock_tg = MockServer::start().await;
+    let base_uri = mock_tg.uri();
+    let h = TestHarness::new().await;
+    let cookie = h.setup_admin_and_cookie().await;
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({
+                "outbound_proxy_url": null,
+                "ssrf_allowlist": ["127.0.0.1/32", "::1/128"]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    Mock::given(method("GET"))
+        .and(path("/bot888:shared_acct_tok/getMe"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "id": 888, "is_bot": true, "first_name": "SharedBot", "username": "shared_bot" }
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot888:shared_acct_tok/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: chat_id is empty"
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot888:shared_acct_tok/getChat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "id": -100111, "type": "supergroup", "title": "Group Alpha" }
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot888:shared_acct_tok/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 505 }
+        })))
+        .mount(&mock_tg)
+        .await;
+
+    // 1. Create Telegram account without name -> auto-named `@shared_bot`, with `hourly_quota = 1`.
+    let (status, _, ch_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "888:shared_acct_tok",
+                    "api_base_url": base_uri
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "hourly_quota": 1,
+                "daily_quota": null,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let ch = parse_json(&ch_body);
+    let channel_id = ch["id"].as_i64().unwrap();
+    assert_eq!(ch["name"], "@shared_bot");
+    assert_eq!(ch["destinations"].as_array().unwrap().len(), 0);
+
+    // 2. Add Dest 1 without name -> auto-named `"Group Alpha"` via `getChat`.
+    let (status, _, d1_body) = h
+        .send(
+            Method::POST,
+            &format!("/api/v1/channels/{channel_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "config": { "kind": "telegram", "chat_id": "-100111" },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let d1 = parse_json(&d1_body);
+    let d1_id = d1["id"].as_i64().unwrap();
+    assert_eq!(d1["name"], "Group Alpha");
+
+    // 3. Add Dest 2 with explicit name `"Group Beta"`.
+    let (status, _, d2_body) = h
+        .send(
+            Method::POST,
+            &format!("/api/v1/channels/{channel_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "name": "Group Beta",
+                "config": { "kind": "telegram", "chat_id": "-100222", "message_thread_id": 5 },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let d2_id = parse_json(&d2_body)["id"].as_i64().unwrap();
+
+    // 4. Route creation with ONLY `channel_id` must now fail with 400 (ambiguous: 2 destinations).
+    let (status, _, _) = h
+        .send(
+            Method::POST,
+            "/api/v1/routes",
+            Some(&cookie),
+            Some(json!({
+                "name": "Ambiguous",
+                "channel_id": channel_id,
+                "options": { "telegram_mode": "compact_card" }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Create Route 1 -> Dest 1 and Route 2 -> Dest 2.
+    let (status, _, r1_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/routes",
+            Some(&cookie),
+            Some(json!({
+                "name": "Route Alpha",
+                "destination_id": d1_id,
+                "options": { "telegram_mode": "compact_card" }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let r1_id = parse_json(&r1_body)["id"].as_i64().unwrap();
+
+    let (status, _, r2_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/routes",
+            Some(&cookie),
+            Some(json!({
+                "name": "Route Beta",
+                "destination_id": d2_id,
+                "options": { "telegram_mode": "compact_card" }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let r2_id = parse_json(&r2_body)["id"].as_i64().unwrap();
+
+    let feed =
+        h.db.create_feed(&NewFeed::new("https://example.com/shared-quota.xml"))
+            .await
+            .unwrap();
+    let entry = match h
+        .db
+        .insert_entry_if_new(&NewEntry {
+            feed_id: feed.id,
+            fingerprint_sha256: sha256_hex(b"shared-quota-entry"),
+            published_at: Some(now_unix()),
+            discovered_at: now_unix(),
+            title: Some("Shared Rate Limit Post".to_string()),
+            canonical_url: Some("https://example.com/shared-1".to_string()),
+            author: None,
+            content_html: Some("<p>Body</p>".to_string()),
+            first_sentence: Some("Body".to_string()),
+            summary_text: Some("Body".to_string()),
+            media: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+        _ => unreachable!(),
+    };
+
+    let t1 =
+        h.db.enqueue_delivery_task(r1_id, channel_id, d1_id, entry.id, now_unix() - 2)
+            .await
+            .unwrap()
+            .unwrap();
+    let t2 =
+        h.db.enqueue_delivery_task(r2_id, channel_id, d2_id, entry.id, now_unix() - 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+    // 5. Task 1 delivers to Dest 1, consuming the shared account's hourly_quota = 1.
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    assert_eq!(
+        h.db.get_delivery_task(t1.id).await.unwrap().unwrap().status,
+        DeliveryTaskStatus::Delivered
+    );
+
+    // 6. Task 2 targets Dest 2 under the SAME Channel Account -> MUST be deferred by shared hourly quota!
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let t2_after_quota = h.db.get_delivery_task(t2.id).await.unwrap().unwrap();
+    assert_eq!(t2_after_quota.status, DeliveryTaskStatus::Deferred);
+    assert_eq!(t2_after_quota.attempt_count, 0);
+    assert!(
+        t2_after_quota
+            .diagnostic_log
+            .as_deref()
+            .unwrap_or("")
+            .contains("hourly quota"),
+        "Dest 2 must share Dest 1's channel hourly_quota: {:?}",
+        t2_after_quota.diagnostic_log
+    );
+
+    // 7. Raise hourly_quota to 10 and enable `min_interval_secs = 60` -> Task 2 MUST be deferred by shared pacing!
+    h.db.update_channel(
+        channel_id,
+        &UpdateChannel {
+            hourly_quota: Some(Some(10)),
+            min_interval_secs: Some(60),
+            ..UpdateChannel::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE delivery_tasks SET next_attempt_at = ?1 WHERE id = ?2")
+        .bind(now_unix() - 1)
+        .bind(t2.id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let t2_after_pacing = h.db.get_delivery_task(t2.id).await.unwrap().unwrap();
+    assert_eq!(t2_after_pacing.status, DeliveryTaskStatus::Deferred);
+    assert!(
+        t2_after_pacing
+            .diagnostic_log
+            .as_deref()
+            .unwrap_or("")
+            .contains("pacing"),
+        "Dest 2 must share Dest 1's channel pacing interval: {:?}",
+        t2_after_pacing.diagnostic_log
+    );
+
+    // 8. Disabling Dest 2 prevents Task 2 from being claimed even after pacing is cleared.
+    h.db.update_channel(
+        channel_id,
+        &UpdateChannel {
+            min_interval_secs: Some(0),
+            ..UpdateChannel::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/destinations/{d2_id}"),
+            Some(&cookie),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE delivery_tasks SET next_attempt_at = ?1 WHERE id = ?2")
+        .bind(now_unix() - 1)
+        .bind(t2.id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+    assert!(
+        !h.dispatcher.process_next_outbox_task().await.unwrap(),
+        "disabled destination must not be claimed"
+    );
+}
+
+#[tokio::test]
+async fn qa_hardening_quota_ledger_route_sync_status_codes_channel_validation_and_media_referer() {
+    use feedcourier::channels::telegram::MediaStreamFetcher as _;
+
+    let mock_tg = MockServer::start().await;
+    let mock_notion = MockServer::start().await;
+    let notion_base = mock_notion.uri();
+    let h = TestHarness::with_builder(|d| {
+        let notion = NotionSender::with_base_url(&notion_base, None).unwrap();
+        d.with_notion_sender(notion)
+    })
+    .await;
+    let cookie = h.setup_admin_and_cookie().await;
+
+    // -------------------------------------------------------------------------
+    // 1. P1-01: Telegram SSRF guard rejects loopback `api_base_url` BEFORE allowlisting with 403.
+    // -------------------------------------------------------------------------
+    let (status, _, ssrf_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "111:blocked_token",
+                    "api_base_url": mock_tg.uri()
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(parse_json(&ssrf_body)["code"], "ssrf_blocked");
+
+    // Allowlist `127.0.0.1/32` via hot-reloaded settings.
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({
+                "outbound_proxy_url": null,
+                "ssrf_allowlist": ["127.0.0.1/32", "::1/128"]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // -------------------------------------------------------------------------
+    // 2. P3-03: Telegram `getMe` 401 rejects creation; SMTP `password: null` clears password while
+    //    omitting preserves it; SMTP leading empty recipient auto-names first non-empty email.
+    // -------------------------------------------------------------------------
+    Mock::given(method("GET"))
+        .and(path("/bot999:bad_tok/getMe"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "ok": false,
+            "error_code": 401,
+            "description": "Unauthorized"
+        })))
+        .mount(&mock_tg)
+        .await;
+
+    let (status, _, _) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "999:bad_tok",
+                    "api_base_url": mock_tg.uri()
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "invalid Telegram bot token must fail channel creation with 401"
+    );
+
+    // SMTP password clear vs preserve + leading empty recipient auto-naming.
+    let (status, _, smtp_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "smtp",
+                "config": {
+                    "kind": "smtp",
+                    "host": "smtp.example.com",
+                    "port": 587,
+                    "username": "mailer@example.com",
+                    "password": "initial-secret-password",
+                    "security": "start_tls",
+                    "from_address": "mailer@example.com"
+                },
+                "initial_destination": {
+                    "config": {
+                        "kind": "smtp",
+                        "to_addresses": ["", "  ", "ops@example.com"]
+                    },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let smtp_ch = parse_json(&smtp_body);
+    let smtp_id = smtp_ch["id"].as_i64().unwrap();
+    assert_eq!(smtp_ch["config"]["has_password"], true);
+    assert_eq!(
+        smtp_ch["destinations"][0]["name"], "ops@example.com",
+        "auto-naming must pick the first non-empty trimmed SMTP recipient"
+    );
+
+    // PATCH omitting `password` preserves stored password.
+    let (status, _, patch1) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/channels/{smtp_id}"),
+            Some(&cookie),
+            Some(json!({ "config": { "kind": "smtp", "port": 2525 } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&patch1)["config"]["has_password"], true);
+
+    // PATCH with explicit `"password": null` clears stored password.
+    let (status, _, patch2) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/channels/{smtp_id}"),
+            Some(&cookie),
+            Some(json!({ "config": { "kind": "smtp", "password": null } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&patch2)["config"]["has_password"], false);
+
+    // -------------------------------------------------------------------------
+    // 3. Notion `/v1/users/me` auto-naming + 0-destination `channel_id` fallback returns 400.
+    // -------------------------------------------------------------------------
+    Mock::given(method("GET"))
+        .and(path("/v1/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "user",
+            "id": "bot-user-1",
+            "type": "bot",
+            "name": "FeedCourier Workspace Bot"
+        })))
+        .expect(1)
+        .mount(&mock_notion)
+        .await;
+
+    let (status, _, notion_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "notion",
+                "config": {
+                    "kind": "notion",
+                    "integration_secret": "ntn_autoname_secret_123456"
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let notion_ch = parse_json(&notion_body);
+    let notion_ch_id = notion_ch["id"].as_i64().unwrap();
+    assert_eq!(notion_ch["name"], "FeedCourier Workspace Bot");
+
+    // 0-destination channel with `channel_id` fallback must fail cleanly with 400 Bad Request.
+    let (status, _, _) = h
+        .send(
+            Method::POST,
+            "/api/v1/routes",
+            Some(&cookie),
+            Some(json!({
+                "name": "Zero Dest Route",
+                "channel_id": notion_ch_id
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // -------------------------------------------------------------------------
+    // 4. P2-05 (Quota ledger survives destination/route deletion & clear-cache) +
+    //    P2-04 (Route destination switch repoints queued/deferred/retrying tasks & clears checkpoint) +
+    //    P2-07 (Delivered clears stale >=400 status; quota deferral preserves prior failure log) +
+    //    P3-01 (Disabled route tasks are NOT claimed; strictest sibling credential-group quota enforced).
+    // -------------------------------------------------------------------------
+    Mock::given(method("GET"))
+        .and(path("/bot555:ledger_tok/getMe"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "id": 555, "is_bot": true, "username": "ledger_bot" }
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot555:ledger_tok/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: chat_id is empty"
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot555:ledger_tok/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 601 }
+        })))
+        .mount(&mock_tg)
+        .await;
+
+    let (status, _, tg_a_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "555:ledger_tok",
+                    "api_base_url": mock_tg.uri()
+                },
+                "initial_destination": {
+                    "name": "Dest One",
+                    "config": { "kind": "telegram", "chat_id": "-1001" },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "hourly_quota": 1,
+                "daily_quota": null,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let tg_a = parse_json(&tg_a_body);
+    let tg_ch_id = tg_a["id"].as_i64().unwrap();
+    let d1_id = tg_a["destinations"][0]["id"].as_i64().unwrap();
+
+    // Add second destination under same channel.
+    let (status, _, d2_body) = h
+        .send(
+            Method::POST,
+            &format!("/api/v1/channels/{tg_ch_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "name": "Dest Two",
+                "config": { "kind": "telegram", "chat_id": "-1002" },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let d2_id = parse_json(&d2_body)["id"].as_i64().unwrap();
+
+    // Create a sibling channel with the SAME bot token and UNLIMITED quota (`hourly_quota: null`),
+    // to prove P3-01 enforces the strictest sibling quota (`1`) across the credential group!
+    let (status, _, sib_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "name": "Sibling Unlimited",
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "555:ledger_tok",
+                    "api_base_url": mock_tg.uri()
+                },
+                "initial_destination": {
+                    "name": "Sibling Dest",
+                    "config": { "kind": "telegram", "chat_id": "-1003" },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "hourly_quota": null,
+                "daily_quota": null,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let sib = parse_json(&sib_body);
+    let sib_ch_id = sib["id"].as_i64().unwrap();
+    let sib_dest_id = sib["destinations"][0]["id"].as_i64().unwrap();
+
+    let feed =
+        h.db.create_feed(&NewFeed::new("https://example.com/ledger.xml"))
+            .await
+            .unwrap();
+    let mut entries = Vec::new();
+    for i in 1..=3 {
+        let e = match h
+            .db
+            .insert_entry_if_new(&NewEntry {
+                feed_id: feed.id,
+                fingerprint_sha256: sha256_hex(format!("ledger-item-{i}").as_bytes()),
+                published_at: Some(now_unix() - 10 + i),
+                discovered_at: now_unix() - 10 + i,
+                title: Some(format!("Ledger Item {i}")),
+                canonical_url: Some(format!("https://example.com/l-{i}")),
+                author: None,
+                content_html: Some("<p>Body</p>".to_string()),
+                first_sentence: Some("Body".to_string()),
+                summary_text: Some("Body".to_string()),
+                media: vec![],
+            })
+            .await
+            .unwrap()
+        {
+            feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+            _ => unreachable!(),
+        };
+        entries.push(e);
+    }
+
+    let r1 =
+        h.db.create_route(&NewRoute {
+            name: "R1".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: tg_ch_id,
+            destination_id: d1_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                telegram_mode: TelegramDeliveryMode::CompactCard,
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let r_sib =
+        h.db.create_route(&NewRoute {
+            name: "R-Sibling".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: sib_ch_id,
+            destination_id: sib_dest_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                telegram_mode: TelegramDeliveryMode::CompactCard,
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    // Deliver task 1 on `d1_id` -> consumes hourly_quota = 1 in `delivery_quota_ledger`.
+    let t1 =
+        h.db.enqueue_delivery_task(r1.id, tg_ch_id, d1_id, entries[0].id, now_unix() - 5)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    assert_eq!(
+        h.db.get_delivery_task(t1.id).await.unwrap().unwrap().status,
+        DeliveryTaskStatus::Delivered
+    );
+
+    // Delete `d1_id` (which cascades `r1` and `t1`!): ledger MUST preserve the quota count (`1`)!
+    let (status, _, _) = h
+        .send(
+            Method::DELETE,
+            &format!("/api/v1/destinations/{d1_id}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Enqueue task on sibling unlimited channel with a prior 502 error log & status code;
+    // P2-05 + P3-01 must STILL defer it due to strictest credential-group quota = 1, AND
+    // P2-07 must preserve the prior failure diagnostic in the deferred log!
+    let t_sib =
+        h.db.enqueue_delivery_task(
+            r_sib.id,
+            sib_ch_id,
+            sib_dest_id,
+            entries[1].id,
+            now_unix() - 2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    h.db.mark_task_retrying(
+        t_sib.id,
+        now_unix() - 1,
+        Some(502),
+        Some(&DeliveryCheckpoint::Telegram {
+            next_batch_offset: 1,
+            sent_message_ids: vec![42],
+            degraded_to_compact: false,
+        }),
+        "Upstream 502 Bad Gateway",
+    )
+    .await
+    .unwrap();
+
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let deferred_sib = h.db.get_delivery_task(t_sib.id).await.unwrap().unwrap();
+    assert_eq!(deferred_sib.status, DeliveryTaskStatus::Deferred);
+    let diag = deferred_sib.diagnostic_log.as_deref().unwrap_or("");
+    assert!(
+        diag.contains("hourly quota") && diag.contains("Upstream 502 Bad Gateway"),
+        "quota deferral must survive deleted destination, enforce sibling strictest quota, and preserve prior error log: {diag}"
+    );
+
+    // P2-04: Update `r_sib` target destination to `d2_id` via REST -> `t_sib` must atomically
+    // repoint to `(tg_ch_id, d2_id)` with cleared checkpoint, `attempt_count = 0`, and `last_status_code = NULL`!
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/routes/{}", r_sib.id),
+            Some(&cookie),
+            Some(json!({ "destination_id": d2_id })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let repointed = h.db.get_delivery_task(t_sib.id).await.unwrap().unwrap();
+    assert_eq!(repointed.channel_id, tg_ch_id);
+    assert_eq!(repointed.destination_id, d2_id);
+    assert_eq!(repointed.checkpoint_json, None);
+    assert_eq!(repointed.attempt_count, 0);
+    assert_eq!(repointed.last_status_code, None);
+
+    // P3-01: Disabling `r_sib` prevents `claim_next_delivery_task` from claiming `t_sib` at all!
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/routes/{}", r_sib.id),
+            Some(&cookie),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        h.db.claim_next_delivery_task(now_unix() + 10, 60)
+            .await
+            .unwrap()
+            .is_none(),
+        "tasks belonging to a disabled route must not be claimed"
+    );
+
+    // P2-07: `mark_task_delivered` with `status_code = None` clears a stale `>= 400` status code.
+    h.db.mark_task_retrying(t_sib.id, now_unix(), Some(503), None, "temp 503")
+        .await
+        .unwrap();
+    let delivered_cleared =
+        h.db.mark_task_delivered(t_sib.id, now_unix(), None, None, Some("delivered ok"))
+            .await
+            .unwrap();
+    assert_eq!(
+        delivered_cleared.last_status_code, None,
+        "mark_task_delivered(None) must clear stale >=400 error codes"
+    );
+
+    // -------------------------------------------------------------------------
+    // 5. P2-03: `ProtectedMediaFetcher` strips cross-origin Referer on redirect, synthesizes
+    //    per-hop origin Referer, and sends browser-compatible User-Agent.
+    // -------------------------------------------------------------------------
+    let hop1 = MockServer::start().await;
+    let hop2 = MockServer::start().await;
+    let hop2_uri = hop2.uri();
+    let hop1_uri = hop1.uri();
+    let hop2_expected_referer = format!("{hop2_uri}/");
+
+    Mock::given(method("GET"))
+        .and(path("/redirect.jpg"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("Location", format!("{hop2_uri}/final.jpg")),
+        )
+        .mount(&hop1)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/final.jpg"))
+        .respond_with(move |req: &wiremock::Request| {
+            let referer = req
+                .headers
+                .get("referer")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let ua = req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(
+                referer, hop2_expected_referer,
+                "cross-origin redirect must use hop-2 origin Referer, not hop-1 ({hop1_uri})"
+            );
+            assert!(
+                ua.starts_with("Mozilla/5.0 (compatible; FeedCourier/"),
+                "media fetcher must send browser-compatible User-Agent, got: {ua}"
+            );
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/jpeg")
+                .set_body_bytes(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])
+        })
+        .expect(1)
+        .mount(&hop2)
+        .await;
+
+    let media = h
+        .dispatcher
+        .media_fetcher()
+        .fetch_media(&format!("{}/redirect.jpg", hop1.uri()), 1024 * 1024, false)
+        .await
+        .expect("cross-origin redirected media fetch must succeed");
+    assert_eq!(media.filename, "final.jpg");
+}
+
+#[tokio::test]
+async fn qa_round2_in_flight_route_sync_deferral_chain_tz_wakeup_and_update_probe() {
+    use chrono::Datelike as _;
+    use feedcourier::db::models::UpdateRoute;
+
+    let mock_tg = MockServer::start().await;
+    let base_uri = mock_tg.uri();
+    let h = TestHarness::new().await;
+    let cookie = h.setup_admin_and_cookie().await;
+
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({
+                "outbound_proxy_url": null,
+                "ssrf_allowlist": ["127.0.0.1/32", "::1/128"],
+                "timezone": "UTC"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    Mock::given(method("GET"))
+        .and(path("/bot777:good_tok/getMe"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "id": 777, "is_bot": true, "first_name": "GoodBot", "username": "good_r2_bot" }
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot777:good_tok/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: chat_id is empty"
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/bot777:revoked_tok/getMe"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "ok": false,
+            "error_code": 401,
+            "description": "Unauthorized"
+        })))
+        .mount(&mock_tg)
+        .await;
+
+    let (status, _, ch_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "777:good_tok",
+                    "api_base_url": base_uri
+                },
+                "initial_destination": {
+                    "name": "Dest A",
+                    "config": { "kind": "telegram", "chat_id": "-10010" },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "hourly_quota": null,
+                "daily_quota": null,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let ch = parse_json(&ch_body);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let d1_id = ch["destinations"][0]["id"].as_i64().unwrap();
+
+    let (status, _, d2_body) = h
+        .send(
+            Method::POST,
+            &format!("/api/v1/channels/{ch_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "name": "Dest B",
+                "config": { "kind": "telegram", "chat_id": "-10020" },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let d2_id = parse_json(&d2_body)["id"].as_i64().unwrap();
+
+    // -------------------------------------------------------------------------
+    // 1. R2-07: `PATCH /api/v1/channels/{id}` with an invalid/revoked Telegram bot_token
+    //    must reject with 401 Unauthorized without overwriting the stored token.
+    // -------------------------------------------------------------------------
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/channels/{ch_id}"),
+            Some(&cookie),
+            Some(json!({
+                "config": { "kind": "telegram", "bot_token": "777:revoked_tok" }
+            })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "updating Telegram bot_token to a 401 token must fail with 401"
+    );
+    let stored_ch = h.db.get_channel(ch_id).await.unwrap().unwrap();
+    let decrypted_cfg: feedcourier::channels::ChannelConfig = h
+        .master_key
+        .decrypt_json(&stored_ch.encrypted_config)
+        .unwrap();
+    match decrypted_cfg {
+        feedcourier::channels::ChannelConfig::Telegram(tg) => {
+            assert_eq!(tg.bot_token, "777:good_tok");
+        }
+        other => panic!("expected Telegram config, got {other:?}"),
+    }
+
+    // Seed feed + entries for R2-02, R2-03, and R2-05 scenarios.
+    let feed =
+        h.db.create_feed(&NewFeed::new("https://example.com/r2.xml"))
+            .await
+            .unwrap();
+    let mut entries = Vec::new();
+    for i in 1..=9 {
+        let e = match h
+            .db
+            .insert_entry_if_new(&NewEntry {
+                feed_id: feed.id,
+                fingerprint_sha256: sha256_hex(format!("r2-item-{i}").as_bytes()),
+                published_at: Some(now_unix() - 20 + i),
+                discovered_at: now_unix() - 20 + i,
+                title: Some(format!("R2 Item {i}")),
+                canonical_url: Some(format!("https://example.com/r2-{i}")),
+                author: None,
+                content_html: Some("<p>Body</p>".to_string()),
+                first_sentence: Some("Body".to_string()),
+                summary_text: Some("Body".to_string()),
+                media: vec![],
+            })
+            .await
+            .unwrap()
+        {
+            feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+            _ => unreachable!(),
+        };
+        entries.push(e);
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. R2-02: In-flight `delivering` tasks (retrying / deferred / expired lease) and
+    //    `dead_letter` tasks (requeue by ID / requeue all) realign `(channel_id, destination_id)`
+    //    and clear stale `checkpoint_json` + `last_status_code` when the route switched target.
+    // -------------------------------------------------------------------------
+    let route_sync =
+        h.db.create_route(&NewRoute {
+            name: "Sync Route".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: ch_id,
+            destination_id: d1_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions::default(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let stale_cp = DeliveryCheckpoint::Telegram {
+        next_batch_offset: 1,
+        sent_message_ids: vec![99],
+        degraded_to_compact: false,
+    };
+    let stale_cp_json = serde_json::to_string(&stale_cp).unwrap();
+
+    let t_retry =
+        h.db.enqueue_delivery_task(route_sync.id, ch_id, d1_id, entries[0].id, now_unix() - 5)
+            .await
+            .unwrap()
+            .unwrap();
+    let t_defer =
+        h.db.enqueue_delivery_task(route_sync.id, ch_id, d1_id, entries[1].id, now_unix() - 4)
+            .await
+            .unwrap()
+            .unwrap();
+    let t_crash =
+        h.db.enqueue_delivery_task(route_sync.id, ch_id, d1_id, entries[2].id, now_unix() - 3)
+            .await
+            .unwrap()
+            .unwrap();
+    let t_dl_id =
+        h.db.enqueue_delivery_task(route_sync.id, ch_id, d1_id, entries[3].id, now_unix() - 2)
+            .await
+            .unwrap()
+            .unwrap();
+    let t_dl_all =
+        h.db.enqueue_delivery_task(route_sync.id, ch_id, d1_id, entries[4].id, now_unix() - 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+    // Put `t_retry`, `t_defer`, `t_crash` into `delivering` on `d1_id` with checkpoints.
+    for tid in [t_retry.id, t_defer.id, t_crash.id] {
+        sqlx::query(
+            "UPDATE delivery_tasks SET status = 'delivering', attempt_count = 2, lease_until = ?1, checkpoint_json = ?2, last_status_code = 502 WHERE id = ?3",
+        )
+        .bind(now_unix() + 60)
+        .bind(&stale_cp_json)
+        .bind(tid)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+    }
+    // Expire `t_crash`'s lease so `claim_next_delivery_task` reclaims it.
+    sqlx::query("UPDATE delivery_tasks SET lease_until = ?1 WHERE id = ?2")
+        .bind(now_unix() - 10)
+        .bind(t_crash.id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+    // Put `t_dl_id` and `t_dl_all` into `dead_letter` on `d1_id` with checkpoints.
+    h.db.mark_task_dead_letter(
+        t_dl_id.id,
+        now_unix(),
+        Some(400),
+        Some(&stale_cp),
+        "bad chat",
+    )
+    .await
+    .unwrap();
+    h.db.mark_task_dead_letter(
+        t_dl_all.id,
+        now_unix(),
+        Some(400),
+        Some(&stale_cp),
+        "bad chat",
+    )
+    .await
+    .unwrap();
+
+    // Switch `route_sync` from `d1_id` to `d2_id` via REST API.
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/routes/{}", route_sync.id),
+            Some(&cookie),
+            Some(json!({ "destination_id": d2_id })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Active `delivering` lease stays untouched until it transitions out.
+    assert_eq!(
+        h.db.get_delivery_task(t_retry.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .destination_id,
+        d1_id
+    );
+
+    // Transitioning `t_retry` -> `retrying` aligns to `d2_id` and clears checkpoint/attempts/status.
+    let retried =
+        h.db.mark_task_retrying(
+            t_retry.id,
+            now_unix() + 600,
+            Some(503),
+            Some(&stale_cp),
+            "transient 503",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.destination_id, d2_id);
+    assert_eq!(retried.checkpoint_json, None);
+    assert_eq!(retried.attempt_count, 0);
+    assert_eq!(retried.last_status_code, None);
+
+    // Transitioning `t_defer` -> `deferred` aligns to `d2_id` and clears checkpoint/attempts/status.
+    let deferred =
+        h.db.mark_task_deferred(
+            t_defer.id,
+            now_unix() + 600,
+            Some(202),
+            Some(&stale_cp),
+            "deferred",
+        )
+        .await
+        .unwrap();
+    assert_eq!(deferred.destination_id, d2_id);
+    assert_eq!(deferred.checkpoint_json, None);
+    assert_eq!(deferred.attempt_count, 0);
+    assert_eq!(deferred.last_status_code, None);
+
+    // Reclaiming crashed `t_crash` aligns to `d2_id`, clears checkpoint/status, and resets attempt_count to 1.
+    let reclaimed =
+        h.db.claim_next_delivery_task(now_unix(), 60)
+            .await
+            .unwrap()
+            .expect("expired lease must be reclaimed");
+    assert_eq!(reclaimed.id, t_crash.id);
+    assert_eq!(reclaimed.destination_id, d2_id);
+    assert_eq!(reclaimed.checkpoint_json, None);
+    assert_eq!(reclaimed.last_status_code, None);
+    assert_eq!(reclaimed.attempt_count, 1);
+    // Park `t_crash` out of the way so it doesn't interfere with later steps.
+    h.db.mark_task_delivered(t_crash.id, now_unix(), Some(200), None, None)
+        .await
+        .unwrap();
+
+    // Requeueing `t_dl_id` by ID aligns to `d2_id` and clears stale checkpoint & status code.
+    assert_eq!(
+        h.db.requeue_tasks_by_ids(&[t_dl_id.id], now_unix() + 600)
+            .await
+            .unwrap(),
+        1
+    );
+    let rq_one = h.db.get_delivery_task(t_dl_id.id).await.unwrap().unwrap();
+    assert_eq!(rq_one.status, DeliveryTaskStatus::Queued);
+    assert_eq!(rq_one.destination_id, d2_id);
+    assert_eq!(rq_one.checkpoint_json, None);
+    assert_eq!(rq_one.last_status_code, None);
+
+    // Requeueing all `dead_letter` tasks aligns `t_dl_all` to `d2_id` and clears stale checkpoint & status code.
+    assert_eq!(
+        h.db.requeue_all_dead_letter_tasks(now_unix() + 600)
+            .await
+            .unwrap(),
+        1
+    );
+    let rq_all = h.db.get_delivery_task(t_dl_all.id).await.unwrap().unwrap();
+    assert_eq!(rq_all.status, DeliveryTaskStatus::Queued);
+    assert_eq!(rq_all.destination_id, d2_id);
+    assert_eq!(rq_all.checkpoint_json, None);
+    assert_eq!(rq_all.last_status_code, None);
+
+    // Disable `route_sync` so its parked tasks do not interfere with R2-03 & R2-05.
+    h.db.update_route(
+        route_sync.id,
+        &UpdateRoute {
+            enabled: Some(false),
+            ..UpdateRoute::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // -------------------------------------------------------------------------
+    // 3. R2-03: Chained cross-type deferrals (window closed -> hourly quota) preserve prior
+    //    HTTP errors (without stripping trailing `)`) AND non-HTTP transient errors (`status_code = None`),
+    //    while never wrapping benign prior deferrals.
+    // -------------------------------------------------------------------------
+    let today_wd = u8::try_from(chrono::Utc::now().weekday().number_from_monday()).unwrap_or(1);
+    let closed_wd = (today_wd % 7) + 1;
+
+    let route_diag =
+        h.db.create_route(&NewRoute {
+            name: "Diag Route".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: ch_id,
+            destination_id: d2_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                active_weekdays: vec![closed_wd],
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    // 3a) HTTP 502 ending in `)` survives window deferral -> hourly quota deferral intact.
+    let t_http_err =
+        h.db.enqueue_delivery_task(route_diag.id, ch_id, d2_id, entries[5].id, now_unix() - 5)
+            .await
+            .unwrap()
+            .unwrap();
+    let _ = h.db.claim_next_delivery_task(now_unix(), 60).await.unwrap();
+    h.db.mark_task_retrying(
+        t_http_err.id,
+        now_unix() - 1,
+        Some(502),
+        None,
+        "Upstream 502 (Bad Gateway)",
+    )
+    .await
+    .unwrap();
+
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let after_win =
+        h.db.get_delivery_task(t_http_err.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(after_win.status, DeliveryTaskStatus::Deferred);
+    assert_eq!(
+        after_win.diagnostic_log.as_deref(),
+        Some(
+            "Route delivery window closed; deferred to the next allowed window (previous: Upstream 502 (Bad Gateway))"
+        )
+    );
+
+    // Open schedule and trigger hourly quota deferral (`t_crash` already recorded 1 delivery in
+    // `delivery_quota_ledger`, so `hourly_quota = 1` is immediately saturated) -> must keep exact
+    // `(previous: Upstream 502 (Bad Gateway))`.
+    h.db.update_route(
+        route_diag.id,
+        &UpdateRoute {
+            options: Some(RouteOptions::default()),
+            ..UpdateRoute::default()
+        },
+    )
+    .await
+    .unwrap();
+    h.db.update_channel(
+        ch_id,
+        &UpdateChannel {
+            hourly_quota: Some(Some(1)),
+            ..UpdateChannel::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE delivery_tasks SET next_attempt_at = ?1 WHERE id = ?2")
+        .bind(now_unix() - 1)
+        .bind(t_http_err.id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let after_quota =
+        h.db.get_delivery_task(t_http_err.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(after_quota.status, DeliveryTaskStatus::Deferred);
+    let quota_diag = after_quota.diagnostic_log.as_deref().unwrap_or("");
+    assert!(
+        quota_diag.contains("Channel hourly quota reached")
+            && quota_diag.ends_with("(previous: Upstream 502 (Bad Gateway))"),
+        "chained deferral must keep exact trailing parenthesis & original error: {quota_diag}"
+    );
+    // Park `t_http_err`.
+    sqlx::query("UPDATE delivery_tasks SET next_attempt_at = ?1 WHERE id = ?2")
+        .bind(now_unix() + 7200)
+        .bind(t_http_err.id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+
+    // 3b) Non-HTTP transient failure (`last_status_code = None`) is also preserved across deferral.
+    let t_net_err =
+        h.db.enqueue_delivery_task(route_diag.id, ch_id, d2_id, entries[6].id, now_unix() - 5)
+            .await
+            .unwrap()
+            .unwrap();
+    let claimed_net =
+        h.db.claim_next_delivery_task(now_unix(), 60)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(claimed_net.id, t_net_err.id);
+    h.db.mark_task_retrying(
+        t_net_err.id,
+        now_unix() - 1,
+        None,
+        None,
+        "SMTP connect timeout (10s)",
+    )
+    .await
+    .unwrap();
+
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let net_deferred = h.db.get_delivery_task(t_net_err.id).await.unwrap().unwrap();
+    let net_diag = net_deferred.diagnostic_log.as_deref().unwrap_or("");
+    assert!(
+        net_diag.contains("Channel hourly quota reached")
+            && net_diag.ends_with("(previous: SMTP connect timeout (10s))"),
+        "non-HTTP transient error (status_code=None) must be preserved across deferrals: {net_diag}"
+    );
+
+    // -------------------------------------------------------------------------
+    // 4. R2-05: Changing global system timezone via `PUT /api/v1/settings` pulls forward
+    //    `queued`/`deferred` tasks on scheduled routes inheriting the system timezone, while
+    //    leaving routes with an explicit `options.timezone` untouched.
+    // -------------------------------------------------------------------------
+    let route_inherit =
+        h.db.create_route(&NewRoute {
+            name: "Inherit TZ Route".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: ch_id,
+            destination_id: d2_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                timezone: None,
+                active_windows: vec![feedcourier::channels::DeliveryTimeWindow {
+                    start: "08:00".to_string(),
+                    end: "09:00".to_string(),
+                }],
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let route_explicit =
+        h.db.create_route(&NewRoute {
+            name: "Explicit TZ Route".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: ch_id,
+            destination_id: d2_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                timezone: Some("Asia/Tokyo".to_string()),
+                active_windows: vec![feedcourier::channels::DeliveryTimeWindow {
+                    start: "08:00".to_string(),
+                    end: "09:00".to_string(),
+                }],
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let far_future = now_unix() + 7200;
+    let t_inherit =
+        h.db.enqueue_delivery_task(route_inherit.id, ch_id, d2_id, entries[7].id, far_future)
+            .await
+            .unwrap()
+            .unwrap();
+    let t_explicit =
+        h.db.enqueue_delivery_task(route_explicit.id, ch_id, d2_id, entries[8].id, far_future)
+            .await
+            .unwrap()
+            .unwrap();
+
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({ "timezone": "America/New_York" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let inherit_after = h.db.get_delivery_task(t_inherit.id).await.unwrap().unwrap();
+    let explicit_after =
+        h.db.get_delivery_task(t_explicit.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        inherit_after.next_attempt_at <= now_unix() + 5,
+        "system timezone change must pull forward scheduled tasks inheriting system timezone (got {})",
+        inherit_after.next_attempt_at
+    );
+    assert_eq!(
+        explicit_after.next_attempt_at, far_future,
+        "routes with explicit timezone override must not be disturbed by system timezone changes"
+    );
 }

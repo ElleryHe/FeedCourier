@@ -24,13 +24,14 @@ use feedcourier::channels::telegram::{
 };
 use feedcourier::channels::{
     ChannelConfig, ChannelKind, ChannelSender, CheckpointSink, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, RouteOptions, SmtpChannelConfig, SmtpSecurity, TelegramCapabilities,
-    TelegramChannelConfig, TelegramDeliveryMode,
+    DeliveryOutcome, DestinationConfig, RouteOptions, SmtpChannelConfig, SmtpDestinationConfig,
+    SmtpSecurity, TelegramCapabilities, TelegramChannelConfig, TelegramDeliveryMode,
+    TelegramDestinationConfig,
 };
 use feedcourier::crypto::sha256_hex;
 use feedcourier::db::models::{
-    AppLocale, Channel, DeliveryTask, DeliveryTaskStatus, Entry, Feed, FeedHealthStatus,
-    MediaAttachment, MediaAttachmentKind, Route,
+    AppLocale, Channel, ChannelDestination, DeliveryTask, DeliveryTaskStatus, Entry, Feed,
+    FeedHealthStatus, MediaAttachment, MediaAttachmentKind, Route,
 };
 use feedcourier::error::{AppError, AppResult};
 
@@ -105,6 +106,18 @@ fn sample_channel(kind: ChannelKind, capabilities_json: &str) -> Channel {
     }
 }
 
+fn sample_destination() -> ChannelDestination {
+    ChannelDestination {
+        id: 101,
+        channel_id: 11,
+        name: "Test Destination".to_owned(),
+        encrypted_config: Vec::new(),
+        enabled: true,
+        created_at: 1_770_000_000,
+        updated_at: 1_770_000_000,
+    }
+}
+
 fn sample_route(id: i64, options: RouteOptions) -> Route {
     Route {
         id,
@@ -112,6 +125,7 @@ fn sample_route(id: i64, options: RouteOptions) -> Route {
         feed_ids_json: "[7]".to_owned(),
         match_tags_json: "[]".to_owned(),
         channel_id: 11,
+        destination_id: 101,
         include_keywords_json: "[]".to_owned(),
         exclude_keywords_json: "[]".to_owned(),
         include_regex: None,
@@ -128,6 +142,7 @@ fn sample_task(route_id: i64) -> DeliveryTask {
         id: 99,
         route_id,
         channel_id: 11,
+        destination_id: 101,
         entry_id: 42,
         status: DeliveryTaskStatus::Delivering,
         lease_until: Some(1_770_001_000),
@@ -176,6 +191,8 @@ fn smtp_headers_force_from_multipart_and_95kib_truncation() {
         password: Some("secret".to_owned()),
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+    };
+    let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec![
             "Reader One <reader1@inbox.example.org>".to_owned(),
             "reader2@inbox.example.org".to_owned(),
@@ -187,10 +204,10 @@ fn smtp_headers_force_from_multipart_and_95kib_truncation() {
     let feed = sample_feed(7, "Rust\r\n  Weekly\tDigest");
     let entry = sample_entry("smtp-entry-1", Vec::new());
 
-    let built1 =
-        SmtpSender::build_entry_email(&smtp_cfg, &feed, &entry, 19, None).expect("build email 1");
-    let built2 =
-        SmtpSender::build_entry_email(&smtp_cfg, &feed, &entry, 19, None).expect("build email 2");
+    let built1 = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 19, None)
+        .expect("build email 1");
+    let built2 = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 19, None)
+        .expect("build email 2");
 
     let expected_msg_id = format!(
         "<fc-{}-r19@verified.example.com>",
@@ -247,8 +264,9 @@ fn smtp_headers_force_from_multipart_and_95kib_truncation() {
     assert!(giant_html.len() > 180 * 1024);
     huge_entry.content_html = Some(giant_html);
 
-    let truncated_email = SmtpSender::build_entry_email(&smtp_cfg, &feed, &huge_entry, 19, None)
-        .expect("build truncated email");
+    let truncated_email =
+        SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &huge_entry, 19, None)
+            .expect("build truncated email");
     assert!(truncated_email.html_truncated);
     assert!(
         truncated_email.html_body.len() <= MAX_EMAIL_HTML_BYTES,
@@ -398,6 +416,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
     let feed = sample_feed(7, "Systems Engineering");
     let entry = sample_entry("smtp-live-fp", Vec::new());
     let channel = sample_channel(ChannelKind::Smtp, "{}");
+    let destination = sample_destination();
     let route = sample_route(5, RouteOptions::default());
     let task = sample_task(route.id);
 
@@ -412,6 +431,8 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+        });
+        let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
             reply_to: None,
         });
@@ -424,6 +445,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             route_options: RouteOptions::default(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -484,10 +508,15 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+        });
+        let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
             reply_to: None,
         });
-        let summary = sender.send_test(&cfg, false).await.expect("send_test 250");
+        let summary = sender
+            .send_test(&cfg, &dest_cfg, false)
+            .await
+            .expect("send_test 250");
         assert!(summary.contains("250"));
         assert!(summary.contains("alerts@verified.example.com"));
         drop(sender);
@@ -506,6 +535,8 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+        });
+        let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
             reply_to: None,
         });
@@ -518,6 +549,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             route_options: RouteOptions::default(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -558,6 +592,8 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+        });
+        let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["bad@dest.example.org".to_owned()],
             reply_to: None,
         });
@@ -570,6 +606,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             route_options: RouteOptions::default(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -599,7 +638,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
 
 #[tokio::test]
 async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
 
     // Case A: Bot API 10.4 server returns `400 Bad Request: chat_id is empty` on `{}` probe
     let modern_server = MockServer::start().await;
@@ -629,8 +670,6 @@ async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
 
     let modern_cfg = TelegramChannelConfig {
         bot_token: "TEST_TOKEN".to_owned(),
-        chat_id: "-100998877".to_owned(),
-        message_thread_id: Some(12),
         api_base_url: Some(modern_server.uri()),
     };
 
@@ -640,6 +679,7 @@ async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
         .expect("probe 10.4");
     assert!(caps.supports_rich_message);
     assert_eq!(caps.bot_username.as_deref(), Some("feedcourier_bot"));
+    assert_eq!(caps.bot_first_name.as_deref(), Some("FeedCourier"));
     assert!(caps.fallback_reason.is_none());
     assert!(caps.probed_at.is_some());
 
@@ -671,8 +711,6 @@ async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
 
     let legacy_cfg = TelegramChannelConfig {
         bot_token: "LEGACY_TOK".to_owned(),
-        chat_id: "@mychannel".to_owned(),
-        message_thread_id: None,
         api_base_url: Some(legacy_server.uri()),
     };
 
@@ -695,7 +733,9 @@ async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
 
 #[tokio::test]
 async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
     let feed = sample_feed(7, "Rust Insider");
     let entry = sample_entry("tg-rich-fp", Vec::new());
     let route_opts = RouteOptions {
@@ -705,6 +745,7 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
     };
     let route = sample_route(3, route_opts.clone());
     let task = sample_task(route.id);
+    let destination = sample_destination();
 
     // 1) Successful `sendRichMessage` with `telegram-rich` normalization + "Read original" button
     {
@@ -724,9 +765,11 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         );
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK1".to_owned(),
+            api_base_url: Some(server.uri()),
+        });
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "-10012345".to_owned(),
             message_thread_id: Some(88),
-            api_base_url: Some(server.uri()),
         });
         let sink = RecordingCheckpointSink::default();
 
@@ -738,6 +781,9 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             route_options: route_opts.clone(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: Some(&sink),
         };
@@ -773,8 +819,16 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             .as_str()
             .expect("rich_message.html");
         assert!(
-            rich_html.contains("<h1><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h1>"),
-            "missing linked <h1> header in rich_html: {rich_html}"
+            rich_html.contains("<h2><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h2>"),
+            "missing linked <h2> header in rich_html: {rich_html}"
+        );
+        assert!(
+            rich_html.contains("<footer>Rust Insider · Alice Chen · "),
+            "missing native <footer> metadata below title: {rich_html}"
+        );
+        assert!(
+            rich_html.contains("<hr/>"),
+            "missing <hr/> divider before body: {rich_html}"
         );
         assert!(
             rich_html.contains("https://blog.example.com/docs"),
@@ -821,9 +875,11 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         let channel = sample_channel(ChannelKind::Telegram, r#"{"bot_username":"fc_bot"}"#);
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK2".to_owned(),
+            api_base_url: Some(server.uri()),
+        });
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "@rust_news".to_owned(),
             message_thread_id: None,
-            api_base_url: Some(server.uri()),
         });
 
         let ctx = DeliveryContext {
@@ -834,6 +890,9 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             route_options: route_opts.clone(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -920,9 +979,11 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         );
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK3".to_owned(),
+            api_base_url: Some(server.uri()),
+        });
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "987654".to_owned(),
             message_thread_id: None,
-            api_base_url: Some(server.uri()),
         });
 
         let ctx = DeliveryContext {
@@ -933,6 +994,9 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             route_options: route_opts,
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -955,7 +1019,10 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         );
         assert_eq!(reqs[0].url.path(), "/botTOK3/sendMessage");
 
-        let test_msg = sender.send_test(&cfg, false).await.expect("tg send_test");
+        let test_msg = sender
+            .send_test(&cfg, &dest_cfg, false)
+            .await
+            .expect("tg send_test");
         assert!(test_msg.contains("@cached_bot"));
     }
 
@@ -1055,7 +1122,9 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
     );
 
     // 2) 0-media fallback -> calls `sendMessage` with 3-line text
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
     let media_opts = RouteOptions {
         telegram_mode: TelegramDeliveryMode::MediaMode,
         link_preview: true,
@@ -1064,6 +1133,7 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
     let route = sample_route(8, media_opts.clone());
     let task = sample_task(route.id);
     let channel = sample_channel(ChannelKind::Telegram, "{}");
+    let destination = sample_destination();
 
     {
         let zero_server = MockServer::start().await;
@@ -1078,9 +1148,11 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
 
         let zero_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK_ZERO".to_owned(),
+            api_base_url: Some(zero_server.uri()),
+        });
+        let zero_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "12345".to_owned(),
             message_thread_id: None,
-            api_base_url: Some(zero_server.uri()),
         });
         let zero_entry = sample_entry("zero-media", Vec::new());
         let ctx = DeliveryContext {
@@ -1091,6 +1163,9 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
             route_options: media_opts.clone(),
             channel: &channel,
             channel_config: &zero_cfg,
+            destination: &destination,
+            destination_config: &zero_dest,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -1132,9 +1207,11 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
 
     let batch_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "TOK_BATCH".to_owned(),
+        api_base_url: Some(server.uri()),
+    });
+    let batch_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-100777".to_owned(),
         message_thread_id: Some(9),
-        api_base_url: Some(server.uri()),
     });
 
     let sink_attempt1 = RecordingCheckpointSink::default();
@@ -1146,6 +1223,9 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         route_options: media_opts.clone(),
         channel: &channel,
         channel_config: &batch_cfg,
+        destination: &destination,
+        destination_config: &batch_dest,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&sink_attempt1),
     };
@@ -1191,6 +1271,9 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         route_options: media_opts,
         channel: &channel,
         channel_config: &batch_cfg,
+        destination: &destination,
+        destination_config: &batch_dest,
+        timezone: chrono_tz::UTC,
         checkpoint: Some(retry_checkpoint),
         checkpoint_sink: Some(&sink_attempt2),
     };
@@ -1337,6 +1420,7 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
     let route = sample_route(12, media_opts.clone());
     let task = sample_task(route.id);
     let channel = sample_channel(ChannelKind::Telegram, "{}");
+    let destination = sample_destination();
 
     // 1) URL pass-through fails with `400 WEBPAGE_CURL_FAILED` -> streaming `attach://` multipart upload succeeds!
     {
@@ -1369,7 +1453,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             },
         );
 
-        let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher { blobs }));
+        let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher { blobs }))
+            .with_ssrf_allowlist(&["127.0.0.1/32"])
+            .expect("allowlist");
         let entry = sample_entry(
             "mp-fallback",
             vec![
@@ -1392,9 +1478,11 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
 
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK_MP".to_owned(),
+            api_base_url: Some(server.uri()),
+        });
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "-100555".to_owned(),
             message_thread_id: None,
-            api_base_url: Some(server.uri()),
         });
 
         let ctx = DeliveryContext {
@@ -1405,6 +1493,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             route_options: media_opts.clone(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -1462,7 +1553,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             .await;
 
         let fetcher = DefaultMediaStreamFetcher::new().with_allow_private_for_tests(true);
-        let sender = TelegramSender::with_media_fetcher(Arc::new(fetcher));
+        let sender = TelegramSender::with_media_fetcher(Arc::new(fetcher))
+            .with_ssrf_allowlist(&["127.0.0.1/32"])
+            .expect("allowlist");
 
         let huge_url = format!("{}/huge-photo.jpg", media_origin.uri());
         let entry = sample_entry(
@@ -1478,9 +1571,11 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
 
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK_CAP".to_owned(),
+            api_base_url: Some(tg_server.uri()),
+        });
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "556677".to_owned(),
             message_thread_id: None,
-            api_base_url: Some(tg_server.uri()),
         });
 
         let ctx = DeliveryContext {
@@ -1491,6 +1586,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             route_options: media_opts.clone(),
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -1579,13 +1677,17 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             .mount(&kicked_server)
             .await;
 
-        let sender = TelegramSender::new();
+        let sender = TelegramSender::new()
+            .with_ssrf_allowlist(&["127.0.0.1/32"])
+            .expect("allowlist");
         let entry = sample_entry("kicked-entry", Vec::new());
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK_KICK".to_owned(),
+            api_base_url: Some(kicked_server.uri()),
+        });
+        let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
             chat_id: "@kicked_channel".to_owned(),
             message_thread_id: None,
-            api_base_url: Some(kicked_server.uri()),
         });
         let ctx = DeliveryContext {
             task: &task,
@@ -1599,6 +1701,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             },
             channel: &channel,
             channel_config: &cfg,
+            destination: &destination,
+            destination_config: &dest_cfg,
+            timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -1711,6 +1816,8 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
     let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher {
         blobs: blobs.clone(),
     }))
+    .with_ssrf_allowlist(&["127.0.0.1/32"])
+    .expect("allowlist")
     .with_locale(AppLocale::ZhCn);
 
     let feed = sample_feed(9, "Video Feed");
@@ -1722,11 +1829,14 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
     let route = sample_route(21, media_opts.clone());
     let task = sample_task(route.id);
     let channel = sample_channel(ChannelKind::Telegram, "{}");
+    let destination = sample_destination();
     let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "TOK_VID".to_owned(),
+        api_base_url: Some(tg_server.uri()),
+    });
+    let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-100888".to_owned(),
         message_thread_id: None,
-        api_base_url: Some(tg_server.uri()),
     });
 
     let video_entry = sample_entry(
@@ -1748,6 +1858,9 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         route_options: media_opts.clone(),
         channel: &channel,
         channel_config: &cfg,
+        destination: &destination,
+        destination_config: &dest_cfg,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
     };
@@ -1814,9 +1927,11 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
 
     let doc_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "TOK_VID".to_owned(),
+        api_base_url: Some(tg_server_doc.uri()),
+    });
+    let doc_dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-100888".to_owned(),
         message_thread_id: None,
-        api_base_url: Some(tg_server_doc.uri()),
     });
     let misclassified_entry = sample_entry(
         "misclassified-doc-video",
@@ -1836,6 +1951,9 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         route_options: media_opts,
         channel: &channel,
         channel_config: &doc_cfg,
+        destination: &destination,
+        destination_config: &doc_dest_cfg,
+        timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
     };
@@ -1859,4 +1977,575 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
             .contains("<a href=\"https://blog.example.com/posts/zero-copy-rust\">阅读原文</a>"),
         "CompactCard under ZhCn must render 阅读原文: {compact_zh}"
     );
+}
+
+// =============================================================================
+// 3. v0.2.0 Tests: SMTP Responsive HTML + Route Timezone & Telegram Rich Layout
+// =============================================================================
+
+#[test]
+fn smtp_responsive_image_table_pre_rewriting_and_route_timezone() {
+    let smtp_cfg = SmtpChannelConfig {
+        host: "smtp.verified.example.com".to_owned(),
+        port: 587,
+        username: None,
+        password: None,
+        security: SmtpSecurity::StartTls,
+        from_address: "alerts@verified.example.com".to_owned(),
+    };
+    let smtp_dest = SmtpDestinationConfig {
+        to_addresses: vec!["reader@example.org".to_owned()],
+        reply_to: None,
+    };
+    let feed = sample_feed(7, "Visual Tech Weekly");
+    let mut entry = sample_entry("smtp-responsive-tz", Vec::new());
+    // 2026-01-15 00:30:00 UTC -> Asia/Shanghai = 2026-01-15 08:30 (UTC+08:00),
+    // America/Los_Angeles = 2026-01-14 16:30 (UTC-08:00).
+    entry.published_at = Some(1_768_437_000);
+    entry.content_html = Some(
+        r#"<p>Lead paragraph.</p>
+<figure><img src="https://cdn.example.com/hero.jpg" width="1200" height="630" alt="Hero"><figcaption>Hero caption</figcaption></figure>
+<p><img src="https://cdn.example.com/no-width.png" alt="Auto"></p>
+<p><img src="https://cdn.example.com/icon.png" width="120" height="80" alt="Small"></p>
+<table><tr><td>Col A</td><td>Col B</td></tr></table>
+<pre><code>fn main() { println!("hello"); }</code></pre>"#
+            .to_owned(),
+    );
+
+    let shanghai: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+    let built_cn = SmtpSender::build_entry_email_with_options(
+        &smtp_cfg,
+        &smtp_dest,
+        &feed,
+        &entry,
+        4,
+        None,
+        AppLocale::ZhCn,
+        shanghai,
+    )
+    .expect("build shanghai email");
+
+    // 1. `<head><style>` fallback + inline responsive image clamping + height stripping.
+    assert!(built_cn.html_body.contains("<style type=\"text/css\">"));
+    assert!(
+        built_cn.html_body.contains("max-width:100%") && built_cn.html_body.contains("height:auto"),
+        "images must carry inline responsive CSS:\n{}",
+        built_cn.html_body
+    );
+    assert!(
+        !built_cn.html_body.contains("height=\"630\"")
+            && !built_cn.html_body.contains("height=\"80\""),
+        "fixed height attributes must be stripped to preserve aspect ratio:\n{}",
+        built_cn.html_body
+    );
+    assert!(
+        built_cn.html_body.contains("width=\"592\""),
+        "oversized/missing image widths must be clamped to 592px inner card width:\n{}",
+        built_cn.html_body
+    );
+    assert!(
+        built_cn.html_body.contains("width=\"120\""),
+        "small inline images (<592px) must preserve their original width:\n{}",
+        built_cn.html_body
+    );
+    assert!(
+        built_cn.html_body.contains(
+            "<div style=\"max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;"
+        ),
+        "tables must be wrapped in horizontally scrollable container:\n{}",
+        built_cn.html_body
+    );
+    assert!(
+        built_cn.html_body.contains("<figure style="),
+        "figure must receive clean responsive margin/width styles"
+    );
+    assert!(
+        built_cn.html_body.contains("<figcaption style="),
+        "figcaption must be styled"
+    );
+    assert!(
+        built_cn.html_body.contains("<pre style="),
+        "pre blocks must receive overflow/wrap styles"
+    );
+
+    // 2. Localized route timezone timestamp in metadata line (NOT hardcoded UTC!).
+    assert!(
+        built_cn.html_body.contains("2026-01-15 08:30 (UTC+08:00)"),
+        "expected Asia/Shanghai timestamp in email HTML:\n{}",
+        built_cn.html_body
+    );
+    assert!(built_cn.plain_body.contains("2026-01-15 08:30 (UTC+08:00)"));
+
+    let la: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
+    let built_la = SmtpSender::build_entry_email_with_options(
+        &smtp_cfg,
+        &smtp_dest,
+        &feed,
+        &entry,
+        4,
+        None,
+        AppLocale::En,
+        la,
+    )
+    .expect("build LA email");
+    assert!(
+        built_la.html_body.contains("2026-01-14 16:30 (UTC-08:00)"),
+        "expected America/Los_Angeles timestamp in email HTML:\n{}",
+        built_la.html_body
+    );
+}
+
+#[tokio::test]
+async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_chat_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_RICH2/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 601 }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/botTOK_RICH2/getChat"))
+        .respond_with(|req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            match body["chat_id"].as_str().unwrap_or("") {
+                "-1001" => ResponseTemplate::new(200).set_body_json(json!({
+                    "ok": true,
+                    "result": { "id": -1001, "type": "channel", "title": "Rust Digest Channel" }
+                })),
+                "-1002" => ResponseTemplate::new(200).set_body_json(json!({
+                    "ok": true,
+                    "result": { "id": -1002, "type": "channel", "username": "rust_digest" }
+                })),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "ok": true,
+                    "result": { "id": 42, "type": "private", "first_name": "Alice", "last_name": "Chen" }
+                })),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
+    let cfg = TelegramChannelConfig {
+        bot_token: "TOK_RICH2".to_owned(),
+        api_base_url: Some(server.uri()),
+    };
+
+    // 1. Verify `get_chat_name` auto-naming priority (`title` -> `@username` -> `first_name last_name`).
+    assert_eq!(
+        sender
+            .get_chat_name(&cfg, "-1001", false)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("Rust Digest Channel")
+    );
+    assert_eq!(
+        sender
+            .get_chat_name(&cfg, "-1002", false)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("@rust_digest")
+    );
+    assert_eq!(
+        sender
+            .get_chat_name(&cfg, "42", false)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("Alice Chen")
+    );
+
+    // 2. Verify v0.2.0 Rich Message typography: h2 title, native <footer> with route timezone,
+    //    <hr/> divider, body heading_offset=2 (h1->h3, h2->h4), 3 imgs -> <tg-collage>, 11 imgs -> <tg-slideshow>.
+    let mut body_html = String::from("<h1>Section One</h1><h2>Subsection</h2><p>Intro text.</p>");
+    for i in 1..=3 {
+        body_html.push_str(&format!("<img src=\"https://cdn.example.com/c{i}.jpg\">"));
+    }
+    body_html.push_str("<p>Gallery break.</p>");
+    for i in 1..=11 {
+        body_html.push_str(&format!("<img src=\"https://cdn.example.com/s{i}.jpg\">"));
+    }
+
+    let feed = sample_feed(7, "Visual Digest");
+    let mut entry = sample_entry("tg-v020-rich", Vec::new());
+    entry.published_at = Some(1_768_437_000); // 2026-01-15 08:30 (UTC+08:00)
+    entry.content_html = Some(body_html);
+
+    let channel = sample_channel(
+        ChannelKind::Telegram,
+        r#"{"supports_rich_message":true,"bot_username":"fc_bot"}"#,
+    );
+    let destination = sample_destination();
+    let route_opts = RouteOptions {
+        telegram_mode: TelegramDeliveryMode::RichMessage,
+        ..RouteOptions::default()
+    };
+    let route = sample_route(33, route_opts.clone());
+    let task = sample_task(route.id);
+    let ch_cfg = ChannelConfig::Telegram(cfg);
+    let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
+        chat_id: "-1001".to_owned(),
+        message_thread_id: None,
+    });
+    let shanghai: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+
+    let ctx = DeliveryContext {
+        task: &task,
+        entry: &entry,
+        feed: &feed,
+        route: &route,
+        route_options: route_opts,
+        channel: &channel,
+        channel_config: &ch_cfg,
+        destination: &destination,
+        destination_config: &dest_cfg,
+        timezone: shanghai,
+        checkpoint: None,
+        checkpoint_sink: None,
+    };
+
+    let outcome = sender.send(&ctx).await.expect("sendRichMessage v0.2.0");
+    assert!(matches!(outcome, DeliveryOutcome::Delivered { .. }));
+
+    let reqs = server.received_requests().await.expect("reqs");
+    let rich_req = reqs
+        .iter()
+        .find(|r| r.url.path().ends_with("/sendRichMessage"))
+        .expect("sendRichMessage request");
+    let payload: Value = serde_json::from_slice(&rich_req.body).expect("json");
+    let rich_html = payload["rich_message"]["html"].as_str().expect("html");
+
+    assert!(
+        rich_html.contains("<h2><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h2>"),
+        "article title must use <h2>:\n{rich_html}"
+    );
+    assert!(
+        !rich_html.contains("<h1>"),
+        "article title and body must not emit oversized <h1>:\n{rich_html}"
+    );
+    assert!(
+        rich_html
+            .contains("<footer>Visual Digest · Alice Chen · 2026-01-15 08:30 (UTC+08:00)</footer>"),
+        "metadata + localized route timestamp must live inside native <footer>:\n{rich_html}"
+    );
+    assert!(
+        rich_html.contains("<hr/>"),
+        "divider must separate header and body:\n{rich_html}"
+    );
+    assert!(
+        rich_html.contains("<h3>Section One</h3>") && rich_html.contains("<h4>Subsection</h4>"),
+        "body headings must shift by heading_offset=2 (h1->h3, h2->h4):\n{rich_html}"
+    );
+    assert!(
+        rich_html.contains("<tg-collage>") && rich_html.contains("</tg-collage>"),
+        "3 consecutive images must group into <tg-collage>:\n{rich_html}"
+    );
+    assert!(
+        rich_html.contains("<tg-slideshow>") && rich_html.contains("</tg-slideshow>"),
+        "11 consecutive images must group into <tg-slideshow>:\n{rich_html}"
+    );
+}
+
+#[tokio::test]
+async fn telegram_ssrf_guard_blocks_loopback_metadata_redirects_and_invalid_base_urls() {
+    // 1. `ChannelConfig::Telegram.validate()` rejects invalid schemes, userinfo, query, and fragment.
+    for bad_base in [
+        "ftp://bot.example.com",
+        "http://user:pass@bot.example.com",
+        "https://bot.example.com?token=1",
+        "https://bot.example.com#frag",
+        "not-a-url",
+    ] {
+        let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+            bot_token: "123:tok".to_owned(),
+            api_base_url: Some(bad_base.to_owned()),
+        });
+        assert!(
+            cfg.validate().is_err(),
+            "invalid api_base_url '{bad_base}' must fail validation"
+        );
+    }
+
+    // 2. Default strict `TelegramSender` blocks loopback (127.0.0.1) and cloud metadata (169.254.169.254).
+    let local_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/botTOK/getMe"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&local_server)
+        .await;
+
+    let strict_sender = TelegramSender::new();
+    let loopback_cfg = TelegramChannelConfig {
+        bot_token: "TOK".to_owned(),
+        api_base_url: Some(local_server.uri()),
+    };
+    assert!(matches!(
+        strict_sender.probe_capabilities(&loopback_cfg, false).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+    assert!(matches!(
+        strict_sender
+            .get_chat_name(&loopback_cfg, "-1001", false)
+            .await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    let metadata_cfg = TelegramChannelConfig {
+        bot_token: "TOK".to_owned(),
+        api_base_url: Some("http://169.254.169.254".to_owned()),
+    };
+    assert!(matches!(
+        strict_sender.probe_capabilities(&metadata_cfg, false).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    // 3. Even when loopback is allowlisted, Bot API 302 redirects are NEVER followed and return SsrfBlocked.
+    let redirect_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/stolen"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/botTOK_REDIR/getMe"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/stolen", target_server.uri())),
+        )
+        .mount(&redirect_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_REDIR/sendMessage"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/stolen", target_server.uri())),
+        )
+        .mount(&redirect_server)
+        .await;
+
+    let allowed_sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
+    let redir_cfg = TelegramChannelConfig {
+        bot_token: "TOK_REDIR".to_owned(),
+        api_base_url: Some(redirect_server.uri()),
+    };
+    assert!(matches!(
+        allowed_sender.probe_capabilities(&redir_cfg, false).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    let feed = sample_feed(1, "Feed");
+    let entry = sample_entry("redir-send", Vec::new());
+    let channel = sample_channel(ChannelKind::Telegram, "{}");
+    let destination = sample_destination();
+    let route_opts = RouteOptions {
+        telegram_mode: TelegramDeliveryMode::CompactCard,
+        ..RouteOptions::default()
+    };
+    let route = sample_route(1, route_opts.clone());
+    let task = sample_task(route.id);
+    let ch_cfg = ChannelConfig::Telegram(redir_cfg);
+    let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
+        chat_id: "123".to_owned(),
+        message_thread_id: None,
+    });
+    let ctx = DeliveryContext {
+        task: &task,
+        entry: &entry,
+        feed: &feed,
+        route: &route,
+        route_options: route_opts,
+        channel: &channel,
+        channel_config: &ch_cfg,
+        destination: &destination,
+        destination_config: &dest_cfg,
+        timezone: chrono_tz::UTC,
+        checkpoint: None,
+        checkpoint_sink: None,
+    };
+    assert!(matches!(
+        allowed_sender.send(&ctx).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+}
+
+#[test]
+fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
+    // 1. HTML sanitizer must decode entities before re-escaping attributes (never `&amp;amp;` or `&amp;#39;`).
+    let raw_html = r#"<p><img src="https://cdn.example.com/pic.jpg?a=1&amp;b=2" alt="Tom&#39;s R&amp;D &quot;Lab&quot;" width="50%"></p>"#;
+    let base_url = url::Url::parse("https://cdn.example.com").expect("valid base url");
+    let cleaned = feedcourier::ingest::html::sanitize_and_extract_html(raw_html, Some(&base_url));
+    assert!(
+        !cleaned.content_html.contains("&amp;amp;")
+            && !cleaned.content_html.contains("&amp;#39;")
+            && !cleaned.content_html.contains("&amp;quot;"),
+        "sanitized HTML must not double-escape entities: {}",
+        cleaned.content_html
+    );
+    assert!(
+        cleaned
+            .content_html
+            .contains("src=\"https://cdn.example.com/pic.jpg?a=1&amp;b=2\""),
+        "URL query ampersands must remain single-escaped: {}",
+        cleaned.content_html
+    );
+
+    // 2. SMTP responsive image rewriter preserves relative percentage widths (`width="50%"`) instead of forcing 592px.
+    let smtp_cfg = SmtpChannelConfig {
+        host: "smtp.verified.example.com".to_owned(),
+        port: 587,
+        username: None,
+        password: None,
+        security: SmtpSecurity::StartTls,
+        from_address: "alerts@verified.example.com".to_owned(),
+    };
+    let smtp_dest = SmtpDestinationConfig {
+        to_addresses: vec!["reader@example.org".to_owned()],
+        reply_to: None,
+    };
+    let feed = sample_feed(7, "Design Notes");
+    let mut entry = sample_entry("smtp-percent-width", Vec::new());
+    entry.content_html = Some(cleaned.content_html);
+
+    let built = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 1, None)
+        .expect("build email");
+    assert!(
+        built.html_body.contains("width=\"50%\""),
+        "relative percentage width must be preserved in email HTML:\n{}",
+        built.html_body
+    );
+    assert!(
+        !built.html_body.contains("width=\"592\""),
+        "percentage width must not be overwritten with 592px:\n{}",
+        built.html_body
+    );
+    assert!(
+        !built.html_body.contains("&amp;amp;") && !built.html_body.contains("&amp;#39;"),
+        "email HTML must not double-escape entities:\n{}",
+        built.html_body
+    );
+}
+
+#[tokio::test]
+async fn telegram_proxied_client_allows_local_proxy_host_while_blocking_ssrf_target() {
+    // Spawn a minimal local HTTP forward-proxy listener on loopback (NOT in SSRF allowlist!).
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local mock HTTP proxy");
+    let proxy_port = listener.local_addr().expect("proxy addr").port();
+
+    let proxy_handle = tokio::spawn(async move {
+        // Handle 2 sequential requests from `probe_capabilities`: `getMe` + `sendRichMessage`.
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut reader = BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await.unwrap_or(0);
+                if n == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_length = v.trim().parse::<usize>().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                let _ = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body).await;
+            }
+
+            let (status_line, json_body) = if request_line.contains("/getMe") {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"ok":true,"result":{"id":77,"is_bot":true,"first_name":"ProxyBot","username":"proxy_ok_bot"}}"#,
+                )
+            } else {
+                (
+                    "HTTP/1.1 400 Bad Request",
+                    r#"{"ok":false,"error_code":400,"description":"Bad Request: chat_id is empty"}"#,
+                )
+            };
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json_body}",
+                json_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    // Strict default SSRF policy (NO loopback allowlist!) + local `http://localhost:<port>` proxy.
+    // Prior to R2-01, attaching `self.ssrf_resolver` to the proxied client blocked `localhost`
+    // with `403 ssrf_blocked`.
+    let sender = TelegramSender::with_proxy_and_fetcher(
+        Some(format!("http://localhost:{proxy_port}")),
+        Arc::new(DefaultMediaStreamFetcher::new()),
+    );
+
+    // 1. Public-looking target URL succeeds through the local proxy without tripping SSRF.
+    let public_cfg = TelegramChannelConfig {
+        bot_token: "PROXY_TOK".to_owned(),
+        api_base_url: Some("http://tg-upstream.example.com".to_owned()),
+    };
+    let caps = sender
+        .probe_capabilities(&public_cfg, true)
+        .await
+        .expect("proxied Telegram Bot API request via local proxy hostname must succeed");
+    assert!(caps.supports_rich_message);
+    assert_eq!(caps.bot_username.as_deref(), Some("proxy_ok_bot"));
+
+    // 2. Private/loopback & metadata target URLs are STILL rejected with `AppError::SsrfBlocked`
+    //    even when routing through a proxy.
+    for blocked_base in ["http://127.0.0.1:9999", "http://169.254.169.254"] {
+        let blocked_cfg = TelegramChannelConfig {
+            bot_token: "PROXY_TOK".to_owned(),
+            api_base_url: Some(blocked_base.to_owned()),
+        };
+        assert!(
+            matches!(
+                sender.probe_capabilities(&blocked_cfg, true).await,
+                Err(AppError::SsrfBlocked(_))
+            ),
+            "proxied Telegram target '{blocked_base}' must still be blocked by SSRF policy"
+        );
+    }
+
+    // 3. `socks4a://` proxy scheme is accepted as a remote-DNS proxy (and still blocks private targets).
+    let socks4a_sender = TelegramSender::with_proxy_and_fetcher(
+        Some("socks4a://127.0.0.1:1080".to_owned()),
+        Arc::new(DefaultMediaStreamFetcher::new()),
+    );
+    let blocked_socks4a_cfg = TelegramChannelConfig {
+        bot_token: "PROXY_TOK".to_owned(),
+        api_base_url: Some("http://127.0.0.1:9999".to_owned()),
+    };
+    assert!(matches!(
+        socks4a_sender
+            .probe_capabilities(&blocked_socks4a_cfg, true)
+            .await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    let _ = proxy_handle.await;
 }

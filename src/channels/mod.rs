@@ -1,7 +1,6 @@
-//! Shared delivery channel domain contracts, encrypted configuration schemas,
-//! route presentation options, checkpoints, and the `ChannelSender` trait.
-//!
-//! Concrete channel implementations (`smtp`, `telegram`, `notion`) plug into this module in Wave 2.
+//! Shared delivery channel domain contracts, two-layer encrypted configuration schemas
+//! (Channel Account credentials + Destination targets), route presentation options, checkpoints,
+//! and the `ChannelSender` trait.
 
 pub mod notion;
 pub mod smtp;
@@ -11,10 +10,11 @@ use std::fmt;
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::compute_credential_group_key;
-use crate::db::models::{AppLocale, Channel, DeliveryTask, Entry, Feed, Route};
+use crate::crypto::{compute_credential_group_key, sha256_hex};
+use crate::db::models::{AppLocale, Channel, ChannelDestination, DeliveryTask, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
 
 /// Supported trusted delivery channel types.
@@ -71,7 +71,8 @@ pub enum SmtpSecurity {
     Plain,
 }
 
-/// Decrypted SMTP channel credentials and Force-From envelope settings.
+/// Decrypted SMTP account credentials and Force-From envelope settings stored encrypted in
+/// `channels.encrypted_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmtpChannelConfig {
     pub host: String,
@@ -84,24 +85,36 @@ pub struct SmtpChannelConfig {
     pub security: SmtpSecurity,
     /// Fixed SPF/DKIM/DMARC-aligned sender address (`Force-From`).
     pub from_address: String,
-    /// Recipients locked inside this trusted channel.
+}
+
+/// Decrypted SMTP destination recipients & optional Reply-To stored encrypted in
+/// `channel_destinations.encrypted_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmtpDestinationConfig {
+    /// Recipients locked inside this trusted destination.
     pub to_addresses: Vec<String>,
     #[serde(default)]
     pub reply_to: Option<String>,
 }
 
-/// Decrypted Telegram Bot channel credentials and target chat/topic.
+/// Decrypted Telegram Bot account credentials stored encrypted in `channels.encrypted_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramChannelConfig {
     pub bot_token: String,
+    /// Optional custom Bot API base URL (defaults to `https://api.telegram.org`).
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+}
+
+/// Decrypted Telegram destination chat/topic stored encrypted in
+/// `channel_destinations.encrypted_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramDestinationConfig {
     /// Target private user ID, group ID, or `@channelusername`.
     pub chat_id: String,
     /// Optional forum supergroup topic ID (`message_thread_id`).
     #[serde(default)]
     pub message_thread_id: Option<i64>,
-    /// Optional custom Bot API base URL (defaults to `https://api.telegram.org`).
-    #[serde(default)]
-    pub api_base_url: Option<String>,
 }
 
 /// Probed Telegram Bot API capabilities cached in `channels.capabilities_json`.
@@ -113,6 +126,8 @@ pub struct TelegramCapabilities {
     pub bot_api_version: Option<String>,
     #[serde(default)]
     pub bot_username: Option<String>,
+    #[serde(default)]
+    pub bot_first_name: Option<String>,
     #[serde(default)]
     pub probed_at: Option<i64>,
     #[serde(default)]
@@ -183,10 +198,16 @@ impl NotionColumnMapping {
     }
 }
 
-/// Decrypted Notion data source credentials and property mapping (`Notion-Version: 2026-03-11`).
+/// Decrypted Notion integration credentials stored encrypted in `channels.encrypted_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotionChannelConfig {
     pub integration_secret: String,
+}
+
+/// Decrypted Notion target data source and column mapping (`Notion-Version: 2026-03-11`) stored
+/// encrypted in `channel_destinations.encrypted_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotionDestinationConfig {
     pub data_source_id: String,
     #[serde(default)]
     pub database_id: Option<String>,
@@ -196,7 +217,7 @@ pub struct NotionChannelConfig {
     pub column_mapping: NotionColumnMapping,
 }
 
-/// Decrypted channel configuration stored encrypted in `channels.encrypted_config`.
+/// Decrypted account-level channel configuration stored encrypted in `channels.encrypted_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelConfig {
@@ -215,8 +236,12 @@ impl ChannelConfig {
         }
     }
 
-    /// Compute shared rate-limit group key (`channels.credential_group_key`) so multiple channels
-    /// sharing the same SMTP account, Bot token, or Notion integration share pacing & cooldowns.
+    /// Compute shared rate-limit group key (`channels.credential_group_key`) so all destinations
+    /// (and any accounts sharing identical SMTP/Bot/Notion credentials) share pacing, quotas,
+    /// and cooldowns.
+    ///
+    /// For SMTP, the SHA-256 digest of `password` is folded into the key so distinct API keys
+    /// under a shared username (e.g. SendGrid `apikey`) stay isolated from one another.
     pub fn credential_group_key(&self) -> String {
         match self {
             Self::Smtp(cfg) => {
@@ -225,13 +250,20 @@ impl ChannelConfig {
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or(&cfg.from_address);
+                let pw_digest = cfg
+                    .password
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| sha256_hex(p.as_bytes()))
+                    .unwrap_or_default();
                 compute_credential_group_key(
                     "smtp",
                     &format!(
-                        "{}@{}:{}",
+                        "{}@{}:{}:{}",
                         identity.trim().to_ascii_lowercase(),
                         cfg.host.trim().to_ascii_lowercase(),
-                        cfg.port
+                        cfg.port,
+                        pw_digest
                     ),
                 )
             }
@@ -253,7 +285,47 @@ impl ChannelConfig {
         }
     }
 
-    /// Validate required fields before persisting a channel.
+    /// Strict identity key used by the v0.1.x → v0.2.0 automatic migration to decide whether two
+    /// legacy channels represent the exact same Channel Account and can be merged without losing
+    /// any credentials, TLS mode, or sender identity.
+    pub fn migration_merge_key(&self) -> String {
+        match self {
+            Self::Smtp(cfg) => {
+                let username = cfg
+                    .username
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let pw_digest = cfg
+                    .password
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| sha256_hex(p.as_bytes()))
+                    .unwrap_or_default();
+                let security = match cfg.security {
+                    SmtpSecurity::StartTls => "start_tls",
+                    SmtpSecurity::Tls => "tls",
+                    SmtpSecurity::Plain => "plain",
+                };
+                compute_credential_group_key(
+                    "smtp_merge",
+                    &format!(
+                        "{}|{}|{}|{}|{}|{}",
+                        cfg.host.trim().to_ascii_lowercase(),
+                        cfg.port,
+                        username,
+                        pw_digest,
+                        security,
+                        cfg.from_address.trim().to_ascii_lowercase()
+                    ),
+                )
+            }
+            Self::Telegram(_) | Self::Notion(_) => self.credential_group_key(),
+        }
+    }
+
+    /// Validate required account-level fields before persisting a channel.
     pub fn validate(&self) -> AppResult<()> {
         match self {
             Self::Smtp(cfg) => {
@@ -272,13 +344,6 @@ impl ChannelConfig {
                         "SMTP from_address must not be empty".to_string(),
                     ));
                 }
-                if cfg.to_addresses.is_empty()
-                    || cfg.to_addresses.iter().all(|addr| addr.trim().is_empty())
-                {
-                    return Err(AppError::Validation(
-                        "SMTP to_addresses must contain at least one recipient".to_string(),
-                    ));
-                }
                 Ok(())
             }
             Self::Telegram(cfg) => {
@@ -287,10 +352,13 @@ impl ChannelConfig {
                         "Telegram bot_token must not be empty".to_string(),
                     ));
                 }
-                if cfg.chat_id.trim().is_empty() {
-                    return Err(AppError::Validation(
-                        "Telegram chat_id must not be empty".to_string(),
-                    ));
+                if let Some(raw_base) = cfg
+                    .api_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    validate_telegram_api_base_url(raw_base)?;
                 }
                 Ok(())
             }
@@ -300,12 +368,7 @@ impl ChannelConfig {
                         "Notion integration_secret must not be empty".to_string(),
                     ));
                 }
-                if cfg.data_source_id.trim().is_empty() {
-                    return Err(AppError::Validation(
-                        "Notion data_source_id must not be empty".to_string(),
-                    ));
-                }
-                cfg.column_mapping.validate()
+                Ok(())
             }
         }
     }
@@ -322,19 +385,86 @@ impl ChannelConfig {
                 "has_password": cfg.password.as_ref().is_some_and(|p| !p.is_empty()),
                 "security": cfg.security,
                 "from_address": cfg.from_address,
-                "to_addresses": cfg.to_addresses,
-                "reply_to": cfg.reply_to,
             }),
             Self::Telegram(cfg) => serde_json::json!({
                 "kind": "telegram",
                 "bot_token_hint": mask_secret(&cfg.bot_token),
-                "chat_id": cfg.chat_id,
-                "message_thread_id": cfg.message_thread_id,
                 "api_base_url": cfg.api_base_url,
             }),
             Self::Notion(cfg) => serde_json::json!({
                 "kind": "notion",
                 "secret_hint": mask_secret(&cfg.integration_secret),
+            }),
+        }
+    }
+}
+
+/// Decrypted destination configuration stored encrypted in `channel_destinations.encrypted_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DestinationConfig {
+    Smtp(SmtpDestinationConfig),
+    Telegram(TelegramDestinationConfig),
+    Notion(NotionDestinationConfig),
+}
+
+impl DestinationConfig {
+    /// Discriminant kind matching the parent channel's `channels.kind`.
+    pub const fn kind(&self) -> ChannelKind {
+        match self {
+            Self::Smtp(_) => ChannelKind::Smtp,
+            Self::Telegram(_) => ChannelKind::Telegram,
+            Self::Notion(_) => ChannelKind::Notion,
+        }
+    }
+
+    /// Validate required destination target fields before persisting.
+    pub fn validate(&self) -> AppResult<()> {
+        match self {
+            Self::Smtp(cfg) => {
+                if cfg.to_addresses.is_empty()
+                    || cfg.to_addresses.iter().all(|addr| addr.trim().is_empty())
+                {
+                    return Err(AppError::Validation(
+                        "SMTP to_addresses must contain at least one recipient".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::Telegram(cfg) => {
+                if cfg.chat_id.trim().is_empty() {
+                    return Err(AppError::Validation(
+                        "Telegram chat_id must not be empty".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::Notion(cfg) => {
+                if cfg.data_source_id.trim().is_empty() {
+                    return Err(AppError::Validation(
+                        "Notion data_source_id must not be empty".to_string(),
+                    ));
+                }
+                cfg.column_mapping.validate()
+            }
+        }
+    }
+
+    /// Produce a JSON representation safe to return to the WebUI (`GET /api/v1/channels`).
+    pub fn view(&self) -> serde_json::Value {
+        match self {
+            Self::Smtp(cfg) => serde_json::json!({
+                "kind": "smtp",
+                "to_addresses": cfg.to_addresses,
+                "reply_to": cfg.reply_to,
+            }),
+            Self::Telegram(cfg) => serde_json::json!({
+                "kind": "telegram",
+                "chat_id": cfg.chat_id,
+                "message_thread_id": cfg.message_thread_id,
+            }),
+            Self::Notion(cfg) => serde_json::json!({
+                "kind": "notion",
                 "data_source_id": cfg.data_source_id,
                 "database_id": cfg.database_id,
                 "parent_page_id": cfg.parent_page_id,
@@ -342,6 +472,138 @@ impl ChannelConfig {
             }),
         }
     }
+}
+
+/// Pre-v0.2.0 combined channel configuration schema used strictly by the automatic startup
+/// migration (`Database::migrate_channels_to_v2`) to split legacy `channels.encrypted_config`
+/// blobs into `(ChannelConfig, DestinationConfig)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LegacyChannelConfig {
+    Smtp {
+        host: String,
+        port: u16,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        security: SmtpSecurity,
+        from_address: String,
+        to_addresses: Vec<String>,
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
+    Telegram {
+        bot_token: String,
+        chat_id: String,
+        #[serde(default)]
+        message_thread_id: Option<i64>,
+        #[serde(default)]
+        api_base_url: Option<String>,
+    },
+    Notion {
+        integration_secret: String,
+        data_source_id: String,
+        #[serde(default)]
+        database_id: Option<String>,
+        #[serde(default)]
+        parent_page_id: Option<String>,
+        #[serde(default)]
+        column_mapping: NotionColumnMapping,
+    },
+}
+
+impl LegacyChannelConfig {
+    /// Split a legacy v0.1.x configuration into its v0.2.0 account + destination halves.
+    pub fn into_split(self) -> (ChannelConfig, DestinationConfig) {
+        match self {
+            Self::Smtp {
+                host,
+                port,
+                username,
+                password,
+                security,
+                from_address,
+                to_addresses,
+                reply_to,
+            } => (
+                ChannelConfig::Smtp(SmtpChannelConfig {
+                    host,
+                    port,
+                    username,
+                    password,
+                    security,
+                    from_address,
+                }),
+                DestinationConfig::Smtp(SmtpDestinationConfig {
+                    to_addresses,
+                    reply_to,
+                }),
+            ),
+            Self::Telegram {
+                bot_token,
+                chat_id,
+                message_thread_id,
+                api_base_url,
+            } => (
+                ChannelConfig::Telegram(TelegramChannelConfig {
+                    bot_token,
+                    api_base_url,
+                }),
+                DestinationConfig::Telegram(TelegramDestinationConfig {
+                    chat_id,
+                    message_thread_id,
+                }),
+            ),
+            Self::Notion {
+                integration_secret,
+                data_source_id,
+                database_id,
+                parent_page_id,
+                column_mapping,
+            } => (
+                ChannelConfig::Notion(NotionChannelConfig { integration_secret }),
+                DestinationConfig::Notion(NotionDestinationConfig {
+                    data_source_id,
+                    database_id,
+                    parent_page_id,
+                    column_mapping,
+                }),
+            ),
+        }
+    }
+}
+
+/// Validate a custom Telegram `api_base_url`: only `http://` or `https://` with an explicit host,
+/// and no userinfo (`user:pass@`), query string, or fragment.
+pub fn validate_telegram_api_base_url(raw: &str) -> AppResult<url::Url> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed).map_err(|err| {
+        AppError::Validation(format!("invalid Telegram api_base_url '{trimmed}': {err}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::Validation(format!(
+            "Telegram api_base_url must use http or https scheme, got '{}'",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(AppError::Validation(
+            "Telegram api_base_url must include a host".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::Validation(
+            "Telegram api_base_url must not contain embedded credentials (userinfo)".to_string(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::Validation(
+            "Telegram api_base_url must not contain query parameters or fragments".to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Mask a secret token keeping at most 4 prefix and 4 suffix characters.
@@ -366,8 +628,8 @@ pub enum TelegramDeliveryMode {
     MediaMode,
 }
 
-/// Daily delivery window (`HH:MM`–`HH:MM`, system timezone). `end < start` wraps past midnight;
-/// `start == end` means the whole day.
+/// Daily delivery window (`HH:MM`–`HH:MM`, route or system timezone). `end < start` wraps past
+/// midnight; `start == end` means the whole day.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryTimeWindow {
     pub start: String,
@@ -384,7 +646,12 @@ pub struct RouteOptions {
     /// Delivery template language of this route. `None` inherits the legacy system locale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<AppLocale>,
-    /// Daily windows in the system timezone during which this route may deliver (empty = always).
+    /// Optional per-route IANA timezone (e.g. `"Asia/Shanghai"`). `None` inherits the system
+    /// timezone (`system_settings.timezone`). Controls delivery windows, SMTP article timestamps,
+    /// and Telegram rich-message footer timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Daily windows in the route timezone during which this route may deliver (empty = always).
     #[serde(default)]
     pub active_windows: Vec<DeliveryTimeWindow>,
     /// ISO weekdays (`1` = Monday … `7` = Sunday) on which windows start (empty = every day).
@@ -402,6 +669,7 @@ impl Default for RouteOptions {
             telegram_mode: TelegramDeliveryMode::RichMessage,
             link_preview: true,
             locale: None,
+            timezone: None,
             active_windows: Vec::new(),
             active_weekdays: Vec::new(),
         }
@@ -455,6 +723,9 @@ pub struct DeliveryContext<'a> {
     pub route_options: RouteOptions,
     pub channel: &'a Channel,
     pub channel_config: &'a ChannelConfig,
+    pub destination: &'a ChannelDestination,
+    pub destination_config: &'a DestinationConfig,
+    pub timezone: Tz,
     pub checkpoint: Option<DeliveryCheckpoint>,
     pub checkpoint_sink: Option<&'a dyn CheckpointSink>,
 }
@@ -501,6 +772,11 @@ pub trait ChannelSender: Send + Sync {
     /// Deliver a single entry according to the route's options and existing checkpoint.
     async fn send(&self, ctx: &DeliveryContext<'_>) -> AppResult<DeliveryOutcome>;
 
-    /// Send an interactive connectivity test message/page when configuring a channel in WebUI/MCP.
-    async fn send_test(&self, config: &ChannelConfig, use_proxy: bool) -> AppResult<String>;
+    /// Send an interactive connectivity test message/page to a specific destination under an account.
+    async fn send_test(
+        &self,
+        channel_config: &ChannelConfig,
+        destination_config: &DestinationConfig,
+        use_proxy: bool,
+    ) -> AppResult<String>;
 }

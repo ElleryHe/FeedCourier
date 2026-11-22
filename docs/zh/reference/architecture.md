@@ -17,7 +17,7 @@ description: "FeedCourier 系统架构总览：模块划分、四级 SHA-256 指
 FeedCourier 运行于单个 Rust 进程内，主要由五个核心组件协同工作：
 - **`ProtectedHttpClient`（`src/net/`）**：在 DNS 解析与 TCP 连接阶段执行防 SSRF 校验，支持逐跳重定向校验（最多 5 跳）、响应流字节上限控制及可选全局出站代理。
 - **`IngestEngine`（`src/ingest/`）**：执行订阅源拉取（支持 `ETag` / `Last-Modified` 条件请求）、按需 `dom_smoothie` Readability 全文提取、`ammonia` HTML 净化、四级 SHA-256 指纹计算以及路由过滤匹配。
-- **`Database`（`src/db/`）**：维护基于 SQLite WAL 的串行写池（`write_pool`）与并发读池（`read_pool`），承载 `feeds`、`entries`、`channels`、`routes`、`delivery_tasks` 等持久化表。
+- **`Database`（`src/db/`）**：维护基于 SQLite WAL 的串行写池（`write_pool`）与并发读池（`read_pool`），承载 `feeds`、`entries`、`channels`、`channel_destinations`、`routes`、`delivery_tasks` 等持久化表，并在启动时自动执行 v0.2.0 原子迁移钩子（`Database::migrate_channels_to_v2`）。
 - **`DeliveryDispatcher`（`src/scheduler/`）**：驱动后台订阅源轮询协程、租约制发件箱投递 Worker（含步进流控、配额窗口与 `checkpoint_json` 断点恢复）以及定期维护协程（`NOT EXISTS` 正文回收与 `PRAGMA optimize`）。
 - **Axum HTTP 服务（`src/api/`、`src/mcp/`）**：在同一监听端口上挂载内嵌 React 19 WebUI、REST API（`/api/v1/*`）以及 Streamable HTTP MCP 服务端点（`/mcp`）。
 
@@ -165,7 +165,7 @@ stateDiagram-v2
 
 ### 2. `lease_until` 过期租约自动接管
 
-`claim_next_delivery_task` 在每次调度周期中通过单条 `UPDATE ... RETURNING *` 同时匹配两类候选行：
+`claim_next_delivery_task` 在每次调度周期中通过单条 `UPDATE ... RETURNING *`（同时要求 `routes.enabled = 1`、`channels.enabled = 1` 与 `channel_destinations.enabled = 1`）匹配两类候选行：
 1. `status IN ('queued', 'retrying', 'deferred') AND next_attempt_at <= now`
 2. `status = 'delivering' AND lease_until <= now`
 
@@ -173,26 +173,27 @@ stateDiagram-v2
 
 若进程在投递中途因容器重启或断电退出，正在执行的任务在 `120` 秒租约到期后会被后续调度周期自动重新领取。Worker 在发起网络请求前会先读取任务上的 `checkpoint_json`（`DeliveryCheckpoint`），按通道协议执行幂等对账或断点续传（详见[通道协议与投递实现](/zh/reference/channel-protocols)）。
 
-### 3. 共享凭据组流控（`credential_group_key`）与配额护栏
+### 3. 共享凭据组流控（`credential_group_key`）与持久化配额账本（`delivery_quota_ledger`）
 
-多个逻辑通道可能共用同一个底层发信账号（例如同一个 Telegram `bot_token` 推送至不同群组/频道，或同一个 Notion `integration_secret` 写入不同数据源）。为防止并发通道叠加触发上游速率限制，FeedCourier 在保存通道时计算 `credential_group_key`（基于协议类型与核心凭据的 SHA-256 摘要）：
+在双层通道模型（`channels` 账号 + 多个 `channel_destinations` 目的地）下，同一账号下的所有目的地天然共享该账号的凭据、代理、步进间隔、配额与冷却时间。此外，即使存在多个独立账号，只要其底层发信身份一致（同一 SMTP 主机/端口/登录账号与密码 SHA-256 摘要、同一 `api_base_url` 下的同一 Telegram `bot_token`，或同一 Notion `integration_secret`），FeedCourier 会计算出相同的 SHA-256 `credential_group_key` 进行跨账号联动限流（同时确保共用通用用户名但 API Key 不同的 SMTP 账号如 SendGrid `apikey` 彼此隔离）：
 
-- **步进间隔与随机抖动（Pacing & Jitter）**：`DeliveryDispatcher` 按 `credential_group_key` 维护下次允许发送时间戳。每次投递完成后，同组通道共同延迟 `min_interval_secs + uniform_random(0..=jitter_max_secs)` 秒；
-- **上游 `429` 组级冷却（`cooldown_until`）**：当任一通道收到下游 `429 Too Many Requests`（含 Telegram `parameters.retry_after` 或 HTTP `Retry-After` 响应头）时，系统按 `credential_group_key` 批量更新同组所有通道的 `cooldown_until`；
-- **滚动配额窗口（`hourly_quota` / `daily_quota`）**：发送前统计当前通道过去 `3,600` 秒与 `86,400` 秒内 `status = 'delivered'` 的任务数；若达到上限，任务转入 `deferred` 状态并推迟至最早一笔已完成任务滑出窗口的时间点。
+- **逐条独立抖动与内存态存储（Pacing & Jitter）**：`DeliveryDispatcher` 在内存中按 `credential_group_key` 维护下一次允许发送时间戳（`pacing_next_allowed_at`）。每次投递**完成后**独立抽取一次 `uniform_random(0..=jitter_max_secs)` 随机秒数，并写入 `next_allowed = completed_at + min_interval_secs + jitter`（同一批任务不共享抖动值）。随机抖动仅驻留内存；进程重启后，首条投递依据 SQLite `delivery_quota_ledger` 中持久化的 `last_completed_at` 满足 `min_interval_secs` 约束（`max(last_completed_at + min_interval_secs, mem_earliest)`），随后恢复完整的带抖动步进；
+- **上游 `429` 组级冷却（`cooldown_until`）**：当任一目的地收到下游 `429 Too Many Requests`（含 Telegram `parameters.retry_after` 或 HTTP `Retry-After` 响应头）时，系统按 `credential_group_key` 批量更新所属账号及同凭据组所有账号的 `cooldown_until`；
+- **持久化滚动配额账本（`delivery_quota_ledger`）**：每次投递成功时向无业务外键的 `delivery_quota_ledger` 写入 `(credential_group_key, channel_id, completed_at)`（超过 24 小时由维护任务定期清理）。发送前 `get_channel_quota_usage` 改读账本统计过去 `3,600` 秒与 `86,400` 秒内的投递量，并按同 `credential_group_key` 组内最严有效 `hourly_quota` / `daily_quota` 判断，因此删除订阅源、路由、目的地或清除缓存绝不会清零配额或重置步进时间戳；达到上限时任务转入 `deferred` 且不消耗故障重试次数。
 
-### 4. 路由时间窗口与全局队列暂停
+### 4. 路由级时区、夏令时安全窗口与全局队列暂停
 
 领取循环之前有两道闸门：
 
-- **路由时间窗口**：`routes.options_json` 可包含 `active_windows`（`HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日），按 `system_settings.timezone` 中保存的 IANA 时区判定（`src/schedule.rs`）。`end` 早于 `start` 的窗口跨午夜，`start == end` 表示全天，空列表表示不限制；跨午夜窗口按窗口开始那一天的星期判定。窗口外的任务**不会被丢弃**：保持 `queued` / `deferred` 状态，`next_attempt_at` 被设为下一个窗口开始时间，之后由常规领取查询接管。
+- **路由时区与夏令时（DST）安全时间窗口**：`routes.options_json` 可包含可选的路由级 IANA `timezone`（通过 `resolve_route_timezone` 解析，未设置时继承 `system_settings.timezone`）、`active_windows`（`HH:MM` 区间）与 `active_weekdays`（`1` = 周一 … `7` = 周日）（`src/schedule.rs`）。生效后的路由时区同时用于判定推送时间窗口，以及渲染 SMTP 邮件和 Telegram 富文本 `<footer>` 中的本地文章发布时间（`format_local_timestamp`，格式为 `YYYY-MM-DD HH:MM (UTC±HH:MM)`）。`end` 早于 `start` 的窗口跨午夜；仅 `00:00`–`00:00`（或空列表 `[]`）表示全天，其余非零 `start == end` 窗口会被拒绝并返回 `400 Bad Request`。夏令时切换具备安全边界处理：春季跳变间隙自动向前推进至跳变后首个合法时刻，秋季回拨重叠区间起点取最早时刻、终点取最晚时刻；跨午夜窗口按窗口开始那一天的星期判定。窗口外的任务**不会被丢弃**：保持 `queued` / `deferred` 状态，`next_attempt_at` 被设为下一个窗口开始时间，之后由常规领取查询接管。
+- **路由变更时的在途任务同步**：更换路由的 `destination_id` 会在同一事务内重指该路由下 `queued` / `deferred` / `retrying` 任务（清空 `checkpoint_json` 并重置 `attempt_count = 0`，进行中的 `delivering` 任务不受影响）；修改 `active_windows`、`active_weekdays` 或 `timezone` 时会立即将 `queued` / `deferred` 任务的 `next_attempt_at` 重置为当前时间并唤醒发件箱。
 - **全局暂停**：`system_settings.outbox_queue` 保存暂停状态与可选的 `resume_at`。暂停期间调度器不领取任何任务，但订阅源轮询与任务入队照常进行。已过期的 `resume_at` 视为已恢复（`GET /api/v1/tasks/queue` 返回 `paused: false`）。恢复后，所有到期任务按上述时间顺序依次发出。
 
 每个任务的投递语言按 `routes.options_json.locale` 解析，缺省时回退到旧版 `system_settings.locale`。WebUI 界面语言只是浏览器本地偏好（`localStorage`），不保存到服务端。
 
 ### 5. 调试推送（`POST /api/v1/feeds/preview/push`、MCP `test_push_feed_entry`）
 
-调试推送会实时抓取一条文章，并以内存中的条目直接调用通道发送器。它不写入 `entries` 指纹，也不创建 `delivery_tasks` 行，并绕过路由过滤、时间窗口、全局暂停、步进间隔与配额。Notion 页面的 `FC-ID` 带 `test-` 前缀，下游错误会以 `ok: false` 诊断信息返回给调用方。
+调试推送会实时抓取一条文章，并以内存中的条目直接调用通道发送器发往目标授信 `destination_id`（或兼容单目的地账号的 `channel_id`），支持传入 `options.timezone`。它不写入 `entries` 指纹，也不创建 `delivery_tasks` 行，并绕过路由过滤、时间窗口、全局暂停、步进间隔与配额。Notion 页面的 `FC-ID` 带 `test-` 前缀，下游错误会以 `ok: false` 诊断信息返回给调用方。
 
 ---
 

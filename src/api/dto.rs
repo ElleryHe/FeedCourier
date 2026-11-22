@@ -6,14 +6,16 @@ use serde_json::Value;
 
 use crate::channels::notion::normalize_notion_id;
 use crate::channels::{
-    ChannelConfig, ChannelKind, DeliveryCheckpoint, NotionChannelConfig, NotionColumnMapping,
-    RouteOptions, SmtpChannelConfig, SmtpSecurity, TelegramChannelConfig, TelegramDeliveryMode,
+    ChannelConfig, ChannelKind, DeliveryCheckpoint, DestinationConfig, NotionChannelConfig,
+    NotionColumnMapping, NotionDestinationConfig, RouteOptions, SmtpChannelConfig,
+    SmtpDestinationConfig, SmtpSecurity, TelegramChannelConfig, TelegramDeliveryMode,
+    TelegramDestinationConfig,
 };
 use crate::config::{LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::MasterKey;
 use crate::db::models::{
-    AppLocale, Channel, DeliveryTaskDetail, DeliveryTaskStatus, Feed, FeedHealthStatus, McpToken,
-    McpTokenScope, OverviewSnapshot, Route, unix_to_rfc3339,
+    AppLocale, Channel, ChannelDestination, DeliveryTaskDetail, DeliveryTaskStatus, Feed,
+    FeedHealthStatus, McpToken, McpTokenScope, OverviewSnapshot, Route, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::ContentFilterRules;
@@ -356,6 +358,8 @@ pub struct DebugPushOptions {
     pub link_preview: Option<bool>,
     #[serde(default)]
     pub locale: Option<AppLocale>,
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -369,7 +373,10 @@ pub struct DebugPushRequest {
     pub fetch_full_content: bool,
     #[serde(default)]
     pub use_proxy: bool,
-    pub channel_id: i64,
+    #[serde(default)]
+    pub destination_id: Option<i64>,
+    #[serde(default)]
+    pub channel_id: Option<i64>,
     #[serde(default)]
     pub options: DebugPushOptions,
 }
@@ -397,8 +404,187 @@ pub struct OpmlImportResponse {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Trusted Channels (`/api/v1/channels*`)
+// 4. Trusted Channels (Accounts) & Destinations (`/api/v1/channels*`, `/api/v1/destinations*`)
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDestinationDto {
+    pub id: i64,
+    pub channel_id: i64,
+    pub name: String,
+    pub kind: ChannelKind,
+    pub config: Value,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl ChannelDestinationDto {
+    pub fn from_model(
+        dest: ChannelDestination,
+        kind: ChannelKind,
+        master_key: &MasterKey,
+    ) -> AppResult<Self> {
+        let decrypted: DestinationConfig = master_key.decrypt_json(&dest.encrypted_config)?;
+        Ok(Self {
+            id: dest.id,
+            channel_id: dest.channel_id,
+            name: dest.name,
+            kind,
+            config: decrypted.view(),
+            enabled: dest.enabled,
+            created_at: unix_to_rfc3339(dest.created_at),
+            updated_at: unix_to_rfc3339(dest.updated_at),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateDestinationRequest {
+    /// Optional label; auto-derived from Telegram `getChat`, SMTP first recipient, or Notion
+    /// database title when omitted or blank.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub config: DestinationConfig,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Partial destination patch (`PATCH /api/v1/destinations/{id}`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DestinationPatch {
+    Smtp {
+        #[serde(default)]
+        to_addresses: Option<Vec<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        reply_to: Option<Option<String>>,
+    },
+    Telegram {
+        #[serde(default)]
+        chat_id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        message_thread_id: Option<Option<i64>>,
+    },
+    Notion {
+        #[serde(default)]
+        data_source_id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        database_id: Option<Option<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        parent_page_id: Option<Option<String>>,
+        #[serde(default)]
+        column_mapping: Option<NotionColumnMapping>,
+    },
+}
+
+impl DestinationPatch {
+    pub const fn kind(&self) -> ChannelKind {
+        match self {
+            Self::Smtp { .. } => ChannelKind::Smtp,
+            Self::Telegram { .. } => ChannelKind::Telegram,
+            Self::Notion { .. } => ChannelKind::Notion,
+        }
+    }
+
+    pub fn apply_to(&self, existing: &DestinationConfig) -> AppResult<DestinationConfig> {
+        match (existing, self) {
+            (
+                DestinationConfig::Smtp(cur),
+                Self::Smtp {
+                    to_addresses,
+                    reply_to,
+                },
+            ) => {
+                let next_reply_to = match reply_to {
+                    Some(opt) => normalize_opt_string(opt.clone()),
+                    None => cur.reply_to.clone(),
+                };
+                let next_to_addresses = match to_addresses {
+                    Some(list) => normalize_string_vec(list.clone()),
+                    None => cur.to_addresses.clone(),
+                };
+                let merged = DestinationConfig::Smtp(SmtpDestinationConfig {
+                    to_addresses: next_to_addresses,
+                    reply_to: next_reply_to,
+                });
+                merged.validate()?;
+                Ok(merged)
+            }
+            (
+                DestinationConfig::Telegram(cur),
+                Self::Telegram {
+                    chat_id,
+                    message_thread_id,
+                },
+            ) => {
+                let next_thread = match message_thread_id {
+                    Some(opt) => *opt,
+                    None => cur.message_thread_id,
+                };
+                let merged = DestinationConfig::Telegram(TelegramDestinationConfig {
+                    chat_id: chat_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or(&cur.chat_id)
+                        .to_string(),
+                    message_thread_id: next_thread,
+                });
+                merged.validate()?;
+                Ok(merged)
+            }
+            (
+                DestinationConfig::Notion(cur),
+                Self::Notion {
+                    data_source_id,
+                    database_id,
+                    parent_page_id,
+                    column_mapping,
+                },
+            ) => {
+                let next_ds_id = match data_source_id.as_deref().map(str::trim) {
+                    Some(raw) if !raw.is_empty() => normalize_notion_id(raw)?,
+                    _ => cur.data_source_id.clone(),
+                };
+                let next_db_id = match database_id {
+                    Some(Some(raw)) if !raw.trim().is_empty() => Some(normalize_notion_id(raw)?),
+                    Some(_) => None,
+                    None => cur.database_id.clone(),
+                };
+                let next_parent_id = match parent_page_id {
+                    Some(Some(raw)) if !raw.trim().is_empty() => Some(normalize_notion_id(raw)?),
+                    Some(_) => None,
+                    None => cur.parent_page_id.clone(),
+                };
+                let merged = DestinationConfig::Notion(NotionDestinationConfig {
+                    data_source_id: next_ds_id,
+                    database_id: next_db_id,
+                    parent_page_id: next_parent_id,
+                    column_mapping: column_mapping
+                        .clone()
+                        .unwrap_or_else(|| cur.column_mapping.clone()),
+                });
+                merged.validate()?;
+                Ok(merged)
+            }
+            (existing_cfg, patch) => Err(AppError::Validation(format!(
+                "cannot change destination kind from '{}' to '{}'",
+                existing_cfg.kind(),
+                patch.kind()
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateDestinationRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub config: Option<DestinationPatch>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelDto {
@@ -414,15 +600,28 @@ pub struct ChannelDto {
     pub use_proxy: bool,
     pub cooldown_until: Option<String>,
     pub enabled: bool,
+    pub destinations: Vec<ChannelDestinationDto>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 impl ChannelDto {
-    pub fn from_model(channel: Channel, master_key: &MasterKey) -> AppResult<Self> {
+    pub fn from_model(
+        channel: Channel,
+        destinations: Vec<ChannelDestination>,
+        master_key: &MasterKey,
+    ) -> AppResult<Self> {
         let decrypted: ChannelConfig = master_key.decrypt_json(&channel.encrypted_config)?;
         let redacted_view = decrypted.redacted_view();
         let capabilities = channel.capabilities_value();
+        let mut dest_dtos = Vec::with_capacity(destinations.len());
+        for d in destinations {
+            dest_dtos.push(ChannelDestinationDto::from_model(
+                d,
+                channel.kind,
+                master_key,
+            )?);
+        }
 
         Ok(Self {
             id: channel.id,
@@ -437,6 +636,7 @@ impl ChannelDto {
             use_proxy: channel.use_proxy,
             cooldown_until: channel.cooldown_until.map(unix_to_rfc3339),
             enabled: channel.enabled,
+            destinations: dest_dtos,
             created_at: unix_to_rfc3339(channel.created_at),
             updated_at: unix_to_rfc3339(channel.updated_at),
         })
@@ -445,9 +645,15 @@ impl ChannelDto {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateChannelRequest {
-    pub name: String,
+    /// Optional account display name; auto-derived from Telegram `getMe`, SMTP `from_address`,
+    /// or Notion `/v1/users/me` when omitted or blank.
+    #[serde(default)]
+    pub name: Option<String>,
     pub kind: ChannelKind,
     pub config: ChannelConfig,
+    /// Optional first destination to create alongside the account.
+    #[serde(default)]
+    pub initial_destination: Option<CreateDestinationRequest>,
     #[serde(default = "default_min_interval_secs")]
     pub min_interval_secs: i64,
     #[serde(default = "default_jitter_max_secs")]
@@ -462,10 +668,12 @@ pub struct CreateChannelRequest {
     pub enabled: bool,
 }
 
-/// Secret-preserving target patch payload (`PATCH /api/v1/channels/{id}`).
+/// Secret-preserving account patch payload (`PATCH /api/v1/channels/{id}`).
 ///
-/// When `password` / `bot_token` / `integration_secret` is omitted, `null`, or empty,
-/// the backend preserves the stored encrypted secret intact.
+/// - For `bot_token` / `integration_secret`: omitting, passing `null`, or passing `""` preserves
+///   the stored encrypted secret intact.
+/// - For SMTP `password`: omitting or passing `""` preserves the stored password; passing explicit
+///   JSON `null` clears the stored password (e.g. switching to unauthenticated relay).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelTargetPatch {
@@ -476,38 +684,22 @@ pub enum ChannelTargetPatch {
         port: Option<u16>,
         #[serde(default, deserialize_with = "deserialize_optional_nullable")]
         username: Option<Option<String>>,
-        #[serde(default)]
-        password: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        password: Option<Option<String>>,
         #[serde(default)]
         security: Option<SmtpSecurity>,
         #[serde(default)]
         from_address: Option<String>,
-        #[serde(default)]
-        to_addresses: Option<Vec<String>>,
-        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-        reply_to: Option<Option<String>>,
     },
     Telegram {
         #[serde(default)]
         bot_token: Option<String>,
-        #[serde(default)]
-        chat_id: Option<String>,
-        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-        message_thread_id: Option<Option<i64>>,
         #[serde(default, deserialize_with = "deserialize_optional_nullable")]
         api_base_url: Option<Option<String>>,
     },
     Notion {
         #[serde(default)]
         integration_secret: Option<String>,
-        #[serde(default)]
-        data_source_id: Option<String>,
-        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-        database_id: Option<Option<String>>,
-        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-        parent_page_id: Option<Option<String>>,
-        #[serde(default)]
-        column_mapping: Option<NotionColumnMapping>,
     },
 }
 
@@ -532,25 +724,16 @@ impl ChannelTargetPatch {
                     password,
                     security,
                     from_address,
-                    to_addresses,
-                    reply_to,
                 },
             ) => {
                 let next_username = match username {
                     Some(opt) => normalize_opt_string(opt.clone()),
                     None => cur.username.clone(),
                 };
-                let next_password = match password.as_deref() {
-                    Some(raw) if !raw.is_empty() => Some(raw.to_string()),
-                    _ => cur.password.clone(),
-                };
-                let next_reply_to = match reply_to {
-                    Some(opt) => normalize_opt_string(opt.clone()),
-                    None => cur.reply_to.clone(),
-                };
-                let next_to_addresses = match to_addresses {
-                    Some(list) => normalize_string_vec(list.clone()),
-                    None => cur.to_addresses.clone(),
+                let next_password = match password {
+                    Some(None) => None,
+                    Some(Some(raw)) if !raw.is_empty() => Some(raw.clone()),
+                    None | Some(Some(_)) => cur.password.clone(),
                 };
 
                 let merged = ChannelConfig::Smtp(SmtpChannelConfig {
@@ -568,8 +751,6 @@ impl ChannelTargetPatch {
                         .map(str::trim)
                         .unwrap_or(&cur.from_address)
                         .to_string(),
-                    to_addresses: next_to_addresses,
-                    reply_to: next_reply_to,
                 });
                 merged.validate()?;
                 Ok((merged, false))
@@ -578,8 +759,6 @@ impl ChannelTargetPatch {
                 ChannelConfig::Telegram(cur),
                 Self::Telegram {
                     bot_token,
-                    chat_id,
-                    message_thread_id,
                     api_base_url,
                 },
             ) => {
@@ -592,61 +771,21 @@ impl ChannelTargetPatch {
                     None => cur.api_base_url.clone(),
                 };
                 let base_changed = next_api_base != cur.api_base_url;
-                let next_thread = match message_thread_id {
-                    Some(opt) => *opt,
-                    None => cur.message_thread_id,
-                };
 
                 let merged = ChannelConfig::Telegram(TelegramChannelConfig {
                     bot_token: next_token,
-                    chat_id: chat_id
-                        .as_deref()
-                        .map(str::trim)
-                        .unwrap_or(&cur.chat_id)
-                        .to_string(),
-                    message_thread_id: next_thread,
                     api_base_url: next_api_base,
                 });
                 merged.validate()?;
                 Ok((merged, token_changed || base_changed))
             }
-            (
-                ChannelConfig::Notion(cur),
-                Self::Notion {
-                    integration_secret,
-                    data_source_id,
-                    database_id,
-                    parent_page_id,
-                    column_mapping,
-                },
-            ) => {
+            (ChannelConfig::Notion(cur), Self::Notion { integration_secret }) => {
                 let next_secret = match integration_secret.as_deref().map(str::trim) {
                     Some(sec) if !sec.is_empty() => sec.to_string(),
                     _ => cur.integration_secret.clone(),
                 };
-                let next_ds_id = match data_source_id.as_deref().map(str::trim) {
-                    Some(raw) if !raw.is_empty() => normalize_notion_id(raw)?,
-                    _ => cur.data_source_id.clone(),
-                };
-                let next_db_id = match database_id {
-                    Some(Some(raw)) if !raw.trim().is_empty() => Some(normalize_notion_id(raw)?),
-                    Some(_) => None,
-                    None => cur.database_id.clone(),
-                };
-                let next_parent_id = match parent_page_id {
-                    Some(Some(raw)) if !raw.trim().is_empty() => Some(normalize_notion_id(raw)?),
-                    Some(_) => None,
-                    None => cur.parent_page_id.clone(),
-                };
-
                 let merged = ChannelConfig::Notion(NotionChannelConfig {
                     integration_secret: next_secret,
-                    data_source_id: next_ds_id,
-                    database_id: next_db_id,
-                    parent_page_id: next_parent_id,
-                    column_mapping: column_mapping
-                        .clone()
-                        .unwrap_or_else(|| cur.column_mapping.clone()),
                 });
                 merged.validate()?;
                 Ok((merged, false))
@@ -684,6 +823,8 @@ pub struct UpdateChannelRequest {
 pub struct TestChannelRequest {
     #[serde(default)]
     pub locale: Option<AppLocale>,
+    #[serde(default)]
+    pub destination_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,6 +846,7 @@ pub struct RouteDto {
     pub feed_ids: Vec<i64>,
     pub match_tags: Vec<String>,
     pub channel_id: i64,
+    pub destination_id: i64,
     pub include_keywords: Vec<String>,
     pub exclude_keywords: Vec<String>,
     pub include_regex: Option<String>,
@@ -729,6 +871,7 @@ impl RouteDto {
             feed_ids,
             match_tags,
             channel_id: route.channel_id,
+            destination_id: route.destination_id,
             include_keywords,
             exclude_keywords,
             include_regex: route.include_regex,
@@ -748,7 +891,12 @@ pub struct CreateRouteRequest {
     pub feed_ids: Vec<i64>,
     #[serde(default)]
     pub match_tags: Vec<String>,
-    pub channel_id: i64,
+    /// Primary delivery destination ID (`channel_destinations.id`).
+    #[serde(default)]
+    pub destination_id: Option<i64>,
+    /// Legacy fallback: accepted when the target channel owns exactly 1 destination.
+    #[serde(default)]
+    pub channel_id: Option<i64>,
     #[serde(default)]
     pub include_keywords: Vec<String>,
     #[serde(default)]
@@ -771,6 +919,8 @@ pub struct UpdateRouteRequest {
     pub feed_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub match_tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub destination_id: Option<i64>,
     #[serde(default)]
     pub channel_id: Option<i64>,
     #[serde(default)]
@@ -807,6 +957,8 @@ pub struct DeliveryTaskDto {
     pub channel_id: i64,
     pub channel_name: String,
     pub channel_kind: ChannelKind,
+    pub destination_id: i64,
+    pub destination_name: String,
     pub entry_id: i64,
     pub entry_title: Option<String>,
     pub entry_url: Option<String>,
@@ -844,6 +996,8 @@ impl DeliveryTaskDto {
             channel_id: detail.channel_id,
             channel_name: detail.channel_name,
             channel_kind: detail.channel_kind,
+            destination_id: detail.destination_id,
+            destination_name: detail.destination_name,
             entry_id: detail.entry_id,
             entry_title: detail.entry_title,
             entry_url: detail.entry_url,
@@ -994,16 +1148,28 @@ pub fn normalize_channel_config_on_create(cfg: &mut ChannelConfig) -> AppResult<
             smtp.username = normalize_opt_string(smtp.username.take());
             smtp.password = smtp.password.take().filter(|p| !p.is_empty());
             smtp.from_address = smtp.from_address.trim().to_string();
-            smtp.to_addresses = normalize_string_vec(std::mem::take(&mut smtp.to_addresses));
-            smtp.reply_to = normalize_opt_string(smtp.reply_to.take());
         }
         ChannelConfig::Telegram(tg) => {
             tg.bot_token = tg.bot_token.trim().to_string();
-            tg.chat_id = tg.chat_id.trim().to_string();
             tg.api_base_url = normalize_opt_string(tg.api_base_url.take());
         }
         ChannelConfig::Notion(notion) => {
             notion.integration_secret = notion.integration_secret.trim().to_string();
+        }
+    }
+    cfg.validate()
+}
+
+pub fn normalize_destination_config_on_create(cfg: &mut DestinationConfig) -> AppResult<()> {
+    match cfg {
+        DestinationConfig::Smtp(smtp) => {
+            smtp.to_addresses = normalize_string_vec(std::mem::take(&mut smtp.to_addresses));
+            smtp.reply_to = normalize_opt_string(smtp.reply_to.take());
+        }
+        DestinationConfig::Telegram(tg) => {
+            tg.chat_id = tg.chat_id.trim().to_string();
+        }
+        DestinationConfig::Notion(notion) => {
             notion.data_source_id = normalize_notion_id(&notion.data_source_id)?;
             notion.database_id = match notion.database_id.take() {
                 Some(raw) if !raw.trim().is_empty() => Some(normalize_notion_id(&raw)?),

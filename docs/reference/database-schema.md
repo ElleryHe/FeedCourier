@@ -1,10 +1,10 @@
 ---
-description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, routes, delivery_tasks, sessions, mcp_tokens, and system_settings."
+description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, channel_destinations, routes, delivery_tasks, delivery_quota_ledger, sessions, mcp_tokens, and system_settings."
 ---
 
 # SQLite Database Schema
 
-FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) and run automatically on startup. All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and foreign keys enforce **`ON DELETE CASCADE`**.
+FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) and [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql) and run automatically on startup. When upgrading an existing `v0.1.x` database, `Database::connect` first creates a pure `v0.1.x` online `VACUUM INTO` snapshot at `<DATA_DIR>/pre-v0.2.0-backup.db` (or `pre-v0.2.0-backup-<timestamp>.db` if a backup already exists) **before** `0002_channel_destinations.sql` executes, followed by the atomic Rust migration hook `Database::migrate_channels_to_v2`. All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and relational business foreign keys enforce **`ON DELETE CASCADE`** (while `delivery_quota_ledger` intentionally omits foreign keys so deletions never clear quota usage).
 
 ---
 
@@ -13,9 +13,12 @@ FeedCourier stores all persistent state in a single SQLite `WAL` database at `<D
 ```mermaid
 erDiagram
     feeds ||--o{ entries : "feed_id (ON DELETE CASCADE)"
+    channels ||--o{ channel_destinations : "channel_id (ON DELETE CASCADE)"
     channels ||--o{ routes : "channel_id (ON DELETE CASCADE)"
+    channel_destinations ||--o{ routes : "destination_id (ON DELETE CASCADE)"
     routes ||--o{ delivery_tasks : "route_id (ON DELETE CASCADE)"
     channels ||--o{ delivery_tasks : "channel_id (ON DELETE CASCADE)"
+    channel_destinations ||--o{ delivery_tasks : "destination_id (ON DELETE CASCADE)"
     entries ||--o{ delivery_tasks : "entry_id (ON DELETE CASCADE)"
 ```
 
@@ -80,24 +83,24 @@ Stores the permanent 64-character SHA-256 deduplication fingerprint alongside tr
 
 ---
 
-### 3. `channels` — Encrypted Trusted Delivery Channels
+### 3. `channels` — Encrypted Trusted Delivery Accounts
 
-Stores ChaCha20-Poly1305 encrypted credentials, recipient endpoints, shared credential group keys, and pacing/quota settings (see [Security & Isolation](/reference/security)).
+Stores account-level ChaCha20-Poly1305 encrypted credentials (`ChannelConfig`), shared credential group keys, outbound proxy toggles, and account-wide pacing/quota/cooldown settings shared by all child `channel_destinations` (see [Security & Isolation](/reference/security)).
 
 | Column | Type | Constraints / Default | Description |
 | :--- | :--- | :--- | :--- |
-| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique channel ID (referenced by `routes` and MCP `configure_route`). |
-| `name` | `TEXT` | `NOT NULL` | Display name shown in WebUI and MCP summaries. |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique channel account ID. |
+| `name` | `TEXT` | `NOT NULL` | Display name shown in WebUI and MCP summaries (auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me` when omitted). |
 | `kind` | `TEXT` | `NOT NULL` | `'smtp'`, `'telegram'`, or `'notion'`. |
-| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext (`12-byte nonce \|\| ciphertext \|\| 16-byte Poly1305 tag`) of `ChannelConfig`. |
-| `credential_group_key` | `TEXT` | `NOT NULL` | SHA-256 key grouping channels that share the same underlying sender credential. |
-| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Cached capability probe JSON (e.g., Telegram `supports_rich_message`, `bot_api_version`). |
-| `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15` | Minimum pacing delay in seconds between deliveries. |
-| `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10` | Random jitter ceiling in seconds (`0 ..= jitter_max_secs`). |
-| `hourly_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 1-hour window. |
-| `daily_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 24-hour window. |
-| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0` | `1` to route channel requests through the global outbound proxy. |
-| `cooldown_until` | `INTEGER` | `NULL` | Downstream rate-limit cooldown expiration timestamp. |
+| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext (`12-byte nonce \|\| ciphertext \|\| 16-byte Poly1305 tag`) of account-level `ChannelConfig` (SMTP server/auth/`from_address`, Telegram `bot_token`/`api_base_url`, or Notion `integration_secret`). |
+| `credential_group_key` | `TEXT` | `NOT NULL` | SHA-256 key grouping accounts sharing the same underlying sender credential (for SMTP, incorporates the SHA-256 digest of the password—never plaintext—so distinct API keys under a shared username such as SendGrid's `apikey` stay isolated). |
+| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Cached capability probe JSON (e.g., Telegram `supports_rich_message`, `bot_api_version`, `bot_username`). |
+| `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15` | Minimum pacing delay in seconds between deliveries across all destinations of this account. |
+| `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10` | Per-delivery random jitter ceiling in seconds (`0 ..= jitter_max_secs`, kept in memory). |
+| `hourly_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 1-hour window shared across all destinations of this account. |
+| `daily_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 24-hour window shared across all destinations of this account. |
+| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0` | `1` to route all requests for this account and its destinations through the global outbound proxy. |
+| `cooldown_until` | `INTEGER` | `NULL` | Downstream rate-limit cooldown expiration timestamp shared across all destinations. |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when paused. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
@@ -107,9 +110,28 @@ Stores ChaCha20-Poly1305 encrypted credentials, recipient endpoints, shared cred
 
 ---
 
+### 3b. `channel_destinations` — Encrypted Delivery Destinations
+
+Stores one or more concrete delivery targets per parent Channel Account (`migrations/0002_channel_destinations.sql`), each independently encrypted, toggleable, and testable.
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique destination ID (primary target for `routes` and MCP `configure_route` / `test_push_feed_entry`). |
+| `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to `channels(id) ON DELETE CASCADE`. |
+| `name` | `TEXT` | `NOT NULL` | Destination label shown in WebUI and redacted MCP summaries (auto-derived from Telegram `getChat`, SMTP first recipient, or Notion database title when omitted). |
+| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext of `DestinationConfig` (Telegram `chat_id`/`message_thread_id`, SMTP `to_addresses`/`reply_to`, or Notion `data_source_id`/`column_mapping`). |
+| `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when paused independently of sibling destinations. |
+| `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
+| `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
+
+**Indexes:**
+- `idx_channel_destinations_channel_id ON channel_destinations (channel_id)`
+
+---
+
 ### 4. `routes` — Routing Rules, Content Filters & Presentation Options
 
-Binds feed IDs or tags to a target `channel_id`.
+Binds feed IDs or tags to a target `destination_id` (alongside its parent `channel_id`).
 
 | Column | Type | Constraints / Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -117,15 +139,19 @@ Binds feed IDs or tags to a target `channel_id`.
 | `name` | `TEXT` | `NOT NULL` | Human-readable route rule name. |
 | `feed_ids_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of matched feed IDs (`i64`). |
 | `match_tags_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of matched feed tags (`string`). |
-| `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to `channels(id) ON DELETE CASCADE`. |
+| `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to parent `channels(id) ON DELETE CASCADE`. |
+| `destination_id` | `INTEGER` | `REFERENCES channel_destinations(id) ON DELETE CASCADE` | Target delivery destination ID (populated automatically on v0.2.0 migration and on all route creations). |
 | `include_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of case-insensitive required keywords. |
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of case-insensitive excluded keywords. |
 | `include_regex` | `TEXT` | `NULL` | Optional regular expression that must match. |
 | `exclude_regex` | `TEXT` | `NULL` | Optional regular expression that rejects matching entries. |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `active_windows` (`[{start, end}]`, `HH:MM` in the system timezone), and `active_weekdays` (`1` = Mon … `7` = Sun). |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `timezone` (optional per-route IANA timezone override inheriting `system_settings.timezone`), `active_windows` (`[{start, end}]`, `HH:MM` in the route timezone), and `active_weekdays` (`1` = Mon … `7` = Sun). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when disabled. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
+
+**Indexes:**
+- `idx_routes_destination_id ON routes (destination_id)`
 
 ---
 
@@ -137,7 +163,8 @@ Tracks every `Entry × Route` delivery lifecycle.
 | :--- | :--- | :--- | :--- |
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique task ID. |
 | `route_id` | `INTEGER` | `NOT NULL` | Foreign key to `routes(id) ON DELETE CASCADE`. |
-| `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to `channels(id) ON DELETE CASCADE`. |
+| `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to parent `channels(id) ON DELETE CASCADE` (retained for account/group rolling quota aggregation). |
+| `destination_id` | `INTEGER` | `REFERENCES channel_destinations(id) ON DELETE CASCADE` | Target delivery destination ID. |
 | `entry_id` | `INTEGER` | `NOT NULL` | Foreign key to `entries(id) ON DELETE CASCADE`. |
 | `status` | `TEXT` | `NOT NULL DEFAULT 'queued'` | `'queued'` (pending), `'delivering'` (leased), `'delivered'`, `'retrying'` (failed/backoff), `'deferred'`, or `'dead_letter'`. |
 | `lease_until` | `INTEGER` | `NULL` | Worker lease expiration timestamp while `status = 'delivering'`. |
@@ -154,7 +181,26 @@ Tracks every `Entry × Route` delivery lifecycle.
 - `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)` *(The outbox claim then orders due tasks by `COALESCE(entries.published_at, entries.discovered_at)` via a join on `entries`, producing a merged chronological stream across feeds)*
 - `idx_delivery_tasks_status_lease ON delivery_tasks (status, lease_until)`
 - `idx_delivery_tasks_entry_status ON delivery_tasks (entry_id, status)` *(Supports `NOT EXISTS` GC subquery)*
-- `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` *(Supports rolling hourly/daily quota window counts)*
+- `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` *(Supports channel delivery history queries and `v0.2.0` migration backfill into `delivery_quota_ledger`)*
+- `idx_delivery_tasks_destination_id ON delivery_tasks (destination_id)`
+
+---
+
+### 5b. `delivery_quota_ledger` — Persistent Rolling Quota & Pacing Ledger
+
+Added in `migrations/0002_channel_destinations.sql` to decouple rolling 1-hour / 24-hour quota accounting and `last_completed_at` pacing timestamps from cascade-deleted `delivery_tasks` rows. Intentionally has **no business foreign keys** (`feeds`, `routes`, `channel_destinations`, or `channels`) so deleting feeds, routes, or destinations—or running Clear cache—never resets quota usage or pacing timestamps.
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | Unique ledger entry ID. |
+| `credential_group_key` | `TEXT` | `NOT NULL` | Account credential group key at the time of delivery. |
+| `channel_id` | `INTEGER` | `NOT NULL` | Parent channel account ID at the time of delivery (no foreign key). |
+| `completed_at` | `INTEGER` | `NOT NULL` | UTC Unix timestamp when the delivery succeeded. |
+
+- **Lifecycle**: Appended whenever a delivery succeeds (and backfilled from trailing 24-hour `delivered` tasks during `v0.2.0` migration); automatically pruned by the hourly maintenance task once `completed_at` is older than 24 hours (`86,400` seconds).
+- **Indexes:**
+  - `idx_delivery_quota_ledger_group_completed ON delivery_quota_ledger (credential_group_key, completed_at)` *(Primary index for rolling 1h/24h quota counts and `last_completed_at` pacing lookups)*
+  - `idx_delivery_quota_ledger_channel_completed ON delivery_quota_ledger (channel_id, completed_at)`
 
 ---
 
@@ -170,8 +216,9 @@ Tracks every `Entry × Route` delivery lifecycle.
   | `admin_totp_pending` | Encrypted TOTP secret awaiting its first confirmed code during 2FA setup. |
   | `admin_totp_last_step` | Last accepted TOTP time step (replay protection). |
   | `admin_recovery_hashes` | SHA-256 hashes of the unused single-use recovery codes. |
-  | `timezone` | IANA system timezone for route time windows (seeded from `TIMEZONE` / `TZ`, default `America/Los_Angeles`). |
+  | `timezone` | Default IANA system timezone inherited by routes (seeded from `TIMEZONE` / `TZ`, default `America/Los_Angeles`). |
   | `outbox_queue` | Global queue pause state (`paused`, optional `resume_at`). |
+  | `channel_model_version` | Integer schema marker (`2` once the v0.2.0 two-layer Account + Destinations migration completes; prevents re-running migration on subsequent restarts). |
   | `locale` | **Legacy** fallback delivery language for routes without `options.locale`. |
   | `outbound_proxy_url` | Global outbound proxy URL. |
   | `ssrf_allowlist` | SSRF CIDR / hostname allowlist entries. |

@@ -34,6 +34,7 @@ import { useToast } from "@/components/ui/toast";
 import { useI18n } from "@/i18n";
 import type { Messages } from "@/i18n/en";
 import {
+  cn,
   errorMessage,
   formatDateTime,
   formatRelativeTime,
@@ -63,6 +64,70 @@ function statusBadge(
       return { label: m.status.task.deferred, variant: "warning" };
     case "dead_letter":
       return { label: m.status.task.dead_letter, variant: "danger" };
+  }
+}
+
+/**
+ * Semantic status code badge variant:
+ * - `202` (Notion async accepted) / `429` (rate limit) / transient SMTP 421/45x -> amber (`warning`)
+ * - Other `2xx` -> green (`success`)
+ * - Permanent `4xx` / `5xx` -> red (`danger`)
+ * - Other -> neutral (`default`)
+ */
+function statusCodeVariant(code: number, status: TaskStatus): BadgeVariant {
+  if (code === 202 || code === 429) return "warning";
+  if (code >= 200 && code < 300) return "success";
+  if (
+    (code === 421 || (code >= 450 && code <= 459)) &&
+    (status === "retrying" || status === "deferred")
+  ) {
+    return "warning";
+  }
+  if (code >= 400) return "danger";
+  return "default";
+}
+
+/**
+ * Semantic attempt count coloring:
+ * - `0x` / `1x` -> neutral (`default`)
+ * - `2x..5x` -> amber (`warning`)
+ * - `>= 6x` (retry limit) -> red (`danger`)
+ */
+function attemptCountVariant(attempts: number): BadgeVariant {
+  if (attempts >= 6) return "danger";
+  if (attempts >= 2) return "warning";
+  return "default";
+}
+
+/** Diagnostic log preview color in table rows matching task status (never red for delivered). */
+function diagnosticRowTextClass(status: TaskStatus): string {
+  switch (status) {
+    case "delivered":
+      return "text-emerald-700 dark:text-emerald-400";
+    case "retrying":
+    case "deferred":
+      return "text-amber-700 dark:text-amber-400";
+    case "dead_letter":
+      return "text-rose-600 dark:text-rose-400";
+    case "queued":
+    case "delivering":
+      return "text-zinc-600 dark:text-zinc-400";
+  }
+}
+
+/** Diagnostic log color inside dark modal `<pre>` matching task status. */
+function diagnosticModalTextClass(status: TaskStatus): string {
+  switch (status) {
+    case "delivered":
+      return "text-emerald-300";
+    case "retrying":
+    case "deferred":
+      return "text-amber-300";
+    case "dead_letter":
+      return "text-rose-300";
+    case "queued":
+    case "delivering":
+      return "text-zinc-200";
   }
 }
 
@@ -139,7 +204,11 @@ function QueueControlBar({ queue }: { queue: QueueStateDto | undefined }) {
     const chosen = PAUSE_PRESETS.find((p) => p.id === preset);
     if (preset === "custom") {
       const when = customAt ? new Date(customAt) : null;
-      if (!when || Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) {
+      if (
+        !when ||
+        Number.isNaN(when.getTime()) ||
+        when.getTime() <= Date.now()
+      ) {
         setError(m.tasks.queue.errCustomPast);
         return;
       }
@@ -222,7 +291,9 @@ function QueueControlBar({ queue }: { queue: QueueStateDto | undefined }) {
             variant="outline"
             size="sm"
             onClick={handlePause}
-            loading={mutation.isPending && mutation.variables?.action === "pause"}
+            loading={
+              mutation.isPending && mutation.variables?.action === "pause"
+            }
           >
             <Pause className="h-3.5 w-3.5" />
             {paused ? m.tasks.queue.updatePause : m.tasks.queue.pauseBtn}
@@ -505,12 +576,19 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                         <div className="font-medium text-zinc-800 dark:text-zinc-200">
                           {task.route_name}
                         </div>
-                        <div className="text-[11px] text-zinc-500">
-                          → {task.channel_name} (
-                          <span className="font-mono uppercase">
-                            {task.channel_kind}
+                        <div className="mt-0.5 flex flex-wrap items-center gap-1 text-[11px] text-zinc-500">
+                          <span>→ {task.channel_name}</span>
+                          {task.destination_name && (
+                            <>
+                              <span className="text-zinc-400">/</span>
+                              <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                                {task.destination_name}
+                              </span>
+                            </>
+                          )}
+                          <span className="font-mono text-[10px] uppercase text-zinc-400">
+                            ({task.channel_kind})
                           </span>
-                          )
                         </div>
                       </td>
 
@@ -555,15 +633,34 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                         )}
                       </td>
 
-                      <td className="px-3 py-3 font-mono">
-                        <span>{task.attempt_count}x</span>
-                        {task.last_status_code !== null && (
-                          <span className="ml-1.5 rounded bg-zinc-100 px-1.5 py-0.5 text-[11px] dark:bg-zinc-800">
-                            {task.last_status_code}
-                          </span>
-                        )}
+                      <td className="px-3 py-3">
+                        <div className="flex flex-wrap items-center gap-1.5 font-mono">
+                          <Badge
+                            variant={attemptCountVariant(task.attempt_count)}
+                            className="font-mono text-[11px]"
+                          >
+                            {task.attempt_count}x
+                          </Badge>
+                          {task.last_status_code !== null && (
+                            <Badge
+                              variant={statusCodeVariant(
+                                task.last_status_code,
+                                task.status,
+                              )}
+                              className="font-mono text-[11px]"
+                            >
+                              {task.last_status_code}
+                            </Badge>
+                          )}
+                        </div>
                         {task.diagnostic_log && (
-                          <div className="mt-0.5 max-w-[180px] truncate font-sans text-[11px] text-rose-600 dark:text-rose-400">
+                          <div
+                            className={cn(
+                              "mt-1 max-w-[200px] truncate font-sans text-[11px]",
+                              diagnosticRowTextClass(task.status),
+                            )}
+                            title={task.diagnostic_log}
+                          >
                             {task.diagnostic_log}
                           </div>
                         )}
@@ -631,7 +728,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
           open={inspectingTask !== null}
           onClose={() => setInspectingTask(null)}
           title={m.tasks.modal.title(inspectingTask.id)}
-          description={`${inspectingTask.route_name} → ${inspectingTask.channel_name} (${inspectingTask.channel_kind.toUpperCase()})`}
+          description={`${inspectingTask.route_name} → ${inspectingTask.channel_name}${inspectingTask.destination_name ? ` / ${inspectingTask.destination_name}` : ""} (${inspectingTask.channel_kind.toUpperCase()})`}
           size="lg"
           footer={
             <>
@@ -661,22 +758,43 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
             <div className="grid grid-cols-2 gap-3 rounded-lg border border-zinc-200 bg-zinc-50/60 p-3 sm:grid-cols-3 dark:border-zinc-800 dark:bg-zinc-950">
               <div>
                 <div className="text-zinc-500">{m.tasks.modal.status}</div>
-                <div className="mt-0.5 font-semibold">
-                  {statusBadge(inspectingTask.status, m).label}
+                <div className="mt-1">
+                  <Badge variant={statusBadge(inspectingTask.status, m).variant}>
+                    {statusBadge(inspectingTask.status, m).label}
+                  </Badge>
                 </div>
               </div>
               <div>
                 <div className="text-zinc-500">{m.tasks.modal.attempts}</div>
-                <div className="mt-0.5 font-mono font-semibold">
-                  {inspectingTask.attempt_count}
+                <div className="mt-1">
+                  <Badge
+                    variant={attemptCountVariant(inspectingTask.attempt_count)}
+                    className="font-mono"
+                  >
+                    {inspectingTask.attempt_count}x
+                  </Badge>
                 </div>
               </div>
               <div>
                 <div className="text-zinc-500">
                   {m.tasks.modal.lastStatusCode}
                 </div>
-                <div className="mt-0.5 font-mono font-semibold">
-                  {inspectingTask.last_status_code ?? "—"}
+                <div className="mt-1">
+                  {inspectingTask.last_status_code !== null ? (
+                    <Badge
+                      variant={statusCodeVariant(
+                        inspectingTask.last_status_code,
+                        inspectingTask.status,
+                      )}
+                      className="font-mono"
+                    >
+                      {inspectingTask.last_status_code}
+                    </Badge>
+                  ) : (
+                    <span className="font-mono font-semibold text-zinc-400">
+                      —
+                    </span>
+                  )}
                 </div>
               </div>
               <div>
@@ -715,7 +833,14 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
               <div className="mb-1 font-semibold text-zinc-700 dark:text-zinc-300">
                 {m.tasks.modal.diagnosticLog}
               </div>
-              <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-900 p-3 font-mono text-[11px] text-zinc-200">
+              <pre
+                className={cn(
+                  "max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-900 p-3 font-mono text-[11px]",
+                  inspectingTask.diagnostic_log
+                    ? diagnosticModalTextClass(inspectingTask.status)
+                    : "text-zinc-400",
+                )}
+              >
                 {inspectingTask.diagnostic_log || m.tasks.modal.noDiagnosticLog}
               </pre>
             </div>

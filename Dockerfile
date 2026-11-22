@@ -1,7 +1,7 @@
 # =============================================================================
 # Stage 1: Build embedded React 19 + Vite WebUI (`web/dist`)
 # =============================================================================
-FROM --platform=$BUILDPLATFORM node:26-alpine AS web-builder
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web-builder
 
 RUN npm install -g pnpm@10
 
@@ -16,7 +16,7 @@ RUN pnpm build
 # =============================================================================
 # Stage 2: Normalize Cargo manifests so version bumps do not bust dep cache
 # =============================================================================
-FROM --platform=$BUILDPLATFORM node:26-alpine AS cargo-recipe
+FROM --platform=$BUILDPLATFORM node:24-alpine AS cargo-recipe
 
 WORKDIR /recipe
 

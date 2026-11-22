@@ -18,8 +18,8 @@ For MCP client setup and tool schemas, see [Client Setup & Security](/mcp/setup)
   2. Otherwise, FeedCourier reads `<DATA_DIR>/master.key` (or a custom key path such as `/data/secret.key`). If the file does not exist, a 32-byte key is generated from the OS CSPRNG (`ChaCha20Poly1305::generate_key`) and written atomically with **`0600` Unix permissions**.
 - **Memory Scrubbing**: `MasterKey` implements a redacted `Debug` formatter (`MasterKey([REDACTED])`) and zeros its 32-byte buffer on `Drop` using `std::hint::black_box`.
 
-### 2. ChaCha20-Poly1305 AEAD Encryption in `channels.encrypted_config`
-Channel configurations (`ChannelConfig`, containing SMTP credentials and recipient addresses, Telegram `bot_token` and `chat_id`, or Notion `integration_secret` and `data_source_id`) are serialized to JSON and encrypted with **ChaCha20-Poly1305** before being stored in `channels.encrypted_config` (`BLOB`):
+### 2. ChaCha20-Poly1305 AEAD Encryption for Accounts & Destinations
+Under the two-layer channel model, account credentials (`ChannelConfig` in `channels.encrypted_config`: SMTP server/password/`from_address`, Telegram `bot_token`/`api_base_url`, Notion `integration_secret`) and destination targets (`DestinationConfig` in `channel_destinations.encrypted_config`: SMTP `to_addresses`/`reply_to`, Telegram `chat_id`/`message_thread_id`, Notion `data_source_id`/`column_mapping`) are each serialized to JSON and encrypted independently with **ChaCha20-Poly1305**:
 - Each encryption operation generates a fresh 12-byte (96-bit) random CSPRNG nonce (`NONCE_LEN = 12`);
 - Binary layout: `[12-byte nonce || ciphertext || 16-byte Poly1305 tag]`;
 - Decryption verifies the 16-byte Poly1305 authentication tag (`TAG_LEN = 16`) and rejects tampered ciphertexts or mismatched master keys.
@@ -44,21 +44,21 @@ Optional second factor for the WebUI administrator (managed under **Settings →
 
 | Interface | Output Struct | Credential & Destination Exposure Policy |
 | :--- | :--- | :--- |
-| **WebUI REST API**<br>(`GET /api/v1/channels`) | `ChannelDto`<br>(`src/api/dto.rs`) | Returns non-secret routing fields (`host`, `to_addresses`, `chat_id`, `data_source_id`) while replacing secrets with masked indicators: `has_password: bool`, `bot_token_hint: "123456...abcd"`, `secret_hint: "ntn_12...ef"`. `PATCH /api/v1/channels/{id}` preserves existing encrypted secrets when secret fields are omitted. |
-| **MCP Endpoint**<br>(`list_feeds_status`) | `McpChannelSummary`<br>(`src/mcp/tools.rs`) | **Omits all secrets and destination identifiers**: returns only `{ id, name, kind, enabled, cooldown_until }`. MCP clients never see SMTP passwords or recipient emails, Telegram `bot_token` or `chat_id`, or Notion `integration_secret` or `data_source_id`. |
+| **WebUI REST API**<br>(`GET /api/v1/channels`, `/api/v1/channels/{id}/destinations`) | `ChannelDto`, `ChannelDestinationDto`<br>(`src/api/dto.rs`) | Returns non-secret account fields (`host`, `from_address`, `api_base_url`) and nested destination target fields (`to_addresses`, `chat_id`, `data_source_id`) while replacing secrets with masked indicators: `has_password: bool`, `bot_token_hint: "123456...abcd"`, `secret_hint: "ntn_12...ef"`. `PATCH /api/v1/channels/{id}` preserves existing encrypted secrets when secret fields are omitted. |
+| **MCP Endpoint**<br>(`list_feeds_status`) | `McpChannelSummary`, `McpDestinationSummary`<br>(`src/mcp/tools.rs`) | **Omits all secrets and destination identifiers**: returns redacted `channels` (`{ id, name, kind, enabled, cooldown_until, destinations }`) and top-level `destinations` (`{ id, channel_id, name, kind, enabled }`). MCP clients never see SMTP passwords or recipient emails, Telegram `bot_token` or `chat_id`, or Notion `integration_secret` or `data_source_id`. |
 
 ---
 
 ## 2. Destination Lock (`src/mcp/tools.rs`, `src/mcp/auth.rs`)
 
-When an AI agent inspects untrusted RSS feeds, a primary threat is **data exfiltration via prompt injection**: a malicious feed item could instruct the assistant to create a new delivery channel pointing to an attacker-controlled email address, Telegram chat, or Notion workspace.
+When an AI agent inspects untrusted RSS feeds, a primary threat is **data exfiltration via prompt injection**: a malicious feed item could instruct the assistant to create a new delivery channel or destination pointing to an attacker-controlled email address, Telegram chat, or Notion workspace.
 
 FeedCourier prevents this through the **Destination Lock** boundary:
-1. **No Channel Creation or Mutation Tools on `/mcp`**: The MCP server exposes zero tools for creating, updating, or deleting channels, and no tool that accepts channel credentials or destination addresses. Channel lifecycle operations exist exclusively in the `fc_session`-authenticated WebUI REST API (`/api/v1/channels*`).
-2. **Integer `channel_id` Lookup in `configure_route`**: When an `admin`-scoped MCP client calls `configure_route`, the target destination parameter (`ConfigureRouteParams.channel_id: Option<i64>`) accepts only an integer ID. Before creating or updating a route, the handler queries `db.get_channel(channel_id)` to verify that the ID references an existing WebUI-created channel in `channels`.
+1. **No Account or Destination Mutation Tools on `/mcp`**: The MCP server exposes zero tools for creating, updating, or deleting channel accounts or destinations, and no tool that accepts credentials or target addresses. Channel and destination lifecycle operations exist exclusively in the `fc_session`-authenticated WebUI REST API (`/api/v1/channels*`, `/api/v1/destinations*`).
+2. **Integer `destination_id` Lookup in `configure_route` & `test_push_feed_entry`**: When an `admin`-scoped MCP client calls `configure_route` or `test_push_feed_entry`, the target parameter accepts only an integer `destination_id` (or a legacy `channel_id` when that account owns exactly 1 destination). Before proceeding, the handler calls `db.resolve_destination_target(destination_id, channel_id)` to verify that the target references an existing WebUI-created row in `channel_destinations` and `channels`.
 3. **Dual-Scope Bearer Token Separation (`readonly` vs. `admin`)**:
    - `readonly` tokens are restricted to `list_feeds_status`, `inspect_failed_deliveries`, and `preview_feed_latest`;
-   - `admin` tokens additionally permit `manage_feed` (including `clear_cache`), `configure_route`, `reset_and_poll_feed`, `retry_dead_tasks`, `manage_outbox_queue`, and `test_push_feed_entry`, while remaining bound to existing `channel_id` rows. `test_push_feed_entry` only sends an entry to an existing channel; it cannot change the destination.
+   - `admin` tokens additionally permit `manage_feed` (including `clear_cache`), `configure_route`, `reset_and_poll_feed`, `retry_dead_tasks`, `manage_outbox_queue`, and `test_push_feed_entry`, while remaining strictly bound to existing WebUI-created `destination_id` rows. `test_push_feed_entry` only sends an entry to an existing destination; it cannot create or alter destinations.
 
 ---
 
@@ -95,7 +95,7 @@ Unlike the WebUI preview endpoint (`POST /api/v1/feeds/preview`), which includes
 
 ## 4. Connection-Layer SSRF Protection (`src/net/ssrf.rs`, `src/net/mod.rs`)
 
-All outbound HTTP requests for feed polling, feed previewing, Readability article extraction, and Telegram media fallback streaming execute through `ProtectedHttpClient` backed by `SsrfDnsResolver` (`reqwest::dns::Resolve`).
+All outbound HTTP requests for feed polling, feed previewing, Readability article extraction, Telegram media fallback streaming, **and all Telegram Bot API calls** (both official `https://api.telegram.org` and custom `api_base_url` / self-hosted Local Bot API servers) execute with connect-time `SsrfPolicy` DNS validation (`SsrfDnsResolver` implementing `reqwest::dns::Resolve`) backed by a shared, hot-reloadable `Arc<RwLock<SsrfPolicy>>`.
 
 ```mermaid
 sequenceDiagram
@@ -150,3 +150,9 @@ For self-hosted intranet services (such as local `FreshRSS` or `RSSHub` instance
 When a feed is added via MCP `manage_feed(action = "add")` or REST API `POST /api/v1/feeds`, FeedCourier inserts the `feeds` row and immediately runs an initial poll:
 - If the initial poll fails with a transient upstream error (such as a timeout or `503`), the feed row is kept and enters exponential backoff;
 - If the initial poll fails with **`AppError::SsrfBlocked`** (either on the initial URL or on a redirect hop), the handler immediately deletes the newly inserted row (`db.delete_feed(created.id)`) and returns an `ssrf_blocked` error so blocked internal targets are never persisted for background polling.
+
+### 5. Telegram Bot API (`api_base_url`) SSRF Enforcement
+`TelegramSender` injects the same shared `Arc<RwLock<SsrfPolicy>>` (reloaded immediately whenever `PUT /api/v1/settings` updates `ssrf_allowlist`) into its Bot API HTTP client:
+- **Connect-Time DNS & No Redirects**: Every Bot API call—both to official `https://api.telegram.org` and to custom `api_base_url` / self-hosted Local Bot API servers—resolves through `SsrfDnsResolver` with `redirect::Policy::none()` (and validates literal IP / `localhost` hops when routed via `OUTBOUND_PROXY`).
+- **Strict `api_base_url` Validation**: `ChannelConfig::validate` and channel patch handlers allow only `http://` and `https://` URLs with no embedded userinfo (`user:pass@`), query string, or fragment. Account creation, updates, and probes blocked by SSRF policy return HTTP `403` (`ssrf_blocked`).
+- **No Automatic Allowlisting**: Existing internal/private Local Bot API endpoints are **not** auto-allowlisted when upgrading to `v0.2.0`; operators must add their hostname or IP/CIDR to `SSRF_ALLOWLIST`.

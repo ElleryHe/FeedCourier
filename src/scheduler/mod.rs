@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
-use reqwest::header::{ACCEPT, HeaderValue, REFERER};
+use reqwest::header::{ACCEPT, HeaderValue, USER_AGENT};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -23,7 +23,7 @@ use crate::channels::smtp::SmtpSender;
 use crate::channels::telegram::{FetchedMedia, MediaStreamFetcher, TelegramSender};
 use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, RouteOptions,
+    DeliveryOutcome, DestinationConfig, RouteOptions,
 };
 use crate::config::AppConfig;
 use crate::crypto::MasterKey;
@@ -35,7 +35,7 @@ use crate::db::models::{
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
-use crate::schedule::{has_schedule, next_allowed_at};
+use crate::schedule::{has_schedule, next_allowed_at, resolve_route_timezone};
 
 /// Default lease duration in seconds granted when a worker claims a `delivery_tasks` row.
 pub const DEFAULT_TASK_LEASE_SECS: i64 = 120;
@@ -69,6 +69,7 @@ pub const DEFAULT_MAINTENANCE_TICK: Duration = Duration::from_secs(3600);
 pub const DEFAULT_SINGLE_FEED_POLL_TIMEOUT: Duration = Duration::from_secs(90);
 
 const MEDIA_ACCEPT_HEADER: &str = "image/*,video/*,audio/*,*/*;q=0.8";
+const MEDIA_USER_AGENT: &str = "Mozilla/5.0 (compatible; FeedCourier/0.2)";
 
 /// SSRF-protected [`MediaStreamFetcher`] backed by the live runtime [`ProtectedHttpClient`].
 ///
@@ -100,22 +101,14 @@ impl MediaStreamFetcher for ProtectedMediaFetcher {
         use_proxy: bool,
     ) -> AppResult<FetchedMedia> {
         let trimmed = url.trim();
-        let parsed = Url::parse(trimmed)?;
+        let _ = Url::parse(trimmed)?;
 
-        let mut req = OutboundRequest::new(trimmed)
+        let req = OutboundRequest::new(trimmed)
             .max_bytes(max_bytes)
             .use_proxy(use_proxy)
+            .auto_origin_referer(true)
+            .header(USER_AGENT, HeaderValue::from_static(MEDIA_USER_AGENT))
             .header(ACCEPT, HeaderValue::from_static(MEDIA_ACCEPT_HEADER));
-
-        if let Some(host) = parsed.host_str() {
-            let origin = match parsed.port() {
-                Some(port) => format!("{}://{host}:{port}/", parsed.scheme()),
-                None => format!("{}://{host}/", parsed.scheme()),
-            };
-            if let Ok(referer) = HeaderValue::from_str(&origin) {
-                req = req.header(REFERER, referer);
-            }
-        }
 
         let resp = self.http.get_bytes(req).await?;
         if !resp.status.is_success() {
@@ -323,9 +316,11 @@ impl DeliveryDispatcher {
         let media_fetcher = Arc::new(ProtectedMediaFetcher::new(http.clone()));
         let ingest = IngestEngine::new(db.clone(), http.clone());
         let smtp_sender = SmtpSender::new().with_locale(initial_locale);
-        let telegram_sender = TelegramSender::with_proxy_and_fetcher(
+        let telegram_sender = TelegramSender::with_ssrf(
             net_settings.outbound_proxy_url.clone(),
             Arc::clone(&media_fetcher) as Arc<dyn MediaStreamFetcher>,
+            http.ssrf_policy(),
+            http.ssrf_dns_resolver(),
         )
         .with_locale(initial_locale);
         let notion_sender = Arc::new(NotionSender::new(net_settings.outbound_proxy_url)?);
@@ -362,6 +357,7 @@ impl DeliveryDispatcher {
         db: Database,
         master_key: MasterKey,
     ) -> AppResult<Self> {
+        db.migrate_channels_to_v2(&master_key).await?;
         let net_settings = load_persisted_net_settings(&config, &db).await?;
         let persisted_locale = load_persisted_locale(&config, &db).await?;
         let http = ProtectedHttpClient::new(net_settings)?;
@@ -538,11 +534,14 @@ impl DeliveryDispatcher {
             .notion_sender
             .set_outbound_proxy(normalized.outbound_proxy_url.clone())?;
 
-        // Swap a fresh proxy-configured TelegramSender sharing `ProtectedMediaFetcher` and active locale.
+        // Swap a fresh proxy-configured TelegramSender sharing `ProtectedMediaFetcher`, live SSRF
+        // policy/resolver, and active locale.
         let current_locale = self.locale();
-        let next_telegram = TelegramSender::with_proxy_and_fetcher(
+        let next_telegram = TelegramSender::with_ssrf(
             normalized.outbound_proxy_url,
             Arc::clone(&self.inner.media_fetcher) as Arc<dyn MediaStreamFetcher>,
+            self.inner.http.ssrf_policy(),
+            self.inner.http.ssrf_dns_resolver(),
         )
         .with_locale(current_locale);
         {
@@ -744,98 +743,185 @@ impl DeliveryDispatcher {
             return Ok(true);
         };
 
-        if !route.enabled || !channel.enabled {
+        let Some(destination) = self.inner.db.get_destination(task.destination_id).await? else {
+            self.inner
+                .db
+                .mark_task_dead_letter(
+                    task.id,
+                    now,
+                    None,
+                    existing_checkpoint.as_ref(),
+                    "Target destination no longer exists",
+                )
+                .await?;
+            return Ok(true);
+        };
+
+        if !route.enabled || !channel.enabled || !destination.enabled {
+            let diag = format_deferral_diagnostic(
+                "Route, channel, or destination currently disabled",
+                task.attempt_count,
+                task.last_status_code,
+                task.diagnostic_log.as_deref(),
+            );
             self.inner
                 .db
                 .mark_task_deferred(
                     task.id,
                     now.saturating_add(300),
+                    None,
                     existing_checkpoint.as_ref(),
-                    "Route or channel currently disabled",
+                    &diag,
                 )
                 .await?;
             return Ok(true);
         }
 
-        // 1b. Route delivery windows (system timezone): defer to the next allowed window start.
+        // 1b. Route delivery windows (route timezone, inheriting system timezone):
+        // defer to the next allowed window start when outside the schedule.
         let route_options = route.options();
+        let system_tz = self.inner.db.get_timezone().await;
+        let route_tz = resolve_route_timezone(&route_options, system_tz);
         if has_schedule(&route_options) {
-            let tz = self.inner.db.get_timezone().await;
-            let next_window = next_allowed_at(&route_options, now, tz);
+            let next_window = next_allowed_at(&route_options, now, route_tz);
             if next_window > now {
+                let diag = format_deferral_diagnostic(
+                    "Route delivery window closed; deferred to the next allowed window",
+                    task.attempt_count,
+                    task.last_status_code,
+                    task.diagnostic_log.as_deref(),
+                );
                 self.inner
                     .db
                     .mark_task_deferred(
                         task.id,
                         next_window,
+                        None,
                         existing_checkpoint.as_ref(),
-                        "Route delivery window closed; deferred to the next allowed window",
+                        &diag,
                     )
                     .await?;
                 return Ok(true);
             }
         }
 
-        // 2. Quota & anti-spam pacing pre-check (`mark_task_deferred` restores `attempt_count`).
+        // 2. Shared channel & credential-group quota + anti-spam pacing pre-check
+        // (`mark_task_deferred` restores `attempt_count`).
+        // All destinations under a channel account (and any enabled channels sharing identical
+        // credentials) share the strictest effective hourly/daily quota budget and pacing window.
         let usage = self
             .inner
             .db
             .get_channel_quota_usage(channel.id, &channel.credential_group_key, now)
             .await?;
+        let group_limits = self
+            .inner
+            .db
+            .get_credential_group_effective_limits(&channel.credential_group_key)
+            .await?;
+        let effective_hourly_quota = match (
+            channel.hourly_quota,
+            group_limits.and_then(|l| l.hourly_quota),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let effective_daily_quota = match (
+            channel.daily_quota,
+            group_limits.and_then(|l| l.daily_quota),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let effective_min_interval = channel
+            .min_interval_secs
+            .max(group_limits.map(|l| l.min_interval_secs).unwrap_or(0));
+        let effective_jitter_max = channel
+            .jitter_max_secs
+            .max(group_limits.map(|l| l.jitter_max_secs).unwrap_or(0));
 
-        if let Some(hourly_quota) = channel.hourly_quota
-            && (hourly_quota <= 0 || usage.channel_last_hour >= hourly_quota)
+        let used_last_hour = usage
+            .channel_last_hour
+            .max(usage.credential_group_last_hour);
+        let used_last_day = usage.channel_last_day.max(usage.credential_group_last_day);
+
+        if let Some(hourly_quota) = effective_hourly_quota
+            && (hourly_quota <= 0 || used_last_hour >= hourly_quota)
         {
+            let diag = format_deferral_diagnostic(
+                &format!(
+                    "Channel hourly quota reached ({used_last_hour}/{hourly_quota}); deferred to next window"
+                ),
+                task.attempt_count,
+                task.last_status_code,
+                task.diagnostic_log.as_deref(),
+            );
             self.inner
                 .db
                 .mark_task_deferred(
                     task.id,
                     now.saturating_add(300),
+                    None,
                     existing_checkpoint.as_ref(),
-                    &format!(
-                        "Channel hourly quota reached ({}/{hourly_quota}); deferred to next window",
-                        usage.channel_last_hour
-                    ),
+                    &diag,
                 )
                 .await?;
             return Ok(true);
         }
 
-        if let Some(daily_quota) = channel.daily_quota
-            && (daily_quota <= 0 || usage.channel_last_day >= daily_quota)
+        if let Some(daily_quota) = effective_daily_quota
+            && (daily_quota <= 0 || used_last_day >= daily_quota)
         {
+            let diag = format_deferral_diagnostic(
+                &format!(
+                    "Channel daily quota reached ({used_last_day}/{daily_quota}); deferred to next window"
+                ),
+                task.attempt_count,
+                task.last_status_code,
+                task.diagnostic_log.as_deref(),
+            );
             self.inner
                 .db
                 .mark_task_deferred(
                     task.id,
                     now.saturating_add(900),
+                    None,
                     existing_checkpoint.as_ref(),
-                    &format!(
-                        "Channel daily quota reached ({}/{daily_quota}); deferred to next window",
-                        usage.channel_last_day
-                    ),
+                    &diag,
                 )
                 .await?;
             return Ok(true);
         }
 
-        if let Some(earliest_allowed) =
-            self.earliest_pacing_allowed_at(&channel, usage.last_completed_at)
-            && now < earliest_allowed
+        if let Some(earliest_allowed) = self.earliest_pacing_allowed_at_limits(
+            &channel.credential_group_key,
+            effective_min_interval,
+            effective_jitter_max,
+            usage.last_completed_at,
+        ) && now < earliest_allowed
         {
+            let diag = format_deferral_diagnostic(
+                "Channel anti-spam pacing window active",
+                task.attempt_count,
+                task.last_status_code,
+                task.diagnostic_log.as_deref(),
+            );
             self.inner
                 .db
                 .mark_task_deferred(
                     task.id,
                     earliest_allowed,
+                    None,
                     existing_checkpoint.as_ref(),
-                    "Channel anti-spam pacing window active",
+                    &diag,
                 )
                 .await?;
             return Ok(true);
         }
 
-        // 3. Decrypt channel configuration & execute downstream delivery.
+        // 3. Decrypt channel account credentials & destination target config, then execute delivery.
         let channel_config: ChannelConfig = match self
             .inner
             .master_key
@@ -856,6 +942,26 @@ impl DeliveryDispatcher {
                 return Ok(true);
             }
         };
+        let destination_config: DestinationConfig = match self
+            .inner
+            .master_key
+            .decrypt_json(&destination.encrypted_config)
+        {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                self.inner
+                    .db
+                    .mark_task_dead_letter(
+                        task.id,
+                        now,
+                        None,
+                        existing_checkpoint.as_ref(),
+                        &format!("Failed to decrypt destination config: {err}"),
+                    )
+                    .await?;
+                return Ok(true);
+            }
+        };
 
         let checkpoint_sink = self.inner.db.checkpoint_sink(task.id);
         let ctx = DeliveryContext {
@@ -866,6 +972,9 @@ impl DeliveryDispatcher {
             route_options,
             channel: &channel,
             channel_config: &channel_config,
+            destination: &destination,
+            destination_config: &destination_config,
+            timezone: route_tz,
             checkpoint: existing_checkpoint.clone(),
             checkpoint_sink: Some(&checkpoint_sink),
         };
@@ -882,8 +991,15 @@ impl DeliveryDispatcher {
         let completed_now = now_unix();
         match send_result {
             Ok(outcome) => {
-                self.apply_delivery_outcome(&task, &channel, completed_now, outcome)
-                    .await?;
+                self.apply_delivery_outcome(
+                    &task,
+                    &channel,
+                    effective_min_interval,
+                    effective_jitter_max,
+                    completed_now,
+                    outcome,
+                )
+                .await?;
             }
             Err(err) => {
                 self.apply_unexpected_send_error(&task, &channel, completed_now, err)
@@ -894,23 +1010,27 @@ impl DeliveryDispatcher {
         Ok(true)
     }
 
-    /// Stateless debug push: fetch the live feed item, render it for `params.channel_id` with the
-    /// requested route options and send it immediately through the channel adapter. Nothing is
+    /// Stateless debug push: fetch the live feed item, render it for the resolved destination with
+    /// the requested route options, and send it immediately through the channel adapter. Nothing is
     /// persisted (no entries, fingerprints, tasks or quota usage); Notion pages carry a
     /// `test-` prefixed `FC-ID`.
     pub async fn debug_push(&self, params: DebugPushParams) -> AppResult<DebugPushResult> {
-        let channel = self
+        let (channel, destination) = self
             .inner
             .db
-            .get_channel(params.channel_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound(format!("channel {} not found", params.channel_id))
-            })?;
+            .resolve_destination_target(params.destination_id, params.channel_id)
+            .await?;
         let channel_config: ChannelConfig = self
             .inner
             .master_key
             .decrypt_json(&channel.encrypted_config)?;
+        let destination_config: DestinationConfig = self
+            .inner
+            .master_key
+            .decrypt_json(&destination.encrypted_config)?;
+
+        let system_tz = self.inner.db.get_timezone().await;
+        let route_tz = resolve_route_timezone(&params.options, system_tz);
 
         let debug = self
             .inner
@@ -962,6 +1082,7 @@ impl DeliveryDispatcher {
             feed_ids_json: "[]".to_string(),
             match_tags_json: "[]".to_string(),
             channel_id: channel.id,
+            destination_id: destination.id,
             include_keywords_json: "[]".to_string(),
             exclude_keywords_json: "[]".to_string(),
             include_regex: None,
@@ -975,6 +1096,7 @@ impl DeliveryDispatcher {
             id: 0,
             route_id: 0,
             channel_id: channel.id,
+            destination_id: destination.id,
             entry_id: 0,
             status: DeliveryTaskStatus::Delivering,
             lease_until: None,
@@ -994,6 +1116,9 @@ impl DeliveryDispatcher {
             route_options: params.options.clone(),
             channel: &channel,
             channel_config: &channel_config,
+            destination: &destination,
+            destination_config: &destination_config,
+            timezone: route_tz,
             checkpoint: None,
             checkpoint_sink: None,
         };
@@ -1053,6 +1178,7 @@ impl DeliveryDispatcher {
             .purge_expired_entry_payloads(now, self.inner.config.retention_secs())
             .await?;
         let purged_sessions = self.inner.db.purge_expired_sessions(now).await?;
+        let purged_ledger = self.inner.db.purge_expired_quota_ledger(now).await?;
         self.inner.db.run_pragma_optimize().await?;
 
         {
@@ -1066,7 +1192,7 @@ impl DeliveryDispatcher {
 
         debug!(
             purged_entries,
-            purged_sessions, "completed scheduled database maintenance cycle"
+            purged_sessions, purged_ledger, "completed scheduled database maintenance cycle"
         );
         Ok(purged_entries)
     }
@@ -1200,13 +1326,15 @@ impl DeliveryDispatcher {
         }
     }
 
-    fn earliest_pacing_allowed_at(
+    fn earliest_pacing_allowed_at_limits(
         &self,
-        channel: &Channel,
+        credential_group_key: &str,
+        min_interval_secs: i64,
+        jitter_max_secs: i64,
         last_completed_at: Option<i64>,
     ) -> Option<i64> {
-        let min_iv = channel.min_interval_secs.max(0);
-        let jitter_max = channel.jitter_max_secs.max(0);
+        let min_iv = min_interval_secs.max(0);
+        let jitter_max = jitter_max_secs.max(0);
         if min_iv == 0 && jitter_max == 0 {
             return None;
         }
@@ -1223,7 +1351,7 @@ impl DeliveryDispatcher {
                 .pacing_next_allowed_at
                 .lock()
                 .expect("pacing_next_allowed_at mutex poisoned");
-            guard.get(&channel.credential_group_key).copied()
+            guard.get(credential_group_key).copied()
         };
 
         match (db_earliest, mem_earliest) {
@@ -1234,9 +1362,15 @@ impl DeliveryDispatcher {
         }
     }
 
-    fn record_pacing_after_delivery(&self, channel: &Channel, completed_at: i64) {
-        let min_iv = channel.min_interval_secs.max(0);
-        let jitter_max = channel.jitter_max_secs.max(0);
+    fn record_pacing_after_delivery_limits(
+        &self,
+        credential_group_key: &str,
+        min_interval_secs: i64,
+        jitter_max_secs: i64,
+        completed_at: i64,
+    ) {
+        let min_iv = min_interval_secs.max(0);
+        let jitter_max = jitter_max_secs.max(0);
         if min_iv == 0 && jitter_max == 0 {
             return;
         }
@@ -1253,9 +1387,7 @@ impl DeliveryDispatcher {
             .pacing_next_allowed_at
             .lock()
             .expect("pacing_next_allowed_at mutex poisoned");
-        let slot = guard
-            .entry(channel.credential_group_key.clone())
-            .or_insert(0);
+        let slot = guard.entry(credential_group_key.to_owned()).or_insert(0);
         *slot = (*slot).max(next_allowed);
     }
 
@@ -1263,6 +1395,8 @@ impl DeliveryDispatcher {
         &self,
         task: &DeliveryTask,
         channel: &Channel,
+        effective_min_interval: i64,
+        effective_jitter_max: i64,
         completed_now: i64,
         outcome: DeliveryOutcome,
     ) -> AppResult<()> {
@@ -1289,7 +1423,12 @@ impl DeliveryDispatcher {
                         diagnostic.as_deref(),
                     )
                     .await?;
-                self.record_pacing_after_delivery(channel, completed_now);
+                self.record_pacing_after_delivery_limits(
+                    &channel.credential_group_key,
+                    effective_min_interval,
+                    effective_jitter_max,
+                    completed_now,
+                );
             }
             DeliveryOutcome::Deferred {
                 next_window_at,
@@ -1297,9 +1436,15 @@ impl DeliveryDispatcher {
                 diagnostic,
             } => {
                 let target_window = next_window_at.max(completed_now.saturating_add(1));
+                let diag = format_deferral_diagnostic(
+                    &diagnostic,
+                    task.attempt_count,
+                    task.last_status_code,
+                    task.diagnostic_log.as_deref(),
+                );
                 self.inner
                     .db
-                    .mark_task_deferred(task.id, target_window, checkpoint.as_ref(), &diagnostic)
+                    .mark_task_deferred(task.id, target_window, None, checkpoint.as_ref(), &diag)
                     .await?;
             }
             DeliveryOutcome::PermanentFailure {
@@ -1340,6 +1485,7 @@ impl DeliveryDispatcher {
                         .mark_task_deferred(
                             task.id,
                             completed_now.saturating_add(poll_delay),
+                            Some(202),
                             checkpoint.as_ref(),
                             &diagnostic,
                         )
@@ -1420,6 +1566,7 @@ impl DeliveryDispatcher {
             | AppError::BadRequest(_)
             | AppError::Unauthorized(_)
             | AppError::Forbidden(_)
+            | AppError::SsrfBlocked(_)
             | AppError::Crypto(_) => {
                 self.inner
                     .db
@@ -1462,7 +1609,8 @@ impl DeliveryDispatcher {
 /// Input of [`DeliveryDispatcher::debug_push`].
 #[derive(Debug, Clone)]
 pub struct DebugPushParams {
-    pub channel_id: i64,
+    pub destination_id: Option<i64>,
+    pub channel_id: Option<i64>,
     pub url: String,
     pub feed_id: Option<i64>,
     pub fingerprint: Option<String>,
@@ -1539,6 +1687,42 @@ pub fn compute_delivery_retry_delay_secs(attempt_count: i64, retry_after_secs: O
     let jitter_cap = (exp / 5).max(1);
     let jitter = rand::random_range(0..=jitter_cap);
     exp.saturating_add(jitter)
+}
+
+fn is_benign_deferral_diagnostic(msg: &str) -> bool {
+    msg.starts_with("Route, channel, or destination currently disabled")
+        || msg.starts_with("Route delivery window closed")
+        || msg.starts_with("Channel hourly quota reached")
+        || msg.starts_with("Channel daily quota reached")
+        || msg.starts_with("Channel anti-spam pacing window active")
+}
+
+fn format_deferral_diagnostic(
+    reason: &str,
+    prior_attempts: i64,
+    prior_status: Option<i32>,
+    prior_log: Option<&str>,
+) -> String {
+    let Some(prior) = prior_log.map(str::trim).filter(|s| !s.is_empty()) else {
+        return reason.to_owned();
+    };
+    let (preserved, had_wrapped_previous) = match prior.rsplit_once(" (previous: ") {
+        Some((_, tail)) => (tail.strip_suffix(')').unwrap_or(tail).trim(), true),
+        None => (prior, false),
+    };
+    if preserved.is_empty() {
+        return reason.to_owned();
+    }
+    let has_prior_failure = had_wrapped_previous
+        || prior_status.is_some_and(|c| c >= 400)
+        || (prior_status.is_none()
+            && prior_attempts > 1
+            && !is_benign_deferral_diagnostic(preserved));
+    if !has_prior_failure {
+        return reason.to_owned();
+    }
+    let snippet: String = preserved.chars().take(240).collect();
+    format!("{reason} (previous: {snippet})")
 }
 
 fn derive_media_filename(url: &Url, content_type: Option<&str>) -> String {

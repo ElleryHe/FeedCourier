@@ -12,13 +12,13 @@ It is designed as a delivery service rather than a local feed reader: reading, s
 
 ## Key Capabilities
 
-- **Feed Polling & Full-Text Extraction**: Polls RSS, Atom, and JSON Feed subscriptions on configurable intervals with HTTP conditional caching (`ETag` / `Last-Modified`) and optional full-article extraction for summary-only feeds.
-- **Multi-Channel Delivery**:
-  - **[SMTP Email](/channels/smtp)**: Sends single-article HTML and plain-text emails with sender alignment (`Force-From`) and standard mailing-list headers.
-  - **[Telegram](/channels/telegram)**: Supports private chats, groups, forum topics, and channels with three route-selectable modes: Rich Message, Compact Card, and Media Mode.
-  - **[Notion](/channels/notion)**: Creates pages in a Notion database with mapped article properties and Markdown-converted body content, supporting one-click database initialization or binding to an existing database.
-- **Send Rate Control, Quotas & Route Filters**: Spaces out bursts using per-channel minimum intervals, random jitter, and optional hourly/daily quotas, filters incoming entries by feed tags, keywords, or regular expressions, restricts each route to delivery time windows and weekdays, and lets you pause the global queue ([Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas)). Backlogs and multiple feeds are delivered in chronological order.
-- **WebUI & MCP Integration**: Ships with an embedded web console for managing channels, feeds, routes, and settings (username and password sign-in with optional TOTP 2FA), alongside a Streamable HTTP Model Context Protocol endpoint (`/mcp`) for inspecting status, previewing feeds, and managing routes from AI clients ([Client Setup & Security](/mcp/setup)).
+- **Feed Polling, Filtering & Full-Text Extraction**: Polls RSS, Atom, and JSON Feed subscriptions on configurable intervals with HTTP conditional caching (`ETag` / `Last-Modified`), optional full-article extraction for summary-only feeds, and a WebUI Feeds list with tag filtering, persistent CJK/Latin sorting, and pagination.
+- **Two-Layer Multi-Channel Delivery (`Account` + `Destinations`)**: Configure credentials, outbound proxy, pacing, and quotas once per **Channel Account**, then attach multiple independently toggleable and testable **Destinations**:
+  - **[SMTP Email](/channels/smtp)**: Sends single-article responsive HTML and plain-text emails (with Outlook-safe image scaling, localized timestamps, sender alignment `Force-From`, and standard `List-Id` headers) to one or more recipient groups under the same SMTP account.
+  - **[Telegram](/channels/telegram)**: Connects one Bot account to multiple private chats, groups, forum topics, and channels, with three route-selectable modes: Rich Message (`telegram-rich 0.0.2` native footers, heading demotion, and image collages/slideshows), Compact Card, and Media Mode.
+  - **[Notion](/channels/notion)**: Connects one Notion Integration to multiple databases, creating pages with mapped article properties and Markdown v2 body content via one-click database initialization or binding to existing databases.
+- **Send Rate Control, Quotas & Route Rules**: Shares minimum intervals, per-delivery random jitter, rolling hourly/daily quotas, and `429` cooldowns across all destinations of a Channel Account; filters incoming entries by feed tags, keywords, or regular expressions; supports per-route delivery language, IANA timezone overrides (for delivery windows and article timestamps), and weekdays; and lets you pause the global queue ([Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas)). Backlogs and multiple feeds are delivered in chronological order.
+- **WebUI & MCP Integration**: Ships with an embedded web console (featuring channel/route cascading filters, semantic outbox status colors, and username/password sign-in with optional TOTP 2FA), alongside a Streamable HTTP Model Context Protocol endpoint (`/mcp`) for inspecting status, previewing feeds, and managing routes by redacted `destination_id` from AI clients ([Client Setup & Security](/mcp/setup)).
 
 ---
 

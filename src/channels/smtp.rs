@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono_tz::Tz;
 use lettre::address::Address;
 use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Mailbox, MultiPart};
@@ -20,11 +21,12 @@ use minijinja::{Environment, context};
 
 use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, SmtpChannelConfig, SmtpSecurity,
+    DeliveryOutcome, DestinationConfig, SmtpChannelConfig, SmtpDestinationConfig, SmtpSecurity,
 };
 use crate::crypto::sha256_hex;
-use crate::db::models::{AppLocale, Entry, Feed, unix_to_datetime};
+use crate::db::models::{AppLocale, Entry, Feed};
 use crate::error::{AppError, AppResult};
+use crate::schedule::format_local_timestamp;
 
 /// Maximum UTF-8 byte budget for the rendered HTML email part (`95 KiB`), keeping the
 /// final MIME-encoded message safely below Gmail's `102 KB` clipping threshold.
@@ -36,12 +38,22 @@ pub const PLAIN_TEXT_WRAP_WIDTH: usize = 78;
 /// Default per-operation SMTP socket/command timeout.
 pub const DEFAULT_SMTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Inner usable card width in pixels (`640px - 2 * 24px` horizontal padding).
+pub const EMAIL_CARD_INNER_WIDTH_PX: u32 = 592;
+
 const EMAIL_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 <html lang="{{ html_lang }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{{ subject }}</title>
+<style type="text/css">
+img { max-width: 100% !important; height: auto !important; }
+figure { margin: 16px 0 !important; padding: 0 !important; max-width: 100% !important; }
+figcaption { font-size: 13px !important; line-height: 1.5 !important; color: #6b7280 !important; }
+table { max-width: 100% !important; }
+pre { max-width: 100% !important; overflow-x: auto !important; white-space: pre-wrap !important; word-break: break-word !important; }
+</style>
 </head>
 <body style="margin:0;padding:24px 12px;background-color:#f6f7f9;color:#1a1d21;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;line-height:1.65;-webkit-text-size-adjust:100%;">
   <div style="max-width:640px;margin:0 auto;background-color:#ffffff;border:1px solid #e5e7eb;border-radius:8px;padding:28px 24px;">
@@ -210,32 +222,89 @@ impl SmtpSender {
         Ok(transport)
     }
 
-    /// Render and assemble an RFC 5322 `multipart/alternative` email for a feed entry.
+    /// Test SMTP server reachability and authentication without sending an email.
+    pub async fn test_account(&self, cfg: &SmtpChannelConfig) -> AppResult<String> {
+        let transport = self
+            .transport_for(cfg)
+            .map_err(|err| AppError::Upstream(format!("SMTP transport setup failed: {err}")))?;
+        let ok = transport.test_connection().await.map_err(|err| {
+            let status = err.status().map(u16::from);
+            if status == Some(535) {
+                AppError::Unauthorized(format!("SMTP authentication failed (535): {err}"))
+            } else {
+                AppError::Upstream(format!("SMTP connection test failed: {err}"))
+            }
+        })?;
+        if !ok {
+            return Err(AppError::Upstream(format!(
+                "SMTP server {}:{} rejected connection test",
+                cfg.host.trim(),
+                cfg.port
+            )));
+        }
+        Ok(format!(
+            "SMTP account {} ({}:{}, {:?}) verified",
+            cfg.from_address.trim(),
+            cfg.host.trim(),
+            cfg.port,
+            cfg.security
+        ))
+    }
+
+    /// Render and assemble an RFC 5322 `multipart/alternative` email for a feed entry (UTC default).
     pub fn build_entry_email(
         cfg: &SmtpChannelConfig,
+        dest: &SmtpDestinationConfig,
         feed: &Feed,
         entry: &Entry,
         route_id: i64,
         existing_message_id: Option<&str>,
     ) -> AppResult<BuiltEmail> {
-        Self::build_entry_email_with_locale(
+        Self::build_entry_email_with_options(
             cfg,
+            dest,
             feed,
             entry,
             route_id,
             existing_message_id,
             AppLocale::En,
+            chrono_tz::UTC,
         )
     }
 
-    /// Render and assemble an RFC 5322 `multipart/alternative` email localized to `locale`.
+    /// Render and assemble an RFC 5322 `multipart/alternative` email localized to `locale` (UTC default).
     pub fn build_entry_email_with_locale(
         cfg: &SmtpChannelConfig,
+        dest: &SmtpDestinationConfig,
         feed: &Feed,
         entry: &Entry,
         route_id: i64,
         existing_message_id: Option<&str>,
         locale: AppLocale,
+    ) -> AppResult<BuiltEmail> {
+        Self::build_entry_email_with_options(
+            cfg,
+            dest,
+            feed,
+            entry,
+            route_id,
+            existing_message_id,
+            locale,
+            chrono_tz::UTC,
+        )
+    }
+
+    /// Render and assemble an RFC 5322 `multipart/alternative` email localized to `locale` and `tz`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_entry_email_with_options(
+        cfg: &SmtpChannelConfig,
+        dest: &SmtpDestinationConfig,
+        feed: &Feed,
+        entry: &Entry,
+        route_id: i64,
+        existing_message_id: Option<&str>,
+        locale: AppLocale,
+        tz: Tz,
     ) -> AppResult<BuiltEmail> {
         let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
             AppError::Validation(format!(
@@ -249,8 +318,8 @@ impl SmtpSender {
         let display_name = format!("{sanitized_feed} via FeedCourier");
         let from_mailbox = Mailbox::new(Some(display_name), from_addr);
 
-        let to_mailboxes = parse_recipient_mailboxes(&cfg.to_addresses)?;
-        let reply_to_mailbox = parse_optional_mailbox(cfg.reply_to.as_deref(), "reply_to")?;
+        let to_mailboxes = parse_recipient_mailboxes(&dest.to_addresses)?;
+        let reply_to_mailbox = parse_optional_mailbox(dest.reply_to.as_deref(), "reply_to")?;
 
         let entry_title = entry
             .title
@@ -274,7 +343,7 @@ impl SmtpSender {
             });
 
         let list_id = list_id_value(feed.id, &from_domain);
-        let (html_body, html_truncated) = render_entry_html(feed, entry, &entry_title, locale)?;
+        let (html_body, html_truncated) = render_entry_html(feed, entry, &entry_title, locale, tz)?;
         let plain_body = render_plain_fallback(&html_body, feed, entry, &entry_title, locale);
 
         let mut builder = Message::builder()
@@ -327,19 +396,27 @@ impl ChannelSender for SmtpSender {
                 ctx.channel_config.kind()
             )));
         };
+        let DestinationConfig::Smtp(dest) = ctx.destination_config else {
+            return Err(AppError::Validation(format!(
+                "SmtpSender received incompatible destination config kind '{}'",
+                ctx.destination_config.kind()
+            )));
+        };
 
         let prior_msg_id = match &ctx.checkpoint {
             Some(DeliveryCheckpoint::Smtp { message_id }) => Some(message_id.as_str()),
             _ => None,
         };
 
-        let built = match Self::build_entry_email_with_locale(
+        let built = match Self::build_entry_email_with_options(
             cfg,
+            dest,
             ctx.feed,
             ctx.entry,
             ctx.route.id,
             prior_msg_id,
             ctx.route_options.locale.unwrap_or_else(|| self.locale()),
+            ctx.timezone,
         ) {
             Ok(built) => built,
             Err(err) => {
@@ -384,14 +461,26 @@ impl ChannelSender for SmtpSender {
         }
     }
 
-    async fn send_test(&self, config: &ChannelConfig, _use_proxy: bool) -> AppResult<String> {
-        let ChannelConfig::Smtp(cfg) = config else {
+    async fn send_test(
+        &self,
+        channel_config: &ChannelConfig,
+        destination_config: &DestinationConfig,
+        _use_proxy: bool,
+    ) -> AppResult<String> {
+        let ChannelConfig::Smtp(cfg) = channel_config else {
             return Err(AppError::Validation(format!(
-                "SmtpSender::send_test expected smtp config, got '{}'",
-                config.kind()
+                "SmtpSender::send_test expected smtp account config, got '{}'",
+                channel_config.kind()
             )));
         };
-        config.validate()?;
+        let DestinationConfig::Smtp(dest) = destination_config else {
+            return Err(AppError::Validation(format!(
+                "SmtpSender::send_test expected smtp destination config, got '{}'",
+                destination_config.kind()
+            )));
+        };
+        channel_config.validate()?;
+        destination_config.validate()?;
 
         let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
             AppError::Validation(format!(
@@ -401,8 +490,8 @@ impl ChannelSender for SmtpSender {
         })?;
         let from_domain = sanitize_domain_ascii(from_addr.domain());
         let from_mailbox = Mailbox::new(Some("FeedCourier via FeedCourier".to_owned()), from_addr);
-        let to_mailboxes = parse_recipient_mailboxes(&cfg.to_addresses)?;
-        let reply_to = parse_optional_mailbox(cfg.reply_to.as_deref(), "reply_to")?;
+        let to_mailboxes = parse_recipient_mailboxes(&dest.to_addresses)?;
+        let reply_to = parse_optional_mailbox(dest.reply_to.as_deref(), "reply_to")?;
 
         let probe_nonce = sha256_hex(
             format!(
@@ -505,7 +594,7 @@ impl ChannelSender for SmtpSender {
         Ok(format!(
             "SMTP verification email accepted ({code}) from {} to {}",
             cfg.from_address.trim(),
-            cfg.to_addresses.join(", ")
+            dest.to_addresses.join(", ")
         ))
     }
 }
@@ -675,6 +764,7 @@ fn render_entry_html(
     entry: &Entry,
     entry_title: &str,
     locale: AppLocale,
+    tz: Tz,
 ) -> AppResult<(String, bool)> {
     let env = template_env();
     let tmpl = env
@@ -703,8 +793,11 @@ fn render_entry_html(
     {
         meta_parts.push(author);
     }
-    if let Some(ts) = entry.published_at.and_then(unix_to_datetime) {
-        meta_parts.push(ts.format("%Y-%m-%d %H:%M UTC").to_string());
+    if let Some(formatted_ts) = entry
+        .published_at
+        .and_then(|ts| format_local_timestamp(ts, tz))
+    {
+        meta_parts.push(formatted_ts);
     }
     let meta_line = if meta_parts.is_empty() {
         None
@@ -729,7 +822,7 @@ fn render_entry_html(
             )
         };
 
-    let raw_body_html = build_body_html(entry, locale);
+    let raw_body_html = rewrite_body_html_for_email(&build_body_html(entry, locale));
 
     let full_html = tmpl
         .render(context! {
@@ -853,6 +946,309 @@ fn build_body_html(entry: &Entry, locale: AppLocale) -> String {
         "<p><em>订阅源未提供正文内容。</em></p>".to_owned()
     } else {
         "<p><em>No article body available in feed.</em></p>".to_owned()
+    }
+}
+
+/// Rewrite sanitized article body HTML so wide media and containers (`<img>`, `<figure>`,
+/// `<figcaption>`, `<table>`, `<pre>`) never overflow the 640px email card across Gmail,
+/// Apple Mail, and Outlook desktop/web clients.
+pub fn rewrite_body_html_for_email(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 256);
+    let bytes = html.as_bytes();
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        let Some(rel_lt) = html[idx..].find('<') else {
+            out.push_str(&html[idx..]);
+            break;
+        };
+        let lt = idx + rel_lt;
+        out.push_str(&html[idx..lt]);
+
+        if html[lt..].starts_with("<!--") {
+            if let Some(end_comment) = html[lt + 4..].find("-->") {
+                let end = lt + 4 + end_comment + 3;
+                out.push_str(&html[lt..end]);
+                idx = end;
+                continue;
+            }
+            out.push_str(&html[lt..]);
+            break;
+        }
+
+        let Some(tag_end) = find_html_tag_end(&html[lt..]) else {
+            out.push_str(&html[lt..]);
+            break;
+        };
+        let full_tag = &html[lt..=lt + tag_end];
+        idx = lt + tag_end + 1;
+
+        let inner = &full_tag[1..full_tag.len() - 1];
+        let trimmed = inner.trim();
+        if trimmed.is_empty() || trimmed.starts_with('!') || trimmed.starts_with('?') {
+            out.push_str(full_tag);
+            continue;
+        }
+
+        if let Some(closing) = trimmed.strip_prefix('/') {
+            let close_name = closing
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<String>();
+            out.push_str(full_tag);
+            if close_name == "table" {
+                out.push_str("</div>");
+            }
+            continue;
+        }
+
+        let self_closing = trimmed.ends_with('/');
+        let body = if self_closing {
+            trimmed.strip_suffix('/').unwrap_or(trimmed).trim_end()
+        } else {
+            trimmed
+        };
+        let name_end = body
+            .find(|c: char| c.is_ascii_whitespace() || c == '/')
+            .unwrap_or(body.len());
+        let tag_lower = body[..name_end].to_ascii_lowercase();
+
+        if !matches!(
+            tag_lower.as_str(),
+            "img" | "figure" | "figcaption" | "table" | "pre"
+        ) {
+            out.push_str(full_tag);
+            continue;
+        }
+
+        let mut attrs = parse_email_tag_attrs(&body[name_end..]);
+        match tag_lower.as_str() {
+            "img" => {
+                // Strip `height` so aspect ratio scales proportionally on narrow screens.
+                attrs.retain(|a| !a.name.eq_ignore_ascii_case("height"));
+
+                // Preserve relative percentage widths (1%–100%) and explicit small pixel widths
+                // (< 592px) so icons and fractional-width figures aren't stretched; clamp missing
+                // or oversized widths to card inner width (592px) for Outlook compatibility.
+                let raw_width = attrs
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case("width"))
+                    .and_then(|a| a.value.as_deref());
+
+                let (width_attr, img_style) = if let Some(pct) =
+                    raw_width.and_then(parse_percent_dimension)
+                {
+                    (
+                        format!("{pct}%"),
+                        format!(
+                            "display:block;max-width:100%;width:{pct}%;height:auto;border:0;outline:none;text-decoration:none;"
+                        ),
+                    )
+                } else if let Some(w) = raw_width
+                    .and_then(parse_px_dimension)
+                    .filter(|&w| w > 0 && w < EMAIL_CARD_INNER_WIDTH_PX)
+                {
+                    (
+                        w.to_string(),
+                        "display:block;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;".to_string(),
+                    )
+                } else {
+                    (
+                        EMAIL_CARD_INNER_WIDTH_PX.to_string(),
+                        "display:block;max-width:100%;width:100%;height:auto;border:0;outline:none;text-decoration:none;".to_string(),
+                    )
+                };
+
+                set_or_replace_attr(&mut attrs, "width", width_attr);
+                set_or_replace_attr(&mut attrs, "style", img_style);
+                emit_html_tag(&mut out, "img", &attrs, self_closing);
+            }
+            "figure" => {
+                set_or_replace_attr(
+                    &mut attrs,
+                    "style",
+                    "margin:16px 0;padding:0;max-width:100%;".to_string(),
+                );
+                emit_html_tag(&mut out, "figure", &attrs, self_closing);
+            }
+            "figcaption" => {
+                set_or_replace_attr(
+                    &mut attrs,
+                    "style",
+                    "margin:8px 0 0 0;font-size:13px;line-height:1.5;color:#6b7280;".to_string(),
+                );
+                emit_html_tag(&mut out, "figcaption", &attrs, self_closing);
+            }
+            "table" => {
+                attrs.retain(|a| !a.name.eq_ignore_ascii_case("width"));
+                set_or_replace_attr(
+                    &mut attrs,
+                    "style",
+                    "max-width:100%;width:100%;border-collapse:collapse;table-layout:auto;overflow-wrap:break-word;".to_string(),
+                );
+                if !self_closing {
+                    out.push_str(
+                        "<div style=\"max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;margin:14px 0;\">",
+                    );
+                }
+                emit_html_tag(&mut out, "table", &attrs, self_closing);
+            }
+            "pre" => {
+                set_or_replace_attr(
+                    &mut attrs,
+                    "style",
+                    "max-width:100%;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word;background-color:#f3f4f6;padding:12px 14px;border-radius:6px;font-size:13px;line-height:1.5;".to_string(),
+                );
+                emit_html_tag(&mut out, "pre", &attrs, self_closing);
+            }
+            _ => out.push_str(full_tag),
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, Clone)]
+struct EmailTagAttr {
+    name: String,
+    value: Option<String>,
+}
+
+fn find_html_tag_end(slice_from_lt: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, b) in slice_from_lt.bytes().enumerate().skip(1) {
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'>' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn parse_email_tag_attrs(s: &str) -> Vec<EmailTagAttr> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1;
+            continue;
+        }
+        let name = s[name_start..i].to_string();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                out.push(EmailTagAttr {
+                    name,
+                    value: Some(String::new()),
+                });
+                break;
+            }
+            let val = if bytes[i] == b'"' || bytes[i] == b'\'' {
+                let q = bytes[i];
+                i += 1;
+                let val_start = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                let extracted = s[val_start..i].to_string();
+                if i < bytes.len() && bytes[i] == q {
+                    i += 1;
+                }
+                extracted
+            } else {
+                let val_start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                s[val_start..i].to_string()
+            };
+            out.push(EmailTagAttr {
+                name,
+                value: Some(val),
+            });
+        } else {
+            out.push(EmailTagAttr { name, value: None });
+        }
+    }
+    out
+}
+
+fn parse_px_dimension(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    let numeric = trimmed.strip_suffix("px").unwrap_or(&trimmed).trim();
+    numeric.parse::<u32>().ok()
+}
+
+fn parse_percent_dimension(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    let numeric = trimmed.strip_suffix('%')?.trim();
+    let pct = numeric.parse::<u32>().ok()?;
+    (1..=100).contains(&pct).then_some(pct)
+}
+
+fn set_or_replace_attr(attrs: &mut Vec<EmailTagAttr>, name: &str, value: String) {
+    if let Some(existing) = attrs.iter_mut().find(|a| a.name.eq_ignore_ascii_case(name)) {
+        existing.value = Some(value);
+    } else {
+        attrs.push(EmailTagAttr {
+            name: name.to_string(),
+            value: Some(value),
+        });
+    }
+}
+
+fn emit_html_tag(out: &mut String, tag: &str, attrs: &[EmailTagAttr], self_closing: bool) {
+    out.push('<');
+    out.push_str(tag);
+    for attr in attrs {
+        out.push(' ');
+        out.push_str(&attr.name);
+        if let Some(val) = &attr.value {
+            out.push_str("=\"");
+            for ch in val.chars() {
+                match ch {
+                    '"' => out.push_str("&quot;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    other => out.push(other),
+                }
+            }
+            out.push('"');
+        }
+    }
+    if self_closing {
+        out.push_str(" />");
+    } else {
+        out.push('>');
     }
 }
 

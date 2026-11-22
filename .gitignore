@@ -20,6 +20,9 @@ master.key
 /docs/.wrangler
 /.wrangler
 
+# Local QA / security review reports (archived per release under QA/<version>/)
+/QA/
+
 # OS & editor files
 .DS_Store
 .env

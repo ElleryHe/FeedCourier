@@ -6,9 +6,10 @@ use tokio_test as _;
 use wiremock as _;
 
 use feedcourier::channels::{
-    ChannelConfig, ChannelKind, CheckpointSink, DeliveryCheckpoint, NotionChannelConfig,
-    NotionColumnMapping, RouteOptions, SmtpChannelConfig, SmtpSecurity, TelegramChannelConfig,
-    TelegramDeliveryMode,
+    ChannelConfig, ChannelKind, CheckpointSink, DeliveryCheckpoint, DestinationConfig,
+    LegacyChannelConfig, NotionChannelConfig, NotionColumnMapping, NotionDestinationConfig,
+    RouteOptions, SmtpChannelConfig, SmtpDestinationConfig, SmtpSecurity, TelegramChannelConfig,
+    TelegramDeliveryMode, TelegramDestinationConfig,
 };
 use feedcourier::config::AppConfig;
 use feedcourier::crypto::{
@@ -17,8 +18,9 @@ use feedcourier::crypto::{
 };
 use feedcourier::db::Database;
 use feedcourier::db::models::{
-    DeliveryTaskStatus, EntryInsertOutcome, FeedHealthStatus, McpTokenScope, MediaAttachment,
-    MediaAttachmentKind, NewChannel, NewEntry, NewFeed, NewRoute, SETTING_SSRF_ALLOWLIST,
+    CHANNEL_MODEL_VERSION_V2, DeliveryTaskStatus, EntryInsertOutcome, FeedHealthStatus,
+    McpTokenScope, MediaAttachment, MediaAttachmentKind, NewChannel, NewDestination, NewEntry,
+    NewFeed, NewRoute, SETTING_CHANNEL_MODEL_VERSION, SETTING_SSRF_ALLOWLIST,
 };
 
 fn sample_fingerprint(tag: &str) -> String {
@@ -99,15 +101,18 @@ fn chacha20poly1305_roundtrip_channel_configs_and_tamper_rejection() {
     assert!(other_key.decrypt(&c1).is_err());
     assert!(key.decrypt(&c1[..NONCE_LEN + TAG_LEN - 1]).is_err());
 
-    // JSON roundtrip for Notion channel config + secret redaction + shared credential group key.
+    // JSON roundtrip for Notion account + destination configs, secret redaction, and shared credential group key.
     let notion_cfg = ChannelConfig::Notion(NotionChannelConfig {
         integration_secret: "ntn_super_secret_integration_token_1234".to_string(),
+    });
+    let notion_dest = DestinationConfig::Notion(NotionDestinationConfig {
         data_source_id: "ds-2026-03-11-abc".to_string(),
         database_id: Some("db-xyz".to_string()),
         parent_page_id: None,
         column_mapping: NotionColumnMapping::standard(),
     });
     notion_cfg.validate().expect("valid notion config");
+    notion_dest.validate().expect("valid notion destination");
 
     let encrypted = key.encrypt_json(&notion_cfg).expect("encrypt_json");
     let roundtripped: ChannelConfig = key.decrypt_json(&encrypted).expect("decrypt_json");
@@ -123,7 +128,12 @@ fn chacha20poly1305_roundtrip_channel_configs_and_tamper_rejection() {
         !redacted_str.contains("super_secret_integration"),
         "redacted_view must never leak raw secret"
     );
-    assert_eq!(redacted["column_mapping"]["fc_id"], "FC-ID");
+
+    let encrypted_dest = key.encrypt_json(&notion_dest).expect("encrypt dest");
+    let roundtripped_dest: DestinationConfig =
+        key.decrypt_json(&encrypted_dest).expect("decrypt dest");
+    assert_eq!(roundtripped_dest.kind(), ChannelKind::Notion);
+    assert_eq!(roundtripped_dest.view()["column_mapping"]["fc_id"], "FC-ID");
 }
 
 #[test]
@@ -272,18 +282,23 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
         EntryInsertOutcome::Inserted(_)
     ));
 
-    // 3. Create two Telegram channels sharing the SAME bot token (shared credential_group_key).
+    // 3. Create two Telegram channels sharing the SAME bot token (shared credential_group_key),
+    //    each with its own destination.
     let tg_cfg_a = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "123456:ABCDEF-shared-bot-token".to_string(),
+        api_base_url: None,
+    });
+    let tg_dest_a = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-1001111111".to_string(),
         message_thread_id: None,
-        api_base_url: None,
     });
     let tg_cfg_b = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: "123456:ABCDEF-shared-bot-token".to_string(),
+        api_base_url: None,
+    });
+    let tg_dest_b = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: "-1002222222".to_string(),
         message_thread_id: Some(42),
-        api_base_url: None,
     });
     assert_eq!(
         tg_cfg_a.credential_group_key(),
@@ -306,6 +321,15 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
         })
         .await
         .expect("create chan_a");
+    let dest_a = db
+        .create_destination(&NewDestination {
+            channel_id: chan_a.id,
+            name: "Main Chat".to_string(),
+            encrypted_config: key.encrypt_json(&tg_dest_a).expect("enc dest a"),
+            enabled: true,
+        })
+        .await
+        .expect("create dest_a");
 
     let chan_b = db
         .create_channel(&NewChannel {
@@ -323,6 +347,15 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
         })
         .await
         .expect("create chan_b");
+    let dest_b = db
+        .create_destination(&NewDestination {
+            channel_id: chan_b.id,
+            name: "Topic Chat".to_string(),
+            encrypted_config: key.encrypt_json(&tg_dest_b).expect("enc dest b"),
+            enabled: true,
+        })
+        .await
+        .expect("create dest_b");
 
     let route_a = db
         .create_route(&NewRoute {
@@ -330,6 +363,7 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
             feed_ids: vec![feed1.id],
             match_tags: vec![],
             channel_id: chan_a.id,
+            destination_id: dest_a.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -350,6 +384,7 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
             feed_ids: vec![],
             match_tags: vec!["rust".to_string()],
             channel_id: chan_b.id,
+            destination_id: dest_b.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -363,12 +398,12 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
     // 4. `(route_id, entry_id)` unique outbox constraint.
     let t0 = 1_700_000_100;
     let task_a = db
-        .enqueue_delivery_task(route_a.id, chan_a.id, entry1.id, t0)
+        .enqueue_delivery_task(route_a.id, chan_a.id, dest_a.id, entry1.id, t0)
         .await
         .expect("enqueue route_a")
         .expect("must insert first time");
     let dup_a = db
-        .enqueue_delivery_task(route_a.id, chan_a.id, entry1.id, t0)
+        .enqueue_delivery_task(route_a.id, chan_a.id, dest_a.id, entry1.id, t0)
         .await
         .expect("enqueue duplicate route_a");
     assert!(
@@ -378,7 +413,7 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
 
     // Enqueueing the same entry for a DIFFERENT route succeeds.
     let task_b = db
-        .enqueue_delivery_task(route_b.id, chan_b.id, entry1.id, t0 + 50)
+        .enqueue_delivery_task(route_b.id, chan_b.id, dest_b.id, entry1.id, t0 + 50)
         .await
         .expect("enqueue route_b")
         .expect("must insert for route_b");
@@ -460,7 +495,7 @@ async fn idempotent_entries_routes_atomic_lease_takeover_and_quotas() {
 
     // Deferring due to quota must restore `attempt_count` back to 0.
     let deferred_b = db
-        .mark_task_deferred(task_b.id, t0 + 300, None, "hourly quota reached")
+        .mark_task_deferred(task_b.id, t0 + 300, None, None, "hourly quota reached")
         .await
         .expect("defer task_b");
     assert_eq!(deferred_b.status, DeliveryTaskStatus::Deferred);
@@ -528,6 +563,8 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
         password: Some("pw".to_string()),
         security: SmtpSecurity::StartTls,
         from_address: "mailer@example.com".to_string(),
+    });
+    let smtp_dest = DestinationConfig::Smtp(SmtpDestinationConfig {
         to_addresses: vec!["reader@example.com".to_string()],
         reply_to: None,
     });
@@ -547,6 +584,15 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
         })
         .await
         .expect("channel");
+    let dest = db
+        .create_destination(&NewDestination {
+            channel_id: channel.id,
+            name: "Reader Inbox".to_string(),
+            encrypted_config: key.encrypt_json(&smtp_dest).expect("enc dest"),
+            enabled: true,
+        })
+        .await
+        .expect("dest");
 
     let keep_route = db
         .create_route(&NewRoute {
@@ -554,6 +600,7 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
             feed_ids: vec![feed.id],
             match_tags: vec![],
             channel_id: channel.id,
+            destination_id: dest.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -570,6 +617,7 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
             feed_ids: vec![feed.id],
             match_tags: vec![],
             channel_id: channel.id,
+            destination_id: dest.id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -615,7 +663,7 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
     // Case 1: Old entry with a `delivered` task -> MUST BE PURGED.
     let e_delivered = insert(make_entry("delivered", old_ts)).await;
     let t_delivered = db
-        .enqueue_delivery_task(keep_route.id, channel.id, e_delivered.id, old_ts)
+        .enqueue_delivery_task(keep_route.id, channel.id, dest.id, e_delivered.id, old_ts)
         .await
         .unwrap()
         .unwrap();
@@ -631,6 +679,7 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
     db.enqueue_delivery_task(
         ephemeral_route.id,
         channel.id,
+        dest.id,
         e_deleted_route.id,
         old_ts + 60,
     )
@@ -642,7 +691,7 @@ async fn not_exists_payload_gc_covers_delivered_unrouted_deleted_routes_and_prot
     // Case 4: Old entry with an active `retrying` task -> MUST BE PROTECTED (NOT purged).
     let e_retrying = insert(make_entry("active-retry", old_ts)).await;
     let t_retrying = db
-        .enqueue_delivery_task(keep_route.id, channel.id, e_retrying.id, old_ts)
+        .enqueue_delivery_task(keep_route.id, channel.id, dest.id, e_retrying.id, old_ts)
         .await
         .unwrap()
         .unwrap();
@@ -820,5 +869,487 @@ async fn vacuum_into_online_snapshot_backup_and_auth_settings_roundtrip() {
     assert_eq!(overview.feeds_backoff, 1);
 
     snap_db.close().await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn migrate_channels_to_v2_splits_merges_repoints_creates_backup_and_is_idempotent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("feedcourier.db");
+    let key = MasterKey::generate();
+    let db = Database::connect(&db_path, 2).await.expect("connect db");
+
+    // Seed pre-v0.2.0 legacy encrypted configs: two Telegram rows sharing the same bot_token
+    // plus one SMTP row, with legacy routes & tasks (`destination_id IS NULL`).
+    let legacy_tg_1 = LegacyChannelConfig::Telegram {
+        bot_token: "777888999:LEGACY_SHARED_TOKEN".to_string(),
+        chat_id: "-100111".to_string(),
+        message_thread_id: None,
+        api_base_url: None,
+    };
+    let legacy_tg_2 = LegacyChannelConfig::Telegram {
+        bot_token: "777888999:LEGACY_SHARED_TOKEN".to_string(),
+        chat_id: "-100222".to_string(),
+        message_thread_id: Some(99),
+        api_base_url: None,
+    };
+    let legacy_smtp = LegacyChannelConfig::Smtp {
+        host: "smtp.example.com".to_string(),
+        port: 587,
+        username: Some("news@example.com".to_string()),
+        password: Some("pw".to_string()),
+        security: SmtpSecurity::StartTls,
+        from_address: "news@example.com".to_string(),
+        to_addresses: vec!["reader@example.com".to_string()],
+        reply_to: Some("reply@example.com".to_string()),
+    };
+
+    let (tg_acct, _) = legacy_tg_1.clone().into_split();
+    let (smtp_acct, _) = legacy_smtp.clone().into_split();
+
+    let ch_tg1 = db
+        .create_channel(&NewChannel {
+            name: "News Channel".to_string(),
+            kind: ChannelKind::Telegram,
+            encrypted_config: key.encrypt_json(&legacy_tg_1).expect("enc tg1"),
+            credential_group_key: tg_acct.credential_group_key(),
+            capabilities_json: r#"{"supports_rich_message":true,"bot_username":"fc_bot"}"#
+                .to_string(),
+            min_interval_secs: 5,
+            jitter_max_secs: 2,
+            hourly_quota: Some(20),
+            daily_quota: Some(100),
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .expect("ch_tg1");
+
+    let ch_tg2 = db
+        .create_channel(&NewChannel {
+            name: "Topic Alerts".to_string(),
+            kind: ChannelKind::Telegram,
+            encrypted_config: key.encrypt_json(&legacy_tg_2).expect("enc tg2"),
+            credential_group_key: tg_acct.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 15,
+            jitter_max_secs: 8,
+            hourly_quota: Some(10),
+            daily_quota: None,
+            use_proxy: true,
+            enabled: false,
+        })
+        .await
+        .expect("ch_tg2");
+    db.set_channel_cooldown(ch_tg2.id, 1_800_000_000)
+        .await
+        .expect("cooldown");
+
+    let ch_smtp = db
+        .create_channel(&NewChannel {
+            name: "Daily Newsletter".to_string(),
+            kind: ChannelKind::Smtp,
+            encrypted_config: key.encrypt_json(&legacy_smtp).expect("enc smtp"),
+            credential_group_key: smtp_acct.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 10,
+            jitter_max_secs: 4,
+            hourly_quota: None,
+            daily_quota: Some(50),
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .expect("ch_smtp");
+
+    let feed = db
+        .create_feed(&NewFeed::new("https://example.com/rss.xml"))
+        .await
+        .expect("feed");
+    let entry = match db
+        .insert_entry_if_new(&NewEntry {
+            feed_id: feed.id,
+            fingerprint_sha256: sample_fingerprint("mig-entry-1"),
+            published_at: Some(1_700_000_000),
+            discovered_at: 1_700_000_000,
+            title: Some("Migration Article".to_string()),
+            canonical_url: Some("https://example.com/mig-1".to_string()),
+            author: None,
+            content_html: Some("<p>Body</p>".to_string()),
+            first_sentence: None,
+            summary_text: None,
+            media: vec![],
+        })
+        .await
+        .expect("entry")
+    {
+        EntryInsertOutcome::Inserted(e) => *e,
+        EntryInsertOutcome::Duplicate { .. } => unreachable!(),
+    };
+
+    // Insert legacy routes & tasks with `destination_id = NULL` (exactly as SQLite 0002 migration leaves them).
+    let (r_tg1_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO routes (name, feed_ids_json, match_tags_json, channel_id, destination_id, include_keywords_json, exclude_keywords_json, options_json, enabled, created_at, updated_at) VALUES ('R-TG1', '[]', '[]', ?1, NULL, '[]', '[]', '{}', 1, 100, 100) RETURNING id",
+    )
+    .bind(ch_tg1.id)
+    .fetch_one(db.write_pool())
+    .await
+    .expect("r_tg1");
+
+    let (r_tg2_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO routes (name, feed_ids_json, match_tags_json, channel_id, destination_id, include_keywords_json, exclude_keywords_json, options_json, enabled, created_at, updated_at) VALUES ('R-TG2', '[]', '[]', ?1, NULL, '[]', '[]', '{}', 1, 100, 100) RETURNING id",
+    )
+    .bind(ch_tg2.id)
+    .fetch_one(db.write_pool())
+    .await
+    .expect("r_tg2");
+
+    let (r_smtp_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO routes (name, feed_ids_json, match_tags_json, channel_id, destination_id, include_keywords_json, exclude_keywords_json, options_json, enabled, created_at, updated_at) VALUES ('R-SMTP', '[]', '[]', ?1, NULL, '[]', '[]', '{}', 1, 100, 100) RETURNING id",
+    )
+    .bind(ch_smtp.id)
+    .fetch_one(db.write_pool())
+    .await
+    .expect("r_smtp");
+
+    let (t_delivered_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO delivery_tasks (route_id, channel_id, destination_id, entry_id, status, attempt_count, next_attempt_at, completed_at, created_at) VALUES (?1, ?2, NULL, ?3, 'delivered', 1, 100, 120, 100) RETURNING id",
+    )
+    .bind(r_tg2_id)
+    .bind(ch_tg2.id)
+    .bind(entry.id)
+    .fetch_one(db.write_pool())
+    .await
+    .expect("t_delivered");
+
+    let (t_dead_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO delivery_tasks (route_id, channel_id, destination_id, entry_id, status, attempt_count, next_attempt_at, created_at) VALUES (?1, ?2, NULL, ?3, 'dead_letter', 6, 100, 100) RETURNING id",
+    )
+    .bind(r_smtp_id)
+    .bind(ch_smtp.id)
+    .bind(entry.id)
+    .fetch_one(db.write_pool())
+    .await
+    .expect("t_dead");
+
+    // Run automatic atomic v0.2.0 migration!
+    let report = db
+        .migrate_channels_to_v2(&key)
+        .await
+        .expect("migrate to v2");
+    assert!(report.migrated);
+    assert_eq!(report.legacy_channels_scanned, 3);
+    assert_eq!(report.accounts_surviving, 2);
+    assert_eq!(report.accounts_merged, 1);
+    assert_eq!(report.destinations_created, 3);
+
+    // 1. Pre-migration backup exists and preserves all 3 original legacy channel rows intact.
+    let backup_path = report.backup_path.expect("backup_path");
+    assert_eq!(backup_path, tmp.path().join("pre-v0.2.0-backup.db"));
+    assert!(backup_path.exists());
+    let backup_db = Database::connect(&backup_path, 1)
+        .await
+        .expect("open backup");
+    assert_eq!(backup_db.list_channels().await.unwrap().len(), 3);
+    assert!(backup_db.list_destinations().await.unwrap().is_empty());
+    backup_db.close().await;
+
+    // 2. Merged Telegram account aggregates pacing/quotas/proxy/cooldown ONLY from enabled rows
+    //    (so disabled `ch_tg2` does NOT drag down `hourly_quota` or flip `use_proxy`), and picks `@bot_username`.
+    let channels = db.list_channels().await.expect("list channels");
+    assert_eq!(channels.len(), 2);
+
+    let tg_after = db
+        .get_channel(ch_tg1.id)
+        .await
+        .unwrap()
+        .expect("tg surviving");
+    assert!(
+        db.get_channel(ch_tg2.id).await.unwrap().is_none(),
+        "duplicate tg row deleted"
+    );
+    assert_eq!(tg_after.name, "@fc_bot");
+    assert_eq!(tg_after.min_interval_secs, 5);
+    assert_eq!(tg_after.jitter_max_secs, 2);
+    assert_eq!(tg_after.hourly_quota, Some(20));
+    assert_eq!(tg_after.daily_quota, Some(100));
+    assert!(!tg_after.use_proxy);
+    assert!(tg_after.enabled);
+    assert_eq!(tg_after.cooldown_until, None);
+    let dec_tg_acct: ChannelConfig = key
+        .decrypt_json(&tg_after.encrypted_config)
+        .expect("v2 tg cfg");
+    assert_eq!(dec_tg_acct.kind(), ChannelKind::Telegram);
+
+    let tg_dests = db.list_destinations_for_channel(ch_tg1.id).await.unwrap();
+    assert_eq!(tg_dests.len(), 2);
+    assert_eq!(tg_dests[0].name, "News Channel");
+    assert!(tg_dests[0].enabled);
+    assert_eq!(tg_dests[1].name, "Topic Alerts");
+    assert!(!tg_dests[1].enabled);
+    let dec_d2: DestinationConfig = key
+        .decrypt_json(&tg_dests[1].encrypted_config)
+        .expect("dest2");
+    assert_eq!(dec_d2.view()["chat_id"], "-100222");
+    assert_eq!(dec_d2.view()["message_thread_id"], 99);
+
+    // 3. SMTP account auto-named from `from_address` with destination preserving legacy name.
+    let smtp_after = db.get_channel(ch_smtp.id).await.unwrap().expect("smtp");
+    assert_eq!(smtp_after.name, "news@example.com");
+    let smtp_dests = db.list_destinations_for_channel(ch_smtp.id).await.unwrap();
+    assert_eq!(smtp_dests.len(), 1);
+    assert_eq!(smtp_dests[0].name, "Daily Newsletter");
+
+    // 4. All routes and historical/dead_letter tasks repointed to surviving accounts & new destinations.
+    let r1 = db.get_route(r_tg1_id).await.unwrap().unwrap();
+    let r2 = db.get_route(r_tg2_id).await.unwrap().unwrap();
+    let r3 = db.get_route(r_smtp_id).await.unwrap().unwrap();
+    assert_eq!(r1.channel_id, ch_tg1.id);
+    assert_eq!(r1.destination_id, tg_dests[0].id);
+    assert_eq!(r2.channel_id, ch_tg1.id);
+    assert_eq!(r2.destination_id, tg_dests[1].id);
+    assert_eq!(r3.channel_id, ch_smtp.id);
+    assert_eq!(r3.destination_id, smtp_dests[0].id);
+
+    let t1 = db.get_delivery_task(t_delivered_id).await.unwrap().unwrap();
+    assert_eq!(t1.channel_id, ch_tg1.id);
+    assert_eq!(t1.destination_id, tg_dests[1].id);
+    assert_eq!(t1.status, DeliveryTaskStatus::Delivered);
+
+    let t2 = db.get_delivery_task(t_dead_id).await.unwrap().unwrap();
+    assert_eq!(t2.channel_id, ch_smtp.id);
+    assert_eq!(t2.destination_id, smtp_dests[0].id);
+    assert_eq!(t2.status, DeliveryTaskStatus::DeadLetter);
+
+    // 5. Version marker persisted & second invocation is a pure no-op.
+    assert_eq!(
+        db.get_setting_typed::<i64>(SETTING_CHANNEL_MODEL_VERSION)
+            .await
+            .unwrap(),
+        Some(CHANNEL_MODEL_VERSION_V2)
+    );
+    let second = db.migrate_channels_to_v2(&key).await.expect("idempotent");
+    assert!(!second.migrated);
+    assert_eq!(second.destinations_created, 0);
+
+    db.close().await;
+}
+
+#[tokio::test]
+async fn migrate_channels_to_v2_smtp_strict_merge_pre_ddl_backup_no_overwrite_and_sidecar_cleanup()
+{
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("legacy_v016.db");
+    let key = MasterKey::generate();
+
+    // 1. Construct a genuine v0.1.x database containing ONLY `0001_init.sql` (no `0002` migration)
+    //    with 4 legacy SMTP channels:
+    //    - A & B: SendGrid-style shared `username="apikey"` with DIFFERENT passwords -> MUST NOT merge!
+    //    - C: identical credentials to A, DIFFERENT `from_address` -> MUST NOT merge!
+    //    - D: all 6 fields identical to A, `enabled = false`, stricter quota + `use_proxy = true`
+    //         -> MERGES into A without lowering A's quota or flipping A's `use_proxy`!
+    {
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("raw sqlite");
+
+        sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
+            .execute(&raw_pool)
+            .await
+            .expect("apply 0001");
+
+        // Record migration 1 exactly as sqlx::migrate does so `Database::connect` detects v0.1.x.
+        let m1 = &feedcourier::db::MIGRATOR.migrations[0];
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&raw_pool)
+        .await
+        .expect("create _sqlx_migrations");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?1, ?2, 1, ?3, 1)",
+        )
+        .bind(m1.version)
+        .bind(m1.description.as_ref())
+        .bind(m1.checksum.as_ref())
+        .execute(&raw_pool)
+        .await
+        .expect("insert m1");
+
+        let smtp_a = LegacyChannelConfig::Smtp {
+            host: "smtp.sendgrid.net".to_string(),
+            port: 587,
+            username: Some("apikey".to_string()),
+            password: Some("SG.key_alpha".to_string()),
+            security: SmtpSecurity::StartTls,
+            from_address: "alerts@alpha.example.com".to_string(),
+            to_addresses: vec!["one@example.com".to_string()],
+            reply_to: None,
+        };
+        let smtp_b = LegacyChannelConfig::Smtp {
+            host: "smtp.sendgrid.net".to_string(),
+            port: 587,
+            username: Some("apikey".to_string()),
+            password: Some("SG.key_beta".to_string()),
+            security: SmtpSecurity::StartTls,
+            from_address: "alerts@alpha.example.com".to_string(),
+            to_addresses: vec!["two@example.com".to_string()],
+            reply_to: None,
+        };
+        let smtp_c = LegacyChannelConfig::Smtp {
+            host: "smtp.sendgrid.net".to_string(),
+            port: 587,
+            username: Some("apikey".to_string()),
+            password: Some("SG.key_alpha".to_string()),
+            security: SmtpSecurity::StartTls,
+            from_address: "digest@alpha.example.com".to_string(),
+            to_addresses: vec!["three@example.com".to_string()],
+            reply_to: None,
+        };
+        let smtp_d = LegacyChannelConfig::Smtp {
+            host: "smtp.sendgrid.net".to_string(),
+            port: 587,
+            username: Some("apikey".to_string()),
+            password: Some("SG.key_alpha".to_string()),
+            security: SmtpSecurity::StartTls,
+            from_address: "alerts@alpha.example.com".to_string(),
+            to_addresses: vec!["four@example.com".to_string()],
+            reply_to: None,
+        };
+
+        for (name, cfg, hq, use_proxy, enabled) in [
+            ("SG Alpha", &smtp_a, Some(50i64), false, true),
+            ("SG Beta", &smtp_b, Some(50i64), false, true),
+            ("SG Different From", &smtp_c, Some(50i64), false, true),
+            ("SG Alpha Disabled", &smtp_d, Some(5i64), true, false),
+        ] {
+            sqlx::query(
+                "INSERT INTO channels (name, kind, encrypted_config, credential_group_key, capabilities_json, min_interval_secs, jitter_max_secs, hourly_quota, daily_quota, use_proxy, enabled, created_at, updated_at) VALUES (?1, 'smtp', ?2, 'legacy_shared_key', '{}', 10, 5, ?3, NULL, ?4, ?5, 1000, 1000)",
+            )
+            .bind(name)
+            .bind(key.encrypt_json(cfg).expect("enc"))
+            .bind(hq)
+            .bind(use_proxy)
+            .bind(enabled)
+            .execute(&raw_pool)
+            .await
+            .expect("insert legacy smtp");
+        }
+        raw_pool.close().await;
+    }
+
+    // 2. Pre-create a sentinel `pre-v0.2.0-backup.db` so we verify existing backups are NEVER clobbered!
+    let sentinel_path = tmp.path().join("pre-v0.2.0-backup.db");
+    std::fs::write(&sentinel_path, b"DO_NOT_OVERWRITE_SENTINEL").expect("write sentinel");
+
+    // 3. Connect v0.2.0 Database: must take a TRUE pre-DDL backup BEFORE running migration 0002,
+    //    using a timestamped filename because `pre-v0.2.0-backup.db` already exists!
+    let db = Database::connect(&db_path, 2)
+        .await
+        .expect("connect v0.2.0");
+    assert_eq!(
+        std::fs::read(&sentinel_path).expect("read sentinel"),
+        b"DO_NOT_OVERWRITE_SENTINEL",
+        "existing pre-v0.2.0-backup.db must never be overwritten"
+    );
+    let pre_ddl_backup = db
+        .pre_v2_backup_path()
+        .expect("true pre-DDL backup must be created before migration 0002")
+        .to_path_buf();
+    assert_ne!(pre_ddl_backup, sentinel_path);
+    assert!(pre_ddl_backup.exists());
+
+    // Verify the pre-DDL backup has ONLY migration 1 and NO `channel_destinations` table (pure v0.1.x!).
+    {
+        let b_opts = SqliteConnectOptions::new()
+            .filename(&pre_ddl_backup)
+            .read_only(true);
+        let b_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(b_opts)
+            .await
+            .expect("open pre-ddl backup");
+        let (v2_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 2")
+                .fetch_one(&b_pool)
+                .await
+                .expect("query migrations");
+        assert_eq!(
+            v2_count, 0,
+            "pre-DDL backup must not contain migration 0002"
+        );
+        let (has_dest_tbl,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channel_destinations'",
+        )
+        .fetch_one(&b_pool)
+        .await
+        .expect("query sqlite_master");
+        assert_eq!(
+            has_dest_tbl, 0,
+            "pre-DDL backup must be directly compatible with v0.1.6 schema"
+        );
+        b_pool.close().await;
+    }
+
+    // 4. Run Rust v2 channel migration: must reuse `pre_ddl_backup`, merge ONLY A+D (4 -> 3 accounts),
+    //    isolate password-salted `credential_group_key`, and ignore disabled D's quota/proxy!
+    let report = db.migrate_channels_to_v2(&key).await.expect("migrate");
+    assert!(report.migrated);
+    assert_eq!(report.legacy_channels_scanned, 4);
+    assert_eq!(report.accounts_surviving, 3);
+    assert_eq!(report.accounts_merged, 1);
+    assert_eq!(report.destinations_created, 4);
+    assert_eq!(
+        report.backup_path.as_deref(),
+        Some(pre_ddl_backup.as_path())
+    );
+
+    let channels = db.list_channels().await.expect("channels");
+    assert_eq!(channels.len(), 3);
+    // A & B have different passwords -> distinct credential_group_key!
+    assert_ne!(
+        channels[0].credential_group_key, channels[1].credential_group_key,
+        "SendGrid accounts with distinct passwords must have distinct credential_group_key"
+    );
+    // A absorbed disabled D -> keeps A's enabled quota (50) and use_proxy (false)!
+    assert_eq!(channels[0].hourly_quota, Some(50));
+    assert!(!channels[0].use_proxy);
+    let a_dests = db
+        .list_destinations_for_channel(channels[0].id)
+        .await
+        .unwrap();
+    assert_eq!(a_dests.len(), 2);
+    assert!(a_dests[0].enabled);
+    assert!(!a_dests[1].enabled);
+
+    // 5. Verify `vacuum_into` removes stale companion `-wal` and `-shm` sidecar files.
+    let snap_target = tmp.path().join("clean-snap.db");
+    let stale_wal = tmp.path().join("clean-snap.db-wal");
+    let stale_shm = tmp.path().join("clean-snap.db-shm");
+    std::fs::write(&snap_target, b"old").unwrap();
+    std::fs::write(&stale_wal, b"stale wal").unwrap();
+    std::fs::write(&stale_shm, b"stale shm").unwrap();
+    db.vacuum_into(&snap_target).await.expect("vacuum_into");
+    assert!(snap_target.exists());
+    assert!(!stale_wal.exists(), "stale -wal sidecar must be removed");
+    assert!(!stale_shm.exists(), "stale -shm sidecar must be removed");
+
     db.close().await;
 }

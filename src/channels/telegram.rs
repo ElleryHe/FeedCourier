@@ -10,28 +10,32 @@
 //!    anti-hotlink fallback, global concurrency semaphore, and 10 MiB / 50 MiB byte caps).
 
 use std::net::IpAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use chrono_tz::Tz;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use telegram_rich::html::{ParseOptions, normalize};
+use telegram_rich::html::{ParseOptions, normalize, parse as parse_rich_html};
 use telegram_rich::types::InputRichMessage;
-use telegram_rich::{Block, FitOptions};
+use telegram_rich::{Block, Document, FitOptions, Inline};
 use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::channels::{
     ChannelConfig, ChannelKind, ChannelSender, DeliveryCheckpoint, DeliveryContext,
-    DeliveryOutcome, TelegramCapabilities, TelegramChannelConfig, TelegramDeliveryMode,
+    DeliveryOutcome, DestinationConfig, TelegramCapabilities, TelegramChannelConfig,
+    TelegramDeliveryMode, TelegramDestinationConfig, validate_telegram_api_base_url,
 };
 use crate::db::models::{AppLocale, Entry, Feed, MediaAttachment, MediaAttachmentKind, now_unix};
 use crate::error::{AppError, AppResult};
+use crate::net::ssrf::{SsrfDnsResolver, SsrfPolicy, find_ssrf_blocked_in_error};
+use crate::schedule::format_local_timestamp;
 
 /// Default official Telegram Bot API base URL.
 pub const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
@@ -218,7 +222,7 @@ impl MediaStreamFetcher for DefaultMediaStreamFetcher {
             let mut headers = HeaderMap::new();
             headers.insert(
                 USER_AGENT,
-                HeaderValue::from_static("Mozilla/5.0 (compatible; FeedCourier/0.1)"),
+                HeaderValue::from_static("Mozilla/5.0 (compatible; FeedCourier/0.2)"),
             );
             headers.insert(
                 ACCEPT,
@@ -332,6 +336,8 @@ pub struct TelegramSender {
     media_fetcher: Arc<dyn MediaStreamFetcher>,
     upload_semaphore: Arc<Semaphore>,
     locale: AppLocale,
+    ssrf_policy: Arc<RwLock<SsrfPolicy>>,
+    ssrf_resolver: SsrfDnsResolver,
 }
 
 impl std::fmt::Debug for TelegramSender {
@@ -365,12 +371,29 @@ impl TelegramSender {
         Self::with_proxy_and_fetcher(None, media_fetcher)
     }
 
-    /// Create a `TelegramSender` with an optional outbound proxy URL and custom [`MediaStreamFetcher`].
+    /// Create a `TelegramSender` with an optional outbound proxy URL, custom [`MediaStreamFetcher`],
+    /// and a strict default [`SsrfPolicy`] blocking private/loopback/metadata endpoints.
     pub fn with_proxy_and_fetcher(
         proxy_url: Option<String>,
         media_fetcher: Arc<dyn MediaStreamFetcher>,
     ) -> Self {
+        let ssrf_policy = Arc::new(RwLock::new(SsrfPolicy::default()));
+        let ssrf_resolver = SsrfDnsResolver::new(Arc::clone(&ssrf_policy));
+        Self::with_ssrf(proxy_url, media_fetcher, ssrf_policy, ssrf_resolver)
+    }
+
+    /// Create a `TelegramSender` sharing a live hot-reloaded [`SsrfPolicy`] and connect-time
+    /// [`SsrfDnsResolver`] (e.g. from [`crate::net::ProtectedHttpClient`]).
+    pub fn with_ssrf(
+        proxy_url: Option<String>,
+        media_fetcher: Arc<dyn MediaStreamFetcher>,
+        ssrf_policy: Arc<RwLock<SsrfPolicy>>,
+        ssrf_resolver: SsrfDnsResolver,
+    ) -> Self {
         let api_client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(ssrf_resolver.clone()))
             .timeout(DEFAULT_HTTP_TIMEOUT)
             .connect_timeout(Duration::from_secs(15))
             .build()
@@ -381,7 +404,20 @@ impl TelegramSender {
             media_fetcher,
             upload_semaphore: Arc::clone(&GLOBAL_MEDIA_UPLOAD_SEMAPHORE),
             locale: AppLocale::En,
+            ssrf_policy,
+            ssrf_resolver,
         }
+    }
+
+    /// Replace this sender's SSRF policy with a custom allowlist (e.g. `&["127.0.0.1/32"]` in tests).
+    pub fn with_ssrf_allowlist(self, entries: &[&str]) -> AppResult<Self> {
+        let owned: Vec<String> = entries.iter().map(|s| (*s).to_owned()).collect();
+        let policy = Arc::new(RwLock::new(SsrfPolicy::from_allowlist(&owned)?));
+        let resolver = SsrfDnsResolver::new(Arc::clone(&policy));
+        Ok(
+            Self::with_ssrf(self.proxy_url, self.media_fetcher, policy, resolver)
+                .with_locale(self.locale),
+        )
     }
 
     /// Set the delivery template locale on this `TelegramSender` (builder style).
@@ -400,20 +436,80 @@ impl TelegramSender {
         self.locale
     }
 
-    fn bot_api_client(&self, use_proxy: bool) -> AppResult<reqwest::Client> {
-        if use_proxy
-            && let Some(ref raw_proxy) = self.proxy_url
-            && !raw_proxy.trim().is_empty()
+    async fn validated_bot_client(
+        &self,
+        cfg: &TelegramChannelConfig,
+        method_url: &str,
+        use_proxy: bool,
+    ) -> AppResult<reqwest::Client> {
+        if let Some(raw_base) = cfg
+            .api_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
-            let proxy = reqwest::Proxy::all(raw_proxy.trim())
+            validate_telegram_api_base_url(raw_base)?;
+        }
+
+        let parsed = Url::parse(method_url)?;
+        let active_proxy = if use_proxy {
+            self.proxy_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+
+        let remote_proxy_dns = match active_proxy {
+            Some(raw_proxy) => {
+                let parsed_proxy = Url::parse(raw_proxy).map_err(|err| {
+                    AppError::Config(format!("invalid Telegram proxy URL '{raw_proxy}': {err}"))
+                })?;
+                match parsed_proxy.scheme() {
+                    "http" | "https" | "socks5h" | "socks4a" => true,
+                    "socks5" | "socks4" => false,
+                    other => {
+                        return Err(AppError::Config(format!(
+                            "unsupported Telegram proxy scheme '{other}'"
+                        )));
+                    }
+                }
+            }
+            None => false,
+        };
+
+        {
+            let policy = self
+                .ssrf_policy
+                .read()
+                .expect("Telegram SSRF policy RwLock poisoned");
+            policy.validate_url_hop(&parsed, remote_proxy_dns)?;
+        }
+
+        if let Some(raw_proxy) = active_proxy {
+            if !remote_proxy_dns && let Some(host) = parsed.host_str() {
+                self.ssrf_resolver.resolve_and_validate(host).await?;
+            }
+            let proxy = reqwest::Proxy::all(raw_proxy)
                 .map_err(|err| AppError::Config(format!("invalid Telegram proxy URL: {err}")))?;
+            // Do NOT attach `self.ssrf_resolver` here: when a proxy is configured, `reqwest`
+            // runs its custom DNS resolver against the *proxy hostname* itself (e.g. local
+            // sidecar `http://clash:7890`, `http://localhost:7890`, or `http://host.docker.internal:7890`),
+            // which would falsely trip SSRF on the trusted operator-configured proxy. The target
+            // Bot API URL was already validated above via `policy.validate_url_hop` and (for
+            // local-DNS proxies) `self.ssrf_resolver.resolve_and_validate`, matching
+            // `ProtectedHttpClient::ssrf_proxied`.
             return reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(DEFAULT_HTTP_TIMEOUT)
                 .connect_timeout(Duration::from_secs(15))
                 .proxy(proxy)
                 .build()
                 .map_err(|err| AppError::Upstream(format!("Telegram proxy client failed: {err}")));
         }
+
         Ok(self.api_client.clone())
     }
 
@@ -423,13 +519,23 @@ impl TelegramSender {
         cfg: &TelegramChannelConfig,
         use_proxy: bool,
     ) -> AppResult<TelegramCapabilities> {
-        let client = self.bot_api_client(use_proxy)?;
         let get_me_url = api_method_url(cfg, "getMe");
+        let client = self
+            .validated_bot_client(cfg, &get_me_url, use_proxy)
+            .await?;
 
-        let me_resp =
-            client.get(&get_me_url).send().await.map_err(|err| {
-                AppError::Upstream(format!("Telegram getMe request failed: {err}"))
-            })?;
+        let me_resp = client
+            .get(&get_me_url)
+            .send()
+            .await
+            .map_err(|err| map_tg_reqwest_error("Telegram getMe request failed", err))?;
+
+        if me_resp.status().is_redirection() {
+            return Err(AppError::SsrfBlocked(format!(
+                "Telegram Bot API redirect (HTTP {}) is disallowed",
+                me_resp.status().as_u16()
+            )));
+        }
 
         let me_status = me_resp.status().as_u16();
         let me_body: TgApiResponse<TgUser> = me_resp.json().await.map_err(|err| {
@@ -447,6 +553,9 @@ impl TelegramSender {
                 401 => Err(AppError::Unauthorized(format!(
                     "Telegram bot token unauthorized: {desc}"
                 ))),
+                404 => Err(AppError::NotFound(format!(
+                    "Telegram bot token or endpoint not found: {desc}"
+                ))),
                 429 => Err(AppError::RateLimited {
                     message: format!("Telegram getMe rate limited: {desc}"),
                     retry_after_secs: me_body.parameters.and_then(|p| p.retry_after),
@@ -457,7 +566,10 @@ impl TelegramSender {
             };
         }
 
-        let bot_username = me_body.result.and_then(|u| u.username);
+        let (bot_username, bot_first_name) = match me_body.result {
+            Some(u) => (u.username, u.first_name),
+            None => (None, None),
+        };
 
         // Probe `sendRichMessage` with empty JSON `{}`:
         // - Bot API 10.2+ / 10.4 validates parameters and replies `400 Bad Request: chat_id is empty`
@@ -468,9 +580,14 @@ impl TelegramSender {
             .json(&json!({}))
             .send()
             .await
-            .map_err(|err| {
-                AppError::Upstream(format!("Telegram sendRichMessage probe failed: {err}"))
-            })?;
+            .map_err(|err| map_tg_reqwest_error("Telegram sendRichMessage probe failed", err))?;
+
+        if probe_resp.status().is_redirection() {
+            return Err(AppError::SsrfBlocked(format!(
+                "Telegram Bot API redirect (HTTP {}) is disallowed",
+                probe_resp.status().as_u16()
+            )));
+        }
 
         let probe_status = probe_resp.status().as_u16();
         let probe_json: Option<TgApiResponse<Value>> = probe_resp.json().await.ok();
@@ -514,15 +631,78 @@ impl TelegramSender {
             supports_rich_message,
             bot_api_version,
             bot_username,
+            bot_first_name,
             probed_at: Some(now_unix()),
             fallback_reason,
         })
+    }
+
+    /// Fetch the display name of a target Telegram chat/group/channel via `getChat`
+    /// (`title`, else `@username`, else `first_name [last_name]`).
+    pub async fn get_chat_name(
+        &self,
+        cfg: &TelegramChannelConfig,
+        chat_id: &str,
+        use_proxy: bool,
+    ) -> AppResult<Option<String>> {
+        let url = api_method_url(cfg, "getChat");
+        let client = self.validated_bot_client(cfg, &url, use_proxy).await?;
+        let resp = client
+            .post(&url)
+            .json(&json!({ "chat_id": chat_id.trim() }))
+            .send()
+            .await
+            .map_err(|err| map_tg_reqwest_error("Telegram getChat request failed", err))?;
+
+        if resp.status().is_redirection() {
+            return Err(AppError::SsrfBlocked(format!(
+                "Telegram Bot API redirect (HTTP {}) is disallowed",
+                resp.status().as_u16()
+            )));
+        }
+
+        let status = resp.status().as_u16();
+        let body: TgApiResponse<TgChat> = resp.json().await.map_err(|err| {
+            AppError::Upstream(format!(
+                "invalid Telegram getChat JSON (HTTP {status}): {err}"
+            ))
+        })?;
+        if !body.ok {
+            let code = body.error_code.unwrap_or(i32::from(status));
+            let desc = body.description.unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(AppError::Upstream(format!(
+                "Telegram getChat failed ({code}): {desc}"
+            )));
+        }
+
+        let name = body.result.and_then(|chat| {
+            chat.title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    chat.username
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|u| format!("@{}", u.trim_start_matches('@')))
+                })
+                .or_else(|| {
+                    let first = chat.first_name.as_deref().map(str::trim).unwrap_or("");
+                    let last = chat.last_name.as_deref().map(str::trim).unwrap_or("");
+                    let full = format!("{first} {last}").trim().to_string();
+                    (!full.is_empty()).then_some(full)
+                })
+        });
+        Ok(name)
     }
 
     async fn send_rich_mode(
         &self,
         ctx: &DeliveryContext<'_>,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
     ) -> AppResult<DeliveryOutcome> {
         let existing = extract_telegram_checkpoint(&ctx.checkpoint);
         if !existing.sent_message_ids.is_empty() {
@@ -538,17 +718,24 @@ impl TelegramSender {
         let cached_unsupported = caps_val.get("supports_rich_message") == Some(&Value::Bool(false));
 
         if cached_unsupported || existing.degraded_to_compact {
-            return self.send_compact_mode(ctx, cfg, true, None).await;
+            return self.send_compact_mode(ctx, cfg, dest, true, None).await;
         }
 
-        let client = self.bot_api_client(ctx.channel.use_proxy)?;
-        let rich_message = build_rich_message_payload_with_locale(ctx.feed, ctx.entry, self.locale);
+        let client = self
+            .validated_bot_client(
+                cfg,
+                &api_method_url(cfg, "sendRichMessage"),
+                ctx.channel.use_proxy,
+            )
+            .await?;
+        let rich_message =
+            build_rich_message_payload_with_options(ctx.feed, ctx.entry, self.locale, ctx.timezone);
 
         let mut payload = json!({
-            "chat_id": cfg.chat_id.trim(),
+            "chat_id": dest.chat_id.trim(),
             "rich_message": rich_message,
         });
-        if let Some(thread_id) = cfg.message_thread_id {
+        if let Some(thread_id) = dest.message_thread_id {
             payload["message_thread_id"] = json!(thread_id);
         }
 
@@ -572,15 +759,21 @@ impl TelegramSender {
                     updated_capabilities: None,
                 })
             }
+            Err(api_err) if api_err.ssrf_blocked.is_some() => Err(api_err.into_app_error()),
             Err(api_err) if api_err.is_rich_method_unsupported() => {
                 let bot_username = caps_val
                     .get("bot_username")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let bot_first_name = caps_val
+                    .get("bot_first_name")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 let updated = TelegramCapabilities {
                     supports_rich_message: false,
                     bot_api_version: Some("<10.2".to_owned()),
                     bot_username,
+                    bot_first_name,
                     probed_at: Some(now_unix()),
                     fallback_reason: Some(format!(
                         "Auto-degraded to compact_card because sendRichMessage returned {}: {}",
@@ -589,7 +782,7 @@ impl TelegramSender {
                     )),
                 };
                 let updated_val = serde_json::to_value(updated)?;
-                self.send_compact_mode(ctx, cfg, true, Some(updated_val))
+                self.send_compact_mode(ctx, cfg, dest, true, Some(updated_val))
                     .await
             }
             Err(api_err) => Ok(classify_telegram_error(
@@ -603,6 +796,7 @@ impl TelegramSender {
         &self,
         ctx: &DeliveryContext<'_>,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
         degraded_to_compact: bool,
         updated_capabilities: Option<Value>,
     ) -> AppResult<DeliveryOutcome> {
@@ -616,7 +810,13 @@ impl TelegramSender {
             });
         }
 
-        let client = self.bot_api_client(ctx.channel.use_proxy)?;
+        let client = self
+            .validated_bot_client(
+                cfg,
+                &api_method_url(cfg, "sendMessage"),
+                ctx.channel.use_proxy,
+            )
+            .await?;
         let html_text = format_compact_card_html_with_locale(ctx.feed, ctx.entry, self.locale);
         let canonical_url = ctx
             .entry
@@ -633,12 +833,12 @@ impl TelegramSender {
         }
 
         let mut payload = json!({
-            "chat_id": cfg.chat_id.trim(),
+            "chat_id": dest.chat_id.trim(),
             "text": html_text,
             "parse_mode": "HTML",
             "link_preview_options": link_preview_options,
         });
-        if let Some(thread_id) = cfg.message_thread_id {
+        if let Some(thread_id) = dest.message_thread_id {
             payload["message_thread_id"] = json!(thread_id);
         }
 
@@ -673,6 +873,7 @@ impl TelegramSender {
                     updated_capabilities,
                 })
             }
+            Err(api_err) if api_err.ssrf_blocked.is_some() => Err(api_err.into_app_error()),
             Err(api_err) => Ok(classify_telegram_error(api_err, Some(prior_cp))),
         }
     }
@@ -681,9 +882,16 @@ impl TelegramSender {
         &self,
         ctx: &DeliveryContext<'_>,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
     ) -> AppResult<DeliveryOutcome> {
         let mut state = extract_telegram_checkpoint(&ctx.checkpoint);
-        let client = self.bot_api_client(ctx.channel.use_proxy)?;
+        let client = self
+            .validated_bot_client(
+                cfg,
+                &api_method_url(cfg, "sendMediaGroup"),
+                ctx.channel.use_proxy,
+            )
+            .await?;
 
         let media_items: Vec<MediaAttachment> = ctx
             .entry
@@ -710,10 +918,13 @@ impl TelegramSender {
                 self.locale,
             );
             let msg_id = match self
-                .send_plain_text_fallback(&client, cfg, ctx, &text)
+                .send_plain_text_fallback(&client, cfg, dest, ctx, &text)
                 .await
             {
                 Ok(id) => id,
+                Err(api_err) if api_err.ssrf_blocked.is_some() => {
+                    return Err(api_err.into_app_error());
+                }
                 Err(api_err) => {
                     return Ok(classify_telegram_error(
                         api_err,
@@ -763,10 +974,21 @@ impl TelegramSender {
             };
 
             let batch_ids = match self
-                .send_single_media_batch(&client, cfg, ctx, batch_idx, batch, caption_for_batch)
+                .send_single_media_batch(
+                    &client,
+                    cfg,
+                    dest,
+                    ctx,
+                    batch_idx,
+                    batch,
+                    caption_for_batch,
+                )
                 .await
             {
                 Ok(ids) => ids,
+                Err(api_err) if api_err.ssrf_blocked.is_some() => {
+                    return Err(api_err.into_app_error());
+                }
                 Err(api_err) => {
                     return Ok(classify_telegram_error(
                         api_err,
@@ -797,10 +1019,12 @@ impl TelegramSender {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_single_media_batch(
         &self,
         client: &reqwest::Client,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
         ctx: &DeliveryContext<'_>,
         batch_idx: usize,
         batch: &[MediaAttachment],
@@ -832,16 +1056,11 @@ impl TelegramSender {
                 self.locale,
             );
             let id = self
-                .send_plain_text_fallback(client, cfg, ctx, &text)
+                .send_plain_text_fallback(client, cfg, dest, ctx, &text)
                 .await?;
             return Ok(vec![id]);
         }
 
-        // Step 1: For photo/audio/explicit-document batches, try passing external URLs directly to
-        // Telegram first. Videos and extensionless/ambiguous attachments skip Step 1 and go straight
-        // to Step 2 so we can magic-byte sniff, normalize `.mp4` + `video/mp4`, and attach `width`,
-        // `height`, `duration`, and `supports_streaming: true` (preventing Telegram from silently
-        // downgrading video URLs to unpreviewable `Document` files).
         if eligible.iter().all(|item| can_try_direct_url_pass(item)) {
             let (initial_caption, overflow_urls, next_media_idx) = append_degraded_links_to_caption(
                 base_caption,
@@ -851,7 +1070,7 @@ impl TelegramSender {
             );
 
             match self
-                .send_eligible_by_url(client, cfg, &eligible, initial_caption.as_deref())
+                .send_eligible_by_url(client, cfg, dest, &eligible, initial_caption.as_deref())
                 .await
             {
                 Ok(mut ids) => {
@@ -859,7 +1078,7 @@ impl TelegramSender {
                         let overflow_text =
                             format_overflow_links(&overflow_urls, next_media_idx, self.locale);
                         let extra_id = self
-                            .send_plain_text_fallback(client, cfg, ctx, &overflow_text)
+                            .send_plain_text_fallback(client, cfg, dest, ctx, &overflow_text)
                             .await?;
                         ids.push(extra_id);
                     }
@@ -872,8 +1091,6 @@ impl TelegramSender {
             }
         }
 
-        // Step 2: Stream attachments into memory under semaphore & byte caps, sniff magic bytes,
-        // extract MP4 dimensions/duration, and upload via `multipart/form-data`.
         let mut uploaded: Vec<PreparedUploadItem> = Vec::with_capacity(eligible.len());
 
         for item in eligible {
@@ -913,7 +1130,7 @@ impl TelegramSender {
                 self.locale,
             );
             let id = self
-                .send_plain_text_fallback(client, cfg, ctx, &text)
+                .send_plain_text_fallback(client, cfg, dest, ctx, &text)
                 .await?;
             return Ok(vec![id]);
         }
@@ -922,14 +1139,14 @@ impl TelegramSender {
             append_degraded_links_to_caption(base_caption, &degraded_urls, ctx.entry, self.locale);
 
         let mut ids = self
-            .send_uploaded_multipart(client, cfg, &uploaded, multipart_caption.as_deref())
+            .send_uploaded_multipart(client, cfg, dest, &uploaded, multipart_caption.as_deref())
             .await?;
 
         if !multipart_overflow.is_empty() {
             let overflow_text =
                 format_overflow_links(&multipart_overflow, next_media_idx, self.locale);
             let extra_id = self
-                .send_plain_text_fallback(client, cfg, ctx, &overflow_text)
+                .send_plain_text_fallback(client, cfg, dest, ctx, &overflow_text)
                 .await?;
             ids.push(extra_id);
         }
@@ -941,6 +1158,7 @@ impl TelegramSender {
         &self,
         client: &reqwest::Client,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
         items: &[&MediaAttachment],
         caption: Option<&str>,
     ) -> Result<Vec<i64>, TgCallError> {
@@ -953,13 +1171,13 @@ impl TelegramSender {
                 let item = group[0];
                 let (method, field_name) = single_media_method_and_field(item.kind);
                 let mut payload = json!({
-                    "chat_id": cfg.chat_id.trim(),
+                    "chat_id": dest.chat_id.trim(),
                     field_name: item.url.trim(),
                 });
                 if item.kind == MediaAttachmentKind::Video {
                     payload["supports_streaming"] = json!(true);
                 }
-                if let Some(thread_id) = cfg.message_thread_id {
+                if let Some(thread_id) = dest.message_thread_id {
                     payload["message_thread_id"] = json!(thread_id);
                 }
                 if let Some(cap) = group_caption.filter(|s| !s.is_empty()) {
@@ -990,10 +1208,10 @@ impl TelegramSender {
                 }
 
                 let mut payload = json!({
-                    "chat_id": cfg.chat_id.trim(),
+                    "chat_id": dest.chat_id.trim(),
                     "media": media_arr,
                 });
-                if let Some(thread_id) = cfg.message_thread_id {
+                if let Some(thread_id) = dest.message_thread_id {
                     payload["message_thread_id"] = json!(thread_id);
                 }
                 let ids = self.call_json_media_group(client, cfg, &payload).await?;
@@ -1008,6 +1226,7 @@ impl TelegramSender {
         &self,
         client: &reqwest::Client,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
         uploaded: &[PreparedUploadItem],
         caption: Option<&str>,
     ) -> Result<Vec<i64>, TgCallError> {
@@ -1019,8 +1238,8 @@ impl TelegramSender {
             if group.len() == 1 {
                 let item = group[0];
                 let (method, field_name) = single_media_method_and_field(item.kind);
-                let mut form = Form::new().text("chat_id", cfg.chat_id.trim().to_owned());
-                if let Some(thread_id) = cfg.message_thread_id {
+                let mut form = Form::new().text("chat_id", dest.chat_id.trim().to_owned());
+                if let Some(thread_id) = dest.message_thread_id {
                     form = form.text("message_thread_id", thread_id.to_string());
                 }
                 if let Some(cap) = group_caption.filter(|s| !s.is_empty()) {
@@ -1048,8 +1267,8 @@ impl TelegramSender {
                     .await?;
                 all_ids.push(id);
             } else {
-                let mut form = Form::new().text("chat_id", cfg.chat_id.trim().to_owned());
-                if let Some(thread_id) = cfg.message_thread_id {
+                let mut form = Form::new().text("chat_id", dest.chat_id.trim().to_owned());
+                if let Some(thread_id) = dest.message_thread_id {
                     form = form.text("message_thread_id", thread_id.to_string());
                 }
 
@@ -1089,6 +1308,7 @@ impl TelegramSender {
                     description: format!("failed to serialize sendMediaGroup JSON: {err}"),
                     retry_after_secs: None,
                     network_error: false,
+                    ssrf_blocked: None,
                 })?;
                 form = form.text("media", media_json);
 
@@ -1104,6 +1324,7 @@ impl TelegramSender {
         &self,
         client: &reqwest::Client,
         cfg: &TelegramChannelConfig,
+        dest: &TelegramDestinationConfig,
         ctx: &DeliveryContext<'_>,
         text: &str,
     ) -> Result<i64, TgCallError> {
@@ -1121,12 +1342,12 @@ impl TelegramSender {
         }
 
         let mut payload = json!({
-            "chat_id": cfg.chat_id.trim(),
+            "chat_id": dest.chat_id.trim(),
             "text": text,
             "parse_mode": "HTML",
             "link_preview_options": link_preview_options,
         });
-        if let Some(thread_id) = cfg.message_thread_id {
+        if let Some(thread_id) = dest.message_thread_id {
             payload["message_thread_id"] = json!(thread_id);
         }
 
@@ -1214,6 +1435,12 @@ impl ChannelSender for TelegramSender {
                 ctx.channel_config.kind()
             )));
         };
+        let DestinationConfig::Telegram(dest) = ctx.destination_config else {
+            return Err(AppError::Validation(format!(
+                "TelegramSender received incompatible destination config kind '{}'",
+                ctx.destination_config.kind()
+            )));
+        };
 
         // Per-route delivery language overrides the sender-wide (legacy system) default.
         let scoped;
@@ -1226,29 +1453,44 @@ impl ChannelSender for TelegramSender {
         };
 
         match ctx.route_options.telegram_mode {
-            TelegramDeliveryMode::RichMessage => this.send_rich_mode(ctx, cfg).await,
+            TelegramDeliveryMode::RichMessage => this.send_rich_mode(ctx, cfg, dest).await,
             TelegramDeliveryMode::CompactCard => {
-                this.send_compact_mode(ctx, cfg, false, None).await
+                this.send_compact_mode(ctx, cfg, dest, false, None).await
             }
-            TelegramDeliveryMode::MediaMode => this.send_media_mode(ctx, cfg).await,
+            TelegramDeliveryMode::MediaMode => this.send_media_mode(ctx, cfg, dest).await,
         }
     }
 
-    async fn send_test(&self, config: &ChannelConfig, use_proxy: bool) -> AppResult<String> {
-        let ChannelConfig::Telegram(cfg) = config else {
+    async fn send_test(
+        &self,
+        channel_config: &ChannelConfig,
+        destination_config: &DestinationConfig,
+        use_proxy: bool,
+    ) -> AppResult<String> {
+        let ChannelConfig::Telegram(cfg) = channel_config else {
             return Err(AppError::Validation(format!(
-                "TelegramSender::send_test expected telegram config, got '{}'",
-                config.kind()
+                "TelegramSender::send_test expected telegram account config, got '{}'",
+                channel_config.kind()
             )));
         };
-        config.validate()?;
+        let DestinationConfig::Telegram(dest) = destination_config else {
+            return Err(AppError::Validation(format!(
+                "TelegramSender::send_test expected telegram destination config, got '{}'",
+                destination_config.kind()
+            )));
+        };
+        channel_config.validate()?;
+        destination_config.validate()?;
 
         let caps = self.probe_capabilities(cfg, use_proxy).await?;
-        let client = self.bot_api_client(use_proxy)?;
+        let client = self
+            .validated_bot_client(cfg, &api_method_url(cfg, "sendMessage"), use_proxy)
+            .await?;
         let bot_label = caps
             .bot_username
             .as_deref()
             .map(|u| format!("@{u}"))
+            .or_else(|| caps.bot_first_name.clone())
             .unwrap_or_else(|| "bot".to_owned());
 
         let locale = self.locale;
@@ -1264,35 +1506,39 @@ impl ChannelSender for TelegramSender {
             };
             let rich_body = if locale.is_zh() {
                 format!(
-                    "<h1>FeedCourier 已连接</h1><p>已通过 <b>{}</b> 验证向会话 <code>{}</code> 的 Telegram 富文本消息投递。</p>",
+                    "<h2>FeedCourier 已连接</h2><p>已通过 <b>{}</b> 验证向会话 <code>{}</code> 的 Telegram 富文本消息投递。</p>",
                     escape_html(&bot_label),
-                    escape_html(cfg.chat_id.trim())
+                    escape_html(dest.chat_id.trim())
                 )
             } else {
                 format!(
-                    "<h1>FeedCourier Connected</h1><p>Verified Telegram Bot API 10.4 rich message delivery via <b>{}</b> to chat <code>{}</code>.</p>",
+                    "<h2>FeedCourier Connected</h2><p>Verified Telegram Bot API 10.4 rich message delivery via <b>{}</b> to chat <code>{}</code>.</p>",
                     escape_html(&bot_label),
-                    escape_html(cfg.chat_id.trim())
+                    escape_html(dest.chat_id.trim())
                 )
             };
             let rich =
                 normalize(&rich_body, &ParseOptions::default(), &fit).into_input_rich_message();
 
             let mut payload = json!({
-                "chat_id": cfg.chat_id.trim(),
+                "chat_id": dest.chat_id.trim(),
                 "rich_message": rich,
             });
-            if let Some(thread_id) = cfg.message_thread_id {
+            if let Some(thread_id) = dest.message_thread_id {
                 payload["message_thread_id"] = json!(thread_id);
             }
 
-            if let Ok(msg_id) = self
+            match self
                 .call_json_single_message(&client, cfg, "sendRichMessage", &payload)
                 .await
             {
-                return Ok(format!(
-                    "Telegram rich test message delivered (id={msg_id}) via {bot_label}; sendRichMessage supported"
-                ));
+                Ok(msg_id) => {
+                    return Ok(format!(
+                        "Telegram rich test message delivered (id={msg_id}) via {bot_label}; sendRichMessage supported"
+                    ));
+                }
+                Err(err) if err.ssrf_blocked.is_some() => return Err(err.into_app_error()),
+                Err(_) => {}
             }
         }
 
@@ -1300,24 +1546,24 @@ impl ChannelSender for TelegramSender {
             format!(
                 "<b>FeedCourier 已连接</b>\n已通过 <b>{}</b> 验证向会话 <code>{}</code> 的 Telegram 消息投递。\n<i>模式：快讯卡片（富文本支持：{}）</i>",
                 escape_html(&bot_label),
-                escape_html(cfg.chat_id.trim()),
+                escape_html(dest.chat_id.trim()),
                 caps.supports_rich_message
             )
         } else {
             format!(
                 "<b>FeedCourier Connected</b>\nVerified Telegram delivery via <b>{}</b> to chat <code>{}</code>.\n<i>Mode: Compact Card (sendRichMessage supported: {})</i>",
                 escape_html(&bot_label),
-                escape_html(cfg.chat_id.trim()),
+                escape_html(dest.chat_id.trim()),
                 caps.supports_rich_message
             )
         };
 
         let mut payload = json!({
-            "chat_id": cfg.chat_id.trim(),
+            "chat_id": dest.chat_id.trim(),
             "text": compact_test_text,
             "parse_mode": "HTML",
         });
-        if let Some(thread_id) = cfg.message_thread_id {
+        if let Some(thread_id) = dest.message_thread_id {
             payload["message_thread_id"] = json!(thread_id);
         }
 
@@ -1333,16 +1579,32 @@ impl ChannelSender for TelegramSender {
     }
 }
 
-/// Build a Bot API 10.4 [`InputRichMessage`] using `telegram-rich` normalization and limits fitting.
+/// Build a Bot API 10.4 [`InputRichMessage`] using `telegram-rich` normalization and limits fitting
+/// (`AppLocale::En` and UTC defaults).
 pub fn build_rich_message_payload(feed: &Feed, entry: &Entry) -> InputRichMessage {
-    build_rich_message_payload_with_locale(feed, entry, AppLocale::En)
+    build_rich_message_payload_with_options(feed, entry, AppLocale::En, chrono_tz::UTC)
 }
 
-/// Build a Bot API 10.4 [`InputRichMessage`] localized to `locale`.
+/// Build a Bot API 10.4 [`InputRichMessage`] localized to `locale` (UTC default).
 pub fn build_rich_message_payload_with_locale(
     feed: &Feed,
     entry: &Entry,
     locale: AppLocale,
+) -> InputRichMessage {
+    build_rich_message_payload_with_options(feed, entry, locale, chrono_tz::UTC)
+}
+
+/// Build a Bot API 10.4 [`InputRichMessage`] localized to `locale` and route timezone `tz`:
+/// - Article title rendered as `<h2>` (linked when `canonical_url` exists)
+/// - Source · Author · Localized publish time rendered in native Telegram `<footer>`
+/// - `<hr/>` divider separating header from body
+/// - Body HTML parsed via `telegram-rich` with `heading_offset = 2` (`h1`→`h3`, `h2`→`h4`, …)
+///   and `group_consecutive_media = true` (auto `<tg-collage>` / `<tg-slideshow>`).
+pub fn build_rich_message_payload_with_options(
+    feed: &Feed,
+    entry: &Entry,
+    locale: AppLocale,
+    tz: Tz,
 ) -> InputRichMessage {
     let default_title = if locale.is_zh() {
         "无标题"
@@ -1369,34 +1631,52 @@ pub fn build_rich_message_payload_with_locale(
             .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
     });
 
-    let source_meta = format_source_author_line(feed, entry);
+    let mut blocks: Vec<Block> = Vec::new();
 
-    let mut combined_html = String::new();
-    if let Some(url) = canonical_url {
-        combined_html.push_str("<h1><a href=\"");
-        combined_html.push_str(&escape_html_attr(url));
-        combined_html.push_str("\">");
-        combined_html.push_str(&escape_html(&title));
-        combined_html.push_str("</a></h1>");
-    } else {
-        combined_html.push_str("<h1>");
-        combined_html.push_str(&escape_html(&title));
-        combined_html.push_str("</h1>");
+    // 1. Demoted `<h2>` title header (avoids oversized `<h1>` on mobile Telegram clients).
+    let title_inlines = match canonical_url {
+        Some(url) => vec![Inline::Link {
+            href: url.to_owned(),
+            content: vec![Inline::Text(title)],
+        }],
+        None => vec![Inline::Text(title)],
+    };
+    blocks.push(Block::Heading {
+        level: 2,
+        content: title_inlines,
+    });
+
+    // 2. Native Telegram `<footer>` metadata line: Source · Author · Localized Time.
+    let mut meta_parts = Vec::new();
+    let source_author = format_source_author_line(feed, entry);
+    if !source_author.is_empty() {
+        meta_parts.push(source_author);
+    }
+    if let Some(local_ts) = entry
+        .published_at
+        .and_then(|ts| format_local_timestamp(ts, tz))
+    {
+        meta_parts.push(local_ts);
+    }
+    if !meta_parts.is_empty() {
+        blocks.push(Block::Footer(vec![Inline::Text(meta_parts.join(" · "))]));
     }
 
-    if !source_meta.is_empty() {
-        combined_html.push_str("<p><i>");
-        combined_html.push_str(&escape_html(&source_meta));
-        combined_html.push_str("</i></p>");
-    }
+    // 3. Body parsed with heading demotion (`h1`->`h3`..`h6`) and consecutive media grouping.
+    let parse_opts = ParseOptions {
+        base_url: fallback_url.and_then(|u| Url::parse(u).ok()),
+        keep_tracking_pixels: false,
+        heading_offset: 2,
+        group_consecutive_media: true,
+    };
 
-    if let Some(body_html) = entry
+    let body_blocks: Vec<Block> = if let Some(body_html) = entry
         .content_html
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        combined_html.push_str(body_html);
+        parse_rich_html(body_html, &parse_opts).blocks
     } else if let Some(summary) = entry
         .summary_text
         .as_deref()
@@ -1404,21 +1684,20 @@ pub fn build_rich_message_payload_with_locale(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        for para in summary
+        summary
             .split("\n\n")
             .map(str::trim)
             .filter(|p| !p.is_empty())
-        {
-            combined_html.push_str("<p>");
-            combined_html.push_str(&escape_html(para));
-            combined_html.push_str("</p>");
-        }
-    }
-
-    let parse_opts = match fallback_url.and_then(|u| Url::parse(u).ok()) {
-        Some(base) => ParseOptions::with_base_url(base),
-        None => ParseOptions::default(),
+            .map(Block::paragraph)
+            .collect()
+    } else {
+        Vec::new()
     };
+
+    if !body_blocks.is_empty() {
+        blocks.push(Block::Divider);
+        blocks.extend(body_blocks);
+    }
 
     let (read_original_label, truncation_text) = if locale.is_zh() {
         ("阅读原文", "文章较长已截断，点击下方按钮阅读全文。")
@@ -1440,7 +1719,9 @@ pub fn build_rich_message_payload_with_locale(
         ..FitOptions::default()
     };
 
-    normalize(&combined_html, &parse_opts, &fit_opts).into_input_rich_message()
+    let mut doc = Document::new(blocks);
+    doc.fit(&fit_opts);
+    doc.to_input_rich_message()
 }
 
 /// Format `TelegramDeliveryMode::CompactCard` HTML strictly bounded to `<= 4096` UTF-16 code units.
@@ -1592,7 +1873,7 @@ pub fn format_media_mode_caption_with_locale(
         + canonical_url
             .map(|_| 1 + utf16_len(link_label))
             .unwrap_or(0);
-    let line2_budget = max_utf16_units.saturating_sub(visible_reserved).max(16);
+    let line2_budget = max_utf16_units.saturating_sub(visible_reserved);
     let mut line2_plain = truncate_utf16(&sentence_source, line2_budget, "…");
     line2_plain = strip_trailing_sentence_period(&line2_plain);
     let line2 = escape_html(&line2_plain);
@@ -2152,6 +2433,7 @@ fn build_prepared_multipart_part(item: &PreparedUploadItem) -> Result<Part, TgCa
             description: format!("invalid multipart MIME type: {err}"),
             retry_after_secs: None,
             network_error: false,
+            ssrf_blocked: None,
         })
 }
 
@@ -2201,8 +2483,78 @@ fn append_degraded_links_to_caption(
         }
     }
 
+    if utf16_len(&current) > MAX_CAPTION_UTF16_UNITS {
+        current = clamp_caption_html_utf16(&current, MAX_CAPTION_UTF16_UNITS);
+    }
+
     let opt = (!current.is_empty()).then_some(current);
     (opt, overflow, first_overflow_idx)
+}
+
+/// Safely clamp an HTML caption to at most `max_units` UTF-16 code units without splitting
+/// an `<a href="...">...</a>` tag or HTML entity in half.
+fn clamp_caption_html_utf16(html: &str, max_units: usize) -> String {
+    if utf16_len(html) <= max_units {
+        return html.to_owned();
+    }
+    let lines: Vec<&str> = html.lines().collect();
+    if let Some((&last_line, body_lines)) = lines.split_last()
+        && last_line.contains("<a href=")
+        && !body_lines.is_empty()
+    {
+        let link_units = utf16_len(last_line);
+        if link_units + 1 < max_units {
+            let body_budget = max_units - link_units - 1;
+            let body = body_lines.join("\n");
+            let truncated_body = truncate_escaped_html_utf16(&body, body_budget);
+            return if truncated_body.is_empty() {
+                last_line.to_owned()
+            } else {
+                format!("{truncated_body}\n{last_line}")
+            };
+        }
+        // Link line alone exceeds budget: fall back to body text without breaking tags.
+        let body = body_lines.join("\n");
+        return truncate_escaped_html_utf16(&body, max_units);
+    }
+
+    truncate_escaped_html_utf16(html, max_units)
+}
+
+/// Truncate plain/entity-escaped text to `max_units` UTF-16 units without breaking an `&...;` entity
+/// or leaving an unclosed HTML tag.
+fn truncate_escaped_html_utf16(text: &str, max_units: usize) -> String {
+    let stripped = if text.contains('<') {
+        let mut plain = String::with_capacity(text.len());
+        let mut in_tag = false;
+        for ch in text.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => plain.push(ch),
+                _ => {}
+            }
+        }
+        plain
+    } else {
+        text.to_owned()
+    };
+
+    let mut clipped = truncate_utf16(&stripped, max_units, "…");
+    // Avoid truncating mid-entity (e.g. `&am…`).
+    if let Some(amp_idx) = clipped.rfind('&') {
+        let tail = &clipped[amp_idx..];
+        if !tail.contains(';') && tail.len() <= 10 {
+            clipped.truncate(amp_idx);
+            let trimmed = clipped.trim_end();
+            clipped = if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{trimmed}…")
+            };
+        }
+    }
+    clipped
 }
 
 fn compose_degraded_text_message(
@@ -2314,11 +2666,32 @@ struct TgResponseParameters {
 struct TgUser {
     #[serde(default)]
     username: Option<String>,
+    #[serde(default)]
+    first_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgChat {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TgSentMessage {
     message_id: i64,
+}
+
+fn map_tg_reqwest_error(context: &str, err: reqwest::Error) -> AppError {
+    if let Some(detail) = find_ssrf_blocked_in_error(&err) {
+        return AppError::SsrfBlocked(detail);
+    }
+    AppError::Upstream(format!("{context}: {err}"))
 }
 
 #[derive(Debug)]
@@ -2327,15 +2700,18 @@ struct TgCallError {
     description: String,
     retry_after_secs: Option<u64>,
     network_error: bool,
+    ssrf_blocked: Option<String>,
 }
 
 impl TgCallError {
     fn from_reqwest(err: reqwest::Error) -> Self {
+        let ssrf_blocked = find_ssrf_blocked_in_error(&err);
         Self {
             status_code: err.status().map(|s| i32::from(s.as_u16())),
             description: format!("Telegram network/HTTP error: {err}"),
             retry_after_secs: None,
-            network_error: true,
+            network_error: ssrf_blocked.is_none(),
+            ssrf_blocked,
         }
     }
 
@@ -2360,6 +2736,9 @@ impl TgCallError {
     }
 
     fn into_app_error(self) -> AppError {
+        if let Some(reason) = self.ssrf_blocked {
+            return AppError::SsrfBlocked(reason);
+        }
         match self.status_code {
             Some(401) => AppError::Unauthorized(self.description),
             Some(403) => AppError::Forbidden(self.description),
@@ -2388,6 +2767,16 @@ async fn parse_single_message_response(
     resp: reqwest::Response,
 ) -> Result<i64, TgCallError> {
     let http_status = i32::from(resp.status().as_u16());
+    if (300..=399).contains(&http_status) {
+        let reason = format!("Telegram Bot API redirect (HTTP {http_status}) is disallowed");
+        return Err(TgCallError {
+            status_code: Some(http_status),
+            description: reason.clone(),
+            retry_after_secs: None,
+            network_error: false,
+            ssrf_blocked: Some(reason),
+        });
+    }
     let header_retry = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -2407,6 +2796,7 @@ async fn parse_single_message_response(
                 ),
                 retry_after_secs: header_retry,
                 network_error: false,
+                ssrf_blocked: None,
             });
         }
     };
@@ -2432,11 +2822,22 @@ async fn parse_single_message_response(
         description: desc,
         retry_after_secs: retry_after,
         network_error: false,
+        ssrf_blocked: None,
     })
 }
 
 async fn parse_media_group_response(resp: reqwest::Response) -> Result<Vec<i64>, TgCallError> {
     let http_status = i32::from(resp.status().as_u16());
+    if (300..=399).contains(&http_status) {
+        let reason = format!("Telegram Bot API redirect (HTTP {http_status}) is disallowed");
+        return Err(TgCallError {
+            status_code: Some(http_status),
+            description: reason.clone(),
+            retry_after_secs: None,
+            network_error: false,
+            ssrf_blocked: Some(reason),
+        });
+    }
     let header_retry = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -2456,6 +2857,7 @@ async fn parse_media_group_response(resp: reqwest::Response) -> Result<Vec<i64>,
                 ),
                 retry_after_secs: header_retry,
                 network_error: false,
+                ssrf_blocked: None,
             });
         }
     };
@@ -2481,6 +2883,7 @@ async fn parse_media_group_response(resp: reqwest::Response) -> Result<Vec<i64>,
         description: desc,
         retry_after_secs: retry_after,
         network_error: false,
+        ssrf_blocked: None,
     })
 }
 

@@ -14,17 +14,18 @@ FeedCourier 的所有持久化数据均保存在单一 `DATA_DIR`（容器内默
 
 ```text
 /data/
-├── master.key          # 32 字节 ChaCha20-Poly1305 主密钥（权限 0600，未设置 MASTER_KEY 环境变量时自动生成）
-├── feedcourier.db      # SQLite 主数据库文件（表结构、文章指纹、加密后的通道配置、路由与任务队列）
-├── feedcourier.db-wal  # SQLite WAL 预写日志文件
-└── feedcourier.db-shm  # SQLite WAL 共享内存索引文件
+├── master.key            # 32 字节 ChaCha20-Poly1305 主密钥（权限 0600，未设置 MASTER_KEY 环境变量时自动生成）
+├── feedcourier.db        # SQLite 主数据库文件（表结构、文章指纹、加密后的账号与目的地配置、路由与任务队列）
+├── feedcourier.db-wal    # SQLite WAL 预写日志文件
+├── feedcourier.db-shm    # SQLite WAL 共享内存索引文件
+└── pre-v0.2.0-backup.db  # 执行 0002 DDL 迁移前自动生成的纯 v0.1.x 在线快照（若已存在则按 UTC 时间戳命名，不覆盖）
 ```
 
 ### 主密钥（`master.key`）保存须知
 
 > [!IMPORTANT]
-> 数据库中保存的 SMTP 密码、Telegram `bot_token` 与 Notion `integration_secret` 均使用 `master.key`（或环境变量 `MASTER_KEY`）加密存储。
-> **备份或迁移 `feedcourier.db` 时，必须同时保留对应的 `master.key`（或相同的 `MASTER_KEY` 环境变量）**；若丢失主密钥，已保存的通道凭据将无法解密，需要在 WebUI 中重新填写通道密钥。
+> 数据库中保存的通道账号凭据（SMTP 密码、Telegram `bot_token`、Notion `integration_secret`）与目的地配置（收件人列表、`chat_id`、`data_source_id`）均使用 `master.key`（或环境变量 `MASTER_KEY`）加密存储。
+> **备份或迁移 `feedcourier.db` 时，必须同时保留对应的 `master.key`（或相同的 `MASTER_KEY` 环境变量）**；若丢失主密钥，已保存的账号凭据与目的地配置将无法解密，需要在 WebUI 中重新填写。
 
 ---
 
@@ -64,7 +65,27 @@ curl -fL -b cookies.txt \
 1. 停止目标机器上的 FeedCourier 容器或进程；
 2. 删除目标 `/data/` 下的旧 `feedcourier.db`、`feedcourier.db-wal`、`feedcourier.db-shm`；
 3. 将备份的 `.db` 快照文件复制到 `/data/feedcourier.db`，并确保原实例的 `/data/master.key`（权限 `0600`）已放置在 `/data/` 下；
-4. 启动 FeedCourier 服务，即可恢复全部订阅源、去重指纹、推送通道、路由规则与 MCP 令牌。
+4. 启动 FeedCourier 服务，即可恢复全部订阅源、去重指纹、推送通道与目的地、路由规则与 MCP 令牌。
+
+---
+
+## 从 `v0.1.x` 升级至 `v0.2.0` {#upgrading-from-v0-1-x-to-v0-2-0}
+
+FeedCourier `v0.2.0` 引入了**双层投递通道模型（通道账号 + 多个目的地）**。从 `v0.1.x` 升级时，服务会在首次启动阶段**自动、原子地**完成旧数据迁移，无需手动执行 SQL：
+
+1. **DDL 迁移前生成纯 `v0.1.x` 快照（`pre-v0.2.0-backup.db`）**：在 `Database::connect` 检测到已有 `v0.1.x` 数据库（已应用 `0001` 且存在 `channels` 数据、待执行 `0002`）时，系统会**先于 `migrations/0002_channel_destinations.sql` 执行** `VACUUM INTO` 在线快照，生成 `<DATA_DIR>/pre-v0.2.0-backup.db`。由于快照在任何 `0002` 表结构变更前生成，它是可直接回退至 `v0.1.6` 的纯 `v0.1.x` SQLite 数据库（请与 `master.key` 一同妥善保存）。若同名备份文件已存在，FeedCourier 绝不会覆盖旧文件，而是改写为带 UTC 时间戳的文件名（`pre-v0.2.0-backup-<timestamp>.db`）。
+2. **表结构变更与单事务拆分**：`migrations/0002_channel_destinations.sql` 创建 `channel_destinations` 与 `delivery_quota_ledger` 表，并为 `routes` / `delivery_tasks` 增加 `destination_id` 列；随后启动钩子 `Database::migrate_channels_to_v2` 使用 `MasterKey` 在**单个 SQLite 事务**内解密每条旧通道配置，拆分为账号凭据（`channels`）与目的地配置（`channel_destinations`）。
+3. **安全的自动账号合并规则**：共享底层账号的旧通道会自动合并为同一个通道账号，每个旧通道转化为其下一个独立目的地并沿用旧名称作为备注：
+   - **SMTP 全字段一致合并与密码摘要隔离**：旧 SMTP 记录**仅当** `host`、`port`、`username`、`password`、`security` 与 `from_address` 六项字段**全部一致**时才会合并；同时 SMTP 的 `credential_group_key` 纳入密码的 SHA-256 摘要（不存储明文），确保共用同一用户名但 API Key 不同的凭据（例如 SendGrid 的 `apikey`）保持隔离。Telegram 与 Notion 账号则按相同 `credential_group_key`（Bot Token + `api_base_url` 或 Notion Integration Secret）合并。
+   - **仅按已启用通道聚合配额、间隔与代理**：合并后的 `min_interval_secs`（最大值）、`jitter_max_secs`（最大值）、`hourly_quota`（非空最小值）、`daily_quota`（非空最小值）、`cooldown_until`（最晚截止时间）与 `use_proxy`（逻辑或）**仅统计组内 `enabled = true` 的旧通道**，只有当全组旧通道均被禁用时才回退统计全部，避免废弃的已禁用通道拉低配额或污染代理开关。只要任一旧通道处于启用状态，合并后的账号即保持启用（每个目的地各自保留原有的启用/停用状态）。
+   - **账号名称**：SMTP 账号优先使用 `from_address`，Telegram 账号优先使用已缓存的 `@username`，否则沿用主通道原名。
+4. **路由、历史任务重指向与配额账本回填**：所有 `routes` 与 `delivery_tasks`（含历史 `delivered` 与 `dead_letter` 任务）会自动更新指向新的 `destination_id` 与合并后的 `channel_id`（事务结束前会断言不存在 `destination_id IS NULL` 的残留记录，否则整事务回滚），并将近 24 小时内的 `delivered` 记录回填至 `delivery_quota_ledger`。
+5. **幂等标记**：事务提交后写入 `system_settings.channel_model_version = 2`，后续重启不会重复迁移。
+
+> [!WARNING]
+> **升级注意：Telegram Local Bot API 白名单与 API / MCP 调用方兼容**
+> - **自建 Telegram Local Bot API Server**：在 `v0.2.0` 中，**所有** Telegram Bot API 请求（包括自定义 `api_base_url`）均强制经过连接期 `SsrfPolicy` DNS 校验并禁用自动重定向，且 `api_base_url` 仅允许不含 userinfo / query / fragment 的 `http` / `https` URL。存量内网 Local Bot API 地址**不会**自动放行，运维人员必须将其主机名或 IP/CIDR 手动加入 [`SSRF_ALLOWLIST`](/zh/guide/configuration#allowing-trusted-internal-services-ssrf-allowlist)。详见 [Telegram 通道说明](/zh/channels/telegram#self-hosted-local-bot-api-server)。
+> - **API 与 MCP 调用方**：仍使用 `channel_id` 调用 `POST`/`PATCH /api/v1/routes`、`POST /api/v1/feeds/preview/push` 或 MCP `configure_route` / `test_push_feed_entry` 的脚本，在目标账号仅拥有 **1 个目的地** 时仍可自动解析；若账号下存在**多个目的地**（包括旧通道合并后产生多个目的地的情况），服务端会返回校验错误并提示改用 `destination_id`。
 
 ---
 
@@ -79,6 +100,20 @@ curl -fL -b cookies.txt \
 
 > [!TIP]
 > 路由自身的投递时间窗口独立生效：窗口外的任务仍会入队，并在下一个窗口开始时投递。参见[发送频率、配额与时间窗口](/zh/channels/pacing-and-quotas#route-delivery-time-windows)。
+
+### 发件箱队列状态配色
+
+在 **Tasks** 页面中，任务状态标签、HTTP/SMTP 状态码、尝试次数与诊断日志采用统一的语义配色，便于一眼区分正常投递、临时等待与永久错误：
+
+| 状态 / 信号 | 颜色 |
+| :--- | :--- |
+| **已送达** / `2xx`（不含 `202`） | **绿色** |
+| **重试中** / **延后** / `202`（异步任务） / `429` 等可恢复情况 | **黄色** |
+| **死信** / 永久性 `4xx` / `5xx` | **红色** |
+| **排队中** | **灰色** |
+| **尝试次数**：1 次 / ≥ 2 次 / 达到上限（6 次） | **中性色** / **黄色** / **红色** |
+
+诊断日志的文字颜色跟随对应任务的状态变化，成功送达的提示日志以绿色显示，不再显示为红色。
 
 ---
 
@@ -112,8 +147,9 @@ docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
 
 - **后台定时清理**：每间隔 1 小时自动运行一次：
   1. 清理所有超过 `RETENTION_HOURS`（默认 24 小时）且已无未完成投递任务的文章正文与媒体元数据；
-  2. 清理已过期的登录会话记录；
-  3. 执行 `PRAGMA optimize` 更新 SQLite 查询统计信息。
+  2. 清理 `delivery_quota_ledger` 表中超过 24 小时（`86,400` 秒）的历史配额流水记录；
+  3. 清理已过期的登录会话记录；
+  4. 执行 `PRAGMA optimize` 更新 SQLite 查询统计信息。
 - **手动触发清理**：在 WebUI **Settings → Storage & Maintenance** 点击 **Run Payload GC Now**（或调用 `POST /api/v1/maintenance/gc`），可立即执行一次清理并返回本次回收的条目数（`purged_entries`）。
 
 ---

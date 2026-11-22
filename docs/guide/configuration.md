@@ -18,7 +18,7 @@ FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment
 | `ADMIN_USERNAME` | `Courier` | WebUI administrator username. When set, it overrides the stored username on **every startup**. |
 | `ADMIN_PASSWORD` | *(interactive setup)* | Sets or resets the WebUI administrator password on startup. |
 | `RESET_2FA` | *(unset)* | Set to `true` for a one-shot emergency removal of the TOTP secret and all recovery codes at startup (logs a `WARN`). Remove the variable afterwards. See [Lost Authenticator](/guide/operations#lost-authenticator-reset-2fa). |
-| `TIMEZONE` (or `TZ`) | `America/Los_Angeles` | IANA timezone (for example `Asia/Shanghai`) used to evaluate route delivery time windows and weekdays. Seeds the **system timezone** setting once; later changes in **Settings** take precedence. |
+| `TIMEZONE` (or `TZ`) | `America/Los_Angeles` | Default IANA **system timezone** (for example `Asia/Shanghai`) inherited by routes to evaluate delivery time windows, weekdays, and localized article timestamps in SMTP emails and Telegram rich messages. Seeds the database once; later changes in **Settings** take precedence, and individual routes can override it with `options.timezone`. |
 | `OUTBOUND_PROXY` | *(unset)* | Initial global outbound proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`). Falls back to `ALL_PROXY`, `HTTPS_PROXY`, or `HTTP_PROXY` if unset. |
 | `SSRF_ALLOWLIST` | *(empty)* | Comma-separated internal CIDRs or hostnames permitted for outbound requests (e.g., `10.0.0.5/32,rsshub.internal,*.lan`). |
 | `LOCALE` | *(unset)* | Legacy fallback delivery language (`en` or `zh-CN`) for routes that have no delivery language of their own. New routes store their own language; the WebUI language is a browser preference and no longer syncs to the server. |
@@ -32,8 +32,8 @@ FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment
 - **`RESET_2FA=true`** is a one-time recovery switch. Remove it after the restart, otherwise it clears 2FA again on every start.
 :::
 
-::: tip Docker Timezone
-Pass the timezone to the container with `-e TZ=America/Los_Angeles` (or any IANA name). Route time windows are evaluated in this system timezone, not in the browser's timezone.
+::: tip Docker Timezone & Per-Route Overrides
+Pass the default system timezone to the container with `-e TZ=America/Los_Angeles` (or any IANA name). Route time windows and localized article timestamps use this system timezone unless a route sets its own `timezone` override under **Routes**.
 :::
 
 ---
@@ -74,7 +74,7 @@ When reading the initial proxy URL at startup, FeedCourier checks:
 Setting a global proxy URL does not route all traffic through the proxy automatically. Instead, you enable `use_proxy` individually on:
 
 - **Feeds**: Applies to feed polling, full-text extraction, site icon fetching, and media relay for that feed.
-- **Channels**: Applies to outbound deliveries and channel tests for that specific Telegram, Notion, or SMTP channel.
+- **Channel Accounts**: Applies to account verification, outbound deliveries, and destination tests for **all destinations** attached to that Telegram, Notion, or SMTP account.
 - **Feed Previews**: Both the WebUI preview drawer and the MCP `preview_feed_latest` tool accept a `use_proxy` toggle per preview request.
 
 ---
@@ -113,3 +113,14 @@ services:
 ```
 
 You can also edit the allowlist directly in the WebUI under **Settings**. Updates take effect immediately without restarting the service. For technical details on connection-layer IP verification, see [Security & Isolation](/reference/security).
+
+---
+
+## Managing Large Feed Lists in the WebUI
+
+The **Feeds** page provides built-in filtering, sorting, and pagination controls designed for larger OPML libraries:
+
+- **Search**: Matches feed **title** and **URL** directly (tags are filtered via the dedicated dropdown).
+- **Tag Filter Dropdown**: Single-select dropdown to the left of the search input showing **All tags**, every existing tag with its subscribed feed count, and **Untagged**.
+- **Persistent Sort**: Sort selector to the left of the Tag dropdown supporting **Added time** or **Name** (ascending or descending). Name sorting uses `Intl.Collator` for natural CJK and Latin ordering.
+- **Pagination & Persistence**: Displays **15** feeds per page by default (switchable between **15 / 30 / 50**). Changing the search query, tag filter, or sort order resets to page 1; your selected sort mode and page size are saved in browser `localStorage`.

@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use feedcourier::channels::{
-    ChannelConfig, ChannelKind, TelegramChannelConfig, TelegramDeliveryMode,
+    ChannelConfig, ChannelKind, DestinationConfig, TelegramChannelConfig, TelegramDeliveryMode,
+    TelegramDestinationConfig,
 };
 use feedcourier::crypto::{MasterKey, generate_mcp_token};
 use feedcourier::db::Database;
 use feedcourier::db::models::{
-    DeliveryTaskStatus, EntryInsertOutcome, FeedHealthStatus, McpTokenScope, NewChannel, NewEntry,
-    NewFeed, NewRoute, now_unix,
+    DeliveryTaskStatus, EntryInsertOutcome, FeedHealthStatus, McpTokenScope, NewChannel,
+    NewDestination, NewEntry, NewFeed, NewRoute, now_unix,
 };
 use feedcourier::ingest::IngestEngine;
 use feedcourier::mcp::{
@@ -39,11 +40,13 @@ const SECRET_CHAT_ID: &str = "-100999888777";
 struct TestHarness {
     _temp_dir: TempDir,
     db: Database,
+    master_key: MasterKey,
     outbox_notify: Arc<Notify>,
     mcp_url: String,
     readonly_token: String,
     admin_token: String,
     trusted_channel_id: i64,
+    trusted_destination_id: i64,
     server_task: tokio::task::JoinHandle<()>,
 }
 
@@ -63,9 +66,11 @@ async fn spawn_mcp_harness(allow_loopback_feeds: bool) -> TestHarness {
     let master_key = MasterKey::generate();
     let tg_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
         bot_token: SECRET_BOT_TOKEN.to_string(),
+        api_base_url: None,
+    });
+    let tg_dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
         chat_id: SECRET_CHAT_ID.to_string(),
         message_thread_id: Some(42),
-        api_base_url: None,
     });
     let encrypted_config = master_key
         .encrypt_json(&tg_cfg)
@@ -86,6 +91,17 @@ async fn spawn_mcp_harness(allow_loopback_feeds: bool) -> TestHarness {
         })
         .await
         .expect("trusted channel must be created");
+    let destination = db
+        .create_destination(&NewDestination {
+            channel_id: channel.id,
+            name: "Ops Primary Chat".to_string(),
+            encrypted_config: master_key
+                .encrypt_json(&tg_dest_cfg)
+                .expect("destination config must encrypt"),
+            enabled: true,
+        })
+        .await
+        .expect("trusted destination must be created");
 
     let (readonly_token, ro_hash, ro_prefix) = generate_mcp_token("readonly");
     db.create_mcp_token("ci-readonly", &ro_hash, &ro_prefix, McpTokenScope::Readonly)
@@ -124,11 +140,13 @@ async fn spawn_mcp_harness(allow_loopback_feeds: bool) -> TestHarness {
     TestHarness {
         _temp_dir: temp_dir,
         db,
+        master_key,
         outbox_notify,
         mcp_url: format!("http://{addr}{MCP_MOUNT_PATH}"),
         readonly_token,
         admin_token,
         trusted_channel_id: channel.id,
+        trusted_destination_id: destination.id,
         server_task,
     }
 }
@@ -482,6 +500,7 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
             feed_ids: vec![seeded_feed.id],
             match_tags: vec![],
             channel_id: harness.trusted_channel_id,
+            destination_id: harness.trusted_destination_id,
             include_keywords: vec![],
             exclude_keywords: vec![],
             include_regex: None,
@@ -518,6 +537,7 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
         .enqueue_delivery_task(
             seeded_route.id,
             harness.trusted_channel_id,
+            harness.trusted_destination_id,
             seeded_entry.id,
             now_unix(),
         )
@@ -631,6 +651,19 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
         harness.trusted_channel_id
     );
     assert_eq!(status_payload["channels"][0]["name"], "Ops Telegram Alerts");
+    assert_eq!(
+        status_payload["channels"][0]["destinations"][0]["id"],
+        harness.trusted_destination_id
+    );
+    assert_eq!(
+        status_payload["channels"][0]["destinations"][0]["name"],
+        "Ops Primary Chat"
+    );
+    assert_eq!(
+        status_payload["destinations"][0]["id"],
+        harness.trusted_destination_id
+    );
+    assert_eq!(status_payload["destinations"][0]["kind"], "telegram");
     assert_eq!(status_payload["feeds"].as_array().unwrap().len(), 1);
     assert_strictly_framed_untrusted(
         status_payload["feeds"][0]["title"].as_str().unwrap(),
@@ -992,7 +1025,7 @@ async fn mcp_admin_token_orchestration_and_ops_persist_and_notify() {
     );
     assert!(updated_route.options().link_preview);
 
-    // Route language + delivery windows round-trip through `configure_route`.
+    // Route language + timezone + delivery windows round-trip through `configure_route`.
     let schedule_res = admin_client
         .call_tool(
             "configure_route",
@@ -1000,6 +1033,7 @@ async fn mcp_admin_token_orchestration_and_ops_persist_and_notify() {
                 "action": "update",
                 "route_id": route_id,
                 "locale": "zh-CN",
+                "timezone": "Asia/Shanghai",
                 "active_windows": [{ "start": "22:00", "end": "06:00" }],
                 "active_weekdays": [1, 2, 3]
             }),
@@ -1020,10 +1054,64 @@ async fn mcp_admin_token_orchestration_and_ops_persist_and_notify() {
         scheduled.locale,
         Some(feedcourier::db::models::AppLocale::ZhCn)
     );
+    assert_eq!(scheduled.timezone.as_deref(), Some("Asia/Shanghai"));
     assert_eq!(scheduled.active_windows.len(), 1);
     assert_eq!(scheduled.active_weekdays, vec![1, 2, 3]);
     // Presentation options survive a schedule-only update.
     assert_eq!(scheduled.telegram_mode, TelegramDeliveryMode::RichMessage);
+
+    // When a channel has >1 destinations, legacy `channel_id`-only route creation must be rejected
+    // cleanly with validation_error, while explicit `destination_id` succeeds.
+    let second_dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
+        chat_id: "-100444555666".to_string(),
+        message_thread_id: None,
+    });
+    let second_dest = harness
+        .db
+        .create_destination(&NewDestination {
+            channel_id: harness.trusted_channel_id,
+            name: "Ops Secondary Chat".to_string(),
+            encrypted_config: harness.master_key.encrypt_json(&second_dest_cfg).unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let ambiguous_res = admin_client
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Ambiguous Channel Route",
+                "channel_id": harness.trusted_channel_id
+            }),
+        )
+        .await;
+    assert_eq!(ambiguous_res["isError"], true);
+    assert_eq!(
+        extract_tool_payload(&ambiguous_res)["error"],
+        "validation_error"
+    );
+    let explicit_dest_res = admin_client
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Explicit Dest Route",
+                "destination_id": second_dest.id,
+                "enabled": false
+            }),
+        )
+        .await;
+    assert_eq!(explicit_dest_res["isError"], false, "{explicit_dest_res}");
+    let explicit_route_id = extract_tool_payload(&explicit_dest_res)["route"]["id"]
+        .as_i64()
+        .unwrap();
+    let _ = admin_client
+        .call_tool(
+            "configure_route",
+            json!({ "action": "delete", "route_id": explicit_route_id }),
+        )
+        .await;
 
     let bad_window_res = admin_client
         .call_tool(
@@ -1332,4 +1420,87 @@ async fn mcp_session_revalidates_revoked_token_and_supports_feed_id_preview() {
     assert_eq!(post_revoke.status(), StatusCode::UNAUTHORIZED);
 
     server_task.abort();
+}
+
+#[tokio::test]
+async fn mcp_schema_lists_clear_cache_destinations_and_rejects_zero_dest_channel_id() {
+    let harness = spawn_mcp_harness(false).await;
+    let mut admin = McpHttpClient::new(&harness.mcp_url, &harness.admin_token);
+    let _init = admin.initialize().await;
+
+    // 1. P3-04: Verify `tools/list` schema descriptions include `clear_cache` and `destinations`.
+    let tools = admin.list_tools().await;
+    assert_eq!(tools.len(), 9);
+    let manage_feed_tool = tools
+        .iter()
+        .find(|t| t["name"] == "manage_feed")
+        .expect("manage_feed tool");
+    let manage_feed_str = serde_json::to_string(manage_feed_tool).unwrap();
+    assert!(
+        manage_feed_str.contains("clear_cache"),
+        "manage_feed schema/description must document clear_cache: {manage_feed_str}"
+    );
+    let list_status_tool = tools
+        .iter()
+        .find(|t| t["name"] == "list_feeds_status")
+        .expect("list_feeds_status tool");
+    let list_status_desc = list_status_tool["description"].as_str().unwrap_or("");
+    assert!(
+        list_status_desc.contains("destinations"),
+        "list_feeds_status description must mention destinations: {list_status_desc}"
+    );
+
+    // 2. Create a channel with 0 destinations -> MCP `configure_route` using `channel_id` fails with validation_error.
+    let empty_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+        bot_token: "111222333:zero_dest_bot".to_string(),
+        api_base_url: None,
+    });
+    let zero_dest_ch = harness
+        .db
+        .create_channel(&NewChannel {
+            name: "Zero Dest Account".to_string(),
+            kind: ChannelKind::Telegram,
+            encrypted_config: harness.master_key.encrypt_json(&empty_cfg).unwrap(),
+            credential_group_key: empty_cfg.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let zero_res = admin
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Zero Dest Route",
+                "channel_id": zero_dest_ch.id
+            }),
+        )
+        .await;
+    assert_eq!(zero_res["isError"], true);
+    assert_eq!(extract_tool_payload(&zero_res)["error"], "validation_error");
+
+    // 3. P3-02: Non-zero equal time window (`09:00`–`09:00`) is rejected via MCP `configure_route`.
+    let bad_eq_res = admin
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Equal Window Route",
+                "destination_id": harness.trusted_destination_id,
+                "active_windows": [{ "start": "09:00", "end": "09:00" }]
+            }),
+        )
+        .await;
+    assert_eq!(bad_eq_res["isError"], true);
+    assert_eq!(
+        extract_tool_payload(&bad_eq_res)["error"],
+        "validation_error"
+    );
 }

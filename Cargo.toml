@@ -1,6 +1,6 @@
 [package]
 name = "feedcourier"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
@@ -63,7 +63,7 @@ htmd = "0.5"
 html2text = "0.17"
 unicode-segmentation = "1.13"
 regex = "1.13"
-telegram-rich = "0.0.1"
+telegram-rich = "0.0.2"
 
 # Delivery clients (SMTP)
 lettre = { version = "0.11", default-features = false, features = [
