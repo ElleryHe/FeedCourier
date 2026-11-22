@@ -1702,10 +1702,9 @@ impl NotionSender {
                                 "Notion async_task '{task_id}' reported '{state_raw}' without a page_id"
                             ));
                         }
-                        FcIdLookupOutcome::Retry(outcome) => {
-                            return AsyncPollResolution::Outcome(outcome);
-                        }
-                        FcIdLookupOutcome::PermanentFailure(outcome) => {
+                        FcIdLookupOutcome::Retry(outcome)
+                        | FcIdLookupOutcome::PermanentFailure(outcome)
+                        | FcIdLookupOutcome::NotFoundObject(outcome) => {
                             return AsyncPollResolution::Outcome(outcome);
                         }
                     }
@@ -1802,11 +1801,17 @@ impl NotionSender {
         }
 
         if !resp.status.is_success() {
-            return FcIdLookupOutcome::PermanentFailure(DeliveryOutcome::PermanentFailure {
+            let outcome = DeliveryOutcome::PermanentFailure {
                 status_code: Some(i32::from(resp.status.as_u16())),
                 checkpoint,
                 diagnostic: resp.diagnostic_summary("POST /v1/data_sources/{id}/query"),
-            });
+            };
+            if resp.status == StatusCode::NOT_FOUND
+                || resp.error_code().as_deref() == Some("object_not_found")
+            {
+                return FcIdLookupOutcome::NotFoundObject(outcome);
+            }
+            return FcIdLookupOutcome::PermanentFailure(outcome);
         }
 
         if let Some(results) = resp.body.get("results").and_then(Value::as_array) {
@@ -1852,7 +1857,8 @@ impl ChannelSender for NotionSender {
         dest.column_mapping.validate()?;
 
         let secret = cfg.integration_secret.trim();
-        let data_source_id = normalize_notion_id(&dest.data_source_id)?;
+        let mut data_source_id = normalize_notion_id(&dest.data_source_id)?;
+        let mut tried_db_fallback = false;
         let use_proxy = ctx.channel.use_proxy;
 
         let effective_checkpoint = match &ctx.checkpoint {
@@ -1886,6 +1892,7 @@ impl ChannelSender for NotionSender {
 
         // 1b. In-flight `async_task_id` -> poll `/v1/async_tasks/{task_id}` first.
         let mut need_fc_id_reconcile = create_initiated;
+        let mut failed_async_reason: Option<String> = None;
         if let Some(task_id) = existing_async_task_id.filter(|s| !s.trim().is_empty()) {
             match self
                 .poll_async_task_bounded(AsyncPollParams {
@@ -1950,16 +1957,18 @@ impl ChannelSender for NotionSender {
                     });
                 }
                 AsyncPollResolution::Outcome(outcome) => return Ok(outcome),
-                AsyncPollResolution::Failed(_reason) => {
-                    // Clear stale async_task_id and reconcile via FC-ID before recreating.
+                AsyncPollResolution::Failed(reason) => {
+                    // Clear stale async_task_id and reconcile via FC-ID; if no page exists, return
+                    // a retryable error that consumes retry attempts instead of looping indefinitely.
                     need_fc_id_reconcile = true;
+                    failed_async_reason = Some(reason);
                 }
             }
         }
 
         // 1c. Crash/timeout reconciliation: check `FC-ID` on data source before creating a duplicate.
         if need_fc_id_reconcile {
-            match self
+            let mut lookup = self
                 .query_existing_page_by_fc_id(
                     secret,
                     &data_source_id,
@@ -1967,8 +1976,29 @@ impl ChannelSender for NotionSender {
                     &ctx.entry.fingerprint_sha256,
                     use_proxy,
                 )
-                .await
-            {
+                .await;
+
+            if matches!(lookup, FcIdLookupOutcome::NotFoundObject(_)) && !tried_db_fallback {
+                tried_db_fallback = true;
+                if let Ok(resolved) = self
+                    .resolve_data_source_metadata(secret, &data_source_id, use_proxy)
+                    .await
+                    && resolved.data_source_id != data_source_id
+                {
+                    data_source_id = resolved.data_source_id;
+                    lookup = self
+                        .query_existing_page_by_fc_id(
+                            secret,
+                            &data_source_id,
+                            &dest.column_mapping.fc_id,
+                            &ctx.entry.fingerprint_sha256,
+                            use_proxy,
+                        )
+                        .await;
+                }
+            }
+
+            match lookup {
                 FcIdLookupOutcome::Found(existing_id) => {
                     let done_cp = DeliveryCheckpoint::Notion {
                         create_initiated: true,
@@ -1987,9 +2017,28 @@ impl ChannelSender for NotionSender {
                         updated_capabilities: None,
                     });
                 }
-                FcIdLookupOutcome::NotFound => {}
-                FcIdLookupOutcome::Retry(outcome) => return Ok(outcome),
-                FcIdLookupOutcome::PermanentFailure(outcome) => return Ok(outcome),
+                FcIdLookupOutcome::NotFound => {
+                    if let Some(reason) = failed_async_reason {
+                        let cleared_cp = DeliveryCheckpoint::Notion {
+                            create_initiated: true,
+                            async_task_id: None,
+                            page_id: None,
+                        };
+                        if let Some(sink) = ctx.checkpoint_sink {
+                            sink.save_checkpoint(&cleared_cp).await?;
+                        }
+                        return Ok(DeliveryOutcome::Retry {
+                            retry_after_secs: None,
+                            status_code: Some(502),
+                            checkpoint: Some(cleared_cp),
+                            diagnostic: reason,
+                            cooldown_credential_group: false,
+                        });
+                    }
+                }
+                FcIdLookupOutcome::Retry(outcome)
+                | FcIdLookupOutcome::PermanentFailure(outcome)
+                | FcIdLookupOutcome::NotFoundObject(outcome) => return Ok(outcome),
             }
         }
 
@@ -2006,7 +2055,7 @@ impl ChannelSender for NotionSender {
         // 3. Build minimalist `POST /v1/pages` payload (`markdown_version: "v2"`).
         let page_payload = build_create_page_payload(dest, &data_source_id, ctx.entry, ctx.feed);
 
-        let create_resp = match self
+        let mut create_resp = match self
             .execute_json(
                 Method::POST,
                 "/v1/pages",
@@ -2027,6 +2076,42 @@ impl ChannelSender for NotionSender {
                 });
             }
         };
+
+        // Lazy `database_id` -> `data_source_id` resolution when a destination was created with a
+        // Notion database ID instead of its primary data source ID (zero extra calls on happy path).
+        if (create_resp.status == StatusCode::NOT_FOUND
+            || create_resp.error_code().as_deref() == Some("object_not_found"))
+            && !tried_db_fallback
+            && let Ok(resolved) = self
+                .resolve_data_source_metadata(secret, &data_source_id, use_proxy)
+                .await
+            && resolved.data_source_id != data_source_id
+        {
+            data_source_id = resolved.data_source_id;
+            let retry_payload =
+                build_create_page_payload(dest, &data_source_id, ctx.entry, ctx.feed);
+            match self
+                .execute_json(
+                    Method::POST,
+                    "/v1/pages",
+                    secret,
+                    use_proxy,
+                    Some(&retry_payload),
+                )
+                .await
+            {
+                Ok(r) => create_resp = r,
+                Err(err) => {
+                    return Ok(DeliveryOutcome::Retry {
+                        retry_after_secs: None,
+                        status_code: None,
+                        checkpoint: Some(pre_cp),
+                        diagnostic: format!("Notion POST /v1/pages network error: {err}"),
+                        cooldown_credential_group: false,
+                    });
+                }
+            }
+        }
 
         let status_code = i32::from(create_resp.status.as_u16());
 
@@ -2101,9 +2186,12 @@ impl ChannelSender for NotionSender {
                         }
                         AsyncPollResolution::Outcome(outcome) => return Ok(outcome),
                         AsyncPollResolution::Failed(reason) => {
+                            if let Some(sink) = ctx.checkpoint_sink {
+                                sink.save_checkpoint(&pre_cp).await?;
+                            }
                             return Ok(DeliveryOutcome::Retry {
-                                retry_after_secs: Some(4),
-                                status_code: Some(202),
+                                retry_after_secs: None,
+                                status_code: Some(502),
                                 checkpoint: Some(pre_cp),
                                 diagnostic: reason,
                                 cooldown_credential_group: false,
@@ -2225,22 +2313,9 @@ impl ChannelSender for NotionSender {
         let secret = cfg.integration_secret.trim();
         let data_source_id = normalize_notion_id(&dest.data_source_id)?;
 
-        let resp = self
-            .execute_json(
-                Method::GET,
-                &format!("/v1/data_sources/{data_source_id}"),
-                secret,
-                use_proxy,
-                None,
-            )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
-
-        if !resp.status.is_success() {
-            return Err(resp.into_app_error("GET /v1/data_sources/{id}"));
-        }
-
-        let ds = parse_data_source_object(&resp.body, &data_source_id, None, None);
+        let ds = self
+            .resolve_data_source_metadata(secret, &data_source_id, use_proxy)
+            .await?;
         let verified_cols = verify_configured_mapping(&ds.properties, &dest.column_mapping)?;
         let ds_label = ds.title.as_deref().unwrap_or("Untitled Data Source");
 
@@ -2984,6 +3059,7 @@ enum AsyncPollResolution {
 enum FcIdLookupOutcome {
     Found(String),
     NotFound,
+    NotFoundObject(DeliveryOutcome),
     Retry(DeliveryOutcome),
     PermanentFailure(DeliveryOutcome),
 }

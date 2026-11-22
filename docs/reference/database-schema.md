@@ -1,10 +1,10 @@
 ---
-description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, channel_destinations, routes, delivery_tasks, sessions, mcp_tokens, and system_settings."
+description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, channel_destinations, routes, delivery_tasks, delivery_quota_ledger, sessions, mcp_tokens, and system_settings."
 ---
 
 # SQLite Database Schema
 
-FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) and [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql) and run automatically on startup (followed by the atomic Rust migration hook `Database::migrate_channels_to_v2` for `v0.1.x` upgrades, which first writes `<DATA_DIR>/pre-v0.2.0-backup.db`). All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and foreign keys enforce **`ON DELETE CASCADE`**.
+FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) and [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql) and run automatically on startup. When upgrading an existing `v0.1.x` database, `Database::connect` first creates a pure `v0.1.x` online `VACUUM INTO` snapshot at `<DATA_DIR>/pre-v0.2.0-backup.db` (or `pre-v0.2.0-backup-<timestamp>.db` if a backup already exists) **before** `0002_channel_destinations.sql` executes, followed by the atomic Rust migration hook `Database::migrate_channels_to_v2`. All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and relational business foreign keys enforce **`ON DELETE CASCADE`** (while `delivery_quota_ledger` intentionally omits foreign keys so deletions never clear quota usage).
 
 ---
 
@@ -93,7 +93,7 @@ Stores account-level ChaCha20-Poly1305 encrypted credentials (`ChannelConfig`), 
 | `name` | `TEXT` | `NOT NULL` | Display name shown in WebUI and MCP summaries (auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me` when omitted). |
 | `kind` | `TEXT` | `NOT NULL` | `'smtp'`, `'telegram'`, or `'notion'`. |
 | `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext (`12-byte nonce \|\| ciphertext \|\| 16-byte Poly1305 tag`) of account-level `ChannelConfig` (SMTP server/auth/`from_address`, Telegram `bot_token`/`api_base_url`, or Notion `integration_secret`). |
-| `credential_group_key` | `TEXT` | `NOT NULL` | SHA-256 key grouping accounts sharing the same underlying sender credential. |
+| `credential_group_key` | `TEXT` | `NOT NULL` | SHA-256 key grouping accounts sharing the same underlying sender credential (for SMTP, incorporates the SHA-256 digest of the password—never plaintext—so distinct API keys under a shared username such as SendGrid's `apikey` stay isolated). |
 | `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Cached capability probe JSON (e.g., Telegram `supports_rich_message`, `bot_api_version`, `bot_username`). |
 | `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15` | Minimum pacing delay in seconds between deliveries across all destinations of this account. |
 | `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10` | Per-delivery random jitter ceiling in seconds (`0 ..= jitter_max_secs`, kept in memory). |
@@ -181,8 +181,26 @@ Tracks every `Entry × Route` delivery lifecycle.
 - `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)` *(The outbox claim then orders due tasks by `COALESCE(entries.published_at, entries.discovered_at)` via a join on `entries`, producing a merged chronological stream across feeds)*
 - `idx_delivery_tasks_status_lease ON delivery_tasks (status, lease_until)`
 - `idx_delivery_tasks_entry_status ON delivery_tasks (entry_id, status)` *(Supports `NOT EXISTS` GC subquery)*
-- `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` *(Supports rolling hourly/daily quota window counts)*
+- `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` *(Supports channel delivery history queries and `v0.2.0` migration backfill into `delivery_quota_ledger`)*
 - `idx_delivery_tasks_destination_id ON delivery_tasks (destination_id)`
+
+---
+
+### 5b. `delivery_quota_ledger` — Persistent Rolling Quota & Pacing Ledger
+
+Added in `migrations/0002_channel_destinations.sql` to decouple rolling 1-hour / 24-hour quota accounting and `last_completed_at` pacing timestamps from cascade-deleted `delivery_tasks` rows. Intentionally has **no business foreign keys** (`feeds`, `routes`, `channel_destinations`, or `channels`) so deleting feeds, routes, or destinations—or running Clear cache—never resets quota usage or pacing timestamps.
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | Unique ledger entry ID. |
+| `credential_group_key` | `TEXT` | `NOT NULL` | Account credential group key at the time of delivery. |
+| `channel_id` | `INTEGER` | `NOT NULL` | Parent channel account ID at the time of delivery (no foreign key). |
+| `completed_at` | `INTEGER` | `NOT NULL` | UTC Unix timestamp when the delivery succeeded. |
+
+- **Lifecycle**: Appended whenever a delivery succeeds (and backfilled from trailing 24-hour `delivered` tasks during `v0.2.0` migration); automatically pruned by the hourly maintenance task once `completed_at` is older than 24 hours (`86,400` seconds).
+- **Indexes:**
+  - `idx_delivery_quota_ledger_group_completed ON delivery_quota_ledger (credential_group_key, completed_at)` *(Primary index for rolling 1h/24h quota counts and `last_completed_at` pacing lookups)*
+  - `idx_delivery_quota_ledger_channel_completed ON delivery_quota_ledger (channel_id, completed_at)`
 
 ---
 

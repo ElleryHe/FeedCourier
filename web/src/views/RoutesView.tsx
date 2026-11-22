@@ -336,6 +336,11 @@ export function RoutesView() {
             const targetChannel =
               destEntry?.channel ?? channelsById.get(route.channel_id);
             const targetDest = destEntry?.destination;
+            const targetDisabled = Boolean(
+              targetChannel &&
+                targetDest &&
+                (!targetChannel.enabled || !targetDest.enabled),
+            );
             const routeTz = route.options.timezone?.trim() || null;
             const effectiveTz = routeTz ?? systemTimezone;
             const hasFilters =
@@ -426,11 +431,15 @@ export function RoutesView() {
 
                       <Badge
                         variant={
-                          targetChannel && targetDest ? "success" : "danger"
+                          targetChannel && targetDest
+                            ? targetDisabled
+                              ? "warning"
+                              : "success"
+                            : "danger"
                         }
                       >
                         {targetChannel && targetDest
-                          ? `${targetChannel.name} → ${targetDest.name} (${targetChannel.kind.toUpperCase()})`
+                          ? `${targetChannel.name} → ${targetDest.name} (${targetChannel.kind.toUpperCase()})${targetDisabled ? ` (${m.common.disabled})` : ""}`
                           : targetChannel
                             ? `${targetChannel.name} → ${m.routes.destinationFallback(route.destination_id)}`
                             : m.routes.destinationFallback(

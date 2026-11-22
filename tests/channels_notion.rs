@@ -1374,3 +1374,248 @@ async fn send_classifies_5xx_as_retry_preserving_create_initiated_and_4xx_as_per
         other => panic!("expected PermanentFailure on 401, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn async_poll_failed_consumes_retry_budget_and_database_id_falls_back_on_404() {
+    // 1. Inline `AsyncPollResolution::Failed` after 202 must clear `async_task_id` and return
+    //    `status_code: Some(502)` (NOT `202`) so the scheduler counts retry attempts instead of looping.
+    {
+        let server = MockServer::start().await;
+        let ds_id = "88888888-9999-aaaa-bbbb-cccccccccccc";
+        let fx = sample_fixtures(ds_id);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "object": "async_task",
+                "async_task_id": "ntask_fail_inline"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/async_tasks/ntask_fail_inline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "async_task",
+                "id": "ntask_fail_inline",
+                "status": "failed",
+                "error": { "message": "markdown conversion crashed" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sender = NotionSender::with_base_url(server.uri(), None)
+            .expect("sender")
+            .with_async_poll_policy(Duration::from_millis(1), 1, 1);
+        let sink = RecordingCheckpointSink::default();
+        let ctx = DeliveryContext {
+            task: &fx.task,
+            entry: &fx.entry,
+            feed: &fx.feed,
+            route: &fx.route,
+            route_options: RouteOptions::default(),
+            channel: &fx.channel,
+            channel_config: &fx.channel_config,
+            destination: &fx.destination,
+            destination_config: &fx.destination_config,
+            timezone: chrono_tz::UTC,
+            checkpoint: None,
+            checkpoint_sink: Some(&sink),
+        };
+        match sender.send(&ctx).await.expect("inline failed outcome") {
+            DeliveryOutcome::Retry {
+                status_code,
+                checkpoint,
+                diagnostic,
+                ..
+            } => {
+                assert_eq!(
+                    status_code,
+                    Some(502),
+                    "failed async task must not return 202"
+                );
+                assert_eq!(
+                    checkpoint,
+                    Some(DeliveryCheckpoint::Notion {
+                        create_initiated: true,
+                        async_task_id: None,
+                        page_id: None,
+                    })
+                );
+                assert!(diagnostic.contains("markdown conversion crashed"));
+            }
+            other => panic!("expected Retry(502), got {other:?}"),
+        }
+    }
+
+    // 2. Resumed `AsyncPollResolution::Failed` reconciles FC-ID, and when not found returns
+    //    Retry(502) WITHOUT issuing a duplicate `POST /v1/pages` in the same turn.
+    {
+        let server = MockServer::start().await;
+        let ds_id = "99999999-aaaa-bbbb-cccc-dddddddddddd";
+        let fx = sample_fixtures(ds_id);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/async_tasks/ntask_fail_resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "async_task",
+                "id": "ntask_fail_resume",
+                "status": "failed",
+                "error": { "message": "worker killed" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/data_sources/{ds_id}/query")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "results": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let sender = NotionSender::with_base_url(server.uri(), None)
+            .expect("sender")
+            .with_async_poll_policy(Duration::from_millis(1), 1, 1);
+        let ctx = DeliveryContext {
+            task: &fx.task,
+            entry: &fx.entry,
+            feed: &fx.feed,
+            route: &fx.route,
+            route_options: RouteOptions::default(),
+            channel: &fx.channel,
+            channel_config: &fx.channel_config,
+            destination: &fx.destination,
+            destination_config: &fx.destination_config,
+            timezone: chrono_tz::UTC,
+            checkpoint: Some(DeliveryCheckpoint::Notion {
+                create_initiated: true,
+                async_task_id: Some("ntask_fail_resume".to_string()),
+                page_id: None,
+            }),
+            checkpoint_sink: None,
+        };
+        match sender.send(&ctx).await.expect("resume failed outcome") {
+            DeliveryOutcome::Retry {
+                status_code,
+                checkpoint,
+                ..
+            } => {
+                assert_eq!(status_code, Some(502));
+                assert_eq!(
+                    checkpoint,
+                    Some(DeliveryCheckpoint::Notion {
+                        create_initiated: true,
+                        async_task_id: None,
+                        page_id: None,
+                    })
+                );
+            }
+            other => panic!("expected Retry(502) without recreating in same turn, got {other:?}"),
+        }
+    }
+
+    // 3. Lazy `database_id` -> `data_source_id` fallback on 404 object_not_found inside `send`.
+    {
+        let server = MockServer::start().await;
+        let db_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let real_ds_id = "12121212-3434-5656-7878-909090909090";
+        let fx = sample_fixtures(db_id);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/pages"))
+            .respond_with(move |req: &Request| {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                if body["parent"]["data_source_id"] == db_id {
+                    ResponseTemplate::new(404).set_body_json(json!({
+                        "object": "error",
+                        "status": 404,
+                        "code": "object_not_found",
+                        "message": "Could not find data_source"
+                    }))
+                } else {
+                    assert_eq!(body["parent"]["data_source_id"], real_ds_id);
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "object": "page",
+                        "id": "resolved-ds-page-1"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/data_sources/{db_id}")))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "object": "error",
+                "status": 404,
+                "code": "object_not_found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/databases/{db_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "database",
+                "id": db_id,
+                "data_sources": [{ "id": real_ds_id }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/data_sources/{real_ds_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "data_source",
+                "id": real_ds_id,
+                "properties": {
+                    "Title": { "type": "title" },
+                    "FC-ID": { "type": "rich_text" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sender = NotionSender::with_base_url(server.uri(), None).expect("sender");
+        let ctx = DeliveryContext {
+            task: &fx.task,
+            entry: &fx.entry,
+            feed: &fx.feed,
+            route: &fx.route,
+            route_options: RouteOptions::default(),
+            channel: &fx.channel,
+            channel_config: &fx.channel_config,
+            destination: &fx.destination,
+            destination_config: &fx.destination_config,
+            timezone: chrono_tz::UTC,
+            checkpoint: None,
+            checkpoint_sink: None,
+        };
+        match sender.send(&ctx).await.expect("fallback send") {
+            DeliveryOutcome::Delivered {
+                checkpoint: Some(DeliveryCheckpoint::Notion { page_id, .. }),
+                ..
+            } => {
+                assert_eq!(page_id.as_deref(), Some("resolved-ds-page-1"));
+            }
+            other => panic!("expected Delivered via database_id fallback, got {other:?}"),
+        }
+    }
+}

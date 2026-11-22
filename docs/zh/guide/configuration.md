@@ -52,14 +52,14 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 
 ---
 
-## `SSRF_ALLOWLIST` 内网自建服务放行
+## `SSRF_ALLOWLIST` 内网自建服务放行 {#allowing-trusted-internal-services-ssrf-allowlist}
 
 FeedCourier 默认启用连接层防 SSRF 保护，会自动拦截指向以下地址的出站请求：
 - 环回地址（`127.0.0.0/8`、`::1/128`、`localhost`）
 - 私有局域网段（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、Unique Local `fc00::/7`）
 - 链路本地与云实例元数据地址（`169.254.0.0/16`、`169.254.169.254`）
 
-如果你在同一内网或 Docker 网络中自建了 `RSSHub`、FreshRSS 或内部博客，可通过 `SSRF_ALLOWLIST` 放行对应的 IP/CIDR 或内部主机名：
+如果你在同一内网或 Docker 网络中自建了 `RSSHub`、FreshRSS、内部博客或[自建 Telegram Local Bot API Server](/zh/channels/telegram#self-hosted-local-bot-api-server)，可通过 `SSRF_ALLOWLIST` 放行对应的 IP/CIDR 或内部主机名：
 
 ### 支持的白名单格式
 

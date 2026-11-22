@@ -36,7 +36,7 @@ Go to **Channels → New Channel → SMTP** to configure the account and its fir
 | `port` | Yes | `587` | SMTP server port (`587` for STARTTLS, `465` for implicit TLS/SMTPS, `25`/`1025` for local relays). |
 | `security` | Yes | `start_tls` | Encryption mode:<br>• `start_tls`: Upgrade connection via STARTTLS (standard for port `587`)<br>• `tls`: Implicit TLS / SMTPS (standard for port `465`)<br>• `plain`: Unencrypted SMTP (only for local or internal relays) |
 | `username` | No | — | SMTP login username (usually your full email address). |
-| `password` | No | — | SMTP password or App Password (encrypted at rest; leave blank when editing to keep the existing password). |
+| `password` | No | — | SMTP password or App Password (encrypted at rest; leave blank when editing to keep the existing password, or send `"password": null` via `PATCH /api/v1/channels/{id}` to explicitly clear an optional password). |
 | `from_address` | Yes | — | Sender email address (`Force-From`). Must be authorized by your SMTP account. |
 
 ### SMTP Destination Fields (Add Multiple per Account)
@@ -48,11 +48,12 @@ Go to **Channels → New Channel → SMTP** to configure the account and its fir
 | `reply_to` | No | — | Optional `Reply-To` email address. |
 | `enabled` | No | `true` | Independently enable or pause deliveries to this recipient group without affecting sibling destinations. |
 
-### Account vs. Destination Testing & Shared Limits
+### Account vs. Destination Testing, Credential Isolation & Shared Limits
 
 - **Test Account**: Verifies SMTP server connectivity and authentication (`EHLO`/`AUTH`) without sending an email.
 - **Test Destination**: Sends a live verification email (in your current WebUI language) to that destination's `to_addresses`.
-- **Shared Rate Limits & Quotas**: All destinations attached to the same SMTP account share `min_interval_secs`, per-delivery random jitter, `hourly_quota`, `daily_quota`, `use_proxy`, and temporary throttling cooldowns. See [Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas).
+- **Shared Rate Limits & Password-Digest Isolation**: All destinations attached to the same SMTP account share `min_interval_secs`, per-delivery random jitter, `hourly_quota`, `daily_quota`, `use_proxy`, and temporary throttling cooldowns. For cross-account rate-limit grouping, SMTP `credential_group_key` includes a SHA-256 digest of the password (never storing plaintext), so separate API keys sharing a generic username (such as SendGrid's `apikey` username with different keys) remain isolated. See [Send Rate, Quotas, Windows & Filters](/channels/pacing-and-quotas).
+- **Automatic `v0.1.x` → `v0.2.0` Migration Merging**: When upgrading from `v0.1.x`, legacy SMTP channels are merged into a single SMTP Account **only** when all six account fields (`host`, `port`, `username`, `password`, `security`, and `from_address`) match exactly. Merged quotas, pacing, cooldowns, and `use_proxy` are aggregated only from **enabled** legacy channels in the group (falling back to all channels only if every channel in the group was disabled). See [Upgrading from `v0.1.x` to `v0.2.0`](/guide/operations#upgrading-from-v0-1-x-to-v0-2-0).
 
 ---
 

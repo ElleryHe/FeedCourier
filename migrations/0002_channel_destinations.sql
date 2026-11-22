@@ -30,3 +30,28 @@ ALTER TABLE delivery_tasks
 
 CREATE INDEX IF NOT EXISTS idx_delivery_tasks_destination_id
     ON delivery_tasks (destination_id);
+
+-- Independent quota & pacing ledger decoupled from business-entity ON DELETE CASCADE
+-- so deleting feeds, routes, destinations, or clearing feed cache never resets rolling
+-- 1h / 24h channel quotas or min_interval pacing timestamps.
+CREATE TABLE IF NOT EXISTS delivery_quota_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    credential_group_key TEXT NOT NULL,
+    channel_id INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_quota_ledger_group_completed
+    ON delivery_quota_ledger (credential_group_key, completed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_quota_ledger_channel_completed
+    ON delivery_quota_ledger (channel_id, completed_at DESC);
+
+-- Backfill the last 24 hours of delivered tasks for installations upgrading from v0.1.x.
+INSERT INTO delivery_quota_ledger (credential_group_key, channel_id, completed_at)
+SELECT c.credential_group_key, dt.channel_id, dt.completed_at
+FROM delivery_tasks dt
+JOIN channels c ON c.id = dt.channel_id
+WHERE dt.status = 'delivered'
+  AND dt.completed_at IS NOT NULL
+  AND dt.completed_at >= unixepoch() - 86400;

@@ -118,7 +118,7 @@ Executes an online `VACUUM INTO` snapshot and streams the resulting SQLite datab
 | Method & Path | Description |
 | :--- | :--- |
 | `GET /api/v1/feeds` | List all subscribed feeds (`FeedDto[]`). |
-| `POST /api/v1/feeds` | Create a feed (`CreateFeedRequest`) and run an immediate initial poll (`silent_init: true` by default; rolls back the feed row automatically if the initial poll fails with `SsrfBlocked`). |
+| `POST /api/v1/feeds` | Returns **`201 Created`**. Create a feed (`CreateFeedRequest`) and run an immediate initial poll (`silent_init: true` by default; rolls back the feed row automatically if the initial poll fails with `SsrfBlocked`). |
 | `PATCH /api/v1/feeds/{id}` | Update feed URL, title, tags, `poll_interval_secs`, `fetch_full_content`, `use_proxy`, `silent_init`, or `health_status`. |
 | `DELETE /api/v1/feeds/{id}` | Delete a feed and cascade-delete its entries and tasks. |
 | `POST /api/v1/feeds/{id}/poll` | Reset circuit-breaker state and trigger an immediate incremental poll (`PollFeedResponse`). |
@@ -157,12 +157,12 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 | Method & Path | Description |
 | :--- | :--- |
 | `GET /api/v1/channels` | List all channel accounts (`ChannelDto[]`) with secrets redacted (`has_password`, `bot_token_hint`, `secret_hint`) and nested `destinations: ChannelDestinationDto[]` (see [Security & Isolation](/reference/security)). |
-| `POST /api/v1/channels` | Create and encrypt a new `smtp`, `telegram`, or `notion` **Channel Account** (`CreateChannelRequest`, with optional `name` auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me`, and optional `initial_destination`). Automatically probes Telegram Bot API capabilities on creation. |
-| `PATCH /api/v1/channels/{id}` | Secret-preserving partial update for account credentials, proxy, pacing, quotas, or enabled flag (`UpdateChannelRequest`). Omitting `password` / `bot_token` / `integration_secret` preserves the existing encrypted credential intact. |
+| `POST /api/v1/channels` | Returns **`201 Created`**. Create and encrypt a new `smtp`, `telegram`, or `notion` **Channel Account** (`CreateChannelRequest`, with optional `name` auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me`, and optional `initial_destination`). Automatically probes Telegram Bot API capabilities on creation (Telegram `api_base_url` enforces SSRF validation and returns `403 ssrf_blocked` on disallowed targets). |
+| `PATCH /api/v1/channels/{id}` | Secret-preserving partial update for account credentials, proxy, pacing, quotas, or enabled flag (`UpdateChannelRequest`). Omitting `password` / `bot_token` / `integration_secret` preserves the existing encrypted credential intact; passing `"password": null` on an SMTP account explicitly clears an optional SMTP password. |
 | `DELETE /api/v1/channels/{id}` | Delete a channel account and cascade-delete its destinations, routes, and tasks. |
 | `POST /api/v1/channels/{id}/test` | When `destination_id` is omitted, verifies account-level credentials (`EHLO`/`AUTH` for SMTP, `getMe` + `sendRichMessage` probe for Telegram, `GET /v1/users/me` for Notion) without sending a delivery. Passing `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` sends a live test delivery to that destination. |
 | `GET /api/v1/channels/{id}/destinations` | List all destinations belonging to channel account `{id}` (`ChannelDestinationDto[]`). |
-| `POST /api/v1/channels/{id}/destinations` | Create and encrypt a new destination under channel account `{id}` (`CreateDestinationRequest`; optional `name` is auto-derived from Telegram `getChat`, SMTP first recipient, or Notion database title). |
+| `POST /api/v1/channels/{id}/destinations` | Returns **`201 Created`**. Create and encrypt a new destination under channel account `{id}` (`CreateDestinationRequest`; optional `name` is auto-derived from Telegram `getChat`, SMTP first non-empty recipient, or Notion database title). |
 | `PATCH /api/v1/destinations/{id}` | Partially update a destination's label, target config (`DestinationPatch`), or `enabled` state. |
 | `DELETE /api/v1/destinations/{id}` | Delete a destination and cascade-delete its routes and tasks. |
 | `POST /api/v1/destinations/{id}/test` | Send an interactive test email, Telegram message, or Notion verification page to destination `{id}` (`TestChannelResponse`). Optional body `{ "locale"?: "en" \| "zh-CN" }` selects the test message language. |
@@ -176,8 +176,8 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 | Method & Path | Description |
 | :--- | :--- |
 | `GET /api/v1/routes` | List all delivery routes (`RouteDto[]`, including both `channel_id` and `destination_id`). |
-| `POST /api/v1/routes` | Create a delivery route (`CreateRouteRequest`) binding `feed_ids` / `match_tags` and content filters to a trusted `destination_id` (primary; legacy `channel_id` fallback accepted only when that account owns exactly 1 destination), with route `options` (below). |
-| `PATCH /api/v1/routes/{id}` | Update a delivery route (`UpdateRouteRequest`), including `destination_id` (or single-destination `channel_id`) and `options`. |
+| `POST /api/v1/routes` | Returns **`201 Created`**. Create a delivery route (`CreateRouteRequest`) binding `feed_ids` / `match_tags` and content filters to a trusted `destination_id` (primary; legacy `channel_id` fallback accepted only when that account owns exactly 1 destination), with route `options` (below). |
+| `PATCH /api/v1/routes/{id}` | Update a delivery route (`UpdateRouteRequest`), including `destination_id` (or single-destination `channel_id`) and `options`. Changing the target destination atomically repoints pending `queued`/`deferred`/`retrying` tasks (clearing `checkpoint_json` and resetting `attempt_count = 0`; active `delivering` tasks are untouched). Changing `active_windows`, `active_weekdays`, or `timezone` resets `next_attempt_at = now` on `queued`/`deferred` tasks and wakes the outbox immediately. |
 | `DELETE /api/v1/routes/{id}` | Delete a delivery route. |
 | `GET /api/v1/tasks` | List outbox tasks (`DeliveryTaskDto[]`, including `destination_id` and `destination_name`; `?status=dead_letter&limit=50`, accepts `queued`, `delivering`, `retrying`, `deferred`, `dead_letter`, `delivered`, or `all`). |
 | `POST /api/v1/tasks/retry` | Requeue specific tasks (`{"task_ids": [1, 2]}`) or all dead-letter tasks (`{"all_dead_letter": true}`) and wake the outbox dispatcher. |
@@ -206,7 +206,7 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 | `link_preview` | Telegram link preview toggle. |
 | `locale` | Delivery language of this route (`"en"` or `"zh-CN"`). The WebUI pre-fills the current interface language; routes without it inherit the legacy `settings.locale`. |
 | `timezone` | Optional per-route IANA timezone override (e.g., `"Asia/Shanghai"`, `"America/New_York"`; omit or pass `""` to inherit `settings.timezone`). Governs `active_windows` / `active_weekdays`, SMTP email article timestamps, and Telegram rich-message `<footer>` timestamps (`YYYY-MM-DD HH:MM (UTC±HH:MM)`). |
-| `active_windows` | Daily delivery windows (`HH:MM`) in the **route timezone** (inheriting system timezone). `end` earlier than `start` wraps midnight; `start == end` means the whole day; an empty list means always. |
+| `active_windows` | Daily delivery windows (`HH:MM`) in the **route timezone** (inheriting system timezone), evaluated with DST-safe boundaries. `end` earlier than `start` wraps midnight; only `00:00`–`00:00` (or an empty list `[]`) means all day—any other `start == end` window returns **`400 Bad Request`**. |
 | `active_weekdays` | `1` (Monday) – `7` (Sunday); empty means every day. For a window wrapping midnight, the weekday of the day the window starts is used. |
 
 Tasks outside the window or weekdays are **still queued**: their status stays `queued` / `deferred` and `next_attempt_at` is set to the next window start.
@@ -220,5 +220,5 @@ Tasks outside the window or weekdays are **still queued**: their status stays `q
 | `GET /api/v1/settings` | Get runtime settings: `{ "outbound_proxy_url", "ssrf_allowlist", "timezone": "America/Los_Angeles", "locale" }`. `timezone` is an IANA name (default from `TIMEZONE` / `TZ`). `locale` is a **legacy fallback** delivery language for routes without their own `options.locale`; the WebUI no longer writes it or uses it as the interface language. |
 | `PUT /api/v1/settings` | Hot-update any subset of `timezone`, `outbound_proxy_url`, and `ssrf_allowlist`. Network fields are applied (and active runtime clients reloaded) only when at least one of them is present. An invalid IANA timezone returns `400`. |
 | `GET /api/v1/mcp-tokens` | List issued MCP Bearer token metadata (`id`, `name`, `token_prefix`, `scope`, `last_used_at`, `created_at`). |
-| `POST /api/v1/mcp-tokens` | Issue a new `readonly` or `admin` MCP Bearer token (`CreateMcpTokenResponse`, returning the one-time `plaintext_token` and `client_config_json`). |
+| `POST /api/v1/mcp-tokens` | Returns **`201 Created`**. Issue a new `readonly` or `admin` MCP Bearer token (`CreateMcpTokenResponse`, returning the one-time `plaintext_token` and `client_config_json`). |
 | `DELETE /api/v1/mcp-tokens/{id}` | Revoke an MCP Bearer token immediately. |

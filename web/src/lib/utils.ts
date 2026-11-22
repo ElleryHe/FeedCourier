@@ -1,6 +1,5 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
-import { ApiError } from "@/api/client";
 import { getCurrentLocale, getMessages } from "@/i18n";
 
 export function cn(...inputs: ClassValue[]): string {
@@ -8,9 +7,6 @@ export function cn(...inputs: ClassValue[]): string {
 }
 
 export function errorMessage(err: unknown): string {
-  if (err instanceof ApiError) {
-    return err.details ? `${err.message} (${err.details})` : err.message;
-  }
   if (err instanceof Error) {
     return err.message;
   }

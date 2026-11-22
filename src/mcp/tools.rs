@@ -1,4 +1,4 @@
-//! MCP `ServerHandler`, AGPLv3 Section 13 `ServerConfig` (`ServerInfo`), and all 7 FeedCourier
+//! MCP `ServerHandler`, AGPLv3 Section 13 `ServerConfig` (`ServerInfo`), and all 9 FeedCourier
 //! inspection, orchestration, and operational tools (`feedcourier.md` Section 六).
 
 use std::collections::HashMap;
@@ -110,9 +110,9 @@ pub struct PreviewFeedLatestParams {
 /// Parameters for `manage_feed` (`admin` scope ONLY).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ManageFeedParams {
-    /// Operation to perform: `"add"`, `"update"`, `"pause"`, `"resume"`, or `"delete"`.
+    /// Operation to perform: `"add"`, `"update"`, `"pause"`, `"resume"`, `"clear_cache"`, or `"delete"`.
     pub action: String,
-    /// Target feed ID (required for `"update"`, `"pause"`, `"resume"`, and `"delete"`).
+    /// Target feed ID (required for `"update"`, `"pause"`, `"resume"`, `"clear_cache"`, and `"delete"`).
     pub feed_id: Option<i64>,
     /// Feed URL (`http://` or `https://`; required for `"add"`, optional for `"update"`).
     pub url: Option<String>,
@@ -134,8 +134,8 @@ pub struct ManageFeedParams {
     pub poll_now: Option<bool>,
 }
 
-/// Daily delivery window (`HH:MM`) in the system timezone. `end < start` wraps midnight;
-/// `start == end` means the whole day.
+/// Daily delivery window (`HH:MM`) in the route timezone (inheriting the system timezone when
+/// unset). `end < start` wraps midnight; `00:00`–`00:00` means all day.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpTimeWindow {
     pub start: String,
@@ -476,10 +476,10 @@ impl McpServer {
 
 #[rmcp::tool_router]
 impl McpServer {
-    /// Inspect overall gateway metrics, redacted channel IDs, active routes, and feed polling health.
+    /// Inspect overall gateway metrics, redacted channel/destination IDs, active routes, and feed polling health.
     #[rmcp::tool(
         name = "list_feeds_status",
-        description = "List gateway overview counts, trusted channels (ID & name only, no secrets), routes, and subscribed feeds filtered optionally by health_status or tag.",
+        description = "List gateway overview counts, trusted channels and destinations (ID & name only, no secrets), routes, and subscribed feeds filtered optionally by health_status or tag.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -849,10 +849,10 @@ impl McpServer {
         })
     }
 
-    /// Add, update, pause, resume, or delete a feed subscription (`admin` token scope required).
+    /// Add, update, pause, resume, clear cache, or delete a feed subscription (`admin` token scope required).
     #[rmcp::tool(
         name = "manage_feed",
-        description = "Requires 'admin' MCP token scope. Add, update, pause, resume, or delete an RSS/Atom/JSON feed subscription.",
+        description = "Requires 'admin' MCP token scope. Add, update, pause, resume, clear_cache, or delete an RSS/Atom/JSON feed subscription.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1351,11 +1351,20 @@ impl McpServer {
                     enabled: params.enabled,
                 };
 
+                let should_wake_outbox = params.enabled == Some(true)
+                    || resolved_destination_id.is_some()
+                    || patch.options.is_some();
+
                 match db.update_route(route_id, &patch).await {
-                    Ok(updated) => tool_ok(&serde_json::json!({
-                        "action": "update",
-                        "route": McpRouteSummary::from(&updated),
-                    })),
+                    Ok(updated) => {
+                        if should_wake_outbox {
+                            self.state.notify_outbox();
+                        }
+                        tool_ok(&serde_json::json!({
+                            "action": "update",
+                            "route": McpRouteSummary::from(&updated),
+                        }))
+                    }
                     Err(err) => Ok(tool_error_from_app(err)),
                 }
             }

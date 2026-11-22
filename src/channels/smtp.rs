@@ -1029,28 +1029,40 @@ pub fn rewrite_body_html_for_email(html: &str) -> String {
                 // Strip `height` so aspect ratio scales proportionally on narrow screens.
                 attrs.retain(|a| !a.name.eq_ignore_ascii_case("height"));
 
-                // Clamp oversized or unspecified `width` to card inner width (592px) for Outlook,
-                // while preserving explicit small widths (< 592px) so icons aren't stretched.
-                let explicit_small_width = attrs
+                // Preserve relative percentage widths (1%–100%) and explicit small pixel widths
+                // (< 592px) so icons and fractional-width figures aren't stretched; clamp missing
+                // or oversized widths to card inner width (592px) for Outlook compatibility.
+                let raw_width = attrs
                     .iter()
                     .find(|a| a.name.eq_ignore_ascii_case("width"))
-                    .and_then(|a| a.value.as_deref())
-                    .and_then(parse_px_dimension)
-                    .filter(|&w| w > 0 && w < EMAIL_CARD_INNER_WIDTH_PX);
+                    .and_then(|a| a.value.as_deref());
 
-                let (width_attr, img_style) = match explicit_small_width {
-                    Some(w) => (
+                let (width_attr, img_style) = if let Some(pct) =
+                    raw_width.and_then(parse_percent_dimension)
+                {
+                    (
+                        format!("{pct}%"),
+                        format!(
+                            "display:block;max-width:100%;width:{pct}%;height:auto;border:0;outline:none;text-decoration:none;"
+                        ),
+                    )
+                } else if let Some(w) = raw_width
+                    .and_then(parse_px_dimension)
+                    .filter(|&w| w > 0 && w < EMAIL_CARD_INNER_WIDTH_PX)
+                {
+                    (
                         w.to_string(),
-                        "display:block;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;",
-                    ),
-                    None => (
+                        "display:block;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;".to_string(),
+                    )
+                } else {
+                    (
                         EMAIL_CARD_INNER_WIDTH_PX.to_string(),
-                        "display:block;max-width:100%;width:100%;height:auto;border:0;outline:none;text-decoration:none;",
-                    ),
+                        "display:block;max-width:100%;width:100%;height:auto;border:0;outline:none;text-decoration:none;".to_string(),
+                    )
                 };
 
                 set_or_replace_attr(&mut attrs, "width", width_attr);
-                set_or_replace_attr(&mut attrs, "style", img_style.to_string());
+                set_or_replace_attr(&mut attrs, "style", img_style);
                 emit_html_tag(&mut out, "img", &attrs, self_closing);
             }
             "figure" => {
@@ -1194,6 +1206,13 @@ fn parse_px_dimension(raw: &str) -> Option<u32> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let numeric = trimmed.strip_suffix("px").unwrap_or(&trimmed).trim();
     numeric.parse::<u32>().ok()
+}
+
+fn parse_percent_dimension(raw: &str) -> Option<u32> {
+    let trimmed = raw.trim();
+    let numeric = trimmed.strip_suffix('%')?.trim();
+    let pct = numeric.parse::<u32>().ok()?;
+    (1..=100).contains(&pct).then_some(pct)
 }
 
 fn set_or_replace_attr(attrs: &mut Vec<EmailTagAttr>, name: &str, value: String) {

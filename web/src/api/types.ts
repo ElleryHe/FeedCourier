@@ -21,7 +21,7 @@
 export interface ApiErrorBody {
   error: string;
   code?: string;
-  details?: string;
+  message?: string;
 }
 
 export interface ActionAckResponse {
@@ -438,7 +438,8 @@ export type ChannelAccountCreate =
 /**
  * Secret-preserving account-level patch payload (`PATCH /api/v1/channels/:id`).
  * Secret fields (`password`, `bot_token`, `integration_secret`) are optional:
- * when omitted or `null`/empty, the backend preserves the stored encrypted secret.
+ * - Omit (`undefined`) to preserve the stored encrypted secret.
+ * - For SMTP, pass explicit `null` for `password` to clear the stored password.
  */
 export type ChannelAccountPatch =
   | {
@@ -446,7 +447,7 @@ export type ChannelAccountPatch =
       host?: string;
       port?: number;
       username?: string | null;
-      /** Omit or pass `null` to keep existing SMTP password. */
+      /** Omit to keep existing SMTP password; pass explicit `null` to clear it. */
       password?: string | null;
       security?: SmtpSecurity;
       from_address?: string;

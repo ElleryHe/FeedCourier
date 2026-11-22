@@ -18,7 +18,7 @@ FeedCourier 的所有持久化数据均保存在单一 `DATA_DIR`（容器内默
 ├── feedcourier.db        # SQLite 主数据库文件（表结构、文章指纹、加密后的账号与目的地配置、路由与任务队列）
 ├── feedcourier.db-wal    # SQLite WAL 预写日志文件
 ├── feedcourier.db-shm    # SQLite WAL 共享内存索引文件
-└── pre-v0.2.0-backup.db  # 从 v0.1.x 升级到 v0.2.0 时自动生成的升级前在线快照备份
+└── pre-v0.2.0-backup.db  # 执行 0002 DDL 迁移前自动生成的纯 v0.1.x 在线快照（若已存在则按 UTC 时间戳命名，不覆盖）
 ```
 
 ### 主密钥（`master.key`）保存须知
@@ -73,18 +73,19 @@ curl -fL -b cookies.txt \
 
 FeedCourier `v0.2.0` 引入了**双层投递通道模型（通道账号 + 多个目的地）**。从 `v0.1.x` 升级时，服务会在首次启动阶段**自动、原子地**完成旧数据迁移，无需手动执行 SQL：
 
-1. **升级前自动备份（`pre-v0.2.0-backup.db`）**：在修改任何旧通道记录前，系统会自动通过 `VACUUM INTO` 在数据目录下生成一致性快照 `<DATA_DIR>/pre-v0.2.0-backup.db`。若后续需要回退至 `v0.1.6`，将该备份与原 `master.key` 一同还原即可。
-2. **表结构变更与单事务拆分**：`migrations/0002_channel_destinations.sql` 先创建 `channel_destinations` 表并为 `routes` / `delivery_tasks` 增加 `destination_id` 列；随后启动钩子 `Database::migrate_channels_to_v2` 使用 `MasterKey` 在**单个 SQLite 事务**内解密每条旧通道配置，拆分为账号凭据（`channels`）与目的地配置（`channel_destinations`）。
-3. **按 `credential_group_key` 自动合并重复账号**：共享同一底层凭据的旧通道（相同 `credential_group_key`，例如同一 Telegram Bot 分别推送至两个群组，或同一 SMTP 账号发送至两组收件人）会自动合并为同一个通道账号，每个旧通道转化为其下一个独立目的地并沿用旧名称作为备注：
-   - **流速与配额（取最严格值）**：`min_interval_secs` 取最大值、`jitter_max_secs` 取最大值、`hourly_quota` 与 `daily_quota` 取非空最小值、`cooldown_until` 取最晚截止时间。
-   - **代理与启用状态（取并集）**：只要任一被合并的旧通道开启了代理，合并后的账号即开启 `use_proxy`；只要任一旧通道处于启用状态，合并后的账号即保持启用（每个目的地仍各自保留原有的启用/停用状态）。
+1. **DDL 迁移前生成纯 `v0.1.x` 快照（`pre-v0.2.0-backup.db`）**：在 `Database::connect` 检测到已有 `v0.1.x` 数据库（已应用 `0001` 且存在 `channels` 数据、待执行 `0002`）时，系统会**先于 `migrations/0002_channel_destinations.sql` 执行** `VACUUM INTO` 在线快照，生成 `<DATA_DIR>/pre-v0.2.0-backup.db`。由于快照在任何 `0002` 表结构变更前生成，它是可直接回退至 `v0.1.6` 的纯 `v0.1.x` SQLite 数据库（请与 `master.key` 一同妥善保存）。若同名备份文件已存在，FeedCourier 绝不会覆盖旧文件，而是改写为带 UTC 时间戳的文件名（`pre-v0.2.0-backup-<timestamp>.db`）。
+2. **表结构变更与单事务拆分**：`migrations/0002_channel_destinations.sql` 创建 `channel_destinations` 与 `delivery_quota_ledger` 表，并为 `routes` / `delivery_tasks` 增加 `destination_id` 列；随后启动钩子 `Database::migrate_channels_to_v2` 使用 `MasterKey` 在**单个 SQLite 事务**内解密每条旧通道配置，拆分为账号凭据（`channels`）与目的地配置（`channel_destinations`）。
+3. **安全的自动账号合并规则**：共享底层账号的旧通道会自动合并为同一个通道账号，每个旧通道转化为其下一个独立目的地并沿用旧名称作为备注：
+   - **SMTP 全字段一致合并与密码摘要隔离**：旧 SMTP 记录**仅当** `host`、`port`、`username`、`password`、`security` 与 `from_address` 六项字段**全部一致**时才会合并；同时 SMTP 的 `credential_group_key` 纳入密码的 SHA-256 摘要（不存储明文），确保共用同一用户名但 API Key 不同的凭据（例如 SendGrid 的 `apikey`）保持隔离。Telegram 与 Notion 账号则按相同 `credential_group_key`（Bot Token + `api_base_url` 或 Notion Integration Secret）合并。
+   - **仅按已启用通道聚合配额、间隔与代理**：合并后的 `min_interval_secs`（最大值）、`jitter_max_secs`（最大值）、`hourly_quota`（非空最小值）、`daily_quota`（非空最小值）、`cooldown_until`（最晚截止时间）与 `use_proxy`（逻辑或）**仅统计组内 `enabled = true` 的旧通道**，只有当全组旧通道均被禁用时才回退统计全部，避免废弃的已禁用通道拉低配额或污染代理开关。只要任一旧通道处于启用状态，合并后的账号即保持启用（每个目的地各自保留原有的启用/停用状态）。
    - **账号名称**：SMTP 账号优先使用 `from_address`，Telegram 账号优先使用已缓存的 `@username`，否则沿用主通道原名。
-4. **路由与历史任务重指向**：所有 `routes` 与 `delivery_tasks`（含历史 `delivered` 与 `dead_letter` 任务）会自动更新指向新的 `destination_id` 与合并后的 `channel_id`。
+4. **路由、历史任务重指向与配额账本回填**：所有 `routes` 与 `delivery_tasks`（含历史 `delivered` 与 `dead_letter` 任务）会自动更新指向新的 `destination_id` 与合并后的 `channel_id`（事务结束前会断言不存在 `destination_id IS NULL` 的残留记录，否则整事务回滚），并将近 24 小时内的 `delivered` 记录回填至 `delivery_quota_ledger`。
 5. **幂等标记**：事务提交后写入 `system_settings.channel_model_version = 2`，后续重启不会重复迁移。
 
 > [!WARNING]
-> **API 与 MCP 调用方兼容提示**
-> 升级后，仍使用 `channel_id` 调用 `POST`/`PATCH /api/v1/routes`、`POST /api/v1/feeds/preview/push` 或 MCP `configure_route` / `test_push_feed_entry` 的脚本，在目标账号仅拥有 **1 个目的地** 时仍可自动解析；若账号下存在**多个目的地**（包括旧通道合并后产生多个目的地的情况），服务端会返回校验错误并提示改用 `destination_id`。
+> **升级注意：Telegram Local Bot API 白名单与 API / MCP 调用方兼容**
+> - **自建 Telegram Local Bot API Server**：在 `v0.2.0` 中，**所有** Telegram Bot API 请求（包括自定义 `api_base_url`）均强制经过连接期 `SsrfPolicy` DNS 校验并禁用自动重定向，且 `api_base_url` 仅允许不含 userinfo / query / fragment 的 `http` / `https` URL。存量内网 Local Bot API 地址**不会**自动放行，运维人员必须将其主机名或 IP/CIDR 手动加入 [`SSRF_ALLOWLIST`](/zh/guide/configuration#allowing-trusted-internal-services-ssrf-allowlist)。详见 [Telegram 通道说明](/zh/channels/telegram#self-hosted-local-bot-api-server)。
+> - **API 与 MCP 调用方**：仍使用 `channel_id` 调用 `POST`/`PATCH /api/v1/routes`、`POST /api/v1/feeds/preview/push` 或 MCP `configure_route` / `test_push_feed_entry` 的脚本，在目标账号仅拥有 **1 个目的地** 时仍可自动解析；若账号下存在**多个目的地**（包括旧通道合并后产生多个目的地的情况），服务端会返回校验错误并提示改用 `destination_id`。
 
 ---
 
@@ -146,8 +147,9 @@ docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
 
 - **后台定时清理**：每间隔 1 小时自动运行一次：
   1. 清理所有超过 `RETENTION_HOURS`（默认 24 小时）且已无未完成投递任务的文章正文与媒体元数据；
-  2. 清理已过期的登录会话记录；
-  3. 执行 `PRAGMA optimize` 更新 SQLite 查询统计信息。
+  2. 清理 `delivery_quota_ledger` 表中超过 24 小时（`86,400` 秒）的历史配额流水记录；
+  3. 清理已过期的登录会话记录；
+  4. 执行 `PRAGMA optimize` 更新 SQLite 查询统计信息。
 - **手动触发清理**：在 WebUI **Settings → Storage & Maintenance** 点击 **Run Payload GC Now**（或调用 `POST /api/v1/maintenance/gc`），可立即执行一次清理并返回本次回收的条目数（`purged_entries`）。
 
 ---

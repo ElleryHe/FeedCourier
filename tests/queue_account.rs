@@ -980,3 +980,105 @@ async fn setup_defaults_username_to_courier() {
         .await;
     assert_eq!(account["username"], "Courier");
 }
+
+#[tokio::test]
+async fn route_timezone_asia_tokyo_evaluates_windows_independently_of_system_timezone() {
+    use chrono::Timelike;
+
+    let tg = MockServer::start().await;
+    let origin = MockServer::start().await;
+    mount_telegram_ok(&tg).await;
+    let h = Harness::new().await;
+    let cookie = h.setup_admin(None, "tokyo-window-password").await;
+
+    // System timezone is explicitly set to `America/Los_Angeles` (UTC-8 / UTC-7),
+    // far away from `Asia/Tokyo` (UTC+9).
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({ "timezone": "America/Los_Angeles" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let base = origin.uri();
+    mount_feed(
+        &origin,
+        "/tokyo.xml",
+        rss(
+            &base,
+            &[("t1", "Tokyo Item", "Wed, 11 Nov 2026 12:00:00 GMT")],
+        ),
+    )
+    .await;
+
+    let tokyo: chrono_tz::Tz = "Asia/Tokyo".parse().unwrap();
+    let tokyo_now = chrono::Utc::now().with_timezone(&tokyo);
+    // Construct a 1-hour closed window starting 2 hours from now in Asia/Tokyo so `now` is guaranteed outside.
+    let start_h = (tokyo_now.hour() + 2) % 24;
+    let end_h = (tokyo_now.hour() + 3) % 24;
+    let closed_start = format!("{start_h:02}:00");
+    let closed_end = format!("{end_h:02}:00");
+
+    let (channel, dest) = h.telegram_channel(&tg.uri()).await;
+    let mut opts = compact_options();
+    opts.timezone = Some("Asia/Tokyo".to_string());
+    opts.active_windows = vec![feedcourier::channels::DeliveryTimeWindow {
+        start: closed_start,
+        end: closed_end,
+    }];
+    let route = h.catch_all_route(channel.id, dest.id, opts).await;
+    let feed = h.feed(format!("{base}/tokyo.xml")).await;
+
+    let outcome = h
+        .dispatcher
+        .ingest()
+        .poll_feed(feed.id, false, false)
+        .await
+        .unwrap();
+    assert_eq!(outcome.enqueued_tasks, 1);
+
+    let tasks =
+        h.db.list_delivery_task_details(Some(DeliveryTaskStatus::Queued), 10)
+            .await
+            .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(
+        tasks[0].next_attempt_at > now_unix() + 60,
+        "route with Asia/Tokyo closed window must schedule next_attempt_at in the future"
+    );
+    assert!(!h.dispatcher.process_next_outbox_task().await.unwrap());
+
+    // Now update the route to an OPEN window covering `tokyo_now` via REST `PATCH /api/v1/routes/{id}`:
+    // P2-04 must automatically pull `next_attempt_at` back to `now` so delivery proceeds immediately
+    // WITHOUT any manual SQL tampering!
+    let open_start_h = (tokyo_now.hour() + 23) % 24;
+    let open_end_h = (tokyo_now.hour() + 2) % 24;
+    let (status, _, updated) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/routes/{}", route.id),
+            Some(&cookie),
+            Some(json!({
+                "options": {
+                    "telegram_mode": "compact_card",
+                    "link_preview": true,
+                    "timezone": "Asia/Tokyo",
+                    "active_windows": [{
+                        "start": format!("{open_start_h:02}:00"),
+                        "end": format!("{open_end_h:02}:00")
+                    }],
+                    "active_weekdays": []
+                }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert!(
+        h.dispatcher.process_next_outbox_task().await.unwrap(),
+        "updating route window to open must immediately release deferred/queued task"
+    );
+    assert_eq!(sent_texts(&tg).await.len(), 1);
+}

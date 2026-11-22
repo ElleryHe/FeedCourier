@@ -40,7 +40,7 @@ SMTP 邮件通道可将新文章自动排版为响应式单栏 HTML 邮件（同
 | `port` | 是 | `587` | SMTP 端口（`587` 通常配合 `start_tls`，`465` 通常配合 `tls`）。 |
 | `security` | 是 | `start_tls` | 传输加密方式：<br>• `start_tls`：连接后通过 STARTTLS 升级加密（常用于端口 `587`）<br>• `tls`：全程隐式 TLS / SMTPS 加密（常用于端口 `465`）<br>• `plain`：明文连接（仅用于本机或内网自建邮件中继，如端口 `25` / `1025`） |
 | `username` | 否 | `null` | SMTP 登录用户名（通常为完整发件邮箱地址）。 |
-| `password` | 否 | `null` | SMTP 认证密码或应用专用密码。密码经加密后保存在数据库中，后续编辑账号时若留空则保留原密码。 |
+| `password` | 否 | `null` | SMTP 认证密码或应用专用密码。密码经加密后保存在数据库中，后续编辑账号时若留空则保留原密码；调用 `PATCH /api/v1/channels/{id}` 时显式传入 `"password": null` 可清空可选密码。 |
 | `from_address` | 是 | — | 发件人邮箱地址（需与当前认证的 SMTP 账号一致，或具备该地址的发信权限）。 |
 
 ### SMTP 目的地字段（单账号可添加多个）
@@ -52,11 +52,12 @@ SMTP 邮件通道可将新文章自动排版为响应式单栏 HTML 邮件（同
 | `reply_to` | 否 | `null` | 可选的回复地址（`Reply-To`）。 |
 | `enabled` | 否 | `true` | 独立控制该收件人组的启用/停用状态，不影响同账号下的其他目的地。 |
 
-### 账号测试、目的地测试与共享限流
+### 账号测试、凭据隔离与共享限流
 
 - **测试账号**：仅验证 SMTP 服务器连通性与登录认证（`EHLO`/`AUTH`），不会发出真实邮件。
 - **测试目的地**：向该目的地的 `to_addresses` 发送一封验证邮件（使用当前 WebUI 语言）。
-- **共享速率与配额**：挂载在同一 SMTP 账号下的所有收件目的地共享 `min_interval_secs`、逐条随机抖动、`hourly_quota`、`daily_quota`、`use_proxy` 以及临时限流冷却。详见[发送频率、配额与过滤](/zh/channels/pacing-and-quotas)。
+- **共享速率与密码摘要隔离**：挂载在同一 SMTP 账号下的所有收件目的地共享 `min_interval_secs`、逐条随机抖动、`hourly_quota`、`daily_quota`、`use_proxy` 以及临时限流冷却。在跨账号限流分组中，SMTP 的 `credential_group_key` 纳入了密码的 SHA-256 摘要（不存储明文），因此即便多个账号共用同一通用用户名（例如 SendGrid 均使用 `apikey` 作为用户名但密码不同），彼此的配额与限流仍完全隔离。详见[发送频率、配额与过滤](/zh/channels/pacing-and-quotas)。
+- **从 `v0.1.x` 升级至 `v0.2.0` 的自动合并规则**：自动迁移仅在 `host`、`port`、`username`、`password`、`security` 与 `from_address` 六项字段**完全一致**时才将旧 SMTP 通道合并为同一个 SMTP 账号；合并后的配额、间隔、冷却与代理仅统计组内**已启用（`enabled = true`）**的旧通道（仅当全组均被禁用时才回退统计全部）。详见[从 `v0.1.x` 升级至 `v0.2.0`](/zh/guide/operations#upgrading-from-v0-1-x-to-v0-2-0)。
 
 ---
 

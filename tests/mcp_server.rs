@@ -1421,3 +1421,86 @@ async fn mcp_session_revalidates_revoked_token_and_supports_feed_id_preview() {
 
     server_task.abort();
 }
+
+#[tokio::test]
+async fn mcp_schema_lists_clear_cache_destinations_and_rejects_zero_dest_channel_id() {
+    let harness = spawn_mcp_harness(false).await;
+    let mut admin = McpHttpClient::new(&harness.mcp_url, &harness.admin_token);
+    let _init = admin.initialize().await;
+
+    // 1. P3-04: Verify `tools/list` schema descriptions include `clear_cache` and `destinations`.
+    let tools = admin.list_tools().await;
+    assert_eq!(tools.len(), 9);
+    let manage_feed_tool = tools
+        .iter()
+        .find(|t| t["name"] == "manage_feed")
+        .expect("manage_feed tool");
+    let manage_feed_str = serde_json::to_string(manage_feed_tool).unwrap();
+    assert!(
+        manage_feed_str.contains("clear_cache"),
+        "manage_feed schema/description must document clear_cache: {manage_feed_str}"
+    );
+    let list_status_tool = tools
+        .iter()
+        .find(|t| t["name"] == "list_feeds_status")
+        .expect("list_feeds_status tool");
+    let list_status_desc = list_status_tool["description"].as_str().unwrap_or("");
+    assert!(
+        list_status_desc.contains("destinations"),
+        "list_feeds_status description must mention destinations: {list_status_desc}"
+    );
+
+    // 2. Create a channel with 0 destinations -> MCP `configure_route` using `channel_id` fails with validation_error.
+    let empty_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+        bot_token: "111222333:zero_dest_bot".to_string(),
+        api_base_url: None,
+    });
+    let zero_dest_ch = harness
+        .db
+        .create_channel(&NewChannel {
+            name: "Zero Dest Account".to_string(),
+            kind: ChannelKind::Telegram,
+            encrypted_config: harness.master_key.encrypt_json(&empty_cfg).unwrap(),
+            credential_group_key: empty_cfg.credential_group_key(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let zero_res = admin
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Zero Dest Route",
+                "channel_id": zero_dest_ch.id
+            }),
+        )
+        .await;
+    assert_eq!(zero_res["isError"], true);
+    assert_eq!(extract_tool_payload(&zero_res)["error"], "validation_error");
+
+    // 3. P3-02: Non-zero equal time window (`09:00`–`09:00`) is rejected via MCP `configure_route`.
+    let bad_eq_res = admin
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Equal Window Route",
+                "destination_id": harness.trusted_destination_id,
+                "active_windows": [{ "start": "09:00", "end": "09:00" }]
+            }),
+        )
+        .await;
+    assert_eq!(bad_eq_res["isError"], true);
+    assert_eq!(
+        extract_tool_payload(&bad_eq_res)["error"],
+        "validation_error"
+    );
+}

@@ -45,7 +45,7 @@ Telegram 通道支持将订阅文章推送到**个人私聊**、**普通群组**
 | :--- | :---: | :--- | :--- |
 | `name` | 否 | *自动获取* | 账号显示名称。留空时自动调用 Telegram `getMe` 获取机器人的 `@username`。 |
 | `bot_token` | 是 | — | 从 `@BotFather` 获取的机器人令牌（加密保存在数据库中，WebUI 仅展示脱敏提示）。 |
-| `api_base_url` | 否 | `null` | 自定义 Bot API 服务地址（留空默认使用官方 `https://api.telegram.org`）。支持填写反向代理地址或自建 Local Bot API Server 地址。 |
+| `api_base_url` | 否 | `null` | 自定义 Bot API 服务地址（留空默认使用官方 `https://api.telegram.org`）。仅允许不含 userinfo、查询参数（query）或片段（fragment）的 `http://` / `https://` URL，且所有请求均强制执行连接期 `SsrfPolicy` 校验。 |
 
 ### Telegram 目的地字段（单 Bot 可添加多个）
 
@@ -89,6 +89,19 @@ Telegram 通道支持将订阅文章推送到**个人私聊**、**普通群组**
 
 > [!TIP]
 > 想在保存路由前试看某种模式的效果？在**订阅源预览**窗口的 **Debug push** 栏选择 Telegram 目的地、模式、链接预览、语言与可选时区，即可把真实条目推送过去，且不会影响队列。参见[调试推送](/zh/channels/pacing-and-quotas#debug-push-from-the-feed-preview)。
+
+---
+
+## 4. 自建 Local Bot API Server 与 SSRF 校验 {#self-hosted-local-bot-api-server}
+
+**所有** Telegram Bot API 请求（包括官方 `https://api.telegram.org` 以及自定义的 `api_base_url` / 自建 Local Bot API Server）均强制经过连接期 `SsrfPolicy` DNS IP 校验（共享可热更新的 `SSRF_ALLOWLIST`），并禁用自动 HTTP 重定向：
+
+- `api_base_url` 仅允许 `http://` 或 `https://` 协议，禁止携带 userinfo（`user:pass@`）、查询字符串（`?…`）或片段（`#…`）；
+- 创建、编辑或探测 Telegram 账号时，若目标地址被 SSRF 策略拦截，服务端将返回 HTTP `403`（`ssrf_blocked`）。
+
+> [!WARNING]
+> **升级注意：存量内网 Local Bot API 不会自动放行**
+> 从 `v0.1.x` 升级至 `v0.2.0` 后，已配置的内网/私网 Local Bot API 地址**不会**被自动加入白名单。如果你的 `api_base_url` 指向环回地址、Docker 内部服务或私网地址（例如 `http://telegram-bot-api.internal:8081`），请务必通过环境变量或 WebUI **Settings** 将其主机名或 IP/CIDR 手动添加到 [`SSRF_ALLOWLIST`](/zh/guide/configuration#allowing-trusted-internal-services-ssrf-allowlist)。
 
 ---
 

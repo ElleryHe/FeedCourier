@@ -670,8 +670,10 @@ pub struct CreateChannelRequest {
 
 /// Secret-preserving account patch payload (`PATCH /api/v1/channels/{id}`).
 ///
-/// When `password` / `bot_token` / `integration_secret` is omitted, `null`, or empty,
-/// the backend preserves the stored encrypted secret intact.
+/// - For `bot_token` / `integration_secret`: omitting, passing `null`, or passing `""` preserves
+///   the stored encrypted secret intact.
+/// - For SMTP `password`: omitting or passing `""` preserves the stored password; passing explicit
+///   JSON `null` clears the stored password (e.g. switching to unauthenticated relay).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelTargetPatch {
@@ -682,8 +684,8 @@ pub enum ChannelTargetPatch {
         port: Option<u16>,
         #[serde(default, deserialize_with = "deserialize_optional_nullable")]
         username: Option<Option<String>>,
-        #[serde(default)]
-        password: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        password: Option<Option<String>>,
         #[serde(default)]
         security: Option<SmtpSecurity>,
         #[serde(default)]
@@ -728,9 +730,10 @@ impl ChannelTargetPatch {
                     Some(opt) => normalize_opt_string(opt.clone()),
                     None => cur.username.clone(),
                 };
-                let next_password = match password.as_deref() {
-                    Some(raw) if !raw.is_empty() => Some(raw.to_string()),
-                    _ => cur.password.clone(),
+                let next_password = match password {
+                    Some(None) => None,
+                    Some(Some(raw)) if !raw.is_empty() => Some(raw.clone()),
+                    None | Some(Some(_)) => cur.password.clone(),
                 };
 
                 let merged = ChannelConfig::Smtp(SmtpChannelConfig {

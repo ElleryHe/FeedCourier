@@ -96,7 +96,7 @@ WebUI 内部预览接口（`POST /api/v1/feeds/preview`）会返回清洗后的 
 
 ## 4. 连接层防 SSRF 客户端（`src/net/ssrf.rs`、`src/net/mod.rs`）
 
-所有订阅源轮询、预览、Readability 全文提取以及 Telegram 防盗链媒体回退下载，均通过统一的 `ProtectedHttpClient` 与注入 `reqwest` 底层的 `SsrfDnsResolver`（实现 `reqwest::dns::Resolve`）执行。
+所有订阅源轮询、预览、Readability 全文提取、Telegram 防盗链媒体回退下载，以及**所有 Telegram Bot API 请求**（包括官方 `https://api.telegram.org` 与自定义 `api_base_url` / 自建 Local Bot API Server），均通过共享可热更新的 `Arc<RwLock<SsrfPolicy>>` 与注入 `reqwest` 底层的 `SsrfDnsResolver`（实现 `reqwest::dns::Resolve`）执行连接期防 SSRF 校验。
 
 ```mermaid
 sequenceDiagram
@@ -153,3 +153,9 @@ sequenceDiagram
 当通过 MCP `manage_feed(action = "add")` 或 REST API `POST /api/v1/feeds` 添加订阅源时，系统在插入 `feeds` 行后会立即执行一次初始拉取：
 - 若首次拉取返回普通临时网络错误（如上游超时），订阅源保留在库中并返回告警，交由后台指数退避重试；
 - 若首次拉取触发 **`AppError::SsrfBlocked`**，处理器会立即调用 `db.delete_feed(created.id)` **自动回滚删除刚创建的订阅源记录**，并返回 `ssrf_blocked` 错误，防止被拦截的内网探测地址残留在数据库中被后台调度器反复轮询。
+
+### 5. Telegram Bot API（`api_base_url`）防 SSRF 强校验
+`TelegramSender` 注入同一份共享的 `Arc<RwLock<SsrfPolicy>>`（当 `PUT /api/v1/settings` 热更新 `ssrf_allowlist` 时同步刷新）：
+- **连接期 DNS 校验与禁用重定向**：所有 Telegram Bot API 请求（官方地址与自定义 `api_base_url` / 自建 Local Bot API Server）均经过 `SsrfDnsResolver` 连接期解析校验，并禁用自动重定向（`redirect::Policy::none()`）；走 `OUTBOUND_PROXY` 代理时仍对字面量 IP 与 `localhost` 执行逐跳校验。
+- **严格的 `api_base_url` 语法校验**：仅允许 `http://` 与 `https://` 协议，禁止携带 userinfo（`user:pass@`）、查询字符串（`?…`）或片段（`#…`）；创建、编辑或探测时触发 SSRF 拦截统一返回 HTTP `403`（`ssrf_blocked`）。
+- **存量内网地址不自动放行**：升级至 `v0.2.0` 时，已配置的内网/私网 Local Bot API 地址不会被自动加入白名单，运维人员需手动将其主机名或 IP/CIDR 添加至 `SSRF_ALLOWLIST`。

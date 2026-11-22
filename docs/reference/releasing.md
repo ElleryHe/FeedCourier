@@ -72,6 +72,29 @@ In parallel, `docker-build` compiles `linux/amd64` natively on `ubuntu-24.04` an
 
 ---
 
+## Release Checklist
+
+When preparing a new release (e.g., merging `develop` into `main`), keep all version references synchronized before opening the release PR:
+
+1. **Synchronize the release version across all files**:
+   - `Cargo.toml` (`[package].version`)
+   - `Cargo.lock` (`feedcourier` package entry)
+   - `web/package.json` (`version`)
+   - `docs/package.json` (`version`)
+   - `web/src/api/types.ts` (`DEFAULT_VERSION`)
+   - `CHANGELOG.md` (add the matching `## [<version>] - YYYY-MM-DD` section and comparison links)
+2. **Run local verification checks on `develop`**:
+   ```bash
+   pnpm --dir web exec tsc --noEmit && pnpm --dir web build
+   pnpm --dir docs build
+   cargo fmt --all -- --check
+   cargo clippy --all-targets --locked -- -D warnings
+   cargo test --all-targets --locked
+   ```
+3. **Open and merge the PR into `main`**: Once merged, GitHub Actions automatically tags `v<version>`, builds all four platform archives, publishes the multi-arch Docker Hub manifest, and creates the GitHub Release.
+
+---
+
 ## Documentation Site Deployment (`feedcourier.ellery.me`)
 
 The bilingual VitePress documentation site in `docs/` deploys to **Cloudflare Workers Static Assets** via `docs/wrangler.jsonc`:

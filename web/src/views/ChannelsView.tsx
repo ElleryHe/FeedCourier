@@ -204,6 +204,7 @@ export function ChannelsView() {
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
     onError: (err) => {
       toast.error(m.channels.toastDeleteFailed, errorMessage(err));
@@ -248,6 +249,7 @@ export function ChannelsView() {
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
       void queryClient.invalidateQueries({ queryKey: ["overview"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
     },
     onError: (err) => {
       toast.error(m.channels.toastDestDeleteFailed, errorMessage(err));
@@ -1224,6 +1226,7 @@ function ChannelAccountModal({
     initialSmtp?.username ?? "",
   );
   const [smtpPassword, setSmtpPassword] = useState("");
+  const [clearSmtpPassword, setClearSmtpPassword] = useState(false);
   const [smtpFromAddress, setSmtpFromAddress] = useState(
     initialSmtp?.from_address ?? "",
   );
@@ -1282,7 +1285,11 @@ function ChannelAccountModal({
             port: smtpPort,
             security: smtpSecurity,
             username: smtpUsername.trim() || null,
-            password: smtpPassword.trim() ? smtpPassword : null,
+            ...(clearSmtpPassword
+              ? { password: null }
+              : smtpPassword.trim()
+                ? { password: smtpPassword }
+                : {}),
             from_address: smtpFromAddress.trim(),
           };
         } else if (kind === "telegram") {
@@ -1598,7 +1605,11 @@ function ChannelAccountModal({
                 <Input
                   type="password"
                   value={smtpPassword}
-                  onChange={(e) => setSmtpPassword(e.target.value)}
+                  disabled={clearSmtpPassword}
+                  onChange={(e) => {
+                    setSmtpPassword(e.target.value);
+                    if (e.target.value) setClearSmtpPassword(false);
+                  }}
                   placeholder={
                     initialSmtp?.has_password
                       ? m.channels.wizard.smtp.passwordStoredPlaceholder
@@ -1606,6 +1617,20 @@ function ChannelAccountModal({
                   }
                   className="mt-1 font-mono text-xs"
                 />
+                {isEdit && initialSmtp?.has_password && (
+                  <label className="mt-1.5 inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    <input
+                      type="checkbox"
+                      checked={clearSmtpPassword}
+                      onChange={(e) => {
+                        setClearSmtpPassword(e.target.checked);
+                        if (e.target.checked) setSmtpPassword("");
+                      }}
+                      className="h-3.5 w-3.5 rounded border-zinc-300 accent-zinc-900 dark:border-zinc-700 dark:accent-zinc-100"
+                    />
+                    <span>{m.channels.wizard.smtp.clearPasswordLabel}</span>
+                  </label>
+                )}
               </div>
             </div>
 

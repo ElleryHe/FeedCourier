@@ -465,6 +465,7 @@ export const zhCN: Messages = {
         usernameLabel: "SMTP 用户名",
         passwordLabel: "SMTP 密码 / 专用授权码",
         passwordStoredPlaceholder: "已加密保存（••••••••），留空保持不变",
+        clearPasswordLabel: "清空已保存密码",
         fromLabel: "发件人邮箱地址（需通过 SPF/DKIM 校验）",
         fromHint:
           "发件人显示名会自动带入对应订阅源标题，并注入标准 Message-ID 与 List-ID 邮件头便于收件箱归档。",

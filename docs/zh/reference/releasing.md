@@ -67,19 +67,26 @@ flowchart LR
 
 ## 3. 标准发版操作清单（Release Checklist）
 
-发布新版本（例如从 `develop` 合入 `main`）时，只需在 `develop` 完成版本准备并合并 PR 即可自动完成打标与发版：
+发布新版本（例如从 `develop` 合入 `main`）时，在 `develop` 同步全部版本号文件并通过检查后合并 PR，即可自动完成打标与发版：
+
+1. **同步以下所有文件中的计划版本号**：
+   - `Cargo.toml`（`[package].version`）
+   - `Cargo.lock`（`feedcourier` 包版本号）
+   - `web/package.json`（`version`）
+   - `docs/package.json`（`version`）
+   - `web/src/api/types.ts`（`DEFAULT_VERSION`）
+   - `CHANGELOG.md`（新增对应 `## [<version>] - YYYY-MM-DD` 章节与对比链接）
+2. **在 `develop` 分支执行并确保本地检查全部通过**：
 
 ```bash
-# 1. 在 develop 分支完成并通过本地检查
-pnpm --dir web build
+pnpm --dir web exec tsc --noEmit && pnpm --dir web build
 pnpm --dir docs build
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
-
-# 2. 在 develop 分支更新 Cargo.toml 计划版本号与 CHANGELOG.md 对应版本章节并推送
-# 3. 发起 PR 合入 main 分支 —— 合并后 GitHub Actions 将自动创建 v<version> 标签并发布全平台产物与 Docker 镜像
 ```
+
+3. **发起 PR 合入 `main` 分支**：合并后 GitHub Actions 将自动创建 `v<version>` 附注标签，构建四平台归档与双架构 Docker 镜像，并发布 GitHub Release。
 
 ---
 

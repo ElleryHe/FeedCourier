@@ -423,14 +423,14 @@ fn parse_html_attrs(s: &str) -> Vec<ParsedAttr> {
                 break;
             }
 
-            let val = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let raw_val = if bytes[i] == b'"' || bytes[i] == b'\'' {
                 let q = bytes[i];
                 i += 1;
                 let val_start = i;
                 while i < bytes.len() && bytes[i] != q {
                     i += 1;
                 }
-                let extracted = s[val_start..i].to_string();
+                let extracted = &s[val_start..i];
                 if i < bytes.len() && bytes[i] == q {
                     i += 1;
                 }
@@ -440,12 +440,12 @@ fn parse_html_attrs(s: &str) -> Vec<ParsedAttr> {
                 while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                     i += 1;
                 }
-                s[val_start..i].to_string()
+                &s[val_start..i]
             };
 
             out.push(ParsedAttr {
                 name,
-                value: Some(val),
+                value: Some(decode_basic_html_entities(raw_val)),
             });
         } else {
             out.push(ParsedAttr { name, value: None });

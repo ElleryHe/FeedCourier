@@ -1,10 +1,10 @@
 ---
-description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、channel_destinations、routes、delivery_tasks、sessions、mcp_tokens 与 system_settings。"
+description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feeds、entries、channels、channel_destinations、routes、delivery_tasks、delivery_quota_ledger、sessions、mcp_tokens 与 system_settings。"
 ---
 
 # SQLite 数据库表结构参考
 
-FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) 与 [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql)（升级 `v0.1.x` 数据库时还会由启动钩子 `Database::migrate_channels_to_v2` 先生成 `<DATA_DIR>/pre-v0.2.0-backup.db` 快照并在单事务内完成通道拆分合并）。所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，所有外键关联均启用 **`ON DELETE CASCADE`** 级联清理。
+FeedCourier 的全部持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql) 与 [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql)。升级存量 `v0.1.x` 数据库时，`Database::connect` 会**先于 `0002_channel_destinations.sql` 执行** `VACUUM INTO` 生成纯 `v0.1.x` 快照 `<DATA_DIR>/pre-v0.2.0-backup.db`（若已存在则写为带 UTC 时间戳的 `pre-v0.2.0-backup-<timestamp>.db`，不覆盖旧备份），随后再由启动钩子 `Database::migrate_channels_to_v2` 在单事务内完成通道拆分合并。所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，业务表外键关联均启用 **`ON DELETE CASCADE`** 级联清理（`delivery_quota_ledger` 刻意不设外键，确保删除操作不会清空配额计数）。
 
 ---
 
@@ -162,7 +162,7 @@ erDiagram
 | `name` | `TEXT` | `NOT NULL` | 账号显示名称（留空时自动取 Telegram `getMe` `@username`、SMTP `from_address` 或 Notion `/v1/users/me` 集成名）。 |
 | `kind` | `TEXT` | `NOT NULL CHECK (IN ('smtp', 'telegram', 'notion'))` | 通道协议类型。 |
 | `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的账号级 `ChannelConfig` JSON 密文（`12B nonce \|\| ciphertext \|\| 16B tag`）。 |
-| `credential_group_key` | `TEXT` | `NOT NULL` | 基于底层发信身份计算的 SHA-256 分组标识，使同账号与同凭据组共享步进、配额与冷却时间。 |
+| `credential_group_key` | `TEXT` | `NOT NULL` | 基于底层发信身份计算的 SHA-256 分组标识（SMTP 纳入密码的 SHA-256 摘要且不存明文，使共用用户名但不同 API Key 的账号如 SendGrid `apikey` 保持隔离），使同账号与同凭据组共享步进、配额与冷却时间。 |
 | `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 探测到的平台能力快照（如 Telegram `supports_rich_message`、`bot_api_version`、`bot_username`、`fallback_reason`）。 |
 | `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15 CHECK (>= 0)` | 账号下全部目的地共享的最小发信间隔秒数。 |
 | `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10 CHECK (>= 0)` | 每次投递后独立抽取的随机抖动上限秒数（仅存内存）。 |
@@ -243,8 +243,26 @@ erDiagram
   - `idx_delivery_tasks_status_next_attempt ON delivery_tasks (status, next_attempt_at)` —— 用于 Worker 按到期时间领取待发任务（领取时再通过 `entries` 关联，按 `COALESCE(entries.published_at, entries.discovered_at)` 排序，从而让多个订阅源形成统一的时间顺序流）。
   - `idx_delivery_tasks_status_lease ON delivery_tasks (status, lease_until)` —— 用于发现并接管过期租约任务。
   - `idx_delivery_tasks_entry_status ON delivery_tasks (entry_id, status)` —— 支撑 `entries` 正文 GC 的 `NOT EXISTS` 子查询。
-  - `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` —— 支撑滚动小时/每日配额（`hourly_quota` / `daily_quota`）统计。
+  - `idx_delivery_tasks_channel_status_completed ON delivery_tasks (channel_id, status, completed_at)` —— 支撑通道历史投递查询及 `v0.2.0` 升级时向 `delivery_quota_ledger` 的近 24 小时回填。
   - `idx_delivery_tasks_destination_id ON delivery_tasks (destination_id)`
+
+---
+
+## 5b. `delivery_quota_ledger`（持久化配额与步进流水表）
+
+在 `migrations/0002_channel_destinations.sql` 中新增，用于将滚动 1 小时 / 24 小时配额统计与 `last_completed_at` 步进时间戳与会被级联删除的 `delivery_tasks` 解耦。该表**刻意不设置任何业务外键**（不关联 `feeds`、`routes`、`channel_destinations` 或 `channels`），因此删除订阅源、路由、目的地或执行清除缓存（Clear cache）绝不会清零滚动配额或重置步进间隔。
+
+| 字段名 | 类型 | 约束与默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 配额流水主键 ID。 |
+| `credential_group_key` | `TEXT` | `NOT NULL` | 投递成功时的账号凭据组标识。 |
+| `channel_id` | `INTEGER` | `NOT NULL` | 投递成功时的父通道账号 ID（无外键约束）。 |
+| `completed_at` | `INTEGER` | `NOT NULL` | 投递成功时的 UTC Unix 纪元秒。 |
+
+- **生命周期**：每次投递成功时追加写入（升级 `v0.2.0` 时自动从近 24 小时 `delivered` 任务回填）；超过 24 小时（`86,400` 秒）的历史记录由每小时后台维护协程自动清理。
+- **索引**：
+  - `idx_delivery_quota_ledger_group_completed ON delivery_quota_ledger (credential_group_key, completed_at)` —— 支撑按凭据组统计滚动 1h / 24h 配额及查询 `last_completed_at`。
+  - `idx_delivery_quota_ledger_channel_completed ON delivery_quota_ledger (channel_id, completed_at)`
 
 ---
 

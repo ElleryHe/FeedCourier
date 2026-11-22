@@ -473,6 +473,13 @@ pub async fn create_channel(
                         .unwrap_or_else(|| "Telegram Bot".to_string());
                     (default_name, serde_json::to_string(&caps)?)
                 }
+                Err(
+                    err @ (AppError::SsrfBlocked(_)
+                    | AppError::Unauthorized(_)
+                    | AppError::NotFound(_)),
+                ) => {
+                    return Err(err);
+                }
                 Err(err) => {
                     warn!(
                         error = %err,
@@ -594,15 +601,25 @@ pub async fn update_channel(
         patch.credential_group_key = Some(merged_cfg.credential_group_key());
         patch.encrypted_config = Some(state.master_key().encrypt_json(&merged_cfg)?);
 
-        if tg_endpoint_changed
-            && let ChannelConfig::Telegram(ref tg_cfg) = merged_cfg
-            && let Ok(caps) = state
+        if tg_endpoint_changed && let ChannelConfig::Telegram(ref tg_cfg) = merged_cfg {
+            match state
                 .runtime()
                 .telegram_sender()
                 .probe_capabilities(tg_cfg, req.use_proxy.unwrap_or(existing.use_proxy))
                 .await
-        {
-            patch.capabilities_json = Some(serde_json::to_string(&caps)?);
+            {
+                Ok(caps) => {
+                    patch.capabilities_json = Some(serde_json::to_string(&caps)?);
+                }
+                Err(err @ AppError::SsrfBlocked(_)) => return Err(err),
+                Err(err) => {
+                    warn!(
+                        channel_id,
+                        error = %err,
+                        "best-effort Telegram capability probe skipped during channel update"
+                    );
+                }
+            }
         }
     }
 
@@ -874,7 +891,7 @@ async fn create_destination_for_channel(
 
     let name = match explicit_name {
         Some(n) => n,
-        None => derive_default_destination_name(state, channel, account_cfg, &req.config).await,
+        None => derive_default_destination_name(state, channel, account_cfg, &req.config).await?,
     };
 
     let encrypted_config = state.master_key().encrypt_json(&req.config)?;
@@ -894,7 +911,7 @@ async fn derive_default_destination_name(
     channel: &Channel,
     account_cfg: &ChannelConfig,
     dest_cfg: &DestinationConfig,
-) -> String {
+) -> AppResult<String> {
     match (account_cfg, dest_cfg) {
         (ChannelConfig::Telegram(tg_acc), DestinationConfig::Telegram(tg_dest)) => {
             match state
@@ -903,8 +920,9 @@ async fn derive_default_destination_name(
                 .get_chat_name(tg_acc, &tg_dest.chat_id, channel.use_proxy)
                 .await
             {
-                Ok(Some(chat_name)) => chat_name,
-                Ok(None) => tg_dest.chat_id.trim().to_string(),
+                Ok(Some(chat_name)) => Ok(chat_name),
+                Ok(None) => Ok(tg_dest.chat_id.trim().to_string()),
+                Err(err @ AppError::SsrfBlocked(_)) => Err(err),
                 Err(err) => {
                     warn!(
                         channel_id = channel.id,
@@ -912,16 +930,17 @@ async fn derive_default_destination_name(
                         error = %err,
                         "best-effort Telegram getChat lookup skipped; falling back to chat_id"
                     );
-                    tg_dest.chat_id.trim().to_string()
+                    Ok(tg_dest.chat_id.trim().to_string())
                 }
             }
         }
-        (_, DestinationConfig::Smtp(smtp_dest)) => smtp_dest
+        (_, DestinationConfig::Smtp(smtp_dest)) => Ok(smtp_dest
             .to_addresses
-            .first()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "SMTP Recipient".to_string()),
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "SMTP Recipient".to_string())),
         (ChannelConfig::Notion(n_acc), DestinationConfig::Notion(n_dest)) => {
             match state
                 .runtime()
@@ -933,8 +952,8 @@ async fn derive_default_destination_name(
                 )
                 .await
             {
-                Ok(Some(title)) => title,
-                Ok(None) => n_dest.data_source_id.clone(),
+                Ok(Some(title)) => Ok(title),
+                Ok(None) => Ok(n_dest.data_source_id.clone()),
                 Err(err) => {
                     warn!(
                         channel_id = channel.id,
@@ -942,11 +961,11 @@ async fn derive_default_destination_name(
                         error = %err,
                         "best-effort Notion database title lookup skipped; falling back to data_source_id"
                     );
-                    n_dest.data_source_id.clone()
+                    Ok(n_dest.data_source_id.clone())
                 }
             }
         }
-        _ => "Destination".to_string(),
+        _ => Ok("Destination".to_string()),
     }
 }
 
@@ -1219,8 +1238,11 @@ pub async fn update_route(
         enabled: req.enabled,
     };
 
+    let should_wake_outbox =
+        req.enabled == Some(true) || resolved_destination_id.is_some() || patch.options.is_some();
+
     let updated = state.db().update_route(route_id, &patch).await?;
-    if req.enabled == Some(true) {
+    if should_wake_outbox {
         state.runtime().notify_outbox();
     }
 

@@ -24,7 +24,13 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { type ChangeEvent, type FormEvent, useMemo, useState } from "react";
+import {
+  type ChangeEvent,
+  type FormEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import { api } from "@/api/client";
 import type {
   ChannelDestinationDto,
@@ -286,6 +292,11 @@ export function FeedsView({ initialStatusFilter = "all" }: FeedsViewProps) {
 
   const totalItems = filteredSortedFeeds.length;
   const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
   const safePage = Math.min(Math.max(1, page), totalPages);
   const pageStart = (safePage - 1) * pageSize;
   const paginatedFeeds = useMemo(

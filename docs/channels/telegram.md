@@ -27,7 +27,7 @@ The Telegram channel delivers articles to **private chats**, **groups**, **super
 | :--- | :---: | :--- | :--- |
 | `name` | No | *Auto-fetched* | Account display name. If left blank, automatically fetched via Telegram `getMe` (`@username`). |
 | `bot_token` | Yes | — | Bot Token from `@BotFather` (encrypted at rest; shown masked in the WebUI). |
-| `api_base_url` | No | `https://api.telegram.org` | Optional custom Bot API server URL (for reverse proxies or self-hosted Local Bot API servers). |
+| `api_base_url` | No | `https://api.telegram.org` | Optional custom Bot API server URL (for reverse proxies or self-hosted Local Bot API servers). Only `http://` or `https://` URLs without userinfo, query string, or fragment are permitted, and all requests enforce connect-time `SsrfPolicy` validation. |
 
 ### Telegram Destination Fields (Add Multiple per Bot)
 
@@ -83,9 +83,16 @@ In the **Feed Preview** modal, the **Debug push** bar sends a real item to a Tel
 
 ---
 
-## 3. Self-Hosted Local Bot API Server {#self-hosted-local-bot-api-server}
+## 3. Self-Hosted Local Bot API Server & SSRF Validation {#self-hosted-local-bot-api-server}
 
-If you point `api_base_url` to a self-hosted Telegram Bot API server running on your private network or Docker bridge (for example, `http://telegram-bot-api.internal:8081`), add its hostname or IP range to [`SSRF_ALLOWLIST`](/guide/configuration#allowing-trusted-internal-services-ssrf-allowlist) under **Settings** so outbound connections to that private address are permitted.
+**All** Telegram Bot API requests—both to the official `https://api.telegram.org` endpoint and to any custom `api_base_url` (including self-hosted Local Bot API servers)—enforce connect-time `SsrfPolicy` DNS IP validation (sharing the hot-reloadable `SSRF_ALLOWLIST`) with automatic HTTP redirects disabled. In addition:
+
+- `api_base_url` only allows `http://` or `https://` schemes and rejects embedded userinfo (`user:pass@`), query strings (`?…`), or fragments (`#…`).
+- Account creation, updates, and capability probes blocked by SSRF policy return HTTP `403` (`ssrf_blocked`).
+
+::: warning Upgrade Note for Existing Local Bot API Servers
+Existing internal or private-network Local Bot API endpoints configured prior to `v0.2.0` are **not** automatically allowlisted. If your `api_base_url` points to localhost, a Docker bridge service, or an RFC 1918 private network (for example, `http://telegram-bot-api.internal:8081`), you must explicitly add its hostname or IP/CIDR to [`SSRF_ALLOWLIST`](/guide/configuration#allowing-trusted-internal-services-ssrf-allowlist) via environment variable or under **Settings** so outbound connections are permitted.
+:::
 
 ---
 

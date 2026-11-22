@@ -194,7 +194,7 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 | `link_preview` | `bool?` | Optional | Enable link preview in compact/text Telegram messages (`true` by default). |
 | `locale` | `string?` | Optional | Delivery language of this route: `"en"` or `"zh-CN"`. |
 | `timezone` | `string?` | Optional | Optional per-route IANA timezone override (e.g., `"Asia/Shanghai"`; `""` clears on `"update"` to inherit the system timezone). Governs delivery windows, SMTP article timestamps, and Telegram rich-message footer timestamps. |
-| `active_windows` | `{start, end}[]?` | Optional | Daily delivery windows in the **route timezone** (inheriting system timezone), e.g. `[{"start":"08:00","end":"22:00"}]`. `end` earlier than `start` wraps midnight; `start == end` means all day; `[]` means always. |
+| `active_windows` | `{start, end}[]?` | Optional | Daily delivery windows in the **route timezone** (inheriting system timezone) with DST-safe boundaries, e.g. `[{"start":"08:00","end":"22:00"}]`. `end` earlier than `start` wraps midnight; only `00:00`–`00:00` (or `[]`) means all day—other `start == end` windows are rejected with a validation error. |
 | `active_weekdays` | `u8[]?` | Optional | Allowed weekdays `1` (Mon) – `7` (Sun); `[]` means every day. |
 | `enabled` | `bool?` | Optional | Whether this route is active (`true` by default). |
 
@@ -217,7 +217,7 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 }
 ```
 
-Tasks outside a route's window or weekdays are still queued and are delivered at the next window start.
+Tasks outside a route's window or weekdays are still queued and are delivered at the next window start. On `"update"`, changing the target destination atomically repoints pending `queued`/`deferred`/`retrying` tasks (clearing checkpoints and resetting `attempt_count = 0`; active `delivering` tasks are untouched), and changing `active_windows`, `active_weekdays`, or `timezone` wakes `queued`/`deferred` tasks immediately.
 
 #### Example Prompt
 > *"Create a route sending all feeds with the `rust` tag to Telegram destination #5 in `rich_message` mode, using `America/New_York` timezone on weekdays between 08:00 and 22:00."*

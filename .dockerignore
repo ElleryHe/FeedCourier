@@ -20,6 +20,9 @@ docs/
 .git/
 .github/
 
+# Local QA / security review reports
+QA/
+
 # Local environment & OS files
 .env
 .env.*

@@ -638,7 +638,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
 
 #[tokio::test]
 async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
 
     // Case A: Bot API 10.4 server returns `400 Bad Request: chat_id is empty` on `{}` probe
     let modern_server = MockServer::start().await;
@@ -731,7 +733,9 @@ async fn telegram_probe_capabilities_10_4_vs_legacy_404() {
 
 #[tokio::test]
 async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
     let feed = sample_feed(7, "Rust Insider");
     let entry = sample_entry("tg-rich-fp", Vec::new());
     let route_opts = RouteOptions {
@@ -1118,7 +1122,9 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
     );
 
     // 2) 0-media fallback -> calls `sendMessage` with 3-line text
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
     let media_opts = RouteOptions {
         telegram_mode: TelegramDeliveryMode::MediaMode,
         link_preview: true,
@@ -1447,7 +1453,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             },
         );
 
-        let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher { blobs }));
+        let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher { blobs }))
+            .with_ssrf_allowlist(&["127.0.0.1/32"])
+            .expect("allowlist");
         let entry = sample_entry(
             "mp-fallback",
             vec![
@@ -1545,7 +1553,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             .await;
 
         let fetcher = DefaultMediaStreamFetcher::new().with_allow_private_for_tests(true);
-        let sender = TelegramSender::with_media_fetcher(Arc::new(fetcher));
+        let sender = TelegramSender::with_media_fetcher(Arc::new(fetcher))
+            .with_ssrf_allowlist(&["127.0.0.1/32"])
+            .expect("allowlist");
 
         let huge_url = format!("{}/huge-photo.jpg", media_origin.uri());
         let entry = sample_entry(
@@ -1667,7 +1677,9 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             .mount(&kicked_server)
             .await;
 
-        let sender = TelegramSender::new();
+        let sender = TelegramSender::new()
+            .with_ssrf_allowlist(&["127.0.0.1/32"])
+            .expect("allowlist");
         let entry = sample_entry("kicked-entry", Vec::new());
         let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
             bot_token: "TOK_KICK".to_owned(),
@@ -1804,6 +1816,8 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
     let sender = TelegramSender::with_media_fetcher(Arc::new(MockMediaFetcher {
         blobs: blobs.clone(),
     }))
+    .with_ssrf_allowlist(&["127.0.0.1/32"])
+    .expect("allowlist")
     .with_locale(AppLocale::ZhCn);
 
     let feed = sample_feed(9, "Video Feed");
@@ -2115,7 +2129,9 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
         .mount(&server)
         .await;
 
-    let sender = TelegramSender::new();
+    let sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
     let cfg = TelegramChannelConfig {
         bot_token: "TOK_RICH2".to_owned(),
         api_base_url: Some(server.uri()),
@@ -2235,5 +2251,189 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
     assert!(
         rich_html.contains("<tg-slideshow>") && rich_html.contains("</tg-slideshow>"),
         "11 consecutive images must group into <tg-slideshow>:\n{rich_html}"
+    );
+}
+
+#[tokio::test]
+async fn telegram_ssrf_guard_blocks_loopback_metadata_redirects_and_invalid_base_urls() {
+    // 1. `ChannelConfig::Telegram.validate()` rejects invalid schemes, userinfo, query, and fragment.
+    for bad_base in [
+        "ftp://bot.example.com",
+        "http://user:pass@bot.example.com",
+        "https://bot.example.com?token=1",
+        "https://bot.example.com#frag",
+        "not-a-url",
+    ] {
+        let cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+            bot_token: "123:tok".to_owned(),
+            api_base_url: Some(bad_base.to_owned()),
+        });
+        assert!(
+            cfg.validate().is_err(),
+            "invalid api_base_url '{bad_base}' must fail validation"
+        );
+    }
+
+    // 2. Default strict `TelegramSender` blocks loopback (127.0.0.1) and cloud metadata (169.254.169.254).
+    let local_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/botTOK/getMe"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&local_server)
+        .await;
+
+    let strict_sender = TelegramSender::new();
+    let loopback_cfg = TelegramChannelConfig {
+        bot_token: "TOK".to_owned(),
+        api_base_url: Some(local_server.uri()),
+    };
+    assert!(matches!(
+        strict_sender.probe_capabilities(&loopback_cfg, false).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+    assert!(matches!(
+        strict_sender
+            .get_chat_name(&loopback_cfg, "-1001", false)
+            .await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    let metadata_cfg = TelegramChannelConfig {
+        bot_token: "TOK".to_owned(),
+        api_base_url: Some("http://169.254.169.254".to_owned()),
+    };
+    assert!(matches!(
+        strict_sender.probe_capabilities(&metadata_cfg, false).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    // 3. Even when loopback is allowlisted, Bot API 302 redirects are NEVER followed and return SsrfBlocked.
+    let redirect_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/stolen"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/botTOK_REDIR/getMe"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/stolen", target_server.uri())),
+        )
+        .mount(&redirect_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_REDIR/sendMessage"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/stolen", target_server.uri())),
+        )
+        .mount(&redirect_server)
+        .await;
+
+    let allowed_sender = TelegramSender::new()
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .expect("allowlist");
+    let redir_cfg = TelegramChannelConfig {
+        bot_token: "TOK_REDIR".to_owned(),
+        api_base_url: Some(redirect_server.uri()),
+    };
+    assert!(matches!(
+        allowed_sender.probe_capabilities(&redir_cfg, false).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+
+    let feed = sample_feed(1, "Feed");
+    let entry = sample_entry("redir-send", Vec::new());
+    let channel = sample_channel(ChannelKind::Telegram, "{}");
+    let destination = sample_destination();
+    let route_opts = RouteOptions {
+        telegram_mode: TelegramDeliveryMode::CompactCard,
+        ..RouteOptions::default()
+    };
+    let route = sample_route(1, route_opts.clone());
+    let task = sample_task(route.id);
+    let ch_cfg = ChannelConfig::Telegram(redir_cfg);
+    let dest_cfg = DestinationConfig::Telegram(TelegramDestinationConfig {
+        chat_id: "123".to_owned(),
+        message_thread_id: None,
+    });
+    let ctx = DeliveryContext {
+        task: &task,
+        entry: &entry,
+        feed: &feed,
+        route: &route,
+        route_options: route_opts,
+        channel: &channel,
+        channel_config: &ch_cfg,
+        destination: &destination,
+        destination_config: &dest_cfg,
+        timezone: chrono_tz::UTC,
+        checkpoint: None,
+        checkpoint_sink: None,
+    };
+    assert!(matches!(
+        allowed_sender.send(&ctx).await,
+        Err(AppError::SsrfBlocked(_))
+    ));
+}
+
+#[test]
+fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
+    // 1. HTML sanitizer must decode entities before re-escaping attributes (never `&amp;amp;` or `&amp;#39;`).
+    let raw_html = r#"<p><img src="https://cdn.example.com/pic.jpg?a=1&amp;b=2" alt="Tom&#39;s R&amp;D &quot;Lab&quot;" width="50%"></p>"#;
+    let base_url = url::Url::parse("https://cdn.example.com").expect("valid base url");
+    let cleaned = feedcourier::ingest::html::sanitize_and_extract_html(raw_html, Some(&base_url));
+    assert!(
+        !cleaned.content_html.contains("&amp;amp;")
+            && !cleaned.content_html.contains("&amp;#39;")
+            && !cleaned.content_html.contains("&amp;quot;"),
+        "sanitized HTML must not double-escape entities: {}",
+        cleaned.content_html
+    );
+    assert!(
+        cleaned
+            .content_html
+            .contains("src=\"https://cdn.example.com/pic.jpg?a=1&amp;b=2\""),
+        "URL query ampersands must remain single-escaped: {}",
+        cleaned.content_html
+    );
+
+    // 2. SMTP responsive image rewriter preserves relative percentage widths (`width="50%"`) instead of forcing 592px.
+    let smtp_cfg = SmtpChannelConfig {
+        host: "smtp.verified.example.com".to_owned(),
+        port: 587,
+        username: None,
+        password: None,
+        security: SmtpSecurity::StartTls,
+        from_address: "alerts@verified.example.com".to_owned(),
+    };
+    let smtp_dest = SmtpDestinationConfig {
+        to_addresses: vec!["reader@example.org".to_owned()],
+        reply_to: None,
+    };
+    let feed = sample_feed(7, "Design Notes");
+    let mut entry = sample_entry("smtp-percent-width", Vec::new());
+    entry.content_html = Some(cleaned.content_html);
+
+    let built = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 1, None)
+        .expect("build email");
+    assert!(
+        built.html_body.contains("width=\"50%\""),
+        "relative percentage width must be preserved in email HTML:\n{}",
+        built.html_body
+    );
+    assert!(
+        !built.html_body.contains("width=\"592\""),
+        "percentage width must not be overwritten with 592px:\n{}",
+        built.html_body
+    );
+    assert!(
+        !built.html_body.contains("&amp;amp;") && !built.html_body.contains("&amp;#39;"),
+        "email HTML must not double-escape entities:\n{}",
+        built.html_body
     );
 }

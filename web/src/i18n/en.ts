@@ -475,6 +475,7 @@ export const en = {
         usernameLabel: "SMTP Username",
         passwordLabel: "SMTP Password / App Password",
         passwordStoredPlaceholder: "Stored (••••••••) — leave blank to keep",
+        clearPasswordLabel: "Clear stored password",
         fromLabel: "From Address (SPF/DKIM Verified)",
         fromHint:
           "Display name adopts each feed's title, with deterministic Message-ID and List-ID headers.",

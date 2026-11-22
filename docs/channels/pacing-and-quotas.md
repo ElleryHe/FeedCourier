@@ -38,7 +38,7 @@ With the default `15` second minimum interval and `10` second random jitter, con
 
 ::: info How Random Jitter Works
 - **Sampled Independently Per Delivered Task**: Every time a delivery succeeds, FeedCourier draws a fresh uniform random delay in `0..=jitter_max_secs` and adds `min_interval_secs` to compute the earliest allowed send time for the next task. A batch of tasks **never** shares a single jitter value.
-- **In-Memory Only Across Restarts**: The randomized jitter timestamp is kept in memory only. After a process restart, the first delivery honors `min_interval_secs` based on the persisted `last_completed_at` timestamp in SQLite; subsequent deliveries resume full `min_interval_secs + jitter` spacing.
+- **In-Memory Only Across Restarts**: The randomized jitter timestamp is kept in memory only. After a process restart, the first delivery honors `min_interval_secs` based on the persisted `last_completed_at` timestamp in SQLite (`delivery_quota_ledger`); subsequent deliveries resume full `min_interval_secs + jitter` spacing.
 :::
 
 ---
@@ -48,7 +48,7 @@ With the default `15` second minimum interval and `10` second random jitter, con
 Because upstream providers enforce rate limits per Bot Token, SMTP account, or Notion Integration—not per chat or recipient list—FeedCourier enforces all rate limits at the **Channel Account** and **credential group** (`credential_group_key`) level:
 
 - **All Destinations Under One Account**: If one Telegram Bot account sends to 4 groups/topics, one SMTP account sends to 3 recipient groups, or one Notion Integration writes to 2 databases, all of those destinations share the same `min_interval_secs` + per-delivery random jitter, the same `hourly_quota` and `daily_quota`, and the same upstream `429` cooldown window.
-- **Separate Accounts Sharing Identical Credentials**: Even if you create two separate Channel Accounts that use the exact same SMTP login/server, Telegram Bot Token (on the same API base URL), or Notion Integration Secret, FeedCourier automatically links them via `credential_group_key` so their pacing, rolling quotas, and `429` cooldowns are still shared.
+- **Separate Accounts Sharing Identical Credentials**: Even if you create two separate Channel Accounts that use the exact same underlying credentials (SMTP host/port/username + password SHA-256 digest, Telegram Bot Token on the same `api_base_url`, or Notion Integration Secret), FeedCourier automatically links them via `credential_group_key` so their pacing, rolling quotas (enforcing the strictest effective limit in the group), and `429` cooldowns are still shared. Because SMTP includes the password digest, distinct API keys sharing a generic username (such as SendGrid's `apikey`) remain isolated.
 - **Group-Wide Cooldowns**: If any destination receives a `429 Retry-After` response or temporary SMTP throttling, every destination on that account (and any account sharing the same credentials) pauses together until `cooldown_until` elapses.
 
 ---
@@ -64,6 +64,10 @@ When an account reaches its hourly or daily quota:
 - Remaining tasks are placed in **`deferred`** status rather than being dropped or marked as failed.
 - Waiting for a quota window does **not** count against a task's error retry limit.
 - Once the rolling window frees capacity, deferred tasks automatically resume in chronological order.
+
+::: info Persistent Quota Ledger (`delivery_quota_ledger`)
+Every confirmed delivery appends a lightweight record (`credential_group_key`, `channel_id`, `completed_at`) to the dedicated `delivery_quota_ledger` table, which intentionally has no foreign keys to feeds, routes, or destinations and is automatically pruned after 24 hours. Because rolling 1-hour / 24-hour quota usage and `last_completed_at` pacing timestamps are read from this ledger rather than `delivery_tasks`, **deleting feeds, routes, or destinations—or running Clear cache—never resets your quota usage or pacing intervals**.
+:::
 
 ---
 
@@ -107,7 +111,7 @@ Each route can restrict **when** it delivers and customize **how** localized dat
 | Option | Description |
 | :--- | :--- |
 | **`timezone`** | Optional **IANA timezone** override for this route (for example `Asia/Shanghai`, `America/New_York`, or `Europe/London`). When omitted, the route inherits the **system timezone** (default `America/Los_Angeles`, configurable via `TIMEZONE`/`TZ` or **Settings**). |
-| **`active_windows`** | Daily windows as `{ "start": "HH:MM", "end": "HH:MM" }` pairs, evaluated in the **route timezone**. An `end` earlier than `start` wraps past midnight (`22:00`–`06:00`); `start` equal to `end` means the whole day; an empty list means always. |
+| **`active_windows`** | Daily windows as `{ "start": "HH:MM", "end": "HH:MM" }` pairs, evaluated in the **route timezone** with DST-safe boundaries. An `end` earlier than `start` wraps past midnight (`22:00`–`06:00`); **only `00:00`–`00:00` (or an empty list `[]`)** means all day—any other equal `start == end` window (such as `08:00`–`08:00`) is rejected with `400 Bad Request`. |
 | **`active_weekdays`** | Weekdays as numbers `1` (Monday) to `7` (Sunday). An empty list means every day. For a window that wraps midnight, the weekday is the day the window **starts**. |
 | **`locale`** | Delivery language (`en` or `zh-CN`) for localized notification copy. Pre-filled with your current WebUI language on create; routes without it inherit the legacy system locale. |
 
@@ -125,8 +129,10 @@ Localized article timestamps are formatted with an explicit UTC offset—for exa
 2026-11-08 11:00 (UTC+08:00)
 ```
 
-::: info Outside the Window Tasks Are Still Queued
-Tasks are not dropped when a route is outside its window. They stay in the queue (`queued` / `deferred`) with their next attempt scheduled for the **next window start**, and are then delivered in chronological order, still subject to account intervals and quotas.
+::: info DST-Safe Windows, Outside-Window Queuing & Live Route Updates
+- **Outside the Window**: Tasks are not dropped when a route is outside its window. They stay in the queue (`queued` / `deferred`) with their next attempt scheduled for the **next window start**, and are then delivered in chronological order, still subject to account intervals and quotas.
+- **Daylight Saving Time (DST) Safety**: During spring-forward transitions (non-existent local times such as `02:30`), local window boundaries clamp forward to the first valid instant after the gap. During fall-back transitions (ambiguous repeated local times), window starts use the earliest occurrence and window ends use the latest occurrence so deliveries are never cut short.
+- **Updating a Route with Pending Tasks**: Changing a route's target **Destination** atomically repoints pending `queued`, `deferred`, and `retrying` tasks to the new destination, clearing `checkpoint_json` and resetting `attempt_count = 0` (tasks currently mid-flight in `delivering` are left untouched to finish). Changing `active_windows`, `active_weekdays`, or `timezone` immediately resets `next_attempt_at = now` on `queued` and `deferred` tasks and wakes the outbox dispatcher.
 :::
 
 ---

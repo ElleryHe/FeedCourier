@@ -13,14 +13,15 @@ use crate::channels::{
     TelegramCapabilities,
 };
 use crate::crypto::MasterKey;
-use crate::db::Database;
 use crate::db::models::{
     CHANNEL_MODEL_VERSION_V2, Channel, ChannelDestination, DeliveryTask, DeliveryTaskDetail,
-    DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed, FeedHealthStatus, McpToken, McpTokenScope,
-    NewChannel, NewDestination, NewEntry, NewFeed, NewRoute, OverviewSnapshot, QuotaUsage, Route,
-    SETTING_CHANNEL_MODEL_VERSION, SETTING_OUTBOX_QUEUE, SETTING_TIMEZONE, Session, SystemSetting,
-    UpdateChannel, UpdateDestination, UpdateFeed, UpdateRoute, now_unix,
+    DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed, FeedHealthStatus, GroupEffectiveLimits,
+    McpToken, McpTokenScope, NewChannel, NewDestination, NewEntry, NewFeed, NewRoute,
+    OverviewSnapshot, QuotaUsage, Route, SETTING_CHANNEL_MODEL_VERSION, SETTING_OUTBOX_QUEUE,
+    SETTING_TIMEZONE, Session, SystemSetting, UpdateChannel, UpdateDestination, UpdateFeed,
+    UpdateRoute, now_unix,
 };
+use crate::db::{Database, choose_pre_v2_backup_path};
 use crate::error::{AppError, AppResult};
 use crate::schedule::{DEFAULT_TIMEZONE, OutboxQueueState};
 
@@ -863,6 +864,7 @@ impl Database {
             account_cfg: ChannelConfig,
             dest_cfg: DestinationConfig,
             group_key: String,
+            merge_key: String,
         }
 
         let mut legacy_rows = Vec::with_capacity(existing_channels.len());
@@ -871,11 +873,13 @@ impl Database {
                 Ok(legacy_cfg) => {
                     let (account_cfg, dest_cfg) = legacy_cfg.into_split();
                     let group_key = account_cfg.credential_group_key();
+                    let merge_key = account_cfg.migration_merge_key();
                     legacy_rows.push(DecryptedLegacy {
                         row,
                         account_cfg,
                         dest_cfg,
                         group_key,
+                        merge_key,
                     });
                 }
                 Err(legacy_err) => {
@@ -898,19 +902,21 @@ impl Database {
             return Ok(ChannelMigrationReport::default());
         }
 
-        // Snapshot backup right beside the live database BEFORE modifying any legacy rows.
-        let backup_dir = self
-            .db_path()
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let backup_path = backup_dir.join("pre-v0.2.0-backup.db");
-        self.vacuum_into(&backup_path).await?;
+        // Reuse the pre-DDL snapshot captured in `Database::connect` when upgrading from v0.1.x;
+        // otherwise take a non-overwriting snapshot right before mutating legacy rows.
+        let backup_path = if let Some(pre_ddl) = self.pre_v2_backup_path() {
+            pre_ddl.to_path_buf()
+        } else {
+            let path = choose_pre_v2_backup_path(self.db_path());
+            self.vacuum_into(&path).await?;
+            path
+        };
 
-        // Group legacy rows by (kind, credential_group_key) while preserving deterministic ID order.
+        // Group legacy rows strictly by (kind, migration_merge_key) while preserving ID order so
+        // SMTP channels with distinct passwords, security modes, or `from_address` never merge.
         let mut groups: Vec<((ChannelKind, String), Vec<DecryptedLegacy>)> = Vec::new();
         for item in legacy_rows {
-            let key = (item.row.kind, item.group_key.clone());
+            let key = (item.row.kind, item.merge_key.clone());
             if let Some((_, bucket)) = groups.iter_mut().find(|(k, _)| *k == key) {
                 bucket.push(item);
             } else {
@@ -919,6 +925,7 @@ impl Database {
         }
 
         let now = now_unix();
+        let day_cutoff = now.saturating_sub(86_400);
         let legacy_channels_scanned: usize = groups.iter().map(|(_, g)| g.len()).sum();
         let accounts_surviving = groups.len();
         let accounts_merged = legacy_channels_scanned.saturating_sub(accounts_surviving);
@@ -930,21 +937,35 @@ impl Database {
             let surviving = &group[0];
             let surviving_id = surviving.row.id;
 
-            let min_interval_secs = group
+            // Aggregate quotas/pacing/proxy from enabled rows only (falling back to all rows only
+            // when every legacy row in the group was disabled) so disabled channels never drag down
+            // active quotas or unexpectedly flip `use_proxy`.
+            let enabled_rows: Vec<&DecryptedLegacy> =
+                group.iter().filter(|g| g.row.enabled).collect();
+            let active_rows: Vec<&DecryptedLegacy> = if enabled_rows.is_empty() {
+                group.iter().collect()
+            } else {
+                enabled_rows
+            };
+
+            let min_interval_secs = active_rows
                 .iter()
                 .map(|g| g.row.min_interval_secs)
                 .max()
                 .unwrap_or(15);
-            let jitter_max_secs = group
+            let jitter_max_secs = active_rows
                 .iter()
                 .map(|g| g.row.jitter_max_secs)
                 .max()
                 .unwrap_or(10);
-            let hourly_quota = group.iter().filter_map(|g| g.row.hourly_quota).min();
-            let daily_quota = group.iter().filter_map(|g| g.row.daily_quota).min();
-            let use_proxy = group.iter().any(|g| g.row.use_proxy);
+            let hourly_quota = active_rows.iter().filter_map(|g| g.row.hourly_quota).min();
+            let daily_quota = active_rows.iter().filter_map(|g| g.row.daily_quota).min();
+            let use_proxy = active_rows.iter().any(|g| g.row.use_proxy);
             let enabled = group.iter().any(|g| g.row.enabled);
-            let cooldown_until = group.iter().filter_map(|g| g.row.cooldown_until).max();
+            let cooldown_until = active_rows
+                .iter()
+                .filter_map(|g| g.row.cooldown_until)
+                .max();
 
             let capabilities_json = group
                 .iter()
@@ -1074,6 +1095,46 @@ impl Database {
                 .bind(item.row.id)
                 .execute(&mut *tx)
                 .await?;
+
+                // Align any existing quota ledger entries to the surviving account and updated key.
+                sqlx::query(
+                    r#"
+                    UPDATE delivery_quota_ledger
+                    SET channel_id = ?1,
+                        credential_group_key = ?2
+                    WHERE channel_id = ?3
+                    "#,
+                )
+                .bind(surviving_id)
+                .bind(&surviving.group_key)
+                .bind(item.row.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Backfill recent 24h delivered tasks into `delivery_quota_ledger` when not yet seeded.
+            let (existing_ledger_rows,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM delivery_quota_ledger WHERE channel_id = ?1")
+                    .bind(surviving_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if existing_ledger_rows == 0 {
+                sqlx::query(
+                    r#"
+                    INSERT INTO delivery_quota_ledger (credential_group_key, channel_id, completed_at)
+                    SELECT ?1, dt.channel_id, dt.completed_at
+                    FROM delivery_tasks dt
+                    WHERE dt.channel_id = ?2
+                      AND dt.status = 'delivered'
+                      AND dt.completed_at IS NOT NULL
+                      AND dt.completed_at >= ?3
+                    "#,
+                )
+                .bind(&surviving.group_key)
+                .bind(surviving_id)
+                .bind(day_cutoff)
+                .execute(&mut *tx)
+                .await?;
             }
 
             // Delete absorbed duplicate channel rows after all references have been repointed.
@@ -1083,6 +1144,21 @@ impl Database {
                     .execute(&mut *tx)
                     .await?;
             }
+        }
+
+        // Strict integrity assertion: no route or delivery task may remain with NULL destination_id.
+        let (orphan_routes,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM routes WHERE destination_id IS NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        let (orphan_tasks,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM delivery_tasks WHERE destination_id IS NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if orphan_routes > 0 || orphan_tasks > 0 {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "v0.2.0 channel migration aborted: {orphan_routes} route(s) and {orphan_tasks} delivery_task(s) still have NULL destination_id"
+            )));
         }
 
         let ver_json = serde_json::to_string(&CHANNEL_MODEL_VERSION_V2)?;
@@ -1199,14 +1275,19 @@ impl Database {
         Ok(rows)
     }
 
-    /// Apply partial updates to a route serially on `write_pool`.
+    /// Apply partial updates to a route serially on `write_pool`, atomically keeping in-flight
+    /// non-delivering outbox tasks synchronized when the route's target destination or delivery
+    /// schedule changes.
     pub async fn update_route(&self, route_id: i64, patch: &UpdateRoute) -> AppResult<Route> {
+        let mut tx = self.write_pool.begin().await?;
+
         let current = sqlx::query_as::<_, Route>("SELECT * FROM routes WHERE id = ?1")
             .bind(route_id)
-            .fetch_optional(&self.write_pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("route {route_id} not found")))?;
 
+        let old_options = current.options();
         let name = patch
             .name
             .as_deref()
@@ -1223,6 +1304,8 @@ impl Database {
         };
         let channel_id = patch.channel_id.unwrap_or(current.channel_id);
         let destination_id = patch.destination_id.unwrap_or(current.destination_id);
+        let target_changed =
+            channel_id != current.channel_id || destination_id != current.destination_id;
         let include_keywords_json = match &patch.include_keywords {
             Some(kws) => serde_json::to_string(kws)?,
             None => current.include_keywords_json,
@@ -1233,11 +1316,17 @@ impl Database {
         };
         let include_regex = patch.include_regex.clone().unwrap_or(current.include_regex);
         let exclude_regex = patch.exclude_regex.clone().unwrap_or(current.exclude_regex);
+        let schedule_changed = patch.options.as_ref().is_some_and(|new_opts| {
+            new_opts.timezone != old_options.timezone
+                || new_opts.active_windows != old_options.active_windows
+                || new_opts.active_weekdays != old_options.active_weekdays
+        });
         let options_json = match &patch.options {
             Some(opts) => serde_json::to_string(opts)?,
             None => current.options_json,
         };
         let enabled = patch.enabled.unwrap_or(current.enabled);
+        let re_enabled = enabled && !current.enabled;
         let now = now_unix();
 
         let updated = sqlx::query_as::<_, Route>(
@@ -1272,9 +1361,51 @@ impl Database {
         .bind(enabled)
         .bind(now)
         .bind(route_id)
-        .fetch_one(&self.write_pool)
+        .fetch_one(&mut *tx)
         .await?;
 
+        if target_changed {
+            // Repoint queued/deferred/retrying tasks to the new destination and clear any
+            // destination-specific checkpoints/retry counters; leave currently `delivering` tasks
+            // untouched so active leases finish cleanly.
+            sqlx::query(
+                r#"
+                UPDATE delivery_tasks
+                SET channel_id = ?1,
+                    destination_id = ?2,
+                    checkpoint_json = NULL,
+                    attempt_count = 0,
+                    last_status_code = NULL,
+                    next_attempt_at = ?3
+                WHERE route_id = ?4
+                  AND status IN ('queued', 'deferred', 'retrying')
+                "#,
+            )
+            .bind(channel_id)
+            .bind(destination_id)
+            .bind(now)
+            .bind(route_id)
+            .execute(&mut *tx)
+            .await?;
+        } else if schedule_changed || re_enabled {
+            // Pull forward deferred/queued tasks so the new schedule or re-enabled route is
+            // re-evaluated immediately on the next outbox wakeup.
+            sqlx::query(
+                r#"
+                UPDATE delivery_tasks
+                SET next_attempt_at = ?1
+                WHERE route_id = ?2
+                  AND status IN ('queued', 'deferred')
+                  AND next_attempt_at > ?1
+                "#,
+            )
+            .bind(now)
+            .bind(route_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(updated)
     }
 
@@ -1348,10 +1479,12 @@ impl Database {
             WHERE id = (
                 SELECT dt.id
                 FROM delivery_tasks dt
+                JOIN routes r ON r.id = dt.route_id
                 JOIN channels c ON c.id = dt.channel_id
                 JOIN channel_destinations cd ON cd.id = dt.destination_id
                 JOIN entries e ON e.id = dt.entry_id
-                WHERE c.enabled = 1
+                WHERE r.enabled = 1
+                  AND c.enabled = 1
                   AND cd.enabled = 1
                   AND (c.cooldown_until IS NULL OR c.cooldown_until <= ?2)
                   AND (
@@ -1411,7 +1544,8 @@ impl Database {
         self.save_task_checkpoint(task_id, &json).await
     }
 
-    /// Transition an in-flight task to terminal `delivered` state and release its lease.
+    /// Transition an in-flight task to terminal `delivered` state, release its lease, and record
+    /// an independent quota/pacing ledger entry that survives destination/route/feed deletions.
     pub async fn mark_task_delivered(
         &self,
         task_id: i64,
@@ -1421,13 +1555,18 @@ impl Database {
         diagnostic_log: Option<&str>,
     ) -> AppResult<DeliveryTask> {
         let checkpoint_json = checkpoint.map(serde_json::to_string).transpose()?;
+        let mut tx = self.write_pool.begin().await?;
         let row = sqlx::query_as::<_, DeliveryTask>(
             r#"
             UPDATE delivery_tasks
             SET status = 'delivered',
                 lease_until = NULL,
                 checkpoint_json = COALESCE(?1, checkpoint_json),
-                last_status_code = COALESCE(?2, last_status_code),
+                last_status_code = CASE
+                    WHEN ?2 IS NOT NULL THEN ?2
+                    WHEN last_status_code IS NOT NULL AND last_status_code >= 400 THEN NULL
+                    ELSE last_status_code
+                END,
                 diagnostic_log = ?3,
                 completed_at = ?4
             WHERE id = ?5
@@ -1439,10 +1578,24 @@ impl Database {
         .bind(diagnostic_log)
         .bind(completed_at)
         .bind(task_id)
-        .fetch_optional(&self.write_pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("delivery task {task_id} not found")))?;
 
+        sqlx::query(
+            r#"
+            INSERT INTO delivery_quota_ledger (credential_group_key, channel_id, completed_at)
+            SELECT c.credential_group_key, c.id, ?1
+            FROM channels c
+            WHERE c.id = ?2
+            "#,
+        )
+        .bind(completed_at)
+        .bind(row.channel_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(row)
     }
 
@@ -1481,12 +1634,13 @@ impl Database {
         Ok(row)
     }
 
-    /// Transition a task to `deferred` when hourly/daily channel quota is reached.
-    /// Decrements `attempt_count` back by 1 so quota deferral never consumes retry attempts.
+    /// Transition a task to `deferred` (e.g. quota, pacing, delivery window, or Notion `202` async poll).
+    /// Decrements `attempt_count` back by 1 so non-error deferral never consumes retry attempts.
     pub async fn mark_task_deferred(
         &self,
         task_id: i64,
         next_window_at: i64,
+        status_code: Option<i32>,
         checkpoint: Option<&DeliveryCheckpoint>,
         diagnostic_log: &str,
     ) -> AppResult<DeliveryTask> {
@@ -1498,13 +1652,15 @@ impl Database {
                 lease_until = NULL,
                 attempt_count = MAX(attempt_count - 1, 0),
                 next_attempt_at = ?1,
-                checkpoint_json = COALESCE(?2, checkpoint_json),
-                diagnostic_log = ?3
-            WHERE id = ?4
+                last_status_code = COALESCE(?2, last_status_code),
+                checkpoint_json = COALESCE(?3, checkpoint_json),
+                diagnostic_log = ?4
+            WHERE id = ?5
             RETURNING *
             "#,
         )
         .bind(next_window_at)
+        .bind(status_code)
         .bind(checkpoint_json)
         .bind(diagnostic_log)
         .bind(task_id)
@@ -1704,7 +1860,8 @@ impl Database {
     }
 
     /// Compute rolling 1-hour (`3600s`) and 24-hour (`86400s`) delivered counts for both the
-    /// individual `channel_id` and its shared `credential_group_key`, plus the latest completion timestamp.
+    /// individual `channel_id` and its shared `credential_group_key`, plus the latest completion
+    /// timestamp, backed by the cascade-proof `delivery_quota_ledger`.
     pub async fn get_channel_quota_usage(
         &self,
         channel_id: i64,
@@ -1714,30 +1871,18 @@ impl Database {
         let hour_cutoff = now.saturating_sub(3600);
         let day_cutoff = now.saturating_sub(86_400);
 
-        let (channel_last_hour,): (i64,) = sqlx::query_as(
+        let (channel_last_hour, channel_last_day): (i64, i64) = sqlx::query_as(
             r#"
-            SELECT COUNT(*)
-            FROM delivery_tasks
+            SELECT
+                COALESCE(SUM(CASE WHEN completed_at >= ?2 THEN 1 ELSE 0 END), 0),
+                COUNT(*)
+            FROM delivery_quota_ledger
             WHERE channel_id = ?1
-              AND status = 'delivered'
-              AND completed_at >= ?2
+              AND completed_at >= ?3
             "#,
         )
         .bind(channel_id)
         .bind(hour_cutoff)
-        .fetch_one(&self.read_pool)
-        .await?;
-
-        let (channel_last_day,): (i64,) = sqlx::query_as(
-            r#"
-            SELECT COUNT(*)
-            FROM delivery_tasks
-            WHERE channel_id = ?1
-              AND status = 'delivered'
-              AND completed_at >= ?2
-            "#,
-        )
-        .bind(channel_id)
         .bind(day_cutoff)
         .fetch_one(&self.read_pool)
         .await?;
@@ -1749,14 +1894,12 @@ impl Database {
         ) = sqlx::query_as(
             r#"
             SELECT
-                COALESCE(SUM(CASE WHEN dt.completed_at >= ?2 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN completed_at >= ?2 THEN 1 ELSE 0 END), 0),
                 COUNT(*),
-                MAX(dt.completed_at)
-            FROM delivery_tasks dt
-            JOIN channels c ON c.id = dt.channel_id
-            WHERE c.credential_group_key = ?1
-              AND dt.status = 'delivered'
-              AND dt.completed_at >= ?3
+                MAX(completed_at)
+            FROM delivery_quota_ledger
+            WHERE credential_group_key = ?1
+              AND completed_at >= ?3
             "#,
         )
         .bind(credential_group_key)
@@ -1772,6 +1915,49 @@ impl Database {
             credential_group_last_day,
             last_completed_at,
         })
+    }
+
+    /// Return the strictest effective quota and pacing limits across all enabled channels sharing
+    /// `credential_group_key`.
+    pub async fn get_credential_group_effective_limits(
+        &self,
+        credential_group_key: &str,
+    ) -> AppResult<Option<GroupEffectiveLimits>> {
+        let row: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT
+                MIN(hourly_quota),
+                MIN(daily_quota),
+                MAX(min_interval_secs),
+                MAX(jitter_max_secs)
+            FROM channels
+            WHERE credential_group_key = ?1
+              AND enabled = 1
+            "#,
+        )
+        .bind(credential_group_key)
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        match row {
+            (_, _, None, None) => Ok(None),
+            (hourly_quota, daily_quota, min_iv, jitter) => Ok(Some(GroupEffectiveLimits {
+                hourly_quota,
+                daily_quota,
+                min_interval_secs: min_iv.unwrap_or(0),
+                jitter_max_secs: jitter.unwrap_or(0),
+            })),
+        }
+    }
+
+    /// Purge rolling quota ledger entries strictly older than 24 hours (`completed_at < now - 86400`).
+    pub async fn purge_expired_quota_ledger(&self, now: i64) -> AppResult<u64> {
+        let cutoff = now.saturating_sub(86_400);
+        let res = sqlx::query("DELETE FROM delivery_quota_ledger WHERE completed_at < ?1")
+            .bind(cutoff)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     // =========================================================================
@@ -1847,8 +2033,16 @@ impl Database {
             fs::create_dir_all(parent)?;
         }
 
-        if dest_path.exists() {
+        if fs::symlink_metadata(dest_path).is_ok() {
             fs::remove_file(dest_path)?;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut os = dest_path.as_os_str().to_os_string();
+            os.push(suffix);
+            let sidecar = PathBuf::from(os);
+            if fs::symlink_metadata(&sidecar).is_ok() {
+                fs::remove_file(&sidecar)?;
+            }
         }
 
         let dest_str = dest_path.to_str().ok_or_else(|| {

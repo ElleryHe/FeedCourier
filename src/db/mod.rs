@@ -27,6 +27,79 @@ pub struct Database {
     db_path: PathBuf,
     read_pool: SqlitePool,
     write_pool: SqlitePool,
+    /// Path to a true pre-v0.2.0 DDL backup captured via `VACUUM INTO` before applying
+    /// `0002_channel_destinations.sql` on an existing v0.1.x database.
+    pre_v2_backup_path: Option<PathBuf>,
+}
+
+/// Choose a non-overwriting backup path beside `db_path` for pre-v0.2.0 upgrades.
+///
+/// Uses `pre-v0.2.0-backup.db` when absent; if a file or symlink already exists at that path,
+/// falls back to a UTC timestamped filename so an earlier clean backup is never clobbered.
+pub(crate) fn choose_pre_v2_backup_path(db_path: &Path) -> PathBuf {
+    let backup_dir = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = backup_dir.join("pre-v0.2.0-backup.db");
+    if fs::symlink_metadata(&base).is_err() {
+        return base;
+    }
+
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let dated = backup_dir.join(format!("pre-v0.2.0-backup-{stamp}.db"));
+    if fs::symlink_metadata(&dated).is_err() {
+        return dated;
+    }
+
+    for idx in 1u32..=1000 {
+        let candidate = backup_dir.join(format!("pre-v0.2.0-backup-{stamp}-{idx}.db"));
+        if fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+    }
+
+    backup_dir.join(format!(
+        "pre-v0.2.0-backup-{stamp}-{:08x}.db",
+        rand::random::<u32>()
+    ))
+}
+
+async fn needs_pre_v2_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
+    let (has_migrations_table,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(write_pool)
+    .await?;
+    if has_migrations_table == 0 {
+        return Ok(false);
+    }
+
+    let (has_v1,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(write_pool)
+            .await?;
+    let (has_v2,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 2")
+            .fetch_one(write_pool)
+            .await?;
+    if has_v1 == 0 || has_v2 > 0 {
+        return Ok(false);
+    }
+
+    let (has_channels_table,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'channels'",
+    )
+    .fetch_one(write_pool)
+    .await?;
+    if has_channels_table == 0 {
+        return Ok(false);
+    }
+
+    let (channel_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channels")
+        .fetch_one(write_pool)
+        .await?;
+    Ok(channel_count > 0)
 }
 
 impl Database {
@@ -60,6 +133,28 @@ impl Database {
             .connect_with(write_opts)
             .await?;
 
+        // Snapshot a genuine pre-v0.2.0 database BEFORE applying `0002_channel_destinations.sql`
+        // so downgrading back to v0.1.6 can restore the backup directly without schema mismatch.
+        let pre_v2_backup_path = if needs_pre_v2_ddl_backup(&write_pool).await? {
+            let backup_path = choose_pre_v2_backup_path(db_path);
+            let backup_str = backup_path.to_str().ok_or_else(|| {
+                crate::error::AppError::Validation(
+                    "pre-v0.2.0 backup path must be valid UTF-8".to_string(),
+                )
+            })?;
+            sqlx::query("VACUUM INTO ?1")
+                .bind(backup_str)
+                .execute(&write_pool)
+                .await?;
+            tracing::info!(
+                backup_path = %backup_path.display(),
+                "captured pre-v0.2.0 SQLite backup prior to applying 0002 schema migration"
+            );
+            Some(backup_path)
+        } else {
+            None
+        };
+
         MIGRATOR.run(&write_pool).await?;
 
         // 2. Open the concurrent read pool with `PRAGMA query_only = ON` so WAL `-shm` read-marks
@@ -77,12 +172,18 @@ impl Database {
             db_path: db_path.to_path_buf(),
             read_pool,
             write_pool,
+            pre_v2_backup_path,
         })
     }
 
     /// Filesystem path of the underlying SQLite database file.
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// Path to the pre-DDL v0.1.x backup created during [`Database::connect`], if any.
+    pub fn pre_v2_backup_path(&self) -> Option<&Path> {
+        self.pre_v2_backup_path.as_deref()
     }
 
     /// Concurrent read-only pool (`PRAGMA query_only = ON`).

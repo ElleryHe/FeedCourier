@@ -660,6 +660,16 @@ pub struct QuotaUsage {
     pub last_completed_at: Option<i64>,
 }
 
+/// Strictest effective pacing and quota limits aggregated across enabled channels sharing a
+/// `credential_group_key`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupEffectiveLimits {
+    pub hourly_quota: Option<i64>,
+    pub daily_quota: Option<i64>,
+    pub min_interval_secs: i64,
+    pub jitter_max_secs: i64,
+}
+
 /// Aggregated dashboard metrics returned for `GET /api/v1/overview`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OverviewSnapshot {

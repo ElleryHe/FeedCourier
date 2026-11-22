@@ -31,7 +31,7 @@ use feedcourier::db::models::{
     DeliveryTaskStatus, MediaAttachment, MediaAttachmentKind, NewChannel, NewDestination, NewEntry,
     NewFeed, NewRoute, UpdateChannel, now_unix,
 };
-use feedcourier::net::ProtectedHttpClient;
+use feedcourier::net::{NetSettings, ProtectedHttpClient};
 use feedcourier::scheduler::{DeliveryDispatcher, ProtectedMediaFetcher};
 
 struct TestHarness {
@@ -935,6 +935,11 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
     let deferred_task2 = h.db.get_delivery_task(task2.id).await.unwrap().unwrap();
     assert_eq!(deferred_task2.status, DeliveryTaskStatus::Deferred);
     assert_eq!(
+        deferred_task2.last_status_code,
+        Some(202),
+        "Notion 202 async deferral must persist status code 202"
+    );
+    assert_eq!(
         deferred_task2.attempt_count, 0,
         "202 Accepted async poll must not consume retry budget"
     );
@@ -952,6 +957,12 @@ async fn outbox_expired_lease_recovery_and_notion_async_deferral() {
 async fn hourly_quota_and_pacing_defer_without_burning_attempt_count() {
     let mock_tg = MockServer::start().await;
     let h = TestHarness::new().await;
+    h.dispatcher
+        .reload_network_settings(NetSettings {
+            outbound_proxy_url: None,
+            ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+        })
+        .unwrap();
 
     Mock::given(method("POST"))
         .and(path_regex(r"^/bot.*/sendMessage$"))
@@ -1124,6 +1135,12 @@ async fn downstream_429_shared_credential_group_cooldown_dead_letter_and_retry()
     let mock_tg = MockServer::start().await;
     // Set `max_delivery_attempts = 2` so we can verify `retrying` -> `dead_letter` -> `POST /api/v1/tasks/retry`.
     let h = TestHarness::with_builder(|d| d.with_max_delivery_attempts(2)).await;
+    h.dispatcher
+        .reload_network_settings(NetSettings {
+            outbound_proxy_url: None,
+            ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+        })
+        .unwrap();
     let cookie = h.setup_admin_and_cookie().await;
 
     Mock::given(method("POST"))
@@ -1938,6 +1955,18 @@ async fn multi_destination_channel_shares_quotas_pacing_and_auto_naming() {
     let base_uri = mock_tg.uri();
     let h = TestHarness::new().await;
     let cookie = h.setup_admin_and_cookie().await;
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({
+                "outbound_proxy_url": null,
+                "ssrf_allowlist": ["127.0.0.1/32", "::1/128"]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
 
     Mock::given(method("GET"))
         .and(path("/bot888:shared_acct_tok/getMe"))
@@ -2199,4 +2228,558 @@ async fn multi_destination_channel_shares_quotas_pacing_and_auto_naming() {
         !h.dispatcher.process_next_outbox_task().await.unwrap(),
         "disabled destination must not be claimed"
     );
+}
+
+#[tokio::test]
+async fn qa_hardening_quota_ledger_route_sync_status_codes_channel_validation_and_media_referer() {
+    use feedcourier::channels::telegram::MediaStreamFetcher as _;
+
+    let mock_tg = MockServer::start().await;
+    let mock_notion = MockServer::start().await;
+    let notion_base = mock_notion.uri();
+    let h = TestHarness::with_builder(|d| {
+        let notion = NotionSender::with_base_url(&notion_base, None).unwrap();
+        d.with_notion_sender(notion)
+    })
+    .await;
+    let cookie = h.setup_admin_and_cookie().await;
+
+    // -------------------------------------------------------------------------
+    // 1. P1-01: Telegram SSRF guard rejects loopback `api_base_url` BEFORE allowlisting with 403.
+    // -------------------------------------------------------------------------
+    let (status, _, ssrf_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "111:blocked_token",
+                    "api_base_url": mock_tg.uri()
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(parse_json(&ssrf_body)["code"], "ssrf_blocked");
+
+    // Allowlist `127.0.0.1/32` via hot-reloaded settings.
+    let (status, _, _) = h
+        .send(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(&cookie),
+            Some(json!({
+                "outbound_proxy_url": null,
+                "ssrf_allowlist": ["127.0.0.1/32", "::1/128"]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // -------------------------------------------------------------------------
+    // 2. P3-03: Telegram `getMe` 401 rejects creation; SMTP `password: null` clears password while
+    //    omitting preserves it; SMTP leading empty recipient auto-names first non-empty email.
+    // -------------------------------------------------------------------------
+    Mock::given(method("GET"))
+        .and(path("/bot999:bad_tok/getMe"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "ok": false,
+            "error_code": 401,
+            "description": "Unauthorized"
+        })))
+        .mount(&mock_tg)
+        .await;
+
+    let (status, _, _) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "999:bad_tok",
+                    "api_base_url": mock_tg.uri()
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "invalid Telegram bot token must fail channel creation with 401"
+    );
+
+    // SMTP password clear vs preserve + leading empty recipient auto-naming.
+    let (status, _, smtp_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "smtp",
+                "config": {
+                    "kind": "smtp",
+                    "host": "smtp.example.com",
+                    "port": 587,
+                    "username": "mailer@example.com",
+                    "password": "initial-secret-password",
+                    "security": "start_tls",
+                    "from_address": "mailer@example.com"
+                },
+                "initial_destination": {
+                    "config": {
+                        "kind": "smtp",
+                        "to_addresses": ["", "  ", "ops@example.com"]
+                    },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let smtp_ch = parse_json(&smtp_body);
+    let smtp_id = smtp_ch["id"].as_i64().unwrap();
+    assert_eq!(smtp_ch["config"]["has_password"], true);
+    assert_eq!(
+        smtp_ch["destinations"][0]["name"], "ops@example.com",
+        "auto-naming must pick the first non-empty trimmed SMTP recipient"
+    );
+
+    // PATCH omitting `password` preserves stored password.
+    let (status, _, patch1) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/channels/{smtp_id}"),
+            Some(&cookie),
+            Some(json!({ "config": { "kind": "smtp", "port": 2525 } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&patch1)["config"]["has_password"], true);
+
+    // PATCH with explicit `"password": null` clears stored password.
+    let (status, _, patch2) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/channels/{smtp_id}"),
+            Some(&cookie),
+            Some(json!({ "config": { "kind": "smtp", "password": null } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&patch2)["config"]["has_password"], false);
+
+    // -------------------------------------------------------------------------
+    // 3. Notion `/v1/users/me` auto-naming + 0-destination `channel_id` fallback returns 400.
+    // -------------------------------------------------------------------------
+    Mock::given(method("GET"))
+        .and(path("/v1/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "user",
+            "id": "bot-user-1",
+            "type": "bot",
+            "name": "FeedCourier Workspace Bot"
+        })))
+        .expect(1)
+        .mount(&mock_notion)
+        .await;
+
+    let (status, _, notion_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "notion",
+                "config": {
+                    "kind": "notion",
+                    "integration_secret": "ntn_autoname_secret_123456"
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let notion_ch = parse_json(&notion_body);
+    let notion_ch_id = notion_ch["id"].as_i64().unwrap();
+    assert_eq!(notion_ch["name"], "FeedCourier Workspace Bot");
+
+    // 0-destination channel with `channel_id` fallback must fail cleanly with 400 Bad Request.
+    let (status, _, _) = h
+        .send(
+            Method::POST,
+            "/api/v1/routes",
+            Some(&cookie),
+            Some(json!({
+                "name": "Zero Dest Route",
+                "channel_id": notion_ch_id
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // -------------------------------------------------------------------------
+    // 4. P2-05 (Quota ledger survives destination/route deletion & clear-cache) +
+    //    P2-04 (Route destination switch repoints queued/deferred/retrying tasks & clears checkpoint) +
+    //    P2-07 (Delivered clears stale >=400 status; quota deferral preserves prior failure log) +
+    //    P3-01 (Disabled route tasks are NOT claimed; strictest sibling credential-group quota enforced).
+    // -------------------------------------------------------------------------
+    Mock::given(method("GET"))
+        .and(path("/bot555:ledger_tok/getMe"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "id": 555, "is_bot": true, "username": "ledger_bot" }
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot555:ledger_tok/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: chat_id is empty"
+        })))
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/bot555:ledger_tok/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 601 }
+        })))
+        .mount(&mock_tg)
+        .await;
+
+    let (status, _, tg_a_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "555:ledger_tok",
+                    "api_base_url": mock_tg.uri()
+                },
+                "initial_destination": {
+                    "name": "Dest One",
+                    "config": { "kind": "telegram", "chat_id": "-1001" },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "hourly_quota": 1,
+                "daily_quota": null,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let tg_a = parse_json(&tg_a_body);
+    let tg_ch_id = tg_a["id"].as_i64().unwrap();
+    let d1_id = tg_a["destinations"][0]["id"].as_i64().unwrap();
+
+    // Add second destination under same channel.
+    let (status, _, d2_body) = h
+        .send(
+            Method::POST,
+            &format!("/api/v1/channels/{tg_ch_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "name": "Dest Two",
+                "config": { "kind": "telegram", "chat_id": "-1002" },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let d2_id = parse_json(&d2_body)["id"].as_i64().unwrap();
+
+    // Create a sibling channel with the SAME bot token and UNLIMITED quota (`hourly_quota: null`),
+    // to prove P3-01 enforces the strictest sibling quota (`1`) across the credential group!
+    let (status, _, sib_body) = h
+        .send(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "name": "Sibling Unlimited",
+                "kind": "telegram",
+                "config": {
+                    "kind": "telegram",
+                    "bot_token": "555:ledger_tok",
+                    "api_base_url": mock_tg.uri()
+                },
+                "initial_destination": {
+                    "name": "Sibling Dest",
+                    "config": { "kind": "telegram", "chat_id": "-1003" },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "hourly_quota": null,
+                "daily_quota": null,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let sib = parse_json(&sib_body);
+    let sib_ch_id = sib["id"].as_i64().unwrap();
+    let sib_dest_id = sib["destinations"][0]["id"].as_i64().unwrap();
+
+    let feed =
+        h.db.create_feed(&NewFeed::new("https://example.com/ledger.xml"))
+            .await
+            .unwrap();
+    let mut entries = Vec::new();
+    for i in 1..=3 {
+        let e = match h
+            .db
+            .insert_entry_if_new(&NewEntry {
+                feed_id: feed.id,
+                fingerprint_sha256: sha256_hex(format!("ledger-item-{i}").as_bytes()),
+                published_at: Some(now_unix() - 10 + i),
+                discovered_at: now_unix() - 10 + i,
+                title: Some(format!("Ledger Item {i}")),
+                canonical_url: Some(format!("https://example.com/l-{i}")),
+                author: None,
+                content_html: Some("<p>Body</p>".to_string()),
+                first_sentence: Some("Body".to_string()),
+                summary_text: Some("Body".to_string()),
+                media: vec![],
+            })
+            .await
+            .unwrap()
+        {
+            feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+            _ => unreachable!(),
+        };
+        entries.push(e);
+    }
+
+    let r1 =
+        h.db.create_route(&NewRoute {
+            name: "R1".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: tg_ch_id,
+            destination_id: d1_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                telegram_mode: TelegramDeliveryMode::CompactCard,
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let r_sib =
+        h.db.create_route(&NewRoute {
+            name: "R-Sibling".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: sib_ch_id,
+            destination_id: sib_dest_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                telegram_mode: TelegramDeliveryMode::CompactCard,
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    // Deliver task 1 on `d1_id` -> consumes hourly_quota = 1 in `delivery_quota_ledger`.
+    let t1 =
+        h.db.enqueue_delivery_task(r1.id, tg_ch_id, d1_id, entries[0].id, now_unix() - 5)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    assert_eq!(
+        h.db.get_delivery_task(t1.id).await.unwrap().unwrap().status,
+        DeliveryTaskStatus::Delivered
+    );
+
+    // Delete `d1_id` (which cascades `r1` and `t1`!): ledger MUST preserve the quota count (`1`)!
+    let (status, _, _) = h
+        .send(
+            Method::DELETE,
+            &format!("/api/v1/destinations/{d1_id}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Enqueue task on sibling unlimited channel with a prior 502 error log & status code;
+    // P2-05 + P3-01 must STILL defer it due to strictest credential-group quota = 1, AND
+    // P2-07 must preserve the prior failure diagnostic in the deferred log!
+    let t_sib =
+        h.db.enqueue_delivery_task(
+            r_sib.id,
+            sib_ch_id,
+            sib_dest_id,
+            entries[1].id,
+            now_unix() - 2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    h.db.mark_task_retrying(
+        t_sib.id,
+        now_unix() - 1,
+        Some(502),
+        Some(&DeliveryCheckpoint::Telegram {
+            next_batch_offset: 1,
+            sent_message_ids: vec![42],
+            degraded_to_compact: false,
+        }),
+        "Upstream 502 Bad Gateway",
+    )
+    .await
+    .unwrap();
+
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    let deferred_sib = h.db.get_delivery_task(t_sib.id).await.unwrap().unwrap();
+    assert_eq!(deferred_sib.status, DeliveryTaskStatus::Deferred);
+    let diag = deferred_sib.diagnostic_log.as_deref().unwrap_or("");
+    assert!(
+        diag.contains("hourly quota") && diag.contains("Upstream 502 Bad Gateway"),
+        "quota deferral must survive deleted destination, enforce sibling strictest quota, and preserve prior error log: {diag}"
+    );
+
+    // P2-04: Update `r_sib` target destination to `d2_id` via REST -> `t_sib` must atomically
+    // repoint to `(tg_ch_id, d2_id)` with cleared checkpoint, `attempt_count = 0`, and `last_status_code = NULL`!
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/routes/{}", r_sib.id),
+            Some(&cookie),
+            Some(json!({ "destination_id": d2_id })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let repointed = h.db.get_delivery_task(t_sib.id).await.unwrap().unwrap();
+    assert_eq!(repointed.channel_id, tg_ch_id);
+    assert_eq!(repointed.destination_id, d2_id);
+    assert_eq!(repointed.checkpoint_json, None);
+    assert_eq!(repointed.attempt_count, 0);
+    assert_eq!(repointed.last_status_code, None);
+
+    // P3-01: Disabling `r_sib` prevents `claim_next_delivery_task` from claiming `t_sib` at all!
+    let (status, _, _) = h
+        .send(
+            Method::PATCH,
+            &format!("/api/v1/routes/{}", r_sib.id),
+            Some(&cookie),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        h.db.claim_next_delivery_task(now_unix() + 10, 60)
+            .await
+            .unwrap()
+            .is_none(),
+        "tasks belonging to a disabled route must not be claimed"
+    );
+
+    // P2-07: `mark_task_delivered` with `status_code = None` clears a stale `>= 400` status code.
+    h.db.mark_task_retrying(t_sib.id, now_unix(), Some(503), None, "temp 503")
+        .await
+        .unwrap();
+    let delivered_cleared =
+        h.db.mark_task_delivered(t_sib.id, now_unix(), None, None, Some("delivered ok"))
+            .await
+            .unwrap();
+    assert_eq!(
+        delivered_cleared.last_status_code, None,
+        "mark_task_delivered(None) must clear stale >=400 error codes"
+    );
+
+    // -------------------------------------------------------------------------
+    // 5. P2-03: `ProtectedMediaFetcher` strips cross-origin Referer on redirect, synthesizes
+    //    per-hop origin Referer, and sends browser-compatible User-Agent.
+    // -------------------------------------------------------------------------
+    let hop1 = MockServer::start().await;
+    let hop2 = MockServer::start().await;
+    let hop2_uri = hop2.uri();
+    let hop1_uri = hop1.uri();
+    let hop2_expected_referer = format!("{hop2_uri}/");
+
+    Mock::given(method("GET"))
+        .and(path("/redirect.jpg"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("Location", format!("{hop2_uri}/final.jpg")),
+        )
+        .mount(&hop1)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/final.jpg"))
+        .respond_with(move |req: &wiremock::Request| {
+            let referer = req
+                .headers
+                .get("referer")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let ua = req
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(
+                referer, hop2_expected_referer,
+                "cross-origin redirect must use hop-2 origin Referer, not hop-1 ({hop1_uri})"
+            );
+            assert!(
+                ua.starts_with("Mozilla/5.0 (compatible; FeedCourier/"),
+                "media fetcher must send browser-compatible User-Agent, got: {ua}"
+            );
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/jpeg")
+                .set_body_bytes(vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])
+        })
+        .expect(1)
+        .mount(&hop2)
+        .await;
+
+    let media = h
+        .dispatcher
+        .media_fetcher()
+        .fetch_media(&format!("{}/redirect.jpg", hop1.uri()), 1024 * 1024, false)
+        .await
+        .expect("cross-origin redirected media fetch must succeed");
+    assert_eq!(media.filename, "final.jpg");
 }

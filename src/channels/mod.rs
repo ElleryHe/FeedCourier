@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::compute_credential_group_key;
+use crate::crypto::{compute_credential_group_key, sha256_hex};
 use crate::db::models::{AppLocale, Channel, ChannelDestination, DeliveryTask, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
 
@@ -239,6 +239,9 @@ impl ChannelConfig {
     /// Compute shared rate-limit group key (`channels.credential_group_key`) so all destinations
     /// (and any accounts sharing identical SMTP/Bot/Notion credentials) share pacing, quotas,
     /// and cooldowns.
+    ///
+    /// For SMTP, the SHA-256 digest of `password` is folded into the key so distinct API keys
+    /// under a shared username (e.g. SendGrid `apikey`) stay isolated from one another.
     pub fn credential_group_key(&self) -> String {
         match self {
             Self::Smtp(cfg) => {
@@ -247,13 +250,20 @@ impl ChannelConfig {
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or(&cfg.from_address);
+                let pw_digest = cfg
+                    .password
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| sha256_hex(p.as_bytes()))
+                    .unwrap_or_default();
                 compute_credential_group_key(
                     "smtp",
                     &format!(
-                        "{}@{}:{}",
+                        "{}@{}:{}:{}",
                         identity.trim().to_ascii_lowercase(),
                         cfg.host.trim().to_ascii_lowercase(),
-                        cfg.port
+                        cfg.port,
+                        pw_digest
                     ),
                 )
             }
@@ -272,6 +282,46 @@ impl ChannelConfig {
             Self::Notion(cfg) => {
                 compute_credential_group_key("notion", cfg.integration_secret.trim())
             }
+        }
+    }
+
+    /// Strict identity key used by the v0.1.x → v0.2.0 automatic migration to decide whether two
+    /// legacy channels represent the exact same Channel Account and can be merged without losing
+    /// any credentials, TLS mode, or sender identity.
+    pub fn migration_merge_key(&self) -> String {
+        match self {
+            Self::Smtp(cfg) => {
+                let username = cfg
+                    .username
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let pw_digest = cfg
+                    .password
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| sha256_hex(p.as_bytes()))
+                    .unwrap_or_default();
+                let security = match cfg.security {
+                    SmtpSecurity::StartTls => "start_tls",
+                    SmtpSecurity::Tls => "tls",
+                    SmtpSecurity::Plain => "plain",
+                };
+                compute_credential_group_key(
+                    "smtp_merge",
+                    &format!(
+                        "{}|{}|{}|{}|{}|{}",
+                        cfg.host.trim().to_ascii_lowercase(),
+                        cfg.port,
+                        username,
+                        pw_digest,
+                        security,
+                        cfg.from_address.trim().to_ascii_lowercase()
+                    ),
+                )
+            }
+            Self::Telegram(_) | Self::Notion(_) => self.credential_group_key(),
         }
     }
 
@@ -301,6 +351,14 @@ impl ChannelConfig {
                     return Err(AppError::Validation(
                         "Telegram bot_token must not be empty".to_string(),
                     ));
+                }
+                if let Some(raw_base) = cfg
+                    .api_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    validate_telegram_api_base_url(raw_base)?;
                 }
                 Ok(())
             }
@@ -515,6 +573,37 @@ impl LegacyChannelConfig {
             ),
         }
     }
+}
+
+/// Validate a custom Telegram `api_base_url`: only `http://` or `https://` with an explicit host,
+/// and no userinfo (`user:pass@`), query string, or fragment.
+pub fn validate_telegram_api_base_url(raw: &str) -> AppResult<url::Url> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed).map_err(|err| {
+        AppError::Validation(format!("invalid Telegram api_base_url '{trimmed}': {err}"))
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::Validation(format!(
+            "Telegram api_base_url must use http or https scheme, got '{}'",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(AppError::Validation(
+            "Telegram api_base_url must include a host".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::Validation(
+            "Telegram api_base_url must not contain embedded credentials (userinfo)".to_string(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::Validation(
+            "Telegram api_base_url must not contain query parameters or fragments".to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Mask a secret token keeping at most 4 prefix and 4 suffix characters.

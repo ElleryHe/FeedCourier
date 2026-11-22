@@ -1,7 +1,7 @@
 //! Route delivery time windows (`HH:MM`–`HH:MM` in the system IANA timezone) and the global
 //! outbox queue pause state.
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{Datelike, Duration, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +92,12 @@ pub fn validate_schedule(options: &mut RouteOptions) -> AppResult<()> {
                 w.start, w.end
             )));
         };
+        if s == e && s != 0 {
+            return Err(AppError::Validation(format!(
+                "invalid active window '{}'–'{}' (start and end may only be equal as 00:00–00:00 for all-day)",
+                w.start, w.end
+            )));
+        }
         w.start = format!("{:02}:{:02}", s / 60, s % 60);
         w.end = format!("{:02}:{:02}", e / 60, e % 60);
     }
@@ -113,16 +119,54 @@ pub fn has_schedule(options: &RouteOptions) -> bool {
     !options.active_windows.is_empty() || !options.active_weekdays.is_empty()
 }
 
-fn local_to_utc(tz: Tz, date: NaiveDate, minutes: u32) -> Option<i64> {
+fn normalize_date_and_time(date: NaiveDate, minutes: u32) -> Option<(NaiveDate, NaiveTime)> {
     let (date, minutes) = if minutes >= 24 * 60 {
         (date.succ_opt()?, minutes - 24 * 60)
     } else {
         (date, minutes)
     };
     let time = NaiveTime::from_hms_opt(minutes / 60, minutes % 60, 0)?;
-    tz.from_local_datetime(&date.and_time(time))
-        .earliest()
-        .map(|dt| dt.timestamp())
+    Some((date, time))
+}
+
+/// Advance a nonexistent spring-forward local wall-clock instant forward minute-by-minute
+/// to the first valid instant after the DST transition gap.
+fn clamp_forward_dst_gap(tz: Tz, naive: chrono::NaiveDateTime) -> Option<i64> {
+    for step_mins in 1..=180_i64 {
+        let candidate = naive + Duration::minutes(step_mins);
+        match tz.from_local_datetime(&candidate) {
+            LocalResult::Single(dt) => return Some(dt.timestamp()),
+            LocalResult::Ambiguous(earliest, _) => return Some(earliest.timestamp()),
+            LocalResult::None => continue,
+        }
+    }
+    None
+}
+
+/// Convert a window start wall-clock time to UTC seconds:
+/// - Spring-forward gap (`None`): clamp forward to the first valid instant after the jump.
+/// - Fall-back overlap (`Ambiguous`): use the earliest occurrence so the window opens on time.
+fn local_start_to_utc(tz: Tz, date: NaiveDate, minutes: u32) -> Option<i64> {
+    let (date, time) = normalize_date_and_time(date, minutes)?;
+    let naive = date.and_time(time);
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Some(dt.timestamp()),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest.timestamp()),
+        LocalResult::None => clamp_forward_dst_gap(tz, naive),
+    }
+}
+
+/// Convert a window end wall-clock time to UTC seconds:
+/// - Spring-forward gap (`None`): clamp forward to the first valid instant after the jump.
+/// - Fall-back overlap (`Ambiguous`): use the latest occurrence so the window is not closed 1 hour early.
+fn local_end_to_utc(tz: Tz, date: NaiveDate, minutes: u32) -> Option<i64> {
+    let (date, time) = normalize_date_and_time(date, minutes)?;
+    let naive = date.and_time(time);
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Some(dt.timestamp()),
+        LocalResult::Ambiguous(_, latest) => Some(latest.timestamp()),
+        LocalResult::None => clamp_forward_dst_gap(tz, naive),
+    }
 }
 
 fn effective_windows(windows: &[DeliveryTimeWindow]) -> Vec<(u32, u32)> {
@@ -134,7 +178,11 @@ fn effective_windows(windows: &[DeliveryTimeWindow]) -> Vec<(u32, u32)> {
         .filter_map(|w| {
             let s = parse_hhmm(&w.start)?;
             let e = parse_hhmm(&w.end)?;
-            Some(if s == e { (0, 24 * 60) } else { (s, e) })
+            if s == e {
+                (s == 0).then_some((0, 24 * 60))
+            } else {
+                Some((s, e))
+            }
         })
         .collect()
 }
@@ -165,7 +213,7 @@ pub fn next_allowed_at(options: &RouteOptions, now: i64, tz: Tz) -> i64 {
         }
         for &(start_min, end_min) in &windows {
             let end_is_next_day = end_min <= start_min;
-            let Some(start_ts) = local_to_utc(tz, date, start_min) else {
+            let Some(start_ts) = local_start_to_utc(tz, date, start_min) else {
                 continue;
             };
             let end_minutes = if end_is_next_day {
@@ -173,9 +221,12 @@ pub fn next_allowed_at(options: &RouteOptions, now: i64, tz: Tz) -> i64 {
             } else {
                 end_min
             };
-            let Some(end_ts) = local_to_utc(tz, date, end_minutes) else {
+            let Some(end_ts) = local_end_to_utc(tz, date, end_minutes) else {
                 continue;
             };
+            if start_ts >= end_ts {
+                continue;
+            }
             if now >= start_ts && now < end_ts {
                 return now;
             }
@@ -291,6 +342,79 @@ mod tests {
             ..RouteOptions::default()
         };
         assert!(validate_schedule(&mut tz_bad).is_err());
+
+        // `00:00`–`00:00` is the sole valid all-day equal-endpoint window; non-zero equal windows
+        // (e.g. `09:00`–`09:00`) must be rejected.
+        let mut all_day = opts(&[("00:00", "00:00")], &[]);
+        assert!(validate_schedule(&mut all_day).is_ok());
+
+        let mut bad_equal = opts(&[("09:00", "09:00")], &[]);
+        assert!(validate_schedule(&mut bad_equal).is_err());
+    }
+
+    #[test]
+    fn dst_spring_forward_and_fall_back_windows() {
+        let la: Tz = "America/Los_Angeles".parse().unwrap();
+
+        // 1. Spring forward on 2026-03-08 (02:00 PST jumps directly to 03:00 PDT):
+        //    Daytime window `02:30–22:00` must clamp its start forward to `03:00 PDT`, NOT drop the day.
+        let daytime = opts(&[("02:30", "22:00")], &[]);
+        let before_gap = la
+            .with_ymd_and_hms(2026, 3, 8, 1, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let three_am_pdt = la
+            .with_ymd_and_hms(2026, 3, 8, 3, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(next_allowed_at(&daytime, before_gap, la), three_am_pdt);
+        assert_eq!(next_allowed_at(&daytime, three_am_pdt, la), three_am_pdt);
+
+        // 2. Midnight-wrapping Saturday `22:00–02:30` across the 2026-03-08 spring-forward gap:
+        //    end `02:30` clamps forward to `03:00 PDT`, so `01:45 PST` is inside and `03:00 PDT` is outside.
+        let overnight = opts(&[("22:00", "02:30")], &[6]);
+        let sun_0145_pst = la
+            .with_ymd_and_hms(2026, 3, 8, 1, 45, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(next_allowed_at(&overnight, sun_0145_pst, la), sun_0145_pst);
+        let next_sat_2200 = la
+            .with_ymd_and_hms(2026, 3, 14, 22, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(next_allowed_at(&overnight, three_am_pdt, la), next_sat_2200);
+
+        // 3. Fall back on 2026-11-01 (01:00–01:59 occurs twice: PDT -07:00 then PST -08:00):
+        //    Window `00:30–01:30` uses latest `01:30 PST` as its end, so `01:15 PST` (second occurrence)
+        //    is still inside the window!
+        let fallback_win = opts(&[("00:30", "01:30")], &[]);
+        let second_0115_pst = la
+            .with_ymd_and_hms(2026, 11, 1, 1, 15, 0)
+            .latest()
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            next_allowed_at(&fallback_win, second_0115_pst, la),
+            second_0115_pst
+        );
+        let second_0130_pst = la
+            .with_ymd_and_hms(2026, 11, 1, 1, 30, 0)
+            .latest()
+            .unwrap()
+            .timestamp();
+        let next_day_0030 = la
+            .with_ymd_and_hms(2026, 11, 2, 0, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            next_allowed_at(&fallback_win, second_0130_pst, la),
+            next_day_0030
+        );
     }
 
     #[test]

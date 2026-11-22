@@ -63,14 +63,12 @@ const API_BASE = "/api/v1";
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
-  readonly details?: string;
 
-  constructor(status: number, message: string, code?: string, details?: string) {
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
-    this.details = details;
   }
 }
 
@@ -94,14 +92,12 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
   const contentType = res.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     try {
-      const data = (await res.json()) as Partial<ApiErrorBody> & {
-        message?: string;
-      };
+      const data = (await res.json()) as Partial<ApiErrorBody>;
       const message =
-        data.error ??
-        data.message ??
+        data.message?.trim() ||
+        data.error?.trim() ||
         getMessages().common.requestFailedHttp(res.status);
-      return new ApiError(res.status, message, data.code, data.details);
+      return new ApiError(res.status, message, data.code);
     } catch {
       // Fall through to text fallback
     }

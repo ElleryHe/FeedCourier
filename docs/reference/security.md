@@ -95,7 +95,7 @@ Unlike the WebUI preview endpoint (`POST /api/v1/feeds/preview`), which includes
 
 ## 4. Connection-Layer SSRF Protection (`src/net/ssrf.rs`, `src/net/mod.rs`)
 
-All outbound HTTP requests for feed polling, feed previewing, Readability article extraction, and Telegram media fallback streaming execute through `ProtectedHttpClient` backed by `SsrfDnsResolver` (`reqwest::dns::Resolve`).
+All outbound HTTP requests for feed polling, feed previewing, Readability article extraction, Telegram media fallback streaming, **and all Telegram Bot API calls** (both official `https://api.telegram.org` and custom `api_base_url` / self-hosted Local Bot API servers) execute with connect-time `SsrfPolicy` DNS validation (`SsrfDnsResolver` implementing `reqwest::dns::Resolve`) backed by a shared, hot-reloadable `Arc<RwLock<SsrfPolicy>>`.
 
 ```mermaid
 sequenceDiagram
@@ -150,3 +150,9 @@ For self-hosted intranet services (such as local `FreshRSS` or `RSSHub` instance
 When a feed is added via MCP `manage_feed(action = "add")` or REST API `POST /api/v1/feeds`, FeedCourier inserts the `feeds` row and immediately runs an initial poll:
 - If the initial poll fails with a transient upstream error (such as a timeout or `503`), the feed row is kept and enters exponential backoff;
 - If the initial poll fails with **`AppError::SsrfBlocked`** (either on the initial URL or on a redirect hop), the handler immediately deletes the newly inserted row (`db.delete_feed(created.id)`) and returns an `ssrf_blocked` error so blocked internal targets are never persisted for background polling.
+
+### 5. Telegram Bot API (`api_base_url`) SSRF Enforcement
+`TelegramSender` injects the same shared `Arc<RwLock<SsrfPolicy>>` (reloaded immediately whenever `PUT /api/v1/settings` updates `ssrf_allowlist`) into its Bot API HTTP client:
+- **Connect-Time DNS & No Redirects**: Every Bot API call—both to official `https://api.telegram.org` and to custom `api_base_url` / self-hosted Local Bot API servers—resolves through `SsrfDnsResolver` with `redirect::Policy::none()` (and validates literal IP / `localhost` hops when routed via `OUTBOUND_PROXY`).
+- **Strict `api_base_url` Validation**: `ChannelConfig::validate` and channel patch handlers allow only `http://` and `https://` URLs with no embedded userinfo (`user:pass@`), query string, or fragment. Account creation, updates, and probes blocked by SSRF policy return HTTP `403` (`ssrf_blocked`).
+- **No Automatic Allowlisting**: Existing internal/private Local Bot API endpoints are **not** auto-allowlisted when upgrading to `v0.2.0`; operators must add their hostname or IP/CIDR to `SSRF_ALLOWLIST`.

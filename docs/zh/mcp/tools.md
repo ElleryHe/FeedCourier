@@ -235,11 +235,11 @@ FeedCourier 的 `/mcp` 接口共提供 **9 个工具（Tools）**，分为只读
 | `link_preview` | `bool` | 否 | `true` | Telegram 快讯模式下是否开启网页链接预览。 |
 | `locale` | `string` | 否 | `null` | 该路由的投递语言：`"en"` 或 `"zh-CN"`。 |
 | `timezone` | `string` | 否 | `null` | 可选的路由级 IANA 时区（如 `"Asia/Shanghai"`；在 `"update"` 时传 `""` 可清空并回退继承系统时区），同时控制推送窗口、SMTP 文章时间与 Telegram 富文本页脚时间。 |
-| `active_windows` | `{start, end}[]` | 否 | `[]` | **路由时区**（默认继承系统时区）下的每日投递窗口，如 `[{"start":"08:00","end":"22:00"}]`。`end` 早于 `start` 表示跨午夜，`start == end` 表示全天，`[]` 表示不限制。 |
+| `active_windows` | `{start, end}[]` | 否 | `[]` | **路由时区**（默认继承系统时区）下的每日投递窗口，采用夏令时（DST）安全边界，如 `[{"start":"08:00","end":"22:00"}]`。`end` 早于 `start` 表示跨午夜；仅 `00:00`–`00:00`（或 `[]`）表示全天，其余 `start == end` 窗口将返回校验错误。 |
 | `active_weekdays` | `integer[]` | 否 | `[]` | 允许投递的星期，`1`（周一）到 `7`（周日），`[]` 表示每天。 |
 | `enabled` | `bool` | 否 | `true` | 是否启用该路由规则。 |
 
-窗口或星期之外产生的任务仍会入队，并在下一个窗口开始时投递。
+窗口或星期之外产生的任务仍会入队，并在下一个窗口开始时投递。执行 `"update"` 更换目标目的地时，会在同一事务内重指 `queued` / `deferred` / `retrying` 任务并清空断点、重置尝试次数（进行中的 `delivering` 任务不受影响）；修改 `active_windows`、`active_weekdays` 或 `timezone` 时，立即将 `queued` / `deferred` 任务的 `next_attempt_at` 重置为当前时间并唤醒发件箱。
 
 ---
 
