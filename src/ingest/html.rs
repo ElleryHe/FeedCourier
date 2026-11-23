@@ -342,10 +342,15 @@ pub(crate) fn parse_tag_attrs_and_self_closing(attr_str: &str) -> (Vec<ParsedTag
                 i += 1;
             }
             if i >= bytes.len() {
-                out.push(ParsedTagAttr {
-                    name,
-                    value: Some(String::new()),
-                });
+                if !out
+                    .iter()
+                    .any(|existing: &ParsedTagAttr| existing.name.eq_ignore_ascii_case(&name))
+                {
+                    out.push(ParsedTagAttr {
+                        name,
+                        value: Some(String::new()),
+                    });
+                }
                 break;
             }
 
@@ -369,11 +374,20 @@ pub(crate) fn parse_tag_attrs_and_self_closing(attr_str: &str) -> (Vec<ParsedTag
                 &attr_str[val_start..i]
             };
 
-            out.push(ParsedTagAttr {
-                name,
-                value: Some(decode_html_attr_entities(raw_val)),
-            });
-        } else {
+            // HTML5 attribute deduplication: the first occurrence of an attribute name wins.
+            if !out
+                .iter()
+                .any(|existing: &ParsedTagAttr| existing.name.eq_ignore_ascii_case(&name))
+            {
+                out.push(ParsedTagAttr {
+                    name,
+                    value: Some(decode_html_attr_entities(raw_val)),
+                });
+            }
+        } else if !out
+            .iter()
+            .any(|existing: &ParsedTagAttr| existing.name.eq_ignore_ascii_case(&name))
+        {
             out.push(ParsedTagAttr { name, value: None });
         }
     }
@@ -807,13 +821,25 @@ pub fn html_to_plain_text(html: &str) -> String {
     while idx < bytes.len() {
         if let Some(close_tag) = skip_until_close {
             let pat = format!("</{close_tag}");
-            if let Some(pos) = find_ascii_case_insensitive(&html[idx..], &pat) {
-                let close_start = idx + pos;
-                if let Some(end_gt) = html[close_start..].find('>') {
-                    idx = close_start + end_gt + 1;
-                    skip_until_close = None;
-                    continue;
+            let mut scan = idx;
+            let mut closed_at = None;
+            while let Some(pos) = find_ascii_case_insensitive(&html[scan..], &pat) {
+                let close_start = scan + pos;
+                let after_name = close_start + pat.len();
+                let valid_boundary = after_name >= bytes.len()
+                    || bytes[after_name] == b'>'
+                    || bytes[after_name] == b'/'
+                    || bytes[after_name].is_ascii_whitespace();
+                if valid_boundary && let Some(end_gt) = html[after_name..].find('>') {
+                    closed_at = Some(after_name + end_gt + 1);
+                    break;
                 }
+                scan = after_name;
+            }
+            if let Some(next_idx) = closed_at {
+                idx = next_idx;
+                skip_until_close = None;
+                continue;
             }
             break;
         }

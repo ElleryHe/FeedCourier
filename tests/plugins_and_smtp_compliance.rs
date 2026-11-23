@@ -3565,3 +3565,593 @@ async fn qa04_qa10_link_rewrite_parser_cache_before_cap_trailing_dot_cache_clear
         LINK_REWRITE_PLUGIN_ID
     );
 }
+
+#[tokio::test]
+async fn round2_qa_regressions_rg01_rg02_rg04_rg05_and_bounce_classifier() {
+    use axum::extract::ConnectInfo;
+    use feedcourier::channels::smtp::{
+        SmtpComplianceFooter, SmtpSender, is_recipient_hard_bounce_parts,
+    };
+    use feedcourier::crypto::email_to_ascii_punycode;
+    use feedcourier::db::models::{AppLocale, Feed, FeedHealthStatus, SmtpRecipientStatus};
+    use feedcourier::plugins::link_rewrite::{
+        LINK_REWRITE_PLUGIN_ID, MAX_CANDIDATE_URLS_PER_ENTRY,
+    };
+    use feedcourier::plugins::{PluginRegistry, RenderOverrides};
+    use std::net::SocketAddr;
+
+    // 1. RG-01a: `trust_proxy = true` prioritizes rightmost `X-Forwarded-For` over spoofed
+    //    `X-Real-IP`, including across multiple `X-Forwarded-For` headers.
+    let h_proxy = V3Harness::new_with_options(true, None, None, true).await;
+    let proxy_peer = SocketAddr::from(([10, 0, 0, 9], 8080));
+    for i in 1..=31u32 {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/u/nonexistent-rg01-token")
+            .header(HOST, "localhost:8080")
+            .header("x-real-ip", format!("198.51.100.{i}"))
+            .header("x-forwarded-for", format!("1.2.3.{i}"))
+            .header("x-forwarded-for", "203.0.113.201")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(proxy_peer));
+        let resp = h_proxy.router.clone().oneshot(req).await.unwrap();
+        if i <= 30 {
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "req #{i} under limit should return 404"
+            );
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "req #31 must hit 429 using rightmost X-Forwarded-For despite rotating X-Real-IP"
+            );
+        }
+    }
+
+    // 2. RG-01b: Multi-segment `/u/foo/bar` and `/v/foo/bar` return 404 (never SPA `index.html`).
+    for multi in ["/u/foo/bar", "/v/foo/bar", "/u/a/b/c", "/v/a/b/c"] {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(multi)
+            .header(HOST, "localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 202], 1234))));
+        let resp = h_proxy.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "multi-segment public path {multi} must return 404"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(
+            !html.contains("<div id=\"root\">"),
+            "multi-segment public path {multi} must NOT fall through to SPA index.html"
+        );
+    }
+
+    // 3. RG-02: `auto_paused` preserved on no-op PATCH (omitting `enabled` or re-sending unchanged
+    //    `enabled: false`), and manually disabled destinations NEVER flip to `auto_paused = true`.
+    let cookie = h_proxy.setup_admin().await;
+    let (st, _, ch_body) = h_proxy
+        .send_json(
+            Method::POST,
+            "/api/v1/channels",
+            Some(&cookie),
+            Some(json!({
+                "name": "RG02 SMTP",
+                "kind": "smtp",
+                "config": {
+                    "kind": "smtp",
+                    "host": "127.0.0.1",
+                    "port": 2525,
+                    "security": "plain",
+                    "from_address": "bot@fc.test"
+                },
+                "initial_destination": {
+                    "name": "RG02 Dest",
+                    "config": {
+                        "kind": "smtp",
+                        "to_addresses": ["alice@example.org"]
+                    },
+                    "enabled": true
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "use_proxy": false,
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_json = parse_json(&ch_body);
+    let ch_id = ch_json["id"].as_i64().unwrap();
+    let dest_id = ch_json["destinations"][0]["id"].as_i64().unwrap();
+
+    let recips = h_proxy.db.list_smtp_recipients(dest_id).await.unwrap();
+    let alice_id = recips[0].id;
+
+    // Unsubscribe Alice -> auto-pauses enabled destination (`enabled=false, auto_paused=true`).
+    let (_, paused) = h_proxy
+        .db
+        .mark_smtp_recipient_unsubscribed(alice_id, "link", now_unix())
+        .await
+        .unwrap();
+    assert!(paused);
+    let d1 = h_proxy.db.get_destination(dest_id).await.unwrap().unwrap();
+    assert!(!d1.enabled && d1.auto_paused);
+
+    // PATCH omitting `enabled` (rename only) preserves `auto_paused = true`.
+    let (st, _, _) = h_proxy
+        .send_json(
+            Method::PATCH,
+            &format!("/api/v1/destinations/{dest_id}"),
+            Some(&cookie),
+            Some(json!({ "name": "RG02 Renamed" })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h_proxy
+            .db
+            .get_destination(dest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auto_paused,
+        "PATCH omitting enabled must preserve auto_paused=true"
+    );
+
+    // PATCH re-sending unchanged `enabled: false` ALSO preserves `auto_paused = true`.
+    let (st, _, _) = h_proxy
+        .send_json(
+            Method::PATCH,
+            &format!("/api/v1/destinations/{dest_id}"),
+            Some(&cookie),
+            Some(json!({ "name": "RG02 Renamed Again", "enabled": false })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h_proxy
+            .db
+            .get_destination(dest_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auto_paused,
+        "no-op PATCH with unchanged enabled=false must preserve auto_paused=true"
+    );
+
+    // Re-verifying Alice auto-resumes the auto_paused destination!
+    h_proxy
+        .db
+        .reactivate_smtp_recipient(alice_id, now_unix())
+        .await
+        .unwrap();
+    h_proxy
+        .db
+        .mark_smtp_recipient_verified(alice_id, "code", now_unix())
+        .await
+        .unwrap();
+    let d_resumed = h_proxy.db.get_destination(dest_id).await.unwrap().unwrap();
+    assert!(d_resumed.enabled && !d_resumed.auto_paused);
+
+    // RG-02b: Create a MANUALLY DISABLED destination (`enabled: false`), then unsubscribe its sole
+    // recipient -> must NOT flip `auto_paused` to `true`, so later re-verification stays disabled!
+    let (st, _, man_body) = h_proxy
+        .send_json(
+            Method::POST,
+            &format!("/api/v1/channels/{ch_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "name": "Manually Disabled Dest",
+                "config": {
+                    "kind": "smtp",
+                    "to_addresses": ["bob@example.org"]
+                },
+                "enabled": false
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let man_dest_id = parse_json(&man_body)["id"].as_i64().unwrap();
+    let bob_id = h_proxy.db.list_smtp_recipients(man_dest_id).await.unwrap()[0].id;
+    let (_, man_paused) = h_proxy
+        .db
+        .mark_smtp_recipient_unsubscribed(bob_id, "link", now_unix())
+        .await
+        .unwrap();
+    assert!(
+        !man_paused,
+        "manually disabled destination must NOT be auto-paused"
+    );
+    let man_after = h_proxy
+        .db
+        .get_destination(man_dest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!man_after.enabled);
+    assert!(!man_after.auto_paused);
+    // Reactivating + verifying Bob must NOT re-enable the manually disabled destination!
+    h_proxy
+        .db
+        .reactivate_smtp_recipient(bob_id, now_unix())
+        .await
+        .unwrap();
+    h_proxy
+        .db
+        .mark_smtp_recipient_verified(bob_id, "code", now_unix())
+        .await
+        .unwrap();
+    let man_still_off = h_proxy
+        .db
+        .get_destination(man_dest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !man_still_off.enabled,
+        "manually disabled destination must stay disabled after recipient verification"
+    );
+
+    // 4. RG-05a: CAS guard on `rollback_smtp_recipient_verification_reservation` never clobbers
+    //    concurrent state changes or newer reservations.
+    let (st, _, cas_body) = h_proxy
+        .send_json(
+            Method::POST,
+            &format!("/api/v1/channels/{ch_id}/destinations"),
+            Some(&cookie),
+            Some(json!({
+                "name": "CAS Dest",
+                "config": {
+                    "kind": "smtp",
+                    "to_addresses": ["cas@example.org"]
+                },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let cas_dest_id = parse_json(&cas_body)["id"].as_i64().unwrap();
+    let cas_recip = h_proxy
+        .db
+        .list_smtp_recipients(cas_dest_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let now = now_unix();
+    let hash_a = sha256_hex(b"code-A");
+    let hash_b = sha256_hex(b"code-B");
+
+    let (_, reserved_a) = h_proxy
+        .db
+        .reserve_smtp_recipient_verification_code(
+            cas_dest_id,
+            cas_recip.id,
+            &hash_a,
+            now + 1800,
+            now,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reserved_a.status, SmtpRecipientStatus::Pending);
+
+    // Concurrent newer reservation B overwrites `code_sha256`.
+    let _reserved_b = h_proxy
+        .db
+        .reserve_smtp_recipient_verification_code(
+            cas_dest_id,
+            cas_recip.id,
+            &hash_b,
+            now + 1800,
+            now + 1,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+
+    // Stale rollback for A MUST be rejected by CAS (`Ok(false)`), preserving reservation B!
+    let rolled_stale = h_proxy
+        .db
+        .rollback_smtp_recipient_verification_reservation(&cas_recip, &hash_a)
+        .await
+        .unwrap();
+    assert!(
+        !rolled_stale,
+        "stale reservation rollback must not clobber newer code_sha256"
+    );
+    let cur = h_proxy
+        .db
+        .get_smtp_recipient(cas_recip.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cur.code_sha256.as_deref(), Some(hash_b.as_str()));
+
+    // Matching rollback for B succeeds and restores original `unverified` state.
+    let rolled_b = h_proxy
+        .db
+        .rollback_smtp_recipient_verification_reservation(&cas_recip, &hash_b)
+        .await
+        .unwrap();
+    assert!(rolled_b);
+    let restored = h_proxy
+        .db
+        .get_smtp_recipient(cas_recip.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.status, SmtpRecipientStatus::Unverified);
+    assert!(restored.code_sha256.is_none());
+
+    // 5. RG-05b: IDN SMTP addresses convert cleanly to UTS-46 ASCII Punycode across validation
+    //    and `SmtpSender::build_entry_email_full`.
+    assert_eq!(
+        email_to_ascii_punycode("Alice <alice@Bücher.DE>"),
+        "Alice <alice@xn--bcher-kva.de>"
+    );
+    let idn_ch_cfg = SmtpChannelConfig {
+        host: "smtp.example.com".to_string(),
+        port: 587,
+        security: SmtpSecurity::StartTls,
+        username: None,
+        password: None,
+        from_address: "bot@bücher.de".to_string(),
+        sender_identity: None,
+    };
+    ChannelConfig::Smtp(idn_ch_cfg.clone())
+        .validate()
+        .expect("IDN from_address must validate");
+    let idn_dest_cfg = SmtpDestinationConfig {
+        to_addresses: vec!["alice@bücher.de".to_string()],
+        reply_to: Some("reply@bücher.de".to_string()),
+    };
+    DestinationConfig::Smtp(idn_dest_cfg.clone())
+        .validate()
+        .expect("IDN to_addresses and reply_to must validate");
+    let dummy_feed = Feed {
+        id: 1,
+        url: "https://example.com/rss".to_string(),
+        title: "IDN Feed".to_string(),
+        site_url: None,
+        favicon_url: None,
+        tags_json: "[]".to_string(),
+        poll_interval_secs: 900,
+        fetch_full_content: false,
+        use_proxy: false,
+        etag: None,
+        last_modified: None,
+        health_status: FeedHealthStatus::Active,
+        consecutive_failures: 0,
+        next_poll_at: Some(0),
+        last_error: None,
+        silent_init: false,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let dummy_entry = feedcourier::db::models::Entry {
+        id: 1,
+        feed_id: 1,
+        fingerprint_sha256: sha256_hex(b"idn-entry"),
+        published_at: Some(now),
+        discovered_at: now,
+        payload_purged_at: None,
+        title: Some("IDN Delivery".to_string()),
+        canonical_url: Some("https://example.com/post".to_string()),
+        author: None,
+        content_html: Some("<p>Hello IDN</p>".to_string()),
+        first_sentence: Some("Hello IDN".to_string()),
+        summary_text: Some("Hello IDN".to_string()),
+        media_json: None,
+    };
+    let built = SmtpSender::build_entry_email_full(
+        &idn_ch_cfg,
+        &idn_dest_cfg.to_addresses,
+        idn_dest_cfg.reply_to.as_deref(),
+        &dummy_feed,
+        &dummy_entry,
+        1,
+        None,
+        AppLocale::En,
+        chrono_tz::UTC,
+        &RenderOverrides::default(),
+        &SmtpComplianceFooter {
+            destination_id: Some(1),
+            route_name: Some("IDN"),
+            unsubscribe_url: Some("https://fc.example.com/u/tok"),
+            sender_identity: None,
+            include_compliance_headers: true,
+        },
+    )
+    .expect("IDN email build must succeed");
+    let raw_mime = String::from_utf8_lossy(&built.message.formatted()).to_string();
+    assert!(raw_mime.contains("bot@xn--bcher-kva.de"));
+    assert!(raw_mime.contains("alice@xn--bcher-kva.de"));
+    assert!(raw_mime.contains("reply@xn--bcher-kva.de"));
+
+    // 6. P2 SMTP Hard Bounce Classifier: 5.2.1 disabled mailbox, `Addressee unknown`, and
+    //    email local-parts (`author@`, `policy@`, `spam@`) no longer cause false negatives.
+    assert!(is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 5.2.1 The email account that you tried to reach is disabled"
+    ));
+    assert!(is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 <author@example.com>: User unknown"
+    ));
+    assert!(is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 <policy@example.com>: Addressee unknown"
+    ));
+    assert!(is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 spam@example.com: Mailbox unavailable"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 5.7.1 <alice@example.com>: Rejected by policy"
+    ));
+    assert!(!is_recipient_hard_bounce_parts(
+        Some(550),
+        "550 Relay access denied for alice@example.com"
+    ));
+
+    // 7. RG-04: Batch `touch_plugin_link_cache` across >500 chunk boundary AND
+    //    `MAX_CANDIDATE_URLS_PER_ENTRY` (1,000) cap in `LinkRewritePlugin::on_render`.
+    let (st, _, _) = h_proxy
+        .send_json(
+            Method::PATCH,
+            "/api/v1/plugins/link-rewrite",
+            Some(&cookie),
+            Some(json!({ "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _, inst_body) = h_proxy
+        .send_json(
+            Method::POST,
+            "/api/v1/plugins/link-rewrite/instances",
+            Some(&cookie),
+            Some(json!({
+                "name": "YOURLS Batch Touch & Cap",
+                "config": {
+                    "api_url": "https://sho.rt/yourls-api.php",
+                    "auth_mode": "signature",
+                    "signature": "sig-rg04"
+                },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let inst_id = parse_json(&inst_body)["id"].as_i64().unwrap();
+
+    let total_links = MAX_CANDIDATE_URLS_PER_ENTRY + 5;
+    let mut cache_pairs = Vec::with_capacity(total_links);
+    let mut big_html = String::from("<p>");
+    for i in 1..=total_links {
+        let u = format!("https://mass.example/item/{i}");
+        cache_pairs.push((sha256_hex(u.as_bytes()), format!("https://sho.rt/m{i}")));
+        big_html.push_str(&format!("<a href=\"{u}\">{i}</a> "));
+    }
+    big_html.push_str("</p>");
+
+    // Insert all 1,005 rows with old timestamp `1000`, then batch-touch 620 hashes with `now + 50`.
+    h_proxy
+        .db
+        .put_plugin_link_cache_batch(inst_id, &cache_pairs, 1_000)
+        .await
+        .unwrap();
+    let touch_hashes: Vec<String> = cache_pairs[..620].iter().map(|(h, _)| h.clone()).collect();
+    h_proxy
+        .db
+        .touch_plugin_link_cache(inst_id, &touch_hashes, now + 50)
+        .await
+        .unwrap();
+
+    // Run `on_render` on the 1,005-link article: first 1,000 cached links rewrite, links 1001..1005
+    // stay original and emit a `"capped at"` warning without making any HTTP calls!
+    let ch_row = h_proxy.db.get_channel(ch_id).await.unwrap().unwrap();
+    let dest_row = h_proxy.db.get_destination(dest_id).await.unwrap().unwrap();
+    let feed_row = h_proxy
+        .db
+        .create_feed(&NewFeed::new("https://mass.example/rss"))
+        .await
+        .unwrap();
+    let mut p_map = BTreeMap::new();
+    p_map.insert(
+        LINK_REWRITE_PLUGIN_ID.to_string(),
+        json!({ "provider_id": inst_id }),
+    );
+    let r_opts = RouteOptions {
+        plugins: p_map,
+        ..RouteOptions::default()
+    };
+    let route_row = h_proxy
+        .db
+        .create_route(&NewRoute {
+            name: "RG04 Cap Route".to_string(),
+            feed_ids: vec![feed_row.id],
+            match_tags: Vec::new(),
+            channel_id: ch_row.id,
+            destination_id: dest_row.id,
+            include_keywords: Vec::new(),
+            exclude_keywords: Vec::new(),
+            include_regex: None,
+            exclude_regex: None,
+            options: r_opts.clone(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let big_entry = match h_proxy
+        .db
+        .insert_entry_if_new(&NewEntry {
+            feed_id: feed_row.id,
+            fingerprint_sha256: sha256_hex(b"rg04-1005-links"),
+            published_at: Some(now),
+            discovered_at: now,
+            title: Some("1005 Links".to_string()),
+            canonical_url: None,
+            author: None,
+            content_html: Some(big_html),
+            first_sentence: None,
+            summary_text: None,
+            media: Vec::new(),
+        })
+        .await
+        .unwrap()
+    {
+        feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+        _ => unreachable!(),
+    };
+    let registry = PluginRegistry::with_builtins();
+    let http = ProtectedHttpClient::new(NetSettings::default()).unwrap();
+    let (overrides, retry) = registry
+        .run_on_render(
+            &h_proxy.db,
+            &h_proxy.master_key,
+            &http,
+            &big_entry,
+            &feed_row,
+            &route_row,
+            &r_opts,
+            &ch_row,
+            &dest_row,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(retry.is_none());
+    let out_html = overrides.content_html.unwrap();
+    assert!(out_html.contains("https://sho.rt/m1\""));
+    assert!(out_html.contains(&format!("https://sho.rt/m{MAX_CANDIDATE_URLS_PER_ENTRY}\"")));
+    assert!(
+        out_html.contains(&format!(
+            "https://mass.example/item/{}",
+            MAX_CANDIDATE_URLS_PER_ENTRY + 1
+        )),
+        "links beyond MAX_CANDIDATE_URLS_PER_ENTRY must remain original"
+    );
+    assert!(
+        overrides
+            .warnings
+            .iter()
+            .any(|w| w.contains("capped at") && w.contains("1000")),
+        "candidate URL cap must emit a 'capped at' warning: {:?}",
+        overrides.warnings
+    );
+}

@@ -24,7 +24,7 @@ use crate::channels::{
     DeliveryOutcome, DestinationConfig, SmtpChannelConfig, SmtpDeliveryRecipient,
     SmtpDestinationConfig, SmtpSecurity,
 };
-use crate::crypto::{mask_email_address, mask_emails_in_text, sha256_hex};
+use crate::crypto::{email_to_ascii_punycode, mask_email_address, mask_emails_in_text, sha256_hex};
 use crate::db::models::{AppLocale, Entry, Feed};
 use crate::error::{AppError, AppResult};
 use crate::ingest::html::{
@@ -370,12 +370,14 @@ impl SmtpSender {
         overrides: &RenderOverrides,
         compliance: &SmtpComplianceFooter<'_>,
     ) -> AppResult<BuiltEmail> {
-        let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
+        let from_ascii_raw = email_to_ascii_punycode(&cfg.from_address);
+        let from_addr: Address = from_ascii_raw.parse().map_err(|err| {
             AppError::Validation(format!(
                 "invalid SMTP from_address '{}': {err}",
                 cfg.from_address
             ))
         })?;
+        let from_ascii = from_addr.to_string();
         let from_domain = sanitize_domain_ascii(from_addr.domain());
 
         let sanitized_feed = sanitize_feed_title(&feed.title);
@@ -429,7 +431,7 @@ impl SmtpSender {
             ));
 
         if compliance.include_compliance_headers || compliance.unsubscribe_url.is_some() {
-            let mailto = format!("<mailto:{}?subject=unsubscribe>", cfg.from_address.trim());
+            let mailto = format!("<mailto:{from_ascii}?subject=unsubscribe>");
             if let Some(unsub_url) = compliance
                 .unsubscribe_url
                 .map(str::trim)
@@ -488,7 +490,8 @@ impl SmtpSender {
         verify_url: Option<&str>,
         locale: AppLocale,
     ) -> AppResult<String> {
-        let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
+        let from_ascii_raw = email_to_ascii_punycode(&cfg.from_address);
+        let from_addr: Address = from_ascii_raw.parse().map_err(|err| {
             AppError::Validation(format!(
                 "invalid SMTP from_address '{}': {err}",
                 cfg.from_address
@@ -496,9 +499,11 @@ impl SmtpSender {
         })?;
         let from_domain = sanitize_domain_ascii(from_addr.domain());
         let from_mailbox = Mailbox::new(Some("FeedCourier".to_owned()), from_addr);
-        let to_mbox: Mailbox = recipient_email.trim().parse().map_err(|err| {
-            AppError::Validation(format!("invalid SMTP recipient '{recipient_email}': {err}"))
-        })?;
+        let to_mbox: Mailbox = email_to_ascii_punycode(recipient_email)
+            .parse()
+            .map_err(|err| {
+                AppError::Validation(format!("invalid SMTP recipient '{recipient_email}': {err}"))
+            })?;
 
         let probe_nonce = sha256_hex(
             format!(
@@ -666,12 +671,14 @@ impl SmtpSender {
         ChannelConfig::Smtp(cfg.clone()).validate()?;
         DestinationConfig::Smtp(dest.clone()).validate()?;
 
-        let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
+        let from_ascii_raw = email_to_ascii_punycode(&cfg.from_address);
+        let from_addr: Address = from_ascii_raw.parse().map_err(|err| {
             AppError::Validation(format!(
                 "invalid SMTP from_address '{}': {err}",
                 cfg.from_address
             ))
         })?;
+        let from_ascii = from_addr.to_string();
         let from_domain = sanitize_domain_ascii(from_addr.domain());
         let from_mailbox = Mailbox::new(Some("FeedCourier via FeedCourier".to_owned()), from_addr);
         let reply_to = parse_optional_mailbox(dest.reply_to.as_deref(), "reply_to")?;
@@ -708,7 +715,7 @@ impl SmtpSender {
             "Reply to this email to unsubscribe."
         };
         let list_id = format!("<dest-{destination_id}.{from_domain}>");
-        let mailto = format!("<mailto:{}?subject=unsubscribe>", cfg.from_address.trim());
+        let mailto = format!("<mailto:{from_ascii}?subject=unsubscribe>");
         let env = template_env();
         let transport = self
             .transport_for(cfg)
@@ -718,12 +725,15 @@ impl SmtpSender {
         let mut masked_targets = Vec::with_capacity(verified_recipients.len());
 
         for recip in verified_recipients {
-            let to_mbox: Mailbox = recip.email.trim().parse().map_err(|err| {
-                AppError::Validation(format!(
-                    "invalid SMTP recipient '{}': {err}",
-                    mask_email_address(&recip.email)
-                ))
-            })?;
+            let to_mbox: Mailbox =
+                email_to_ascii_punycode(&recip.email)
+                    .parse()
+                    .map_err(|err| {
+                        AppError::Validation(format!(
+                            "invalid SMTP recipient '{}': {err}",
+                            mask_email_address(&recip.email)
+                        ))
+                    })?;
             let probe_nonce = sha256_hex(
                 format!(
                     "test:{}:{}:{}:{}",
@@ -1153,7 +1163,8 @@ impl ChannelSender for SmtpSender {
         channel_config.validate()?;
         destination_config.validate()?;
 
-        let from_addr: Address = cfg.from_address.trim().parse().map_err(|err| {
+        let from_ascii_raw = email_to_ascii_punycode(&cfg.from_address);
+        let from_addr: Address = from_ascii_raw.parse().map_err(|err| {
             AppError::Validation(format!(
                 "invalid SMTP from_address '{}': {err}",
                 cfg.from_address
@@ -1370,12 +1381,14 @@ pub fn is_recipient_hard_bounce_parts(status_code: Option<u16>, diagnostic: &str
         return false;
     }
 
-    // Explicit recipient-permanent-failure enhanced status codes.
+    // Explicit recipient-permanent-failure enhanced status codes (RFC 3463).
+    // Includes 5.2.1 ("Mailbox disabled, not accepting messages", e.g. Gmail disabled accounts).
     if contains_enhanced_code(&lower, "5.1.1")
         || contains_enhanced_code(&lower, "5.1.2")
         || contains_enhanced_code(&lower, "5.1.3")
         || contains_enhanced_code(&lower, "5.1.6")
         || contains_enhanced_code(&lower, "5.1.10")
+        || contains_enhanced_code(&lower, "5.2.1")
     {
         return true;
     }
@@ -1383,6 +1396,11 @@ pub fn is_recipient_hard_bounce_parts(status_code: Option<u16>, diagnostic: &str
     if !matches!(code, 550 | 551 | 553) {
         return false;
     }
+
+    // Strip embedded recipient email addresses (e.g. `<author@x.com>`, `policy@x.com`) before
+    // checking non-recipient markers so local-parts like `author`, `policy`, or `spam` cannot
+    // cause false negatives on genuine recipient hard bounces.
+    let lower_no_emails = strip_emails_for_bounce_classification(&lower);
 
     // Guard against ambiguous 550/551/553 policy, auth, quota, spam, or sender rejections.
     let non_recipient_markers = [
@@ -1411,7 +1429,10 @@ pub fn is_recipient_hard_bounce_parts(status_code: Option<u16>, diagnostic: &str
         "virus",
         "malware",
     ];
-    if non_recipient_markers.iter().any(|m| lower.contains(m)) {
+    if non_recipient_markers
+        .iter()
+        .any(|m| lower_no_emails.contains(m))
+    {
         return false;
     }
 
@@ -1419,6 +1440,7 @@ pub fn is_recipient_hard_bounce_parts(status_code: Option<u16>, diagnostic: &str
         "user unknown",
         "unknown user",
         "no such user",
+        "addressee unknown",
         "does not exist",
         "doesn't exist",
         "mailbox unavailable",
@@ -1438,7 +1460,62 @@ pub fn is_recipient_hard_bounce_parts(status_code: Option<u16>, diagnostic: &str
         "mailbox disabled",
         "user not local",
     ];
-    recipient_reject_markers.iter().any(|m| lower.contains(m))
+    recipient_reject_markers
+        .iter()
+        .any(|m| lower_no_emails.contains(m))
+}
+
+fn strip_emails_for_bounce_classification(lower: &str) -> String {
+    let mut out = String::with_capacity(lower.len());
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Strip `<local@domain>` angle-bracketed email tokens wholesale.
+        if bytes[i] == b'<'
+            && let Some(rel_end) = lower[i + 1..].find('>')
+        {
+            let inner = &lower[i + 1..i + 1 + rel_end];
+            if !inner.chars().any(char::is_whitespace) && inner.contains('@') {
+                out.push(' ');
+                i = i + 1 + rel_end + 1;
+                continue;
+            }
+        }
+
+        // Scan contiguous email-like tokens (`local@domain`) and omit them.
+        if is_email_token_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && is_email_token_byte(bytes[i]) {
+                i += 1;
+            }
+            let tok = &lower[start..i];
+            if let Some((local, domain)) = tok.split_once('@')
+                && !local.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+            {
+                out.push(' ');
+            } else {
+                out.push_str(tok);
+            }
+            continue;
+        }
+
+        let ch = lower[i..].chars().next().expect("valid char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn is_email_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'@' | b'.' | b'-' | b'_' | b'+' | b'%' | b'!' | b'#' | b'$' | b'&' | b'*' | b'='
+        )
 }
 
 fn contains_enhanced_code(lower: &str, code: &str) -> bool {
@@ -1586,7 +1663,7 @@ fn parse_recipient_mailboxes(addresses: &[String]) -> AppResult<Vec<Mailbox>> {
         if trimmed.is_empty() {
             continue;
         }
-        let mbox: Mailbox = trimmed.parse().map_err(|err| {
+        let mbox: Mailbox = email_to_ascii_punycode(trimmed).parse().map_err(|err| {
             AppError::Validation(format!("invalid SMTP recipient '{trimmed}': {err}"))
         })?;
         mailboxes.push(mbox);
@@ -1603,7 +1680,7 @@ fn parse_optional_mailbox(raw: Option<&str>, field_name: &str) -> AppResult<Opti
     let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let mbox: Mailbox = trimmed.parse().map_err(|err| {
+    let mbox: Mailbox = email_to_ascii_punycode(trimmed).parse().map_err(|err| {
         AppError::Validation(format!("invalid SMTP {field_name} '{trimmed}': {err}"))
     })?;
     Ok(Some(mbox))
@@ -2031,7 +2108,26 @@ pub fn rewrite_body_html_for_email(html: &str) -> String {
 fn parse_px_dimension(raw: &str) -> Option<u32> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let numeric = trimmed.strip_suffix("px").unwrap_or(&trimmed).trim();
-    numeric.parse::<u32>().ok()
+    if numeric.is_empty()
+        || numeric.starts_with('+')
+        || numeric.starts_with('-')
+        || !numeric.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    {
+        return None;
+    }
+    let val: f64 = numeric.parse().ok()?;
+    if !val.is_finite() || val < 0.0 {
+        return None;
+    }
+    if val == 0.0 {
+        return Some(0);
+    }
+    let rounded = val.round().max(1.0);
+    if rounded >= f64::from(u32::MAX) {
+        Some(u32::MAX)
+    } else {
+        Some(rounded as u32)
+    }
 }
 
 enum ParsedImgPercent {

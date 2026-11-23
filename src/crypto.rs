@@ -400,6 +400,41 @@ pub fn normalize_email_address(raw: &str) -> String {
     }
 }
 
+/// Convert any internationalized domain name (IDN) inside a raw SMTP address or RFC 5322 mailbox
+/// (`"Name <alice@bücher.de>"` -> `"Name <alice@xn--bcher-kva.de>"`) to ASCII Punycode via UTS-46
+/// so `lettre` accepts it and non-`SMTPUTF8` mail servers deliver it reliably.
+pub fn email_to_ascii_punycode(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_ascii() {
+        return trimmed.to_string();
+    }
+
+    let convert_bare = |bare: &str| -> String {
+        let b = bare.trim();
+        let Some((local, domain)) = b.rsplit_once('@') else {
+            return b.to_string();
+        };
+        let domain_clean = domain.trim().trim_end_matches('.');
+        if domain_clean.is_ascii() {
+            return b.to_string();
+        }
+        match url::Host::parse(domain_clean) {
+            Ok(url::Host::Domain(ascii_domain)) => format!("{}@{ascii_domain}", local.trim()),
+            _ => b.to_string(),
+        }
+    };
+
+    if let Some(start) = trimmed.rfind('<')
+        && let Some(rel_end) = trimmed[start + 1..].find('>')
+    {
+        let end = start + 1 + rel_end;
+        let converted = convert_bare(&trimmed[start + 1..end]);
+        return format!("{}<{converted}>{}", &trimmed[..start], &trimmed[end + 1..]);
+    }
+
+    convert_bare(trimmed)
+}
+
 /// Mask an email address for public confirmation pages and diagnostics
 /// (`alice@example.com` -> `a***e@example.com`).
 pub fn mask_email_address(raw: &str) -> String {

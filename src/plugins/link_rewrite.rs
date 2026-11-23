@@ -39,8 +39,12 @@ use super::{
 /// Canonical plugin identifier for Link Rewrite (YOURLS).
 pub const LINK_REWRITE_PLUGIN_ID: &str = "link-rewrite";
 
-/// Maximum number of unique URLs shortened per article delivery.
+/// Maximum number of unique uncached URLs shortened via YOURLS per article delivery.
 pub const MAX_REWRITE_URLS_PER_ENTRY: usize = 50;
+
+/// Hard upper bound on total unique candidate URLs collected (and looked up in SQLite cache)
+/// per article delivery, bounding memory and SQLite I/O on pathological link-heavy HTML.
+pub const MAX_CANDIDATE_URLS_PER_ENTRY: usize = 1_000;
 
 /// Maximum concurrent YOURLS API requests per article.
 pub const REWRITE_CONCURRENCY: usize = 4;
@@ -430,6 +434,7 @@ impl Plugin for LinkRewritePlugin {
         //    never crowd out uncached links from being shortened.
         let mut candidate_urls: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut candidate_cap_hit = false;
 
         if let Some(p_url) = primary_url
             && is_eligible_rewrite_url(p_url, self_host.as_deref(), &provider_cfg.exclude_domains)
@@ -448,6 +453,10 @@ impl Plugin for LinkRewritePlugin {
                     continue;
                 }
                 if seen.insert(href.clone()) {
+                    if candidate_urls.len() >= MAX_CANDIDATE_URLS_PER_ENTRY {
+                        candidate_cap_hit = true;
+                        break;
+                    }
                     candidate_urls.push(href);
                 }
             }
@@ -586,6 +595,10 @@ impl Plugin for LinkRewritePlugin {
         } else if truncated_cap {
             out.warnings.push(format!(
                 "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} new uncached links; remaining uncached links kept original"
+            ));
+        } else if candidate_cap_hit {
+            out.warnings.push(format!(
+                "Link Rewrite capped at {MAX_CANDIDATE_URLS_PER_ENTRY} unique candidate links per entry; remaining links kept original"
             ));
         }
 

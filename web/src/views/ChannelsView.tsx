@@ -2806,7 +2806,7 @@ function DestinationModal({
         const payload: UpdateDestinationRequest = {
           name: name.trim(),
           config: patchConfig,
-          enabled,
+          ...(enabled !== destination.enabled ? { enabled } : {}),
         };
         return api.destinations.update(destination.id, payload);
       }

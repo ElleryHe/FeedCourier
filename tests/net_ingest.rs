@@ -1397,3 +1397,35 @@ async fn qa09_html5_single_pass_attr_entity_decoding_idna_and_fail_closed_proxy(
         .expect_err("post_form_bytes with use_proxy=true and no global proxy must fail closed");
     assert!(matches!(post_err, AppError::Validation(_)));
 }
+
+#[test]
+fn round2_qa_regressions_html_script_close_boundary_and_duplicate_attrs() {
+    use feedcourier::ingest::html::html_to_plain_text;
+
+    // 1. P2 HTML raw-text boundary: `</scripting>` inside `<script>` must NOT prematurely close
+    //    the `<script>` block and leak script contents into plain text.
+    let raw_script =
+        "<p>Before</p><script>const s = '</scripting>secret_js_leak';</script><p>After</p>";
+    let plain = html_to_plain_text(raw_script);
+    assert!(plain.contains("Before"), "missing Before: {plain}");
+    assert!(plain.contains("After"), "missing After: {plain}");
+    assert!(
+        !plain.contains("secret_js_leak"),
+        "script body leaked past fake </scripting> close tag: {plain}"
+    );
+
+    // 2. P2 HTML5 attribute deduplication: first attribute wins when duplicate attributes appear.
+    let dup_html = r#"<p><a href="https://first.example/a" href="https://second.example/b" HREF="https://third.example/c">Link</a></p>"#;
+    let out = sanitize_and_extract_html(dup_html, None);
+    assert!(
+        out.content_html.contains("https://first.example/a"),
+        "first href must be preserved: {}",
+        out.content_html
+    );
+    assert!(
+        !out.content_html.contains("https://second.example/b")
+            && !out.content_html.contains("https://third.example/c"),
+        "duplicate href attributes must be dropped per HTML5 first-wins rule: {}",
+        out.content_html
+    );
+}

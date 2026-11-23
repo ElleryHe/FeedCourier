@@ -27,9 +27,12 @@ pub async fn api_not_found(uri: Uri) -> AppError {
 pub async fn serve_spa(method: Method, uri: Uri) -> Response {
     let path = uri.path();
 
-    // Never serve SPA HTML for unmatched `/api` or `/mcp` endpoints.
+    // Never serve SPA HTML for unmatched `/api`, `/mcp`, `/u/*`, or `/v/*` endpoints.
     if path == "/api" || path.starts_with("/api/") || path == "/mcp" || path.starts_with("/mcp/") {
         return AppError::NotFound(format!("endpoint '{path}' not found")).into_response();
+    }
+    if path == "/u" || path.starts_with("/u/") || path == "/v" || path.starts_with("/v/") {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     if !matches!(method, Method::GET | Method::HEAD) {

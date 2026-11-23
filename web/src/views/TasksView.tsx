@@ -514,6 +514,26 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
         <Card className="p-8 text-center text-xs text-zinc-500">
           {m.tasks.loading}
         </Card>
+      ) : tasksQuery.isError ? (
+        <Card className="border-rose-200 bg-rose-50/50 p-4 dark:border-rose-900/60 dark:bg-rose-950/20">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs text-rose-700 dark:text-rose-300">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>
+                {m.tasks.loadError} {errorMessage(tasksQuery.error)}
+              </span>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void tasksQuery.refetch()}
+              loading={tasksQuery.isFetching}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              {m.common.retry}
+            </Button>
+          </div>
+        </Card>
       ) : tasks.length === 0 ? (
         <EmptyState
           icon={Inbox}

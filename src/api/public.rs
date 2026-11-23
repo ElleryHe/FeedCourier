@@ -56,21 +56,25 @@ fn sanitize_ip_key(raw: &str) -> String {
 
 fn extract_client_ip(trust_proxy: bool, headers: &HeaderMap, peer_ip: Option<IpAddr>) -> String {
     if trust_proxy {
-        if let Some(real_ip) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return sanitize_ip_key(real_ip);
+        // Prefer the RIGHTMOST non-empty hop across all `X-Forwarded-For` headers (scanning from
+        // the last header backwards) because proxies like Caddy, Traefik, Envoy, AWS ALB, and
+        // standard Nginx append the real client IP to `X-Forwarded-For` while often passing any
+        // spoofed client `X-Real-IP` through untouched.
+        for val in headers.get_all("x-forwarded-for").iter().rev() {
+            if let Ok(raw) = val.to_str()
+                && let Some(xff_rightmost) = raw.rsplit(',').map(str::trim).find(|s| !s.is_empty())
+            {
+                return sanitize_ip_key(xff_rightmost);
+            }
         }
-        // Take the RIGHTMOST hop appended by the trusted reverse proxy (never the spoofable leftmost!).
-        if let Some(xff_rightmost) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|raw| raw.rsplit(',').map(str::trim).find(|s| !s.is_empty()))
-        {
-            return sanitize_ip_key(xff_rightmost);
+        // Only fall back to `X-Real-IP` when no `X-Forwarded-For` header is present at all.
+        for val in headers.get_all("x-real-ip").iter().rev() {
+            if let Ok(raw) = val.to_str() {
+                let real_ip = raw.trim();
+                if !real_ip.is_empty() {
+                    return sanitize_ip_key(real_ip);
+                }
+            }
         }
     }
     if let Some(ip) = peer_ip {

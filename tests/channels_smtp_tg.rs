@@ -2910,3 +2910,132 @@ async fn qa07_and_qa09_telegram_entities_budget_zwj_fallback_and_smtp_percent_ed
         "33.3% image must emit integer width=197 and exact CSS width:33.3%:\n{rewritten}"
     );
 }
+
+#[tokio::test]
+async fn round2_qa_regressions_rg03_tg_urls_and_smtp_fractional_px() {
+    use feedcourier::channels::smtp::rewrite_body_html_for_email;
+    use feedcourier::channels::telegram::suppress_telegram_auto_entities;
+
+    // 1. RG-03: `sendRichMessage` returning `400 Bad Request: message thread not found` or
+    //    `400 Bad Request: CHAT_NOT_FOUND` MUST return `PermanentFailure` without degrading to
+    //    `sendMessage` or mutating `supports_rich_message`!
+    for (idx, err_desc) in [
+        "Bad Request: message thread not found",
+        "Bad Request: CHAT_NOT_FOUND",
+        "Bad Request: PEER_ID_INVALID",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mock_tg = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTOK_RG03/sendRichMessage"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "ok": false,
+                "error_code": 400,
+                "description": err_desc
+            })))
+            .expect(1)
+            .mount(&mock_tg)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTOK_RG03/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "message_id": 999 }
+            })))
+            .expect(0)
+            .mount(&mock_tg)
+            .await;
+
+        let tg_sender =
+            TelegramSender::with_media_fetcher(Arc::new(DefaultMediaStreamFetcher::new()))
+                .with_ssrf_allowlist(&["127.0.0.1/32"])
+                .unwrap();
+        let tg_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+            bot_token: "TOK_RG03".to_owned(),
+            api_base_url: Some(mock_tg.uri()),
+        });
+        let tg_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
+            chat_id: "-100999".to_owned(),
+            message_thread_id: Some(42),
+        });
+        let tg_ch = sample_channel(
+            ChannelKind::Telegram,
+            &json!({ "supports_rich_message": true }).to_string(),
+        );
+        let dest_row = sample_destination();
+        let opts = RouteOptions {
+            telegram_mode: TelegramDeliveryMode::RichMessage,
+            ..RouteOptions::default()
+        };
+        let route = sample_route(80 + idx as i64, opts.clone());
+        let task = sample_task(80 + idx as i64);
+        let feed = sample_feed(80, "RG03 Feed");
+        let entry = sample_entry(&format!("rg03-{idx}"), Vec::new());
+        let ctx = DeliveryContext {
+            task: &task,
+            entry: &entry,
+            feed: &feed,
+            route: &route,
+            route_options: opts,
+            channel: &tg_ch,
+            channel_config: &tg_cfg,
+            destination: &dest_row,
+            destination_config: &tg_dest,
+            timezone: chrono_tz::UTC,
+            checkpoint: None,
+            checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
+        };
+        match tg_sender.send(&ctx).await.expect("outcome") {
+            DeliveryOutcome::PermanentFailure { status_code, .. } => {
+                assert_eq!(status_code, Some(400));
+            }
+            other => panic!(
+                "expected PermanentFailure without sendMessage fallback for '{err_desc}', got {other:?}"
+            ),
+        }
+    }
+
+    // 2. P2 Telegram URL scanner: balanced parens (Wikipedia), Markdown-wrapped balanced parens,
+    //    adjacent Markdown links, and internal commas stay completely untouched!
+    let text = "Read https://en.wikipedia.org/wiki/Rust_(programming_language) and [Wiki](https://en.wikipedia.org/wiki/Rust_(programming_language)) and [a](https://example.com/a/README.md),[b](https://example.com/b/sku.go) and https://example.com/a,b/c, plus /cmd and README.md";
+    let suppressed = suppress_telegram_auto_entities(text);
+    assert!(
+        suppressed.contains("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+        "Wikipedia balanced-paren URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("[Wiki](https://en.wikipedia.org/wiki/Rust_(programming_language))"),
+        "Markdown-wrapped Wikipedia URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed
+            .contains("[a](https://example.com/a/README.md),[b](https://example.com/b/sku.go)"),
+        "adjacent comma-separated Markdown links must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("https://example.com/a,b/c,"),
+        "URL with internal comma must stay intact: {suppressed}"
+    );
+    assert!(suppressed.contains("/\u{200C}cmd"));
+    assert!(suppressed.contains("README.\u{200C}md"));
+
+    // 3. P2 SMTP fractional pixel width (`0.5px` -> `1`, `120.4px` -> `120`, `0.0px` -> `0`).
+    let frac_html = r#"<img src="https://cdn.example.com/sub.png" width="0.5px"><img src="https://cdn.example.com/frac.png" width="120.4px"><img src="https://cdn.example.com/zero.png" width="0.0px">"#;
+    let rewritten = rewrite_body_html_for_email(frac_html);
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/sub.png" width="1" "#),
+        "0.5px image must clamp to width=1 (never 592):\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/frac.png" width="120" "#),
+        "120.4px image must round to width=120:\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/zero.png" width="0" "#),
+        "0.0px image must stay width=0:\n{rewritten}"
+    );
+}

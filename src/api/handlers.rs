@@ -2194,7 +2194,7 @@ pub async fn send_recipient_verification(
         None => {
             let _ = state
                 .db()
-                .rollback_smtp_recipient_verification_reservation(&prev_row)
+                .rollback_smtp_recipient_verification_reservation(&prev_row, &code_sha256)
                 .await;
             return Err(AppError::NotFound(
                 "Recipient address no longer present in destination".to_string(),
@@ -2207,7 +2207,7 @@ pub async fn send_recipient_verification(
         Err(err) => {
             let _ = state
                 .db()
-                .rollback_smtp_recipient_verification_reservation(&prev_row)
+                .rollback_smtp_recipient_verification_reservation(&prev_row, &code_sha256)
                 .await;
             return Err(err);
         }
@@ -2240,7 +2240,7 @@ pub async fn send_recipient_verification(
         Err(err) => {
             let _ = state
                 .db()
-                .rollback_smtp_recipient_verification_reservation(&prev_row)
+                .rollback_smtp_recipient_verification_reservation(&prev_row, &code_sha256)
                 .await;
             return Err(err);
         }

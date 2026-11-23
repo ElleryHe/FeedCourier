@@ -83,7 +83,7 @@ flowchart LR
 
 ## 5. 路由级筛选、内容过滤与页面筛选
 
-在 WebUI **Routes** 页面（或通过 MCP 的 [`configure_route`](/zh/mcp/tools#5-configure-route) 工具）创建路由时，选择目标**目的地**并配置匹配规则。
+在 WebUI **Routes** 页面（或通过 MCP 的 [`configure_route`](/zh/mcp/tools#6-configure-route) 工具）创建路由时，选择目标**目的地**并配置匹配规则。
 
 ### 通道页与路由页筛选
 
@@ -106,7 +106,7 @@ flowchart LR
 4. **包含正则表达式（`include_regex`）**：当填写了正则表达式时，标题或正文必须匹配该表达式，否则跳过。
 
 > [!TIP]
-> 在正式保存路由规则前，你可以在 WebUI 中使用订阅源预览功能，或通过 MCP 调用 [`preview_feed_latest`](/zh/mcp/tools#3-preview-feed-latest) 传入过滤条件，直接查看最近 10 篇文章中哪些会命中、哪些会被哪条规则排除。
+> 在正式保存路由规则前，你可以在 WebUI 中使用订阅源预览功能，或通过 MCP 调用 [`preview_feed_latest`](/zh/mcp/tools#4-preview-feed-latest) 传入过滤条件，直接查看最近 10 篇文章中哪些会命中、哪些会被哪条规则排除。
 
 ---
 
@@ -155,7 +155,7 @@ flowchart LR
 
 想在不订阅、不影响队列的情况下查看文章在某个目的地中的实际效果，可打开某个 URL（或已有订阅源）的**订阅源预览**，使用 **Debug push** 栏：选择目标**目的地**、（Telegram 还可选择）投递模式与链接预览、投递语言、可选的时区覆盖以及可选插件（如链接替换），然后在具体预览条目上点击 **Push latest** 或 **Push this item**。
 
-调试推送是**无状态**的：不写入指纹、不进入队列，也不应用路由过滤、时间窗口与配额，不占用账号额度。针对 SMTP 目的地，调试推送严格仅向 **`verified`**（已验证）收件人按单 `To:` 隔离信封附带合规头发送（0 位已验证收件人时返回错误提示）。通过它在 Notion 创建的页面，`FC-ID` 会带 `test-` 前缀，不会与真实投递冲突。失败时会在结果消息中返回诊断信息。对应的 MCP 工具为 [`test_push_feed_entry`](/zh/mcp/tools#9-test-push-feed-entry)。
+调试推送是**无状态**的：不写入指纹、不进入队列，也不应用路由过滤、时间窗口与配额，不占用账号额度。针对 SMTP 目的地，调试推送严格仅向 **`verified`**（已验证）收件人按单 `To:` 隔离信封附带合规头发送（0 位已验证收件人时返回错误提示）。通过它在 Notion 创建的页面，`FC-ID` 会带 `test-` 前缀，不会与真实投递冲突。失败时会在结果消息中返回诊断信息。对应的 MCP 工具为 [`test_push_feed_entry`](/zh/mcp/tools#10-test-push-feed-entry)。
 
 ---
 

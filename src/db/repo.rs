@@ -798,9 +798,9 @@ impl Database {
             .clone()
             .unwrap_or(current.encrypted_config);
         let enabled = patch.enabled.unwrap_or(current.enabled);
-        // Any explicit admin toggle of `enabled` clears the system `auto_paused` flag so manual
-        // pauses are never silently overridden by subsequent recipient verification.
-        let auto_paused = if patch.enabled.is_some() {
+        // Only clear `auto_paused` when the admin actually changes `enabled`; no-op saves (such as
+        // editing recipient addresses while keeping `enabled` unchanged) preserve `auto_paused`.
+        let auto_paused = if patch.enabled.is_some_and(|next| next != current.enabled) {
             false
         } else {
             current.auto_paused
@@ -831,9 +831,11 @@ impl Database {
     }
 
     /// System auto-pause when all SMTP recipients on a destination are `unsubscribed` or `bounced`.
+    /// Only flips `auto_paused = 1` when the destination was currently enabled (`enabled = 1`),
+    /// so an already manually disabled destination never gets silently re-enabled later.
     pub async fn auto_pause_destination(&self, destination_id: i64, now: i64) -> AppResult<()> {
         sqlx::query(
-            "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
         )
         .bind(now)
         .bind(destination_id)
@@ -3094,15 +3096,19 @@ impl Database {
             return Ok(());
         }
         let mut tx = self.write_pool.begin().await?;
-        for hash in hashes {
-            sqlx::query(
-                "UPDATE plugin_link_cache SET last_used_at = ?1 WHERE instance_id = ?2 AND long_url_sha256 = ?3",
-            )
-            .bind(now)
-            .bind(instance_id)
-            .bind(hash)
-            .execute(&mut *tx)
-            .await?;
+        for chunk in hashes.chunks(500) {
+            let mut qb =
+                QueryBuilder::<sqlx::Sqlite>::new("UPDATE plugin_link_cache SET last_used_at = ");
+            qb.push_bind(now);
+            qb.push(" WHERE instance_id = ");
+            qb.push_bind(instance_id);
+            qb.push(" AND long_url_sha256 IN (");
+            let mut sep = qb.separated(", ");
+            for hash in chunk {
+                sep.push_bind(hash);
+            }
+            sep.push_unseparated(")");
+            qb.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -3467,12 +3473,15 @@ impl Database {
         Ok((current, updated))
     }
 
-    /// Roll back a verification-code reservation if the subsequent SMTP send fails.
+    /// Roll back a verification-code reservation if the subsequent SMTP send fails, guarded by a
+    /// compare-and-swap check (`status = 'pending' AND code_sha256 = ?10`) so a slow SMTP timeout
+    /// can never clobber a concurrent unsubscribe or newer verification attempt.
     pub async fn rollback_smtp_recipient_verification_reservation(
         &self,
         prev: &SmtpRecipientRow,
-    ) -> AppResult<()> {
-        sqlx::query(
+        reserved_code_sha256: &str,
+    ) -> AppResult<bool> {
+        let res = sqlx::query(
             r#"
             UPDATE smtp_recipients
             SET status = ?1,
@@ -3484,6 +3493,8 @@ impl Database {
                 codes_sent_in_window = ?7,
                 updated_at = ?8
             WHERE id = ?9
+              AND status = 'pending'
+              AND code_sha256 = ?10
             "#,
         )
         .bind(prev.status)
@@ -3495,9 +3506,10 @@ impl Database {
         .bind(prev.codes_sent_in_window)
         .bind(prev.updated_at)
         .bind(prev.id)
+        .bind(reserved_code_sha256)
         .execute(&self.write_pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// Persist a freshly generated verification code digest and update per-recipient rate-limit
@@ -3676,14 +3688,14 @@ impl Database {
         .await?;
 
         let auto_paused = if remaining_active == 0 {
-            sqlx::query(
-                "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2",
+            let res = sqlx::query(
+                "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
             )
             .bind(now)
             .bind(row.destination_id)
             .execute(&mut *tx)
             .await?;
-            true
+            res.rows_affected() > 0
         } else {
             false
         };
@@ -3734,14 +3746,14 @@ impl Database {
         .await?;
 
         let auto_paused = if remaining_active == 0 {
-            sqlx::query(
-                "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2",
+            let res = sqlx::query(
+                "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
             )
             .bind(now)
             .bind(row.destination_id)
             .execute(&mut *tx)
             .await?;
-            true
+            res.rows_affected() > 0
         } else {
             false
         };

@@ -983,6 +983,7 @@ export const zhCN: Messages = {
     retrySelected: (count: number) => `重投已选任务 (${count})`,
     retryAllDeadLetter: "重投全部死信任务",
     loading: "正在加载投递任务…",
+    loadError: "加载投递任务失败：",
     emptyTitle: "当前筛选条件下暂无投递任务",
     emptyDesc:
       "当订阅源抓取到命中启用路由的新文章时，对应的投递任务将显示在此处。",

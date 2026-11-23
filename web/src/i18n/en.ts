@@ -1031,6 +1031,7 @@ export const en = {
     retrySelected: (count: number) => `Retry Selected (${count})`,
     retryAllDeadLetter: "Retry All Dead-Letter",
     loading: "Loading outbox tasks…",
+    loadError: "Failed to load outbox tasks:",
     emptyTitle: "No delivery tasks in this view",
     emptyDesc:
       "When subscribed feeds publish new articles matching an active route, delivery tasks appear here.",

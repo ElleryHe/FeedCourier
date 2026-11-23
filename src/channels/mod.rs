@@ -367,7 +367,8 @@ impl ChannelConfig {
                         "SMTP from_address must not be empty".to_string(),
                     ));
                 }
-                if from_trimmed.parse::<lettre::Address>().is_err() {
+                let from_ascii = crate::crypto::email_to_ascii_punycode(from_trimmed);
+                if from_ascii.parse::<lettre::Address>().is_err() {
                     return Err(AppError::Validation(format!(
                         "invalid SMTP from_address '{from_trimmed}'"
                     )));
@@ -461,10 +462,13 @@ impl DestinationConfig {
                 }
                 for raw in &cfg.to_addresses {
                     let trimmed = raw.trim();
-                    if !trimmed.is_empty() && trimmed.parse::<lettre::message::Mailbox>().is_err() {
-                        return Err(AppError::Validation(format!(
-                            "invalid SMTP recipient address '{trimmed}'"
-                        )));
+                    if !trimmed.is_empty() {
+                        let ascii = crate::crypto::email_to_ascii_punycode(trimmed);
+                        if ascii.parse::<lettre::message::Mailbox>().is_err() {
+                            return Err(AppError::Validation(format!(
+                                "invalid SMTP recipient address '{trimmed}'"
+                            )));
+                        }
                     }
                 }
                 if let Some(rt) = cfg
@@ -472,11 +476,13 @@ impl DestinationConfig {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    && rt.parse::<lettre::message::Mailbox>().is_err()
                 {
-                    return Err(AppError::Validation(format!(
-                        "invalid SMTP reply_to address '{rt}'"
-                    )));
+                    let rt_ascii = crate::crypto::email_to_ascii_punycode(rt);
+                    if rt_ascii.parse::<lettre::message::Mailbox>().is_err() {
+                        return Err(AppError::Validation(format!(
+                            "invalid SMTP reply_to address '{rt}'"
+                        )));
+                    }
                 }
                 Ok(())
             }

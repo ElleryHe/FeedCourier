@@ -2900,15 +2900,23 @@ impl TgCallError {
             return false;
         }
         let lower = self.description.to_ascii_lowercase();
-        // Exclude destination/permission/topic errors that CompactCard cannot resolve.
+        // Exclude destination/permission/topic errors (both human-readable and Telegram RPC codes)
+        // that CompactCard cannot resolve.
         !(lower.contains("chat not found")
+            || lower.contains("chat_not_found")
             || lower.contains("chat_id is empty")
+            || lower.contains("peer_id_invalid")
+            || lower.contains("chat_write_forbidden")
+            || lower.contains("channel_private")
             || lower.contains("user not found")
+            || lower.contains("user_not_found")
+            || lower.contains("user_is_blocked")
             || lower.contains("bot was blocked")
             || lower.contains("bot was kicked")
             || lower.contains("have no rights")
             || lower.contains("not enough rights")
             || lower.contains("message thread not found")
+            || lower.contains("message_thread_not_found")
             || lower.contains("topic_deleted")
             || lower.contains("topic_closed")
             || lower.contains("group chat was upgraded"))
@@ -2951,7 +2959,6 @@ fn is_rich_method_unsupported(code: i32, description: &str) -> bool {
     lower.contains("method not found")
         || lower.contains("unknown method")
         || lower.contains("method is not available")
-        || (code == 400 && lower.contains("not found") && !lower.contains("chat"))
 }
 
 async fn parse_single_message_response(
@@ -3194,26 +3201,69 @@ const FILENAME_TLD_EXTENSIONS: &[&str] = &[
 const AMBIGUOUS_FILENAME_TLD_EXTENSIONS: &[&str] =
     &["so", "cc", "ml", "re", "pm", "am", "is", "it", "in", "im"];
 
-fn is_url_delimiter(ch: char) -> bool {
+fn is_hard_url_stop(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,
-            ')' | ']'
-                | '}'
-                | '>'
-                | '"'
-                | '\''
-                | '”'
-                | '’'
-                | '）'
-                | '」'
-                | '』'
-                | ','
-                | ';'
-                | '。'
-                | '，'
-                | '；'
+            '<' | '>' | '"' | '\'' | '”' | '’' | '）' | '」' | '』' | '。' | '，' | '；' | '、'
         )
+}
+
+/// Scan the end byte offset (relative to `s`) of an embedded `http://` / `https://` URL.
+///
+/// Preserves balanced parentheses/brackets/braces (e.g. Wikipedia
+/// `https://en.wikipedia.org/wiki/Rust_(programming_language)`) and internal commas
+/// (e.g. `https://example.com/a,b/c`), while stopping at the first unmatched closing delimiter
+/// (such as Markdown `[Wiki](https://..._(lang))`) and stripping trailing sentence punctuation.
+fn scan_embedded_url_end(s: &str) -> usize {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut raw_end = 0usize;
+
+    for (offset, c) in s.char_indices() {
+        if is_hard_url_stop(c) {
+            break;
+        }
+        match c {
+            '(' => paren_depth += 1,
+            ')' => {
+                if paren_depth == 0 {
+                    break;
+                }
+                paren_depth -= 1;
+            }
+            '[' => bracket_depth += 1,
+            ']' => {
+                if bracket_depth == 0 {
+                    break;
+                }
+                bracket_depth -= 1;
+            }
+            '{' => brace_depth += 1,
+            '}' => {
+                if brace_depth == 0 {
+                    break;
+                }
+                brace_depth -= 1;
+            }
+            _ => {}
+        }
+        raw_end = offset + c.len_utf8();
+    }
+
+    let mut end = raw_end;
+    while end > 0 {
+        let Some(last) = s[..end].chars().next_back() else {
+            break;
+        };
+        if matches!(last, ',' | ';' | '.' | ':' | '!' | '?') {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
 }
 
 fn find_next_http_scheme(s: &str) -> Option<usize> {
@@ -3378,13 +3428,7 @@ pub fn suppress_telegram_auto_entities(text: &str) -> String {
                 let url_start = cursor + rel_url;
                 suppress_non_url_segment(&token[cursor..url_start], &mut out);
 
-                let mut url_end = url_start;
-                for (offset, c) in token[url_start..].char_indices() {
-                    if is_url_delimiter(c) {
-                        break;
-                    }
-                    url_end = url_start + offset + c.len_utf8();
-                }
+                let url_end = url_start + scan_embedded_url_end(&token[url_start..]);
                 out.push_str(&token[url_start..url_end]);
                 cursor = url_end;
             } else {

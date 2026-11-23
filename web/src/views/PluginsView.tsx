@@ -1816,6 +1816,14 @@ function SchemaProviderModal({
               error: m.plugins.providerModal.errFieldRequired(label),
             };
           }
+          if (
+            isEdit &&
+            instance &&
+            instance.config[key] !== undefined &&
+            instance.config[key] !== null
+          ) {
+            config[key] = null;
+          }
           continue;
         }
         const matched = prop.enum.find((opt) => String(opt) === strVal);
@@ -1831,6 +1839,14 @@ function SchemaProviderModal({
               config: null,
               error: m.plugins.providerModal.errFieldRequired(label),
             };
+          }
+          if (
+            isEdit &&
+            instance &&
+            instance.config[key] !== undefined &&
+            instance.config[key] !== null
+          ) {
+            config[key] = null;
           }
           continue;
         }
@@ -1870,6 +1886,14 @@ function SchemaProviderModal({
             config: null,
             error: m.plugins.providerModal.errFieldRequired(label),
           };
+        }
+        if (
+          isEdit &&
+          instance &&
+          instance.config[key] !== undefined &&
+          instance.config[key] !== null
+        ) {
+          config[key] = null;
         }
         continue;
       }
