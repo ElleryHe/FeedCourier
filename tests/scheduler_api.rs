@@ -2358,8 +2358,8 @@ async fn qa_hardening_quota_ledger_route_sync_status_codes_channel_validation_an
     let smtp_id = smtp_ch["id"].as_i64().unwrap();
     assert_eq!(smtp_ch["config"]["has_password"], true);
     assert_eq!(
-        smtp_ch["destinations"][0]["name"], "ops@example.com",
-        "auto-naming must pick the first non-empty trimmed SMTP recipient"
+        smtp_ch["destinations"][0]["name"], "o***s@example.com",
+        "auto-naming must pick and mask the first non-empty trimmed SMTP recipient (zero plaintext PII)"
     );
 
     // PATCH omitting `password` preserves stored password.
@@ -2632,11 +2632,30 @@ async fn qa_hardening_quota_ledger_route_sync_status_codes_channel_validation_an
         DeliveryTaskStatus::Delivered
     );
 
-    // Delete `d1_id` (which cascades `r1` and `t1`!): ledger MUST preserve the quota count (`1`)!
-    let (status, _, _) = h
+    // Delete `d1_id` without `?cascade=true` returns 409 Conflict listing referencing routes (v0.3.0 Q16).
+    let (conflict_status, _, conflict_body) = h
         .send(
             Method::DELETE,
             &format!("/api/v1/destinations/{d1_id}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+    assert_eq!(conflict_status, StatusCode::CONFLICT);
+    let conflict_json = parse_json(&conflict_body);
+    assert_eq!(
+        conflict_json["referencing_routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Delete `d1_id` with `?cascade=true` (cascades `r1` and `t1`): ledger MUST preserve the quota count (`1`)!
+    let (status, _, _) = h
+        .send(
+            Method::DELETE,
+            &format!("/api/v1/destinations/{d1_id}?cascade=true"),
             Some(&cookie),
             None,
         )

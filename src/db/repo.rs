@@ -1,27 +1,32 @@
 //! Full CRUD, outbox lease state machine, quota counters, `NOT EXISTS` payload GC,
 //! `PRAGMA optimize`, and `VACUUM INTO` online snapshot backup operations.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono_tz::Tz;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sqlx::QueryBuilder;
 
 use crate::channels::{
     ChannelConfig, ChannelKind, DeliveryCheckpoint, DestinationConfig, LegacyChannelConfig,
     TelegramCapabilities,
 };
-use crate::crypto::MasterKey;
+use crate::config::AppConfig;
+use crate::crypto::{MasterKey, mask_emails_in_text};
 use crate::db::models::{
     CHANNEL_MODEL_VERSION_V2, Channel, ChannelDestination, DeliveryTask, DeliveryTaskDetail,
     DeliveryTaskStatus, Entry, EntryInsertOutcome, Feed, FeedHealthStatus, GroupEffectiveLimits,
     McpToken, McpTokenScope, NewChannel, NewDestination, NewEntry, NewFeed, NewRoute,
-    OverviewSnapshot, QuotaUsage, Route, SETTING_CHANNEL_MODEL_VERSION, SETTING_OUTBOX_QUEUE,
-    SETTING_TIMEZONE, Session, SystemSetting, UpdateChannel, UpdateDestination, UpdateFeed,
-    UpdateRoute, now_unix,
+    OverviewSnapshot, PluginInstanceRow, PluginRow, QuotaUsage, Route,
+    SETTING_CHANNEL_MODEL_VERSION, SETTING_OUTBOX_QUEUE, SETTING_PUBLIC_URL,
+    SETTING_SMTP_RECIPIENT_MODEL_VERSION, SETTING_TIMEZONE, SMTP_RECIPIENT_MODEL_VERSION_V1,
+    Session, SmtpRecipientRow, SmtpRecipientStatus, SmtpRecipientSummary, SystemSetting,
+    UpdateChannel, UpdateDestination, UpdateFeed, UpdateRoute, now_unix,
 };
-use crate::db::{Database, choose_pre_v2_backup_path};
+use crate::db::{Database, choose_pre_v2_backup_path, remove_sqlite_sidecars};
 use crate::error::{AppError, AppResult};
 use crate::schedule::{DEFAULT_TIMEZONE, OutboxQueueState};
 
@@ -34,6 +39,15 @@ pub struct ChannelMigrationReport {
     pub accounts_merged: usize,
     pub destinations_created: usize,
     pub backup_path: Option<PathBuf>,
+}
+
+/// Atomic outcome of transactional reference-checked delete helpers (`channels`,
+/// `channel_destinations`, `plugin_instances`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteGuardOutcome {
+    Deleted,
+    NotFound,
+    Conflict(Vec<(i64, String)>),
 }
 
 impl Database {
@@ -657,6 +671,41 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Atomically verify route references and delete a channel inside a single `write_pool`
+    /// transaction, returning `Conflict` with `(route_id, route_name)` pairs unless `cascade` is true.
+    pub async fn delete_channel_guarded(
+        &self,
+        channel_id: i64,
+        cascade: bool,
+    ) -> AppResult<DeleteGuardOutcome> {
+        let mut tx = self.write_pool.begin().await?;
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM channels WHERE id = ?1")
+            .bind(channel_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Ok(DeleteGuardOutcome::NotFound);
+        }
+
+        if !cascade {
+            let refs: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, name FROM routes WHERE channel_id = ?1 ORDER BY id ASC")
+                    .bind(channel_id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            if !refs.is_empty() {
+                return Ok(DeleteGuardOutcome::Conflict(refs));
+            }
+        }
+
+        sqlx::query("DELETE FROM channels WHERE id = ?1")
+            .bind(channel_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(DeleteGuardOutcome::Deleted)
+    }
+
     // =========================================================================
     // Channel Destinations CRUD & Target Resolution (v0.2.0 Two-Layer Model)
     // =========================================================================
@@ -749,6 +798,13 @@ impl Database {
             .clone()
             .unwrap_or(current.encrypted_config);
         let enabled = patch.enabled.unwrap_or(current.enabled);
+        // Only clear `auto_paused` when the admin actually changes `enabled`; no-op saves (such as
+        // editing recipient addresses while keeping `enabled` unchanged) preserve `auto_paused`.
+        let auto_paused = if patch.enabled.is_some_and(|next| next != current.enabled) {
+            false
+        } else {
+            current.auto_paused
+        };
         let now = now_unix();
 
         let updated = sqlx::query_as::<_, ChannelDestination>(
@@ -757,19 +813,35 @@ impl Database {
             SET name = ?1,
                 encrypted_config = ?2,
                 enabled = ?3,
-                updated_at = ?4
-            WHERE id = ?5
+                auto_paused = ?4,
+                updated_at = ?5
+            WHERE id = ?6
             RETURNING *
             "#,
         )
         .bind(name)
         .bind(encrypted_config)
         .bind(enabled)
+        .bind(auto_paused)
         .bind(now)
         .bind(destination_id)
         .fetch_one(&self.write_pool)
         .await?;
         Ok(updated)
+    }
+
+    /// System auto-pause when all SMTP recipients on a destination are `unsubscribed` or `bounced`.
+    /// Only flips `auto_paused = 1` when the destination was currently enabled (`enabled = 1`),
+    /// so an already manually disabled destination never gets silently re-enabled later.
+    pub async fn auto_pause_destination(&self, destination_id: i64, now: i64) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
+        )
+        .bind(now)
+        .bind(destination_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
     }
 
     /// Delete a destination (cascading its `routes` and `delivery_tasks`).
@@ -779,6 +851,43 @@ impl Database {
             .execute(&self.write_pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// Atomically check referencing routes and delete a destination inside a single `write_pool`
+    /// transaction, preventing TOCTOU races with concurrent route creation.
+    pub async fn delete_destination_guarded(
+        &self,
+        destination_id: i64,
+        cascade: bool,
+    ) -> AppResult<DeleteGuardOutcome> {
+        let mut tx = self.write_pool.begin().await?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM channel_destinations WHERE id = ?1")
+                .bind(destination_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Ok(DeleteGuardOutcome::NotFound);
+        }
+
+        if !cascade {
+            let refs: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT id, name FROM routes WHERE destination_id = ?1 ORDER BY id ASC",
+            )
+            .bind(destination_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            if !refs.is_empty() {
+                return Ok(DeleteGuardOutcome::Conflict(refs));
+            }
+        }
+
+        sqlx::query("DELETE FROM channel_destinations WHERE id = ?1")
+            .bind(destination_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(DeleteGuardOutcome::Deleted)
     }
 
     /// Resolve a target `(Channel, ChannelDestination)` from either `destination_id` (primary) or
@@ -2271,6 +2380,7 @@ impl Database {
             .bind(dest_str)
             .execute(&self.write_pool)
             .await?;
+        remove_sqlite_sidecars(dest_path);
         Ok(())
     }
 
@@ -2548,5 +2658,1135 @@ impl Database {
             return Ok(resumed);
         }
         Ok(state)
+    }
+
+    /// Resolve effective `PUBLIC_URL` (`env` takes precedence over `system_settings.public_url`),
+    /// returning `(public_url, env_managed)`.
+    pub async fn get_effective_public_url(
+        &self,
+        config: &AppConfig,
+    ) -> AppResult<(Option<String>, bool)> {
+        if let Some(ref env_url) = config.public_url {
+            return Ok((Some(env_url.clone()), true));
+        }
+        let stored = self
+            .get_setting_typed::<Option<String>>(SETTING_PUBLIC_URL)
+            .await?
+            .flatten()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        Ok((stored, false))
+    }
+
+    // =========================================================================
+    // Destination Config Writeback & Reference Checks (v0.3.0)
+    // =========================================================================
+
+    /// Update only `channel_destinations.encrypted_config` and `updated_at`.
+    pub async fn update_destination_encrypted_config(
+        &self,
+        destination_id: i64,
+        encrypted_config: &[u8],
+    ) -> AppResult<bool> {
+        let res = sqlx::query(
+            "UPDATE channel_destinations SET encrypted_config = ?1, updated_at = ?2 WHERE id = ?3",
+        )
+        .bind(encrypted_config)
+        .bind(now_unix())
+        .bind(destination_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Atomically read-modify-write ONLY `data_source_id` (and `database_id` if absent) on a
+    /// Notion destination inside a single `write_pool` transaction, preserving any concurrent
+    /// user updates to `column_mapping` or `allow_async`.
+    pub async fn update_notion_destination_ids_atomic(
+        &self,
+        destination_id: i64,
+        master_key: &MasterKey,
+        resolved_data_source_id: &str,
+        resolved_database_id: Option<&str>,
+    ) -> AppResult<bool> {
+        let mut tx = self.write_pool.begin().await?;
+        let current: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_config FROM channel_destinations WHERE id = ?1")
+                .bind(destination_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((encrypted_config,)) = current else {
+            return Ok(false);
+        };
+        let mut dest_cfg: DestinationConfig = master_key.decrypt_json(&encrypted_config)?;
+        let DestinationConfig::Notion(ref mut notion_cfg) = dest_cfg else {
+            return Ok(false);
+        };
+
+        let mut changed = false;
+        let next_ds = resolved_data_source_id.trim();
+        if !next_ds.is_empty() && notion_cfg.data_source_id != next_ds {
+            notion_cfg.data_source_id = next_ds.to_owned();
+            changed = true;
+        }
+        if notion_cfg.database_id.is_none()
+            && let Some(db_id) = resolved_database_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            notion_cfg.database_id = Some(db_id.to_owned());
+            changed = true;
+        }
+        if !changed {
+            return Ok(true);
+        }
+
+        let re_encrypted = master_key.encrypt_json(&dest_cfg)?;
+        sqlx::query(
+            "UPDATE channel_destinations SET encrypted_config = ?1, updated_at = ?2 WHERE id = ?3",
+        )
+        .bind(&re_encrypted)
+        .bind(now_unix())
+        .bind(destination_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// List `(route_id, route_name)` pairs currently targeting `destination_id`.
+    pub async fn list_routes_referencing_destination(
+        &self,
+        destination_id: i64,
+    ) -> AppResult<Vec<(i64, String)>> {
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, name FROM routes WHERE destination_id = ?1 ORDER BY id ASC")
+                .bind(destination_id)
+                .fetch_all(&self.read_pool)
+                .await?;
+        Ok(rows)
+    }
+
+    /// Pull forward `deferred` tasks for a specific `destination_id` so newly verified SMTP
+    /// recipients start delivering immediately.
+    pub async fn release_deferred_tasks_for_destination(
+        &self,
+        destination_id: i64,
+        now: i64,
+    ) -> AppResult<u64> {
+        let res = sqlx::query(
+            r#"
+            UPDATE delivery_tasks
+            SET next_attempt_at = ?1
+            WHERE destination_id = ?2
+              AND status IN ('queued', 'deferred')
+              AND next_attempt_at > ?1
+            "#,
+        )
+        .bind(now)
+        .bind(destination_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    // =========================================================================
+    // Plugins, Provider Instances & Link Cache (v0.3.0)
+    // =========================================================================
+
+    /// Ensure a built-in plugin row exists in `plugins` (preserving `enabled` and `settings_json`
+    /// across upgrades while keeping `installed_version` current). Performs a `read_pool` fast
+    /// path so unchanged rows never acquire `write_pool` or bump `updated_at`.
+    pub async fn ensure_plugin_row(&self, id: &str, version: &str) -> AppResult<PluginRow> {
+        if let Some(existing) = self.get_plugin(id).await?
+            && existing.installed_version == version
+        {
+            return Ok(existing);
+        }
+        let now = now_unix();
+        let row = sqlx::query_as::<_, PluginRow>(
+            r#"
+            INSERT INTO plugins (id, enabled, installed_version, settings_json, created_at, updated_at)
+            VALUES (?1, 0, ?2, '{}', ?3, ?3)
+            ON CONFLICT (id) DO UPDATE SET
+                installed_version = excluded.installed_version,
+                updated_at = excluded.updated_at
+            WHERE plugins.installed_version != excluded.installed_version
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(version)
+        .bind(now)
+        .fetch_optional(&self.write_pool)
+        .await?;
+        match row {
+            Some(r) => Ok(r),
+            None => self
+                .get_plugin(id)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("plugin '{id}' not found"))),
+        }
+    }
+
+    pub async fn list_plugins(&self) -> AppResult<Vec<PluginRow>> {
+        let rows = sqlx::query_as::<_, PluginRow>("SELECT * FROM plugins ORDER BY id ASC")
+            .fetch_all(&self.read_pool)
+            .await?;
+        Ok(rows)
+    }
+
+    pub async fn get_plugin(&self, id: &str) -> AppResult<Option<PluginRow>> {
+        let row = sqlx::query_as::<_, PluginRow>("SELECT * FROM plugins WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.read_pool)
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn update_plugin(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+        settings_json: Option<&str>,
+    ) -> AppResult<PluginRow> {
+        let current = self
+            .get_plugin(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("plugin '{id}' not found")))?;
+        let next_enabled = enabled.unwrap_or(current.enabled);
+        let next_settings = settings_json.unwrap_or(&current.settings_json);
+        let row = sqlx::query_as::<_, PluginRow>(
+            r#"
+            UPDATE plugins
+            SET enabled = ?1,
+                settings_json = ?2,
+                updated_at = ?3
+            WHERE id = ?4
+            RETURNING *
+            "#,
+        )
+        .bind(next_enabled)
+        .bind(next_settings)
+        .bind(now_unix())
+        .bind(id)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn list_plugin_instances(
+        &self,
+        plugin_id: &str,
+    ) -> AppResult<Vec<PluginInstanceRow>> {
+        let rows = sqlx::query_as::<_, PluginInstanceRow>(
+            "SELECT * FROM plugin_instances WHERE plugin_id = ?1 ORDER BY id ASC",
+        )
+        .bind(plugin_id)
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn list_all_plugin_instances(&self) -> AppResult<Vec<PluginInstanceRow>> {
+        let rows = sqlx::query_as::<_, PluginInstanceRow>(
+            "SELECT * FROM plugin_instances ORDER BY plugin_id ASC, id ASC",
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn get_plugin_instance(
+        &self,
+        instance_id: i64,
+    ) -> AppResult<Option<PluginInstanceRow>> {
+        let row =
+            sqlx::query_as::<_, PluginInstanceRow>("SELECT * FROM plugin_instances WHERE id = ?1")
+                .bind(instance_id)
+                .fetch_optional(&self.read_pool)
+                .await?;
+        Ok(row)
+    }
+
+    pub async fn create_plugin_instance(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        encrypted_config: &[u8],
+        enabled: bool,
+    ) -> AppResult<PluginInstanceRow> {
+        let now = now_unix();
+        let row = sqlx::query_as::<_, PluginInstanceRow>(
+            r#"
+            INSERT INTO plugin_instances (plugin_id, name, encrypted_config, enabled, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            RETURNING *
+            "#,
+        )
+        .bind(plugin_id)
+        .bind(name.trim())
+        .bind(encrypted_config)
+        .bind(enabled)
+        .bind(now)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn update_plugin_instance(
+        &self,
+        instance_id: i64,
+        name: Option<&str>,
+        encrypted_config: Option<&[u8]>,
+        enabled: Option<bool>,
+    ) -> AppResult<PluginInstanceRow> {
+        let current = self
+            .get_plugin_instance(instance_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("plugin instance {instance_id} not found"))
+            })?;
+        let next_name = name.map(str::trim).unwrap_or(&current.name);
+        let next_cfg = encrypted_config.unwrap_or(&current.encrypted_config);
+        let next_enabled = enabled.unwrap_or(current.enabled);
+        let row = sqlx::query_as::<_, PluginInstanceRow>(
+            r#"
+            UPDATE plugin_instances
+            SET name = ?1,
+                encrypted_config = ?2,
+                enabled = ?3,
+                updated_at = ?4
+            WHERE id = ?5
+            RETURNING *
+            "#,
+        )
+        .bind(next_name)
+        .bind(next_cfg)
+        .bind(next_enabled)
+        .bind(now_unix())
+        .bind(instance_id)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn delete_plugin_instance(&self, instance_id: i64) -> AppResult<bool> {
+        let res = sqlx::query("DELETE FROM plugin_instances WHERE id = ?1")
+            .bind(instance_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Atomically verify no route references `instance_id` under `plugin_id` and delete it inside
+    /// a single `write_pool` transaction.
+    pub async fn delete_plugin_instance_if_unreferenced(
+        &self,
+        plugin_id: &str,
+        instance_id: i64,
+    ) -> AppResult<DeleteGuardOutcome> {
+        let mut tx = self.write_pool.begin().await?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM plugin_instances WHERE id = ?1 AND plugin_id = ?2")
+                .bind(instance_id)
+                .bind(plugin_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Ok(DeleteGuardOutcome::NotFound);
+        }
+
+        let json_path = format!("$.plugins.\"{plugin_id}\".provider_id");
+        let refs: Vec<(i64, String)> = sqlx::query_as(
+            r#"
+            SELECT id, name
+            FROM routes
+            WHERE json_extract(options_json, ?1) = ?2
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(json_path)
+        .bind(instance_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !refs.is_empty() {
+            return Ok(DeleteGuardOutcome::Conflict(refs));
+        }
+
+        sqlx::query("DELETE FROM plugin_instances WHERE id = ?1 AND plugin_id = ?2")
+            .bind(instance_id)
+            .bind(plugin_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(DeleteGuardOutcome::Deleted)
+    }
+
+    /// Return `(route_id, route_name)` pairs referencing `instance_id` under `plugin_id` in
+    /// `routes.options_json -> $.plugins.<plugin_id>.provider_id`.
+    pub async fn list_routes_referencing_plugin_instance(
+        &self,
+        plugin_id: &str,
+        instance_id: i64,
+    ) -> AppResult<Vec<(i64, String)>> {
+        let json_path = format!("$.plugins.\"{plugin_id}\".provider_id");
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            r#"
+            SELECT id, name
+            FROM routes
+            WHERE json_extract(options_json, ?1) = ?2
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(json_path)
+        .bind(instance_id)
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn count_plugin_link_cache_by_instance(&self, instance_id: i64) -> AppResult<i64> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM plugin_link_cache WHERE instance_id = ?1")
+                .bind(instance_id)
+                .fetch_one(&self.read_pool)
+                .await?;
+        Ok(count)
+    }
+
+    pub async fn get_plugin_link_cache_batch(
+        &self,
+        instance_id: i64,
+        hashes: &[String],
+    ) -> AppResult<HashMap<String, String>> {
+        let mut out = HashMap::new();
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        // Single `IN (...)` batch query per chunk (capped at 500 params to stay well under
+        // SQLite's bind variable limit).
+        for chunk in hashes.chunks(500) {
+            let mut qb = QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT long_url_sha256, short_url FROM plugin_link_cache WHERE instance_id = ",
+            );
+            qb.push_bind(instance_id);
+            qb.push(" AND long_url_sha256 IN (");
+            let mut sep = qb.separated(", ");
+            for hash in chunk {
+                sep.push_bind(hash);
+            }
+            sep.push_unseparated(")");
+            let rows: Vec<(String, String)> =
+                qb.build_query_as().fetch_all(&self.read_pool).await?;
+            for (hash, short_url) in rows {
+                out.insert(hash, short_url);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn touch_plugin_link_cache(
+        &self,
+        instance_id: i64,
+        hashes: &[String],
+        now: i64,
+    ) -> AppResult<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.write_pool.begin().await?;
+        for chunk in hashes.chunks(500) {
+            let mut qb =
+                QueryBuilder::<sqlx::Sqlite>::new("UPDATE plugin_link_cache SET last_used_at = ");
+            qb.push_bind(now);
+            qb.push(" WHERE instance_id = ");
+            qb.push_bind(instance_id);
+            qb.push(" AND long_url_sha256 IN (");
+            let mut sep = qb.separated(", ");
+            for hash in chunk {
+                sep.push_bind(hash);
+            }
+            sep.push_unseparated(")");
+            qb.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn put_plugin_link_cache_batch(
+        &self,
+        instance_id: i64,
+        pairs: &[(String, String)],
+        now: i64,
+    ) -> AppResult<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.write_pool.begin().await?;
+        for (hash, short_url) in pairs {
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_link_cache (instance_id, long_url_sha256, short_url, created_at, last_used_at)
+                VALUES (?1, ?2, ?3, ?4, ?4)
+                ON CONFLICT (instance_id, long_url_sha256) DO UPDATE SET
+                    short_url = excluded.short_url,
+                    last_used_at = excluded.last_used_at
+                "#,
+            )
+            .bind(instance_id)
+            .bind(hash)
+            .bind(short_url)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn clear_plugin_link_cache(&self, instance_id: i64) -> AppResult<u64> {
+        let res = sqlx::query("DELETE FROM plugin_link_cache WHERE instance_id = ?1")
+            .bind(instance_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Purge cached short URLs unused for more than 90 days (`last_used_at < now - 90d`).
+    pub async fn purge_stale_plugin_link_cache(&self, now: i64) -> AppResult<u64> {
+        let cutoff = now.saturating_sub(90 * 86_400);
+        let res = sqlx::query("DELETE FROM plugin_link_cache WHERE last_used_at < ?1")
+            .bind(cutoff)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    // =========================================================================
+    // SMTP Per-Recipient Compliance & Legacy Backfill (v0.3.0)
+    // =========================================================================
+
+    /// Idempotent startup backfill marking all existing pre-v0.3.0 SMTP destination recipients
+    /// as `verified` with `consent_method = 'legacy'` so upgraded installations continue
+    /// delivering uninterrupted. Fails closed if any SMTP destination cannot be decrypted.
+    pub async fn backfill_legacy_smtp_recipients(&self, master_key: &MasterKey) -> AppResult<u64> {
+        let already_done = self
+            .get_setting_typed::<i64>(SETTING_SMTP_RECIPIENT_MODEL_VERSION)
+            .await?
+            .is_some_and(|v| v >= SMTP_RECIPIENT_MODEL_VERSION_V1);
+        if already_done {
+            return Ok(0);
+        }
+
+        let smtp_dests: Vec<ChannelDestination> = sqlx::query_as(
+            r#"
+            SELECT cd.*
+            FROM channel_destinations cd
+            JOIN channels c ON c.id = cd.channel_id
+            WHERE c.kind = 'smtp'
+            ORDER BY cd.id ASC
+            "#,
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let now = now_unix();
+        let mut tx = self.write_pool.begin().await?;
+        let mut inserted = 0u64;
+
+        for dest in smtp_dests {
+            let cfg: DestinationConfig = master_key.decrypt_json(&dest.encrypted_config)?;
+            if let DestinationConfig::Smtp(smtp_dest) = cfg {
+                let mut seen = HashSet::new();
+                for raw_addr in &smtp_dest.to_addresses {
+                    let trimmed = raw_addr.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let hmac = master_key.smtp_recipient_hmac(trimmed);
+                    if !seen.insert(hmac.clone()) {
+                        continue;
+                    }
+                    let res = sqlx::query(
+                        r#"
+                        INSERT INTO smtp_recipients (
+                            destination_id, address_hmac, status,
+                            consent_method, consented_at, created_at, updated_at
+                        )
+                        VALUES (?1, ?2, 'verified', 'legacy', ?3, ?3, ?3)
+                        ON CONFLICT (destination_id, address_hmac) DO NOTHING
+                        "#,
+                    )
+                    .bind(dest.id)
+                    .bind(hmac)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                    inserted += res.rows_affected();
+                }
+            }
+        }
+
+        let version_json = serde_json::to_string(&SMTP_RECIPIENT_MODEL_VERSION_V1)?;
+        sqlx::query(
+            r#"
+            INSERT INTO system_settings (key, value_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT (key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(SETTING_SMTP_RECIPIENT_MODEL_VERSION)
+        .bind(version_json)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        if inserted > 0 {
+            tracing::info!(
+                legacy_recipients = inserted,
+                "backfilled existing SMTP recipients as verified (legacy)"
+            );
+        }
+        Ok(inserted)
+    }
+
+    /// Synchronize `smtp_recipients` rows for `destination_id` against the current deduplicated
+    /// `address_hmacs` derived from `to_addresses`:
+    /// - Adds missing addresses with `initial_status` (typically `Unverified`)
+    /// - Removes rows whose addresses are no longer present in `to_addresses`
+    /// - Preserves existing rows (and their verification/unsubscribe/bounce audit state) intact
+    pub async fn sync_smtp_recipients_for_destination(
+        &self,
+        destination_id: i64,
+        address_hmacs: &[String],
+        initial_status: SmtpRecipientStatus,
+        consent_method: Option<&str>,
+    ) -> AppResult<Vec<SmtpRecipientRow>> {
+        let now = now_unix();
+        let wanted: HashSet<&str> = address_hmacs.iter().map(String::as_str).collect();
+        let consented_at = (initial_status == SmtpRecipientStatus::Verified).then_some(now);
+
+        let mut tx = self.write_pool.begin().await?;
+        let existing: Vec<SmtpRecipientRow> = sqlx::query_as(
+            "SELECT * FROM smtp_recipients WHERE destination_id = ?1 ORDER BY id ASC",
+        )
+        .bind(destination_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let existing_hmacs: HashSet<String> =
+            existing.iter().map(|r| r.address_hmac.clone()).collect();
+
+        for row in &existing {
+            if !wanted.contains(row.address_hmac.as_str()) {
+                sqlx::query("DELETE FROM smtp_recipients WHERE id = ?1")
+                    .bind(row.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        for hmac in address_hmacs {
+            if !existing_hmacs.contains(hmac) {
+                sqlx::query(
+                    r#"
+                    INSERT INTO smtp_recipients (
+                        destination_id, address_hmac, status,
+                        consent_method, consented_at, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                    ON CONFLICT (destination_id, address_hmac) DO NOTHING
+                    "#,
+                )
+                .bind(destination_id)
+                .bind(hmac)
+                .bind(initial_status)
+                .bind(consent_method)
+                .bind(consented_at)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        let synced: Vec<SmtpRecipientRow> = sqlx::query_as(
+            "SELECT * FROM smtp_recipients WHERE destination_id = ?1 ORDER BY id ASC",
+        )
+        .bind(destination_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(synced)
+    }
+
+    pub async fn list_smtp_recipients(
+        &self,
+        destination_id: i64,
+    ) -> AppResult<Vec<SmtpRecipientRow>> {
+        let rows = sqlx::query_as::<_, SmtpRecipientRow>(
+            "SELECT * FROM smtp_recipients WHERE destination_id = ?1 ORDER BY id ASC",
+        )
+        .bind(destination_id)
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn get_smtp_recipient(
+        &self,
+        recipient_id: i64,
+    ) -> AppResult<Option<SmtpRecipientRow>> {
+        let row =
+            sqlx::query_as::<_, SmtpRecipientRow>("SELECT * FROM smtp_recipients WHERE id = ?1")
+                .bind(recipient_id)
+                .fetch_optional(&self.read_pool)
+                .await?;
+        Ok(row)
+    }
+
+    pub async fn get_smtp_recipient_summary(
+        &self,
+        destination_id: i64,
+    ) -> AppResult<SmtpRecipientSummary> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM smtp_recipients WHERE destination_id = ?1 GROUP BY status",
+        )
+        .bind(destination_id)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let mut s = SmtpRecipientSummary::default();
+        for (st, count) in rows {
+            s.total += count;
+            match st.as_str() {
+                "verified" => s.verified = count,
+                "pending" => s.pending = count,
+                "unverified" => s.unverified = count,
+                "unsubscribed" => s.unsubscribed = count,
+                "bounced" => s.bounced = count,
+                _ => {}
+            }
+        }
+        Ok(s)
+    }
+
+    /// Atomically validate recipient status, 60s resend cooldown, and hourly cap on `write_pool`,
+    /// reserving the new verification code before SMTP delivery to prevent concurrent double-click
+    /// rate-limit bypasses. Returns `(previous_row, reserved_row)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_smtp_recipient_verification_code(
+        &self,
+        destination_id: i64,
+        recipient_id: i64,
+        code_sha256: &str,
+        expires_at: i64,
+        now: i64,
+        cooldown_secs: i64,
+        hourly_cap: i64,
+    ) -> AppResult<(SmtpRecipientRow, SmtpRecipientRow)> {
+        let mut tx = self.write_pool.begin().await?;
+        let current = sqlx::query_as::<_, SmtpRecipientRow>(
+            "SELECT * FROM smtp_recipients WHERE id = ?1 AND destination_id = ?2",
+        )
+        .bind(recipient_id)
+        .bind(destination_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "SMTP recipient {recipient_id} not found on destination {destination_id}"
+            ))
+        })?;
+
+        match current.status {
+            SmtpRecipientStatus::Unverified | SmtpRecipientStatus::Pending => {}
+            SmtpRecipientStatus::Verified => {
+                return Err(AppError::Validation(
+                    "Recipient is already verified".to_string(),
+                ));
+            }
+            SmtpRecipientStatus::Unsubscribed | SmtpRecipientStatus::Bounced => {
+                return Err(AppError::Validation(
+                    "Recipient is unsubscribed or bounced; reactivate it first before sending verification"
+                        .to_string(),
+                ));
+            }
+        }
+
+        if let Some(last_sent) = current.last_code_sent_at {
+            let elapsed = now.saturating_sub(last_sent);
+            if elapsed < cooldown_secs {
+                let retry_after = (cooldown_secs - elapsed).max(1) as u64;
+                return Err(AppError::RateLimited {
+                    message: format!(
+                        "Please wait {retry_after}s before sending another verification email"
+                    ),
+                    retry_after_secs: Some(retry_after),
+                });
+            }
+        }
+        if let Some(ws) = current.codes_sent_window_start
+            && now.saturating_sub(ws) < 3600
+            && current.codes_sent_in_window >= hourly_cap
+        {
+            let retry_after = (3600 - now.saturating_sub(ws)).max(1) as u64;
+            return Err(AppError::RateLimited {
+                message: format!(
+                    "Hourly verification email limit ({hourly_cap}/hour) reached for this recipient"
+                ),
+                retry_after_secs: Some(retry_after),
+            });
+        }
+
+        let (window_start, sent_in_window) = match current.codes_sent_window_start {
+            Some(ws) if now.saturating_sub(ws) < 3600 => (ws, current.codes_sent_in_window + 1),
+            _ => (now, 1),
+        };
+
+        let updated = sqlx::query_as::<_, SmtpRecipientRow>(
+            r#"
+            UPDATE smtp_recipients
+            SET status = 'pending',
+                code_sha256 = ?1,
+                code_expires_at = ?2,
+                code_attempts = 0,
+                last_code_sent_at = ?3,
+                codes_sent_window_start = ?4,
+                codes_sent_in_window = ?5,
+                updated_at = ?3
+            WHERE id = ?6
+            RETURNING *
+            "#,
+        )
+        .bind(code_sha256)
+        .bind(expires_at)
+        .bind(now)
+        .bind(window_start)
+        .bind(sent_in_window)
+        .bind(recipient_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((current, updated))
+    }
+
+    /// Roll back a verification-code reservation if the subsequent SMTP send fails, guarded by a
+    /// compare-and-swap check (`status = 'pending' AND code_sha256 = ?10`) so a slow SMTP timeout
+    /// can never clobber a concurrent unsubscribe or newer verification attempt.
+    pub async fn rollback_smtp_recipient_verification_reservation(
+        &self,
+        prev: &SmtpRecipientRow,
+        reserved_code_sha256: &str,
+    ) -> AppResult<bool> {
+        let res = sqlx::query(
+            r#"
+            UPDATE smtp_recipients
+            SET status = ?1,
+                code_sha256 = ?2,
+                code_expires_at = ?3,
+                code_attempts = ?4,
+                last_code_sent_at = ?5,
+                codes_sent_window_start = ?6,
+                codes_sent_in_window = ?7,
+                updated_at = ?8
+            WHERE id = ?9
+              AND status = 'pending'
+              AND code_sha256 = ?10
+            "#,
+        )
+        .bind(prev.status)
+        .bind(&prev.code_sha256)
+        .bind(prev.code_expires_at)
+        .bind(prev.code_attempts)
+        .bind(prev.last_code_sent_at)
+        .bind(prev.codes_sent_window_start)
+        .bind(prev.codes_sent_in_window)
+        .bind(prev.updated_at)
+        .bind(prev.id)
+        .bind(reserved_code_sha256)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Persist a freshly generated verification code digest and update per-recipient rate-limit
+    /// counters (`60s` cooldown + `5/hour` window).
+    pub async fn set_smtp_recipient_verification_code(
+        &self,
+        recipient_id: i64,
+        code_sha256: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> AppResult<SmtpRecipientRow> {
+        let mut tx = self.write_pool.begin().await?;
+        let current =
+            sqlx::query_as::<_, SmtpRecipientRow>("SELECT * FROM smtp_recipients WHERE id = ?1")
+                .bind(recipient_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("SMTP recipient {recipient_id} not found"))
+                })?;
+
+        let (window_start, sent_in_window) = match current.codes_sent_window_start {
+            Some(ws) if now.saturating_sub(ws) < 3600 => (ws, current.codes_sent_in_window + 1),
+            _ => (now, 1),
+        };
+
+        let row = sqlx::query_as::<_, SmtpRecipientRow>(
+            r#"
+            UPDATE smtp_recipients
+            SET status = 'pending',
+                code_sha256 = ?1,
+                code_expires_at = ?2,
+                code_attempts = 0,
+                last_code_sent_at = ?3,
+                codes_sent_window_start = ?4,
+                codes_sent_in_window = ?5,
+                updated_at = ?3
+            WHERE id = ?6
+            RETURNING *
+            "#,
+        )
+        .bind(code_sha256)
+        .bind(expires_at)
+        .bind(now)
+        .bind(window_start)
+        .bind(sent_in_window)
+        .bind(recipient_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Atomically increment failed verification code attempts and invalidate `code_sha256` /
+    /// `code_expires_at` once `code_attempts >= max_attempts` so previously emailed `/v/{token}`
+    /// links cannot bypass brute-force lockout.
+    pub async fn increment_smtp_recipient_code_attempts_and_lock(
+        &self,
+        recipient_id: i64,
+        max_attempts: i64,
+    ) -> AppResult<i64> {
+        let (attempts,): (i64,) = sqlx::query_as(
+            r#"
+            UPDATE smtp_recipients
+            SET code_attempts = code_attempts + 1,
+                code_sha256 = CASE WHEN code_attempts + 1 >= ?1 THEN NULL ELSE code_sha256 END,
+                code_expires_at = CASE WHEN code_attempts + 1 >= ?1 THEN NULL ELSE code_expires_at END,
+                updated_at = ?2
+            WHERE id = ?3
+            RETURNING code_attempts
+            "#,
+        )
+        .bind(max_attempts)
+        .bind(now_unix())
+        .bind(recipient_id)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(attempts)
+    }
+
+    pub async fn increment_smtp_recipient_code_attempts(
+        &self,
+        recipient_id: i64,
+    ) -> AppResult<i64> {
+        self.increment_smtp_recipient_code_attempts_and_lock(recipient_id, 5)
+            .await
+    }
+
+    /// Mark an SMTP recipient as `verified`. If its parent destination was previously
+    /// system-paused (`auto_paused = 1`), atomically restores `enabled = 1, auto_paused = 0`.
+    pub async fn mark_smtp_recipient_verified(
+        &self,
+        recipient_id: i64,
+        method: &str,
+        now: i64,
+    ) -> AppResult<SmtpRecipientRow> {
+        let mut tx = self.write_pool.begin().await?;
+        let row = sqlx::query_as::<_, SmtpRecipientRow>(
+            r#"
+            UPDATE smtp_recipients
+            SET status = 'verified',
+                code_sha256 = NULL,
+                code_expires_at = NULL,
+                code_attempts = 0,
+                consent_method = ?1,
+                consented_at = ?2,
+                revoked_method = NULL,
+                revoked_at = NULL,
+                bounce_diagnostic = NULL,
+                updated_at = ?2
+            WHERE id = ?3
+            RETURNING *
+            "#,
+        )
+        .bind(method)
+        .bind(now)
+        .bind(recipient_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("SMTP recipient {recipient_id} not found")))?;
+
+        sqlx::query(
+            r#"
+            UPDATE channel_destinations
+            SET enabled = 1,
+                auto_paused = 0,
+                updated_at = ?1
+            WHERE id = ?2 AND auto_paused = 1
+            "#,
+        )
+        .bind(now)
+        .bind(row.destination_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Mark an SMTP recipient as `unsubscribed`. If all recipients on its parent destination are
+    /// now `unsubscribed` or `bounced`, automatically pauses (`enabled = 0, auto_paused = 1`) the
+    /// destination and returns `(row, true)`.
+    pub async fn mark_smtp_recipient_unsubscribed(
+        &self,
+        recipient_id: i64,
+        method: &str,
+        now: i64,
+    ) -> AppResult<(SmtpRecipientRow, bool)> {
+        let mut tx = self.write_pool.begin().await?;
+        let row = sqlx::query_as::<_, SmtpRecipientRow>(
+            r#"
+            UPDATE smtp_recipients
+            SET status = 'unsubscribed',
+                code_sha256 = NULL,
+                code_expires_at = NULL,
+                code_attempts = 0,
+                revoked_method = ?1,
+                revoked_at = ?2,
+                updated_at = ?2
+            WHERE id = ?3
+            RETURNING *
+            "#,
+        )
+        .bind(method)
+        .bind(now)
+        .bind(recipient_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("SMTP recipient {recipient_id} not found")))?;
+
+        let (remaining_active,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM smtp_recipients WHERE destination_id = ?1 AND status NOT IN ('unsubscribed', 'bounced')",
+        )
+        .bind(row.destination_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let auto_paused = if remaining_active == 0 {
+            let res = sqlx::query(
+                "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
+            )
+            .bind(now)
+            .bind(row.destination_id)
+            .execute(&mut *tx)
+            .await?;
+            res.rows_affected() > 0
+        } else {
+            false
+        };
+
+        tx.commit().await?;
+        Ok((row, auto_paused))
+    }
+
+    /// Mark an SMTP recipient as `bounced` after a synchronous 5xx recipient hard-bounce failure.
+    /// Masks any email addresses in `diagnostic` before storing and auto-pauses
+    /// (`enabled = 0, auto_paused = 1`) the destination when every recipient is revoked/bounced.
+    pub async fn mark_smtp_recipient_bounced(
+        &self,
+        recipient_id: i64,
+        diagnostic: &str,
+        now: i64,
+    ) -> AppResult<(SmtpRecipientRow, bool)> {
+        let mut tx = self.write_pool.begin().await?;
+        let sanitized = mask_emails_in_text(diagnostic);
+        let clipped_diag: String = sanitized.chars().take(400).collect();
+        let row = sqlx::query_as::<_, SmtpRecipientRow>(
+            r#"
+            UPDATE smtp_recipients
+            SET status = 'bounced',
+                code_sha256 = NULL,
+                code_expires_at = NULL,
+                code_attempts = 0,
+                revoked_method = 'hard_bounce',
+                revoked_at = ?1,
+                bounce_diagnostic = ?2,
+                updated_at = ?1
+            WHERE id = ?3
+            RETURNING *
+            "#,
+        )
+        .bind(now)
+        .bind(&clipped_diag)
+        .bind(recipient_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("SMTP recipient {recipient_id} not found")))?;
+
+        let (remaining_active,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM smtp_recipients WHERE destination_id = ?1 AND status NOT IN ('unsubscribed', 'bounced')",
+        )
+        .bind(row.destination_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let auto_paused = if remaining_active == 0 {
+            let res = sqlx::query(
+                "UPDATE channel_destinations SET enabled = 0, auto_paused = 1, updated_at = ?1 WHERE id = ?2 AND enabled = 1",
+            )
+            .bind(now)
+            .bind(row.destination_id)
+            .execute(&mut *tx)
+            .await?;
+            res.rows_affected() > 0
+        } else {
+            false
+        };
+
+        tx.commit().await?;
+        Ok((row, auto_paused))
+    }
+
+    /// Reset an `unsubscribed` or `bounced` recipient back to `unverified` so it must complete
+    /// fresh opt-in verification before receiving mail again.
+    pub async fn reactivate_smtp_recipient(
+        &self,
+        recipient_id: i64,
+        now: i64,
+    ) -> AppResult<SmtpRecipientRow> {
+        let row = sqlx::query_as::<_, SmtpRecipientRow>(
+            r#"
+            UPDATE smtp_recipients
+            SET status = 'unverified',
+                code_sha256 = NULL,
+                code_expires_at = NULL,
+                code_attempts = 0,
+                bounce_diagnostic = NULL,
+                updated_at = ?1
+            WHERE id = ?2
+            RETURNING *
+            "#,
+        )
+        .bind(now)
+        .bind(recipient_id)
+        .fetch_optional(&self.write_pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("SMTP recipient {recipient_id} not found")))?;
+        Ok(row)
     }
 }

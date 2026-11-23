@@ -1,6 +1,8 @@
 //! Canonical REST API (`/api/v1/*`) request and response DTOs aligned 1-to-1 with
 //! `web/src/api/types.ts` and `web/src/api/client.ts`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -15,10 +17,12 @@ use crate::config::{LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::MasterKey;
 use crate::db::models::{
     AppLocale, Channel, ChannelDestination, DeliveryTaskDetail, DeliveryTaskStatus, Feed,
-    FeedHealthStatus, McpToken, McpTokenScope, OverviewSnapshot, Route, unix_to_rfc3339,
+    FeedHealthStatus, McpToken, McpTokenScope, OverviewSnapshot, Route, SmtpRecipientStatus,
+    SmtpRecipientSummary, unix_to_rfc3339,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::ContentFilterRules;
+use crate::plugins::PluginManifest;
 
 /// Deserialize an optional nullable field (`T | null | undefined` in TypeScript PATCH payloads):
 /// - Omitted JSON field -> `None` (keep existing value)
@@ -360,6 +364,8 @@ pub struct DebugPushOptions {
     pub locale: Option<AppLocale>,
     #[serde(default)]
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub plugins: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -415,6 +421,10 @@ pub struct ChannelDestinationDto {
     pub kind: ChannelKind,
     pub config: Value,
     pub enabled: bool,
+    #[serde(default)]
+    pub auto_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp_summary: Option<SmtpRecipientSummary>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -425,6 +435,15 @@ impl ChannelDestinationDto {
         kind: ChannelKind,
         master_key: &MasterKey,
     ) -> AppResult<Self> {
+        Self::from_model_with_summary(dest, kind, master_key, None)
+    }
+
+    pub fn from_model_with_summary(
+        dest: ChannelDestination,
+        kind: ChannelKind,
+        master_key: &MasterKey,
+        smtp_summary: Option<SmtpRecipientSummary>,
+    ) -> AppResult<Self> {
         let decrypted: DestinationConfig = master_key.decrypt_json(&dest.encrypted_config)?;
         Ok(Self {
             id: dest.id,
@@ -433,6 +452,8 @@ impl ChannelDestinationDto {
             kind,
             config: decrypted.view(),
             enabled: dest.enabled,
+            auto_paused: dest.auto_paused,
+            smtp_summary,
             created_at: unix_to_rfc3339(dest.created_at),
             updated_at: unix_to_rfc3339(dest.updated_at),
         })
@@ -453,6 +474,7 @@ pub struct CreateDestinationRequest {
 /// Partial destination patch (`PATCH /api/v1/destinations/{id}`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum DestinationPatch {
     Smtp {
         #[serde(default)]
@@ -690,6 +712,8 @@ pub enum ChannelTargetPatch {
         security: Option<SmtpSecurity>,
         #[serde(default)]
         from_address: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+        sender_identity: Option<Option<String>>,
     },
     Telegram {
         #[serde(default)]
@@ -724,6 +748,7 @@ impl ChannelTargetPatch {
                     password,
                     security,
                     from_address,
+                    sender_identity,
                 },
             ) => {
                 let next_username = match username {
@@ -734,6 +759,10 @@ impl ChannelTargetPatch {
                     Some(None) => None,
                     Some(Some(raw)) if !raw.is_empty() => Some(raw.clone()),
                     None | Some(Some(_)) => cur.password.clone(),
+                };
+                let next_sender_identity = match sender_identity {
+                    Some(opt) => normalize_opt_string(opt.clone()),
+                    None => cur.sender_identity.clone(),
                 };
 
                 let merged = ChannelConfig::Smtp(SmtpChannelConfig {
@@ -751,6 +780,7 @@ impl ChannelTargetPatch {
                         .map(str::trim)
                         .unwrap_or(&cur.from_address)
                         .to_string(),
+                    sender_identity: next_sender_identity,
                 });
                 merged.validate()?;
                 Ok((merged, false))
@@ -1070,6 +1100,10 @@ pub struct SystemSettingsDto {
     pub timezone: String,
     #[serde(default)]
     pub locale: Option<AppLocale>,
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub public_url_env_managed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1082,6 +1116,160 @@ pub struct UpdateSystemSettingsRequest {
     pub timezone: Option<String>,
     #[serde(default)]
     pub locale: Option<AppLocale>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub public_url: Option<Option<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// 8. Plugins & Marketplace (`/api/v1/plugins*`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginInstanceDto {
+    pub id: i64,
+    pub plugin_id: String,
+    pub name: String,
+    pub config: Value,
+    pub enabled: bool,
+    pub cache_entries: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDto {
+    pub id: String,
+    pub manifest: PluginManifest,
+    pub enabled: bool,
+    pub installed_version: String,
+    pub settings: Value,
+    pub instance_count: usize,
+    pub instances: Vec<PluginInstanceDto>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdatePluginRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub settings: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatePluginInstanceRequest {
+    pub name: String,
+    pub config: Value,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdatePluginInstanceRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub config: Option<Value>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestPluginInstanceResponse {
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearPluginCacheResponse {
+    pub cleared_entries: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MarketQuery {
+    #[serde(default)]
+    pub refresh: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketPluginItemDto {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub api_version: String,
+    pub kind: String,
+    pub min_core: Option<String>,
+    pub category: String,
+    pub icon: String,
+    pub description: String,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    pub hooks: Vec<String>,
+    pub permissions: Vec<String>,
+    pub installed: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketResponse {
+    pub source: String,
+    pub index_url: String,
+    pub generated_at: Option<String>,
+    pub plugins: Vec<MarketPluginItemDto>,
+}
+
+// ---------------------------------------------------------------------------
+// 9. SMTP Per-Recipient Compliance & Referential Delete Guard
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmtpRecipientDto {
+    pub id: i64,
+    pub destination_id: i64,
+    pub email: String,
+    pub status: SmtpRecipientStatus,
+    pub code_expires_at: Option<String>,
+    pub code_attempts: i64,
+    pub last_code_sent_at: Option<String>,
+    pub consent_method: Option<String>,
+    pub consented_at: Option<String>,
+    pub revoked_method: Option<String>,
+    pub revoked_at: Option<String>,
+    pub bounce_diagnostic: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyRecipientCodeRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendVerificationResponse {
+    pub ok: bool,
+    pub message: String,
+    pub recipient: SmtpRecipientDto,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeleteCascadeQuery {
+    #[serde(default)]
+    pub cascade: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteReferenceDto {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferencingConflictBody {
+    pub error: String,
+    pub code: &'static str,
+    pub message: String,
+    pub referencing_routes: Vec<RouteReferenceDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1148,6 +1336,7 @@ pub fn normalize_channel_config_on_create(cfg: &mut ChannelConfig) -> AppResult<
             smtp.username = normalize_opt_string(smtp.username.take());
             smtp.password = smtp.password.take().filter(|p| !p.is_empty());
             smtp.from_address = smtp.from_address.trim().to_string();
+            smtp.sender_identity = normalize_opt_string(smtp.sender_identity.take());
         }
         ChannelConfig::Telegram(tg) => {
             tg.bot_token = tg.bot_token.trim().to_string();

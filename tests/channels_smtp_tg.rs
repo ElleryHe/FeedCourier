@@ -18,9 +18,10 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use feedcourier::channels::smtp::{MAX_EMAIL_HTML_BYTES, SmtpSender, deterministic_message_id};
 use feedcourier::channels::telegram::{
     DefaultMediaStreamFetcher, FetchedMedia, MAX_CAPTION_UTF16_UNITS, MAX_MESSAGE_UTF16_UNITS,
-    MAX_PHOTO_BYTES, MediaStreamFetcher, TelegramSender, format_compact_card_html,
-    format_compact_card_html_with_locale, format_media_mode_caption,
-    format_media_mode_caption_with_locale, parse_mp4_metadata,
+    MAX_PHOTO_BYTES, MediaStreamFetcher, TelegramSender, build_compact_card_reply_markup,
+    format_compact_card_html, format_compact_card_html_with_locale,
+    format_compact_card_html_with_options, format_media_mode_caption,
+    format_media_mode_caption_with_locale, parse_mp4_metadata, suppress_telegram_auto_entities,
 };
 use feedcourier::channels::{
     ChannelConfig, ChannelKind, ChannelSender, CheckpointSink, DeliveryCheckpoint, DeliveryContext,
@@ -113,6 +114,7 @@ fn sample_destination() -> ChannelDestination {
         name: "Test Destination".to_owned(),
         encrypted_config: Vec::new(),
         enabled: true,
+        auto_paused: false,
         created_at: 1_770_000_000,
         updated_at: 1_770_000_000,
     }
@@ -191,6 +193,7 @@ fn smtp_headers_force_from_multipart_and_95kib_truncation() {
         password: Some("secret".to_owned()),
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+        sender_identity: None,
     };
     let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec![
@@ -431,6 +434,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
@@ -450,13 +454,15 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("send 250");
         match outcome {
             DeliveryOutcome::Delivered {
                 status_code,
-                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id }),
+                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id, .. }),
                 ..
             } => {
                 assert_eq!(status_code, Some(250));
@@ -493,7 +499,9 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
         assert!(
             sessions[0]
                 .raw_data
-                .contains("List-Id: <feed-7.verified.example.com>")
+                .contains("List-Id: <dest-101.verified.example.com>"),
+            "missing destination-scoped List-Id header:\n{}",
+            sessions[0].raw_data
         );
     }
 
@@ -508,6 +516,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
@@ -535,6 +544,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["reader@dest.example.org".to_owned()],
@@ -554,6 +564,8 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("send 421");
@@ -561,7 +573,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             DeliveryOutcome::Retry {
                 retry_after_secs,
                 status_code,
-                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id }),
+                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id, .. }),
                 cooldown_credential_group,
                 ..
             } => {
@@ -592,6 +604,7 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             password: None,
             security: SmtpSecurity::Plain,
             from_address: "alerts@verified.example.com".to_owned(),
+            sender_identity: None,
         });
         let dest_cfg = DestinationConfig::Smtp(SmtpDestinationConfig {
             to_addresses: vec!["bad@dest.example.org".to_owned()],
@@ -611,13 +624,15 @@ async fn smtp_live_mock_tcp_handshake_250_421_and_550() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("send 550");
         match outcome {
             DeliveryOutcome::PermanentFailure {
                 status_code,
-                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id }),
+                checkpoint: Some(DeliveryCheckpoint::Smtp { message_id, .. }),
                 diagnostic,
             } => {
                 assert_eq!(status_code, Some(550));
@@ -786,6 +801,8 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: Some(&sink),
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("sendRichMessage");
@@ -819,8 +836,12 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             .as_str()
             .expect("rich_message.html");
         assert!(
-            rich_html.contains("<h2><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h2>"),
-            "missing linked <h2> header in rich_html: {rich_html}"
+            rich_html.contains("<h3>Zero-Copy Streaming Gateways in Rust</h3>"),
+            "missing plain foreground <h3> header in rich_html: {rich_html}"
+        );
+        assert!(
+            !rich_html.contains("<h1>") && !rich_html.contains("<h2>"),
+            "rich_html must not emit oversized <h1>/<h2> article title: {rich_html}"
         );
         assert!(
             rich_html.contains("<footer>Rust Insider · Alice Chen · "),
@@ -895,6 +916,8 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("runtime fallback");
@@ -937,11 +960,20 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             "https://blog.example.com/posts/zero-copy-rust"
         );
         let text = compact_req["text"].as_str().expect("text");
-        assert!(text.contains("<b>Zero-Copy Streaming Gateways in Rust</b>"));
-        assert!(text.contains("<i>Rust Insider · Alice Chen</i>"));
-        assert!(text.contains(
-            "<a href=\"https://blog.example.com/posts/zero-copy-rust\">Read original</a>"
-        ));
+        assert!(text.starts_with("<b>Zero-Copy Streaming Gateways in Rust</b>"));
+        assert!(text.contains("<blockquote>") && text.contains("</blockquote>"));
+        assert!(
+            text.contains("<i>Rust Insider · Alice Chen · "),
+            "compact card must render bottom italic source/author/time footer: {text}"
+        );
+        assert_eq!(
+            compact_req["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Read original"
+        );
+        assert_eq!(
+            compact_req["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://blog.example.com/posts/zero-copy-rust"
+        );
     }
 
     // 3) Pre-probed `supports_rich_message == false` skips `sendRichMessage` directly + `send_test`
@@ -999,6 +1031,8 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         let outcome = sender.send(&ctx).await.expect("cached degrade");
         assert!(matches!(
@@ -1026,7 +1060,7 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         assert!(test_msg.contains("@cached_bot"));
     }
 
-    // 4) CompactCard <= 4096 UTF-16 code unit strict bound (including surrogate-pair emojis & HTML escaping)
+    // 4) CompactCard <= 4096 UTF-16 code unit strict bound + expandable blockquote on long summaries
     let mut long_entry = entry.clone();
     long_entry.summary_text = Some("🦀 <Rust & Async> ".repeat(500));
     let compact_html = format_compact_card_html(&feed, &long_entry);
@@ -1036,9 +1070,12 @@ async fn telegram_rich_message_and_runtime_404_fallback_to_compact_card() {
         compact_html.encode_utf16().count()
     );
     assert!(
-        compact_html.ends_with(
-            "<a href=\"https://blog.example.com/posts/zero-copy-rust\">Read original</a>"
-        )
+        compact_html.contains("<blockquote expandable>") && compact_html.contains("</blockquote>"),
+        "long CompactCard summary (>300 UTF-16 units) must use <blockquote expandable>: {compact_html}"
+    );
+    assert!(
+        compact_html.ends_with("</i>"),
+        "CompactCard must place italic source/author/time metadata at bottom: {compact_html}"
     );
 }
 
@@ -1168,6 +1205,8 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         let outcome = sender.send(&ctx).await.expect("0-media send");
         assert!(matches!(outcome, DeliveryOutcome::Delivered { .. }));
@@ -1228,6 +1267,8 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: Some(&sink_attempt1),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome1 = sender.send(&ctx1).await.expect("attempt 1");
@@ -1276,6 +1317,8 @@ async fn telegram_media_mode_caption_14_images_checkpoint_sink_and_429_resume() 
         timezone: chrono_tz::UTC,
         checkpoint: Some(retry_checkpoint),
         checkpoint_sink: Some(&sink_attempt2),
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome2 = sender.send(&ctx2).await.expect("attempt 2 resume");
@@ -1498,6 +1541,8 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender.send(&ctx).await.expect("multipart fallback");
@@ -1591,6 +1636,8 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
 
         let outcome = sender
@@ -1706,6 +1753,8 @@ async fn telegram_media_mode_webpage_curl_failed_multipart_fallback_and_10mb_cap
             timezone: chrono_tz::UTC,
             checkpoint: None,
             checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
         };
         let outcome = sender.send(&ctx).await.expect("403 outcome");
         assert!(matches!(
@@ -1863,6 +1912,8 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("send video");
@@ -1956,6 +2007,8 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     let doc_outcome = sender
         .send(&doc_ctx)
@@ -1970,12 +2023,24 @@ async fn telegram_media_mode_video_streaming_mp4_metadata_and_locale_hyperlinks(
         "extensionless Document containing MP4 bytes must be promoted to sendVideo"
     );
 
-    // 4) Chinese CompactCard template (`阅读原文`)
+    // 4) Chinese CompactCard template (`阅读原文` inline button + editorial blockquote layout)
     let compact_zh = format_compact_card_html_with_locale(&feed, &video_entry, AppLocale::ZhCn);
     assert!(
-        compact_zh
-            .contains("<a href=\"https://blog.example.com/posts/zero-copy-rust\">阅读原文</a>"),
-        "CompactCard under ZhCn must render 阅读原文: {compact_zh}"
+        compact_zh.contains("<b>Zero-Copy Streaming Gateways in Rust</b>")
+            && compact_zh.contains("<blockquote>")
+            && compact_zh.contains("<i>Video Feed · Alice Chen · "),
+        "CompactCard under ZhCn must render editorial blockquote + bottom metadata: {compact_zh}"
+    );
+    let markup_zh = build_compact_card_reply_markup(
+        &video_entry,
+        AppLocale::ZhCn,
+        &feedcourier::plugins::RenderOverrides::default(),
+    )
+    .expect("inline button markup");
+    assert_eq!(markup_zh["inline_keyboard"][0][0]["text"], "阅读原文");
+    assert_eq!(
+        markup_zh["inline_keyboard"][0][0]["url"],
+        "https://blog.example.com/posts/zero-copy-rust"
     );
 }
 
@@ -1992,6 +2057,7 @@ fn smtp_responsive_image_table_pre_rewriting_and_route_timezone() {
         password: None,
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+        sender_identity: None,
     };
     let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec!["reader@example.org".to_owned()],
@@ -2210,6 +2276,8 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
         timezone: shanghai,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
 
     let outcome = sender.send(&ctx).await.expect("sendRichMessage v0.2.0");
@@ -2224,25 +2292,24 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
     let rich_html = payload["rich_message"]["html"].as_str().expect("html");
 
     assert!(
-        rich_html.contains("<h2><a href=\"https://blog.example.com/posts/zero-copy-rust\">Zero-Copy Streaming Gateways in Rust</a></h2>"),
-        "article title must use <h2>:\n{rich_html}"
+        rich_html.contains("<h3>Zero-Copy Streaming Gateways in Rust</h3>"),
+        "article title must use plain foreground <h3> without hyperlink blue:\n{rich_html}"
     );
     assert!(
-        !rich_html.contains("<h1>"),
-        "article title and body must not emit oversized <h1>:\n{rich_html}"
+        !rich_html.contains("<h1>") && !rich_html.contains("<h2>"),
+        "article title and body must not emit oversized <h1> or <h2>:\n{rich_html}"
     );
     assert!(
-        rich_html
-            .contains("<footer>Visual Digest · Alice Chen · 2026-01-15 08:30 (UTC+08:00)</footer>"),
-        "metadata + localized route timestamp must live inside native <footer>:\n{rich_html}"
+        rich_html.contains("<footer>Visual Digest · Alice Chen · 2026-01-15 08:30</footer>"),
+        "metadata + compact localized route timestamp must live inside native <footer>:\n{rich_html}"
     );
     assert!(
         rich_html.contains("<hr/>"),
         "divider must separate header and body:\n{rich_html}"
     );
     assert!(
-        rich_html.contains("<h3>Section One</h3>") && rich_html.contains("<h4>Subsection</h4>"),
-        "body headings must shift by heading_offset=2 (h1->h3, h2->h4):\n{rich_html}"
+        rich_html.contains("<h4>Section One</h4>") && rich_html.contains("<h5>Subsection</h5>"),
+        "body headings must shift by heading_offset=3 (h1->h4, h2->h5):\n{rich_html}"
     );
     assert!(
         rich_html.contains("<tg-collage>") && rich_html.contains("</tg-collage>"),
@@ -2252,6 +2319,106 @@ async fn telegram_rich_v020_typography_heading_offset_collage_slideshow_and_get_
         rich_html.contains("<tg-slideshow>") && rich_html.contains("</tg-slideshow>"),
         "11 consecutive images must group into <tg-slideshow>:\n{rich_html}"
     );
+}
+
+#[test]
+fn telegram_v030_compact_card_editorial_layout_expandable_and_auto_entity_suppression() {
+    let feed = sample_feed(42, "OVH Nexus Changelog");
+    let la: chrono_tz::Tz = "America/Los_Angeles".parse().unwrap();
+    let overrides = feedcourier::plugins::RenderOverrides::default();
+
+    // 1. Auto-entity suppression neutralizes `/cmd`, `@pkg`, and multi-dot code/doc filenames
+    //    while keeping real `https://` URLs and email addresses untouched.
+    let raw = "Firewall (/ip/{ip}/firewall) & (/vps), docs/README.fr.md, README.zh-CN.md, @astrojs/starlight, server/internal/sku.go, see (https://ovh-nexus.ellery.me) or mail alice@example.com.";
+    let suppressed = suppress_telegram_auto_entities(raw);
+    assert!(suppressed.contains("/\u{200C}firewall"), "{suppressed}");
+    assert!(suppressed.contains("/\u{200C}vps"), "{suppressed}");
+    assert!(
+        suppressed.contains("README.\u{200C}fr.\u{200C}md"),
+        "multi-dot filenames must break every dot so .fr is not linked: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("README.\u{200C}zh-CN.\u{200C}md"),
+        "{suppressed}"
+    );
+    assert!(
+        suppressed.contains("@\u{200C}astrojs/\u{200C}starlight"),
+        "{suppressed}"
+    );
+    assert!(suppressed.contains("sku.\u{200C}go"), "{suppressed}");
+    assert!(
+        suppressed.contains("(https://ovh-nexus.ellery.me)"),
+        "real https URL must remain verbatim: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("alice@example.com"),
+        "email address must not trigger @mention suppression: {suppressed}"
+    );
+
+    // 2. Short summary (<= 300 UTF-16) uses plain `<blockquote>`, compact route timezone footer.
+    let mut short_entry = sample_entry("compact-short", Vec::new());
+    short_entry.author = None;
+    short_entry.published_at = Some(1_768_437_000); // 2026-01-14 16:30 America/Los_Angeles
+    short_entry.summary_text =
+        Some("Added firewall (/ip/{ip}/firewall) and README.md guide.".to_owned());
+    let short_html =
+        format_compact_card_html_with_options(&feed, &short_entry, AppLocale::En, la, &overrides);
+    assert!(short_html.starts_with("<b>Zero-Copy Streaming Gateways in Rust</b>\n\n<blockquote>"));
+    assert!(!short_html.contains("<blockquote expandable>"));
+    assert!(short_html.contains("README.\u{200C}md"));
+    assert!(
+        short_html.ends_with("\n\n<i>OVH Nexus Changelog · 2026-01-14 16:30</i>"),
+        "expected compact LA timestamp in bottom footer: {short_html}"
+    );
+
+    // 3. Long summary (> 300 UTF-16, > 800 cap) uses `<blockquote expandable>` and avoids mid-word chop.
+    let mut long_entry = short_entry.clone();
+    long_entry.summary_text = Some(
+        "Dedicated server monitoring and infrastructure automation improvements across clusters. "
+            .repeat(20),
+    );
+    let long_html =
+        format_compact_card_html_with_options(&feed, &long_entry, AppLocale::En, la, &overrides);
+    assert!(long_html.contains("<blockquote expandable>"));
+    assert!(long_html.contains("…</blockquote>"));
+    // Verify clean word boundary: char immediately before `…` should not cut mid-word from `clusters`/`monitoring`
+    let before_ell = long_html
+        .split("…</blockquote>")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap();
+    assert!(
+        [
+            "Dedicated",
+            "server",
+            "monitoring",
+            "and",
+            "infrastructure",
+            "automation",
+            "improvements",
+            "across",
+            "clusters."
+        ]
+        .contains(&before_ell),
+        "expected clean whole-word boundary before ellipsis, got '{before_ell}'"
+    );
+
+    // 4. Duplicate summary equal to title omits redundant blockquote.
+    let mut dup_entry = short_entry.clone();
+    dup_entry.summary_text = dup_entry.title.clone();
+    let dup_html =
+        format_compact_card_html_with_options(&feed, &dup_entry, AppLocale::En, la, &overrides);
+    assert!(
+        !dup_html.contains("<blockquote"),
+        "duplicate summary matching title must omit blockquote: {dup_html}"
+    );
+
+    // 5. No canonical URL yields None reply_markup.
+    let mut no_url_entry = short_entry;
+    no_url_entry.canonical_url = None;
+    assert!(build_compact_card_reply_markup(&no_url_entry, AppLocale::En, &overrides).is_none());
 }
 
 #[tokio::test]
@@ -2374,6 +2541,8 @@ async fn telegram_ssrf_guard_blocks_loopback_metadata_redirects_and_invalid_base
         timezone: chrono_tz::UTC,
         checkpoint: None,
         checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
     };
     assert!(matches!(
         allowed_sender.send(&ctx).await,
@@ -2383,15 +2552,24 @@ async fn telegram_ssrf_guard_blocks_loopback_metadata_redirects_and_invalid_base
 
 #[test]
 fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
-    // 1. HTML sanitizer must decode entities before re-escaping attributes (never `&amp;amp;` or `&amp;#39;`).
-    let raw_html = r#"<p><img src="https://cdn.example.com/pic.jpg?a=1&amp;b=2" alt="Tom&#39;s R&amp;D &quot;Lab&quot;" width="50%"></p>"#;
+    // 1. HTML sanitizer must decode full HTML5 named entities (`&euro;`, `&mdash;`, `&copy;`)
+    //    before re-escaping attributes (never `&amp;amp;` or `&amp;#39;`).
+    let raw_html = r#"<p>Price: 49&euro; &mdash; &copy; 2026</p><p><img src="https://cdn.example.com/pic.jpg?a=1&amp;b=2" alt="Tom&#39;s R&amp;D &quot;Lab&quot; &euro;" width="50%"><img src="https://cdn.example.com/third.jpg" width="33.3%"></p>"#;
     let base_url = url::Url::parse("https://cdn.example.com").expect("valid base url");
     let cleaned = feedcourier::ingest::html::sanitize_and_extract_html(raw_html, Some(&base_url));
     assert!(
         !cleaned.content_html.contains("&amp;amp;")
             && !cleaned.content_html.contains("&amp;#39;")
-            && !cleaned.content_html.contains("&amp;quot;"),
+            && !cleaned.content_html.contains("&amp;quot;")
+            && !cleaned.content_html.contains("&amp;euro;"),
         "sanitized HTML must not double-escape entities: {}",
+        cleaned.content_html
+    );
+    assert!(
+        cleaned.content_html.contains('€')
+            && cleaned.content_html.contains('—')
+            && cleaned.content_html.contains('©'),
+        "R2-08: full HTML5 named entities must decode cleanly: {}",
         cleaned.content_html
     );
     assert!(
@@ -2402,7 +2580,9 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         cleaned.content_html
     );
 
-    // 2. SMTP responsive image rewriter preserves relative percentage widths (`width="50%"`) instead of forcing 592px.
+    // 2. SMTP responsive image rewriter preserves integer AND fractional percentage widths in
+    //    inline CSS (`width:50%`, `width:33.3%`) while emitting `592px`-scaled integer pixel HTML
+    //    `width` attributes (`296`, `197`) for HTML5 & Outlook compliance.
     let smtp_cfg = SmtpChannelConfig {
         host: "smtp.verified.example.com".to_owned(),
         port: 587,
@@ -2410,6 +2590,7 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
         password: None,
         security: SmtpSecurity::StartTls,
         from_address: "alerts@verified.example.com".to_owned(),
+        sender_identity: None,
     };
     let smtp_dest = SmtpDestinationConfig {
         to_addresses: vec!["reader@example.org".to_owned()],
@@ -2422,13 +2603,18 @@ fn html_entity_no_double_escaping_and_smtp_percentage_width_preserved() {
     let built = SmtpSender::build_entry_email(&smtp_cfg, &smtp_dest, &feed, &entry, 1, None)
         .expect("build email");
     assert!(
-        built.html_body.contains("width=\"50%\""),
-        "relative percentage width must be preserved in email HTML:\n{}",
+        built.html_body.contains("width=\"296\"") && built.html_body.contains("width:50%;"),
+        "50% image must emit 592px-scaled integer width=296 + CSS width:50%:\n{}",
+        built.html_body
+    );
+    assert!(
+        built.html_body.contains("width=\"197\"") && built.html_body.contains("width:33.3%;"),
+        "33.3% image must emit 592px-scaled integer width=197 + CSS width:33.3%:\n{}",
         built.html_body
     );
     assert!(
         !built.html_body.contains("width=\"592\""),
-        "percentage width must not be overwritten with 592px:\n{}",
+        "percentage widths must not be overwritten with 592px:\n{}",
         built.html_body
     );
     assert!(
@@ -2548,4 +2734,308 @@ async fn telegram_proxied_client_allows_local_proxy_host_while_blocking_ssrf_tar
     ));
 
     let _ = proxy_handle.await;
+}
+
+#[tokio::test]
+async fn qa07_and_qa09_telegram_entities_budget_zwj_fallback_and_smtp_percent_edge_cases() {
+    use feedcourier::channels::smtp::rewrite_body_html_for_email;
+    use feedcourier::channels::telegram::{
+        format_compact_card_html, suppress_telegram_auto_entities,
+    };
+
+    // 1. QA-07: `suppress_telegram_auto_entities` preserves inline CJK/Markdown URLs, emails, and
+    //    bare domains like `notion.so`, while still neutralizing `/cmd`, `@handle`, and code filenames.
+    let sample = "详见https://example.com/docs/v1 链接：https://a.com/x。 [原文](https://example.com/a/b) 联系 alice@corp.it 与 notion.so，查看 README.fr.md、sku.go、libssl.so、/firewall 和 @astrojs/starlight";
+    let suppressed = suppress_telegram_auto_entities(sample);
+    assert!(
+        suppressed.contains("详见https://example.com/docs/v1"),
+        "CJK-prefixed URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("链接：https://a.com/x。"),
+        "URL followed by CJK punctuation must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("[原文](https://example.com/a/b)"),
+        "Markdown-wrapped URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("alice@corp.it"),
+        "email with ccTLD `.it` must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("notion.so"),
+        "bare website domain `notion.so` must not be broken: {suppressed}"
+    );
+    assert!(suppressed.contains("README.\u{200C}fr.\u{200C}md"));
+    assert!(suppressed.contains("sku.\u{200C}go"));
+    assert!(suppressed.contains("libssl.\u{200C}so"));
+    assert!(suppressed.contains("/\u{200C}firewall"));
+    assert!(suppressed.contains("@\u{200C}astrojs/\u{200C}starlight"));
+
+    // 2. QA-07: High-density `&` / `<` characters in title + summary shrink budget smoothly
+    //    without zeroing out the entire blockquote summary.
+    let feed = sample_feed(9, "Entity Stress");
+    let mut dense_entry = sample_entry("qa07-dense", Vec::new());
+    dense_entry.title = Some("&".repeat(280));
+    dense_entry.summary_text = Some("&<".repeat(450));
+    let compact = format_compact_card_html(&feed, &dense_entry);
+    assert!(
+        compact.encode_utf16().count() <= 4096,
+        "compact card must stay <= 4096 UTF-16 units (got {})",
+        compact.encode_utf16().count()
+    );
+    assert!(
+        compact.contains("<blockquote"),
+        "high-density escaped summary must shrink smoothly instead of dropping the blockquote:\n{compact}"
+    );
+
+    // 3. QA-07: ZWJ compound emoji truncation never splits mid-grapheme cluster.
+    let mut zwj_entry = sample_entry("qa07-zwj", Vec::new());
+    let family = "👨‍👩‍👧‍👦"; // 11 UTF-16 units per grapheme
+    zwj_entry.title = Some(family.repeat(35)); // 385 UTF-16 units -> truncated to <= 300
+    let zwj_card = format_compact_card_html(&feed, &zwj_entry);
+    let title_part = zwj_card
+        .strip_prefix("<b>")
+        .and_then(|s| s.split("</b>").next())
+        .expect("bold title");
+    let stripped_title = title_part.trim_end_matches('…');
+    assert!(!stripped_title.is_empty());
+    assert!(
+        !stripped_title.ends_with('\u{200D}'),
+        "truncation must never leave a dangling ZWJ: {title_part:?}"
+    );
+    assert_eq!(
+        stripped_title.len() % family.len(),
+        0,
+        "truncated ZWJ emoji sequence must preserve whole grapheme clusters: {title_part:?}"
+    );
+
+    // 4. QA-07: `sendRichMessage` 400 content error falls back once to `CompactCard` WITHOUT
+    //    permanently flipping `supports_rich_message = false`.
+    let mock_tg = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_QA07/sendRichMessage"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: RICH_MESSAGE_ENTITIES_TOO_DEEP"
+        })))
+        .expect(1)
+        .mount(&mock_tg)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/botTOK_QA07/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "result": { "message_id": 7007 }
+        })))
+        .expect(1)
+        .mount(&mock_tg)
+        .await;
+
+    let tg_sender = TelegramSender::with_media_fetcher(Arc::new(DefaultMediaStreamFetcher::new()))
+        .with_ssrf_allowlist(&["127.0.0.1/32"])
+        .unwrap();
+    let tg_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+        bot_token: "TOK_QA07".to_owned(),
+        api_base_url: Some(mock_tg.uri()),
+    });
+    let tg_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
+        chat_id: "-100777".to_owned(),
+        message_thread_id: None,
+    });
+    let tg_ch = sample_channel(
+        ChannelKind::Telegram,
+        &json!({ "supports_rich_message": true }).to_string(),
+    );
+    let dest_row = sample_destination();
+    let opts = RouteOptions {
+        telegram_mode: TelegramDeliveryMode::RichMessage,
+        ..RouteOptions::default()
+    };
+    let route = sample_route(77, opts.clone());
+    let task = sample_task(77);
+    let entry = sample_entry("qa07-rich-400", Vec::new());
+    let ctx = DeliveryContext {
+        task: &task,
+        entry: &entry,
+        feed: &feed,
+        route: &route,
+        route_options: opts,
+        channel: &tg_ch,
+        channel_config: &tg_cfg,
+        destination: &dest_row,
+        destination_config: &tg_dest,
+        timezone: chrono_tz::UTC,
+        checkpoint: None,
+        checkpoint_sink: None,
+        overrides: Default::default(),
+        smtp_delivery: None,
+    };
+    match tg_sender.send(&ctx).await.expect("fallback delivery") {
+        DeliveryOutcome::Delivered {
+            updated_capabilities,
+            checkpoint:
+                Some(DeliveryCheckpoint::Telegram {
+                    degraded_to_compact,
+                    sent_message_ids,
+                    ..
+                }),
+            ..
+        } => {
+            assert!(degraded_to_compact);
+            assert_eq!(sent_message_ids, vec![7007]);
+            assert!(
+                updated_capabilities.is_none(),
+                "content 400 fallback must NOT permanently disable supports_rich_message"
+            );
+        }
+        other => panic!("expected one-shot compact_card fallback Delivered, got {other:?}"),
+    }
+
+    // 5. QA-09: SMTP percentage image width edge cases (`0%`, `0.004%`, `33.3%`).
+    let edge_html = r#"<img src="https://cdn.example.com/a.png" width="0%"><img src="https://cdn.example.com/b.png" width="0.004%"><img src="https://cdn.example.com/c.png" width="33.3%">"#;
+    let rewritten = rewrite_body_html_for_email(edge_html);
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/a.png" width="0" style="display:block;max-width:100%;width:0;"#),
+        "0% image must remain 0 without stretching to 592px:\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/b.png" width="6" style="display:block;max-width:100%;width:1%;"#),
+        "0.004% positive image must clamp up to 1% (width=6), never 0%:\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/c.png" width="197" style="display:block;max-width:100%;width:33.3%;"#),
+        "33.3% image must emit integer width=197 and exact CSS width:33.3%:\n{rewritten}"
+    );
+}
+
+#[tokio::test]
+async fn round2_qa_regressions_rg03_tg_urls_and_smtp_fractional_px() {
+    use feedcourier::channels::smtp::rewrite_body_html_for_email;
+    use feedcourier::channels::telegram::suppress_telegram_auto_entities;
+
+    // 1. RG-03: `sendRichMessage` returning `400 Bad Request: message thread not found` or
+    //    `400 Bad Request: CHAT_NOT_FOUND` MUST return `PermanentFailure` without degrading to
+    //    `sendMessage` or mutating `supports_rich_message`!
+    for (idx, err_desc) in [
+        "Bad Request: message thread not found",
+        "Bad Request: CHAT_NOT_FOUND",
+        "Bad Request: PEER_ID_INVALID",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mock_tg = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botTOK_RG03/sendRichMessage"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "ok": false,
+                "error_code": 400,
+                "description": err_desc
+            })))
+            .expect(1)
+            .mount(&mock_tg)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botTOK_RG03/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "message_id": 999 }
+            })))
+            .expect(0)
+            .mount(&mock_tg)
+            .await;
+
+        let tg_sender =
+            TelegramSender::with_media_fetcher(Arc::new(DefaultMediaStreamFetcher::new()))
+                .with_ssrf_allowlist(&["127.0.0.1/32"])
+                .unwrap();
+        let tg_cfg = ChannelConfig::Telegram(TelegramChannelConfig {
+            bot_token: "TOK_RG03".to_owned(),
+            api_base_url: Some(mock_tg.uri()),
+        });
+        let tg_dest = DestinationConfig::Telegram(TelegramDestinationConfig {
+            chat_id: "-100999".to_owned(),
+            message_thread_id: Some(42),
+        });
+        let tg_ch = sample_channel(
+            ChannelKind::Telegram,
+            &json!({ "supports_rich_message": true }).to_string(),
+        );
+        let dest_row = sample_destination();
+        let opts = RouteOptions {
+            telegram_mode: TelegramDeliveryMode::RichMessage,
+            ..RouteOptions::default()
+        };
+        let route = sample_route(80 + idx as i64, opts.clone());
+        let task = sample_task(80 + idx as i64);
+        let feed = sample_feed(80, "RG03 Feed");
+        let entry = sample_entry(&format!("rg03-{idx}"), Vec::new());
+        let ctx = DeliveryContext {
+            task: &task,
+            entry: &entry,
+            feed: &feed,
+            route: &route,
+            route_options: opts,
+            channel: &tg_ch,
+            channel_config: &tg_cfg,
+            destination: &dest_row,
+            destination_config: &tg_dest,
+            timezone: chrono_tz::UTC,
+            checkpoint: None,
+            checkpoint_sink: None,
+            overrides: Default::default(),
+            smtp_delivery: None,
+        };
+        match tg_sender.send(&ctx).await.expect("outcome") {
+            DeliveryOutcome::PermanentFailure { status_code, .. } => {
+                assert_eq!(status_code, Some(400));
+            }
+            other => panic!(
+                "expected PermanentFailure without sendMessage fallback for '{err_desc}', got {other:?}"
+            ),
+        }
+    }
+
+    // 2. P2 Telegram URL scanner: balanced parens (Wikipedia), Markdown-wrapped balanced parens,
+    //    adjacent Markdown links, and internal commas stay completely untouched!
+    let text = "Read https://en.wikipedia.org/wiki/Rust_(programming_language) and [Wiki](https://en.wikipedia.org/wiki/Rust_(programming_language)) and [a](https://example.com/a/README.md),[b](https://example.com/b/sku.go) and https://example.com/a,b/c, plus /cmd and README.md";
+    let suppressed = suppress_telegram_auto_entities(text);
+    assert!(
+        suppressed.contains("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+        "Wikipedia balanced-paren URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("[Wiki](https://en.wikipedia.org/wiki/Rust_(programming_language))"),
+        "Markdown-wrapped Wikipedia URL must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed
+            .contains("[a](https://example.com/a/README.md),[b](https://example.com/b/sku.go)"),
+        "adjacent comma-separated Markdown links must stay intact: {suppressed}"
+    );
+    assert!(
+        suppressed.contains("https://example.com/a,b/c,"),
+        "URL with internal comma must stay intact: {suppressed}"
+    );
+    assert!(suppressed.contains("/\u{200C}cmd"));
+    assert!(suppressed.contains("README.\u{200C}md"));
+
+    // 3. P2 SMTP fractional pixel width (`0.5px` -> `1`, `120.4px` -> `120`, `0.0px` -> `0`).
+    let frac_html = r#"<img src="https://cdn.example.com/sub.png" width="0.5px"><img src="https://cdn.example.com/frac.png" width="120.4px"><img src="https://cdn.example.com/zero.png" width="0.0px">"#;
+    let rewritten = rewrite_body_html_for_email(frac_html);
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/sub.png" width="1" "#),
+        "0.5px image must clamp to width=1 (never 592):\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/frac.png" width="120" "#),
+        "120.4px image must round to width=120:\n{rewritten}"
+    );
+    assert!(
+        rewritten.contains(r#"src="https://cdn.example.com/zero.png" width="0" "#),
+        "0.0px image must stay width=0:\n{rewritten}"
+    );
 }

@@ -1,10 +1,10 @@
 ---
-description: "Reference for FeedCourier's 9 MCP tools covering feed status inspection, article preview, failed delivery diagnostics, feed management, route configuration, global queue control, and debug push."
+description: "Reference for FeedCourier's 10 MCP tools covering feed status inspection, secret-free plugin discovery (list_plugins), article preview, failed delivery diagnostics, feed management, route and plugin configuration, global queue control, and debug push."
 ---
 
 # Tools Overview
 
-FeedCourier exposes **9 structured MCP tools** across two permission scopes (`readonly` and `admin`). All tools return structured JSON responses.
+FeedCourier exposes **10 structured MCP tools** across two permission scopes (`readonly` and `admin`). All tools return structured JSON responses.
 
 ---
 
@@ -12,15 +12,20 @@ FeedCourier exposes **9 structured MCP tools** across two permission scopes (`re
 
 | Tool Name | Minimum Scope | Modifies State? | Purpose |
 | :--- | :--- | :--- | :--- |
-| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | No | View system overview counters, redacted channel accounts and destinations (ID, name, kind, enabled only), active routes, and feed health. |
-| [`inspect_failed_deliveries`](#2-inspect-failed-deliveries) | `readonly` | No | Inspect delivery tasks in `dead_letter`, `retrying`, `deferred`, `queued`, or `all` states. |
-| [`preview_feed_latest`](#3-preview-feed-latest) | `readonly` | No | Fetch up to 10 recent entries from a URL or `feed_id` to test full-text extraction and content filters. |
-| [`manage_feed`](#4-manage-feed) | `admin` | Yes | Add, update, pause, resume, clear cache, or delete a feed subscription. |
-| [`configure_route`](#5-configure-route) | `admin` | Yes | Create, update, or delete a delivery route linked to an existing trusted `destination_id` (or legacy single-destination `channel_id`). |
-| [`reset_and_poll_feed`](#6-reset-and-poll-feed) | `admin` | Yes | Reset failure counters on a feed and trigger an immediate poll. |
-| [`retry_dead_tasks`](#7-retry-dead-tasks) | `admin` | Yes | Requeue failed delivery tasks by `task_ids` or `all_dead_letter: true`. |
-| [`manage_outbox_queue`](#8-manage-outbox-queue) | `admin` | Yes | Check, pause, or resume the global delivery queue (optionally with a scheduled resume). |
-| [`test_push_feed_entry`](#9-test-push-feed-entry) | `admin` | No (stateless) | Debug push of one feed entry to a trusted `destination_id` (or legacy single-destination `channel_id`) without fingerprints, queue, or quota. |
+| [`list_feeds_status`](#1-list-feeds-status) | `readonly` | No | View system overview counters, redacted channel accounts and destinations (ID, name, kind, enabled only), active routes (including `plugins`), and feed health. |
+| [`list_plugins`](#2-list-plugins) | `readonly` | No | List installed plugins and their provider instances (IDs, names, hooks, enabled status only — strictly zero secrets or API URLs). |
+| [`inspect_failed_deliveries`](#3-inspect-failed-deliveries) | `readonly` | No | Inspect delivery tasks in `dead_letter`, `retrying`, `deferred`, `queued`, or `all` states. |
+| [`preview_feed_latest`](#4-preview-feed-latest) | `readonly` | No | Fetch up to 10 recent entries from a URL or `feed_id` to test full-text extraction and content filters. |
+| [`manage_feed`](#5-manage-feed) | `admin` | Yes | Add, update, pause, resume, clear cache, or delete a feed subscription. |
+| [`configure_route`](#6-configure-route) | `admin` | Yes | Create, update, or delete a delivery route linked to an existing trusted `destination_id` (or legacy single-destination `channel_id`), including per-route `plugins` bindings. |
+| [`reset_and_poll_feed`](#7-reset-and-poll-feed) | `admin` | Yes | Reset failure counters on a feed and trigger an immediate poll. |
+| [`retry_dead_tasks`](#8-retry-dead-tasks) | `admin` | Yes | Requeue failed delivery tasks by `task_ids` or `all_dead_letter: true`. |
+| [`manage_outbox_queue`](#9-manage-outbox-queue) | `admin` | Yes | Check, pause, or resume the global delivery queue (optionally with a scheduled resume). |
+| [`test_push_feed_entry`](#10-test-push-feed-entry) | `admin` | No (stateless) | Debug push of one feed entry to a trusted `destination_id` (or legacy single-destination `channel_id`) without fingerprints, queue, or quota. |
+
+::: info WebUI-Only Security Boundaries
+Channel account/destination creation, plugin provider credentials (such as YOURLS API URLs and tokens), and SMTP recipient verification/unsubscription are **WebUI-only** and cannot be mutated over `/mcp`.
+:::
 
 ---
 
@@ -28,7 +33,7 @@ FeedCourier exposes **9 structured MCP tools** across two permission scopes (`re
 
 ### 1. `list_feeds_status` {#1-list-feeds-status}
 
-Returns system-wide counters (`overview`), redacted channel accounts (`channels`, each with `id`, `name`, `kind`, `enabled`, `cooldown_until`, and nested `destinations`), a top-level redacted `destinations` list (`id`, `channel_id`, `name`, `kind`, `enabled` — never exposing secrets, email addresses, `chat_id`, or `data_source_id`), configured routes (with `channel_id`, `destination_id`, `locale`, `timezone`, `active_windows`, and `active_weekdays`), and subscribed feeds. The response also includes the global outbox state `queue: { paused, resume_at }` and the system `timezone`.
+Returns system-wide counters (`overview`), redacted channel accounts (`channels`, each with `id`, `name`, `kind`, `enabled`, `cooldown_until`, and nested `destinations`), a top-level redacted `destinations` list (`id`, `channel_id`, `name`, `kind`, `enabled` — never exposing secrets, email addresses, `chat_id`, or `data_source_id`), configured routes (with `channel_id`, `destination_id`, `locale`, `timezone`, `active_windows`, `active_weekdays`, and `plugins`), and subscribed feeds. The response also includes the global outbox state `queue: { paused, resume_at }` and the system `timezone`.
 
 #### Input Parameters
 | Parameter | Type | Required | Description |
@@ -52,7 +57,42 @@ Returns system-wide counters (`overview`), redacted channel accounts (`channels`
 
 ---
 
-### 2. `inspect_failed_deliveries` {#2-inspect-failed-deliveries}
+### 2. `list_plugins` {#2-list-plugins}
+
+Returns a secret-free catalog of all installed plugins and their configured provider instances so AI assistants can discover valid `plugin_id` and `provider_id` integers for [`configure_route`](#6-configure-route) without ever seeing provider URLs, signature tokens, usernames, or passwords.
+
+#### Input Parameters
+Takes an empty object `{}` (no parameters).
+
+#### Example Response
+```json
+{
+  "plugins": [
+    {
+      "id": "link-rewrite",
+      "name": "Link Rewrite (YOURLS)",
+      "version": "0.3.0",
+      "api_version": "1",
+      "enabled": true,
+      "hooks": ["on_render"],
+      "instances": [
+        {
+          "id": 1,
+          "name": "Personal sho.rt",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### Example Prompt
+> *"List the installed FeedCourier plugins and see which link-rewrite provider instances are currently enabled."*
+
+---
+
+### 3. `inspect_failed_deliveries` {#3-inspect-failed-deliveries}
 
 Retrieves delivery tasks along with their route, channel account, destination (`destination_id`, `destination_name`), attempt count, last status code, and diagnostic error log.
 
@@ -78,7 +118,7 @@ Retrieves delivery tasks along with their route, channel account, destination (`
 
 ---
 
-### 3. `preview_feed_latest` {#3-preview-feed-latest}
+### 4. `preview_feed_latest` {#4-preview-feed-latest}
 
 Fetches and parses a feed live without writing to the database. Returns up to `10` latest entries, optionally runs full-text extraction on up to the top `3` entries when `fetch_full_content: true`, and tests optional keyword or regex filters.
 
@@ -118,7 +158,7 @@ Fetches and parses a feed live without writing to the database. Returns up to `1
 Calling any of the six tools below with a `readonly` token returns an `"insufficient_scope"` error without making changes.
 :::
 
-### 4. `manage_feed` {#4-manage-feed}
+### 5. `manage_feed` {#5-manage-feed}
 
 Adds, updates, pauses, resumes, clears the cache of, or deletes a feed subscription. On `"add"`, FeedCourier performs an initial poll right away (with `silent_init: true` enabled by default so existing historical articles are recorded without flooding your channels). If the initial request is blocked by private network protection, the new feed record is rolled back automatically.
 
@@ -172,7 +212,7 @@ Adds, updates, pauses, resumes, clears the cache of, or deletes a feed subscript
 
 ---
 
-### 5. `configure_route` {#5-configure-route}
+### 6. `configure_route` {#6-configure-route}
 
 Creates, updates, or deletes a delivery route that connects feeds/tags and content filters to an existing trusted `destination_id` created in the WebUI (discoverable via `list_feeds_status`). For backward compatibility, `channel_id` is still accepted if that channel account owns **exactly one** destination; if the account has multiple destinations, an error is returned asking for `destination_id`.
 
@@ -196,6 +236,7 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
 | `timezone` | `string?` | Optional | Optional per-route IANA timezone override (e.g., `"Asia/Shanghai"`; `""` clears on `"update"` to inherit the system timezone). Governs delivery windows, SMTP article timestamps, and Telegram rich-message footer timestamps. |
 | `active_windows` | `{start, end}[]?` | Optional | Daily delivery windows in the **route timezone** (inheriting system timezone) with DST-safe boundaries, e.g. `[{"start":"08:00","end":"22:00"}]`. `end` earlier than `start` wraps midnight; only `00:00`–`00:00` (or `[]`) means all day—other `start == end` windows are rejected with a validation error. |
 | `active_weekdays` | `u8[]?` | Optional | Allowed weekdays `1` (Mon) – `7` (Sun); `[]` means every day. |
+| `plugins` | `Record<string, object>?` | Optional | Per-plugin route options keyed by plugin ID (for example, `{"link-rewrite": {"provider_id": 1}}`). Validated against installed plugins and existing provider instances before saving; pass `{}` or `{"link-rewrite": {"provider_id": null}}` to disable. Discover valid IDs with [`list_plugins`](#2-list-plugins). |
 | `enabled` | `bool?` | Optional | Whether this route is active (`true` by default). |
 
 #### Example Call (`create`)
@@ -212,7 +253,10 @@ Creates, updates, or deletes a delivery route that connects feeds/tags and conte
     "locale": "en",
     "timezone": "America/New_York",
     "active_windows": [{ "start": "08:00", "end": "22:00" }],
-    "active_weekdays": [1, 2, 3, 4, 5]
+    "active_weekdays": [1, 2, 3, 4, 5],
+    "plugins": {
+      "link-rewrite": { "provider_id": 1 }
+    }
   }
 }
 ```
@@ -224,7 +268,7 @@ Tasks outside a route's window or weekdays are still queued and are delivered at
 
 ---
 
-### 6. `reset_and_poll_feed` {#6-reset-and-poll-feed}
+### 7. `reset_and_poll_feed` {#7-reset-and-poll-feed}
 
 Resets a feed's consecutive failure counter, restores a `circuit_open` or `backoff` feed back to `active`, and runs an immediate poll.
 
@@ -248,7 +292,7 @@ Resets a feed's consecutive failure counter, restores a `circuit_open` or `backo
 
 ---
 
-### 7. `retry_dead_tasks` {#7-retry-dead-tasks}
+### 8. `retry_dead_tasks` {#8-retry-dead-tasks}
 
 Requeues specific failed tasks (`task_ids`) or all `dead_letter` tasks whose article bodies are still within the retention window (`all_dead_letter: true`), setting their status back to `queued` for immediate delivery.
 
@@ -273,7 +317,7 @@ Requeues specific failed tasks (`task_ids`) or all `dead_letter` tasks whose art
 
 ---
 
-### 8. `manage_outbox_queue` {#8-manage-outbox-queue}
+### 9. `manage_outbox_queue` {#9-manage-outbox-queue}
 
 Reads or changes the global delivery queue state. While paused, feeds are still polled and tasks accumulate; on resume all due tasks across feeds are delivered oldest-first by article publish time (falling back to discovery time).
 
@@ -302,7 +346,7 @@ Without `resume_in_minutes` or `resume_at`, a pause lasts until `"resume"` is ca
 
 ---
 
-### 9. `test_push_feed_entry` {#9-test-push-feed-entry}
+### 10. `test_push_feed_entry` {#10-test-push-feed-entry}
 
 Debug push: fetches a feed entry live and delivers it to a trusted destination once. It is **stateless**: it creates no fingerprints, does not enter the queue, and does not use route filters, time windows, or quotas. Notion pages use a `test-` prefixed `FC-ID`. Downstream failures are returned as a diagnostic result instead of an error.
 

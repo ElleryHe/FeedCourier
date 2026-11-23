@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  AlertTriangle,
   CheckCircle2,
   Info,
   X,
@@ -15,7 +16,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 
-type ToastTone = "success" | "error" | "info";
+type ToastTone = "success" | "error" | "warning" | "info";
 
 interface ToastItem {
   id: number;
@@ -27,6 +28,7 @@ interface ToastItem {
 interface ToastApi {
   success: (title: string, description?: string) => void;
   error: (title: string, description?: string) => void;
+  warning: (title: string, description?: string) => void;
   info: (title: string, description?: string) => void;
 }
 
@@ -48,7 +50,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       setItems((prev) => [...prev.slice(-4), { id, tone, title, description }]);
       window.setTimeout(() => {
         dismiss(id);
-      }, tone === "error" ? 6500 : 4000);
+      }, tone === "error" ? 6500 : tone === "warning" ? 5500 : 4000);
     },
     [dismiss],
   );
@@ -57,6 +59,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     () => ({
       success: (title, description) => push("success", title, description),
       error: (title, description) => push("error", title, description),
+      warning: (title, description) => push("warning", title, description),
       info: (title, description) => push("info", title, description),
     }),
     [push],
@@ -79,6 +82,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 "border-emerald-200 dark:border-emerald-900/70",
               item.tone === "error" &&
                 "border-rose-200 dark:border-rose-900/70",
+              item.tone === "warning" &&
+                "border-amber-200 dark:border-amber-900/70",
               item.tone === "info" && "border-zinc-200 dark:border-zinc-800",
             )}
           >
@@ -87,6 +92,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             )}
             {item.tone === "error" && (
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+            )}
+            {item.tone === "warning" && (
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
             )}
             {item.tone === "info" && (
               <Info className="mt-0.5 h-4 w-4 shrink-0 text-zinc-600 dark:text-zinc-400" />

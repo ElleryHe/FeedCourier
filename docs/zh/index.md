@@ -24,28 +24,28 @@ hero:
       link: /zh/reference/architecture
 
 features:
-  - title: 文章去重与定期清理
-    details: 在 SQLite 中长期保留文章 SHA-256 指纹以避免重复投递；已完成投递的正文与媒体元数据在保留期（默认 24 小时）过后自动清理。
-    link: /zh/guide/introduction
-    linkText: 查看项目简介
+  - title: 内置插件框架与链接替换
+    details: 基于 Protocol v1 的投递期 on_render 钩子体系，内置 YOURLS 链接替换插件、加密多服务商配置、90 天 SQLite 短链缓存、按路由选择以及由 ElleryHe/FeedCourier-Plugins 驱动的插件市场。
+    link: /zh/plugins/
+    linkText: 浏览插件与市场
+  - title: 合规 SMTP 邮件投递
+    details: 支持逐收件人单独发送、手动触发的双重确认验证（6 位验证码与可选 /v/{token}）、RFC 8058 一键退订（/u/{token}）、同步 5xx 硬退信保护、Force-From 发件人对齐与防撑宽响应式邮件模板。
+    link: /zh/channels/smtp
+    linkText: 配置 SMTP 邮件
   - title: 发送频率控制与路由级时区
     details: 按 1 Task = 1 Entry × 1 Route 独立入队，同一通道账号下的多个目的地共享最小间隔、逐条独立随机抖动、小时/日配额与 429 冷却，并支持按路由自定义 IANA 时区。
     link: /zh/channels/pacing-and-quotas
     linkText: 查看频率、配额与过滤
-  - title: SMTP 邮件投递
-    details: 使用响应式内联 CSS 邮件模板渲染正文（自动适配图片/表格宽度与本地时区时间），支持单发件账号挂载多组收件目的地、Force-From 发件人对齐与按源分类的 List-Id。
-    link: /zh/channels/smtp
-    linkText: 配置 SMTP 邮件
   - title: Telegram 多模式投递
     details: 单个 Bot 账号可挂载多个私聊、群组、话题或频道目的地；按路由选择富文本（原生页脚、标题降级、连图拼贴/幻灯片）、快讯或媒体模式，支持防盗链代传与 Local Bot API 降级。
     link: /zh/channels/telegram
     linkText: 配置 Telegram 通道
   - title: Notion 数据库同步
-    details: 单个 Notion 集成可同步至多个数据库目的地，支持一键初始化 7 列标准数据库或绑定已有数据源，内置 Markdown v2 转换、长文异步创建及重复页面校验。
+    details: 单个 Notion 集成可同步至多个数据库目的地，支持一键初始化 8 列标准数据库（含可选 Short URL）或绑定已有数据源、404 自动回写 data_source_id、Markdown v2 转换与长文异步创建。
     link: /zh/channels/notion
     linkText: 配置 Notion 通道
-  - title: 内置 Web 控制台与 /mcp 接口
-    details: 单二进制内嵌 React 管理界面（支持订阅源标签筛选、排序记忆与分页、路由级联筛选、发件箱语义配色）与 Streamable HTTP /mcp 端点，支持双级令牌、凭据与目的地隔离加密及连接层防 SSRF。
+  - title: 内置 Web 控制台与 10 个 MCP 工具
+    details: 单二进制内嵌 React 管理界面与 Streamable HTTP /mcp 端点（含零凭据 list_plugins 共 10 个工具），支持 ChaCha20-Poly1305 凭据加密、目的地锁定、TOTP 两步验证与连接层防 SSRF。
     link: /zh/mcp/setup
     linkText: 配置 MCP 客户端
 ---

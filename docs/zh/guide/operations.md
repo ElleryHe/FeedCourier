@@ -162,6 +162,7 @@ docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
 > **反向代理配置建议**：
 > 1. 传递 `X-Forwarded-Proto` 与 `X-Forwarded-Host` 请求头——WebUI 在生成 MCP 客户端配置示例时，会自动根据这两个请求头拼接完整的 `https://<your-domain>/mcp` 地址。
 > 2. 对于 `/mcp` 路径（Streamable HTTP），建议关闭代理缓冲（`proxy_buffering off`），避免流式响应被缓存延迟。
+> 3. 在受信任的反向代理后方部署时，建议在环境变量中启用 `TRUST_PROXY=true`，以便公开退订（`/u/{token}`）与确认（`/v/{token}`）接口的限流器按真实访客 IP 而非 `127.0.0.1` 计数。启用后优先取最后一个 `X-Forwarded-For` 的最右端跳点（由你的反代追加），仅在缺失 `X-Forwarded-For` 时回退到 `X-Real-IP`；若直接暴露服务而无反代，请保持默认的 `TRUST_PROXY=false`。
 
 ### Caddy 配置示例
 

@@ -34,6 +34,9 @@ async fn main() -> AppResult<()> {
     // atomically (taking a `pre-v0.2.0-backup.db` snapshot first when legacy rows exist).
     db.migrate_channels_to_v2(&master_key).await?;
 
+    // Backfill existing pre-v0.3.0 SMTP destination recipients as `verified (legacy)` idempotently.
+    db.backfill_legacy_smtp_recipients(&master_key).await?;
+
     let runtime =
         DeliveryDispatcher::from_db_settings(config.clone(), db.clone(), master_key.clone())
             .await?;
@@ -59,9 +62,12 @@ async fn main() -> AppResult<()> {
         "starting FeedCourier full-stack server"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(mcp_cancel))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(mcp_cancel))
+    .await?;
 
     tracing::info!("HTTP server drained; stopping background scheduler");
     scheduler_handle.shutdown().await;

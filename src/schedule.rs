@@ -57,6 +57,14 @@ pub fn format_local_timestamp(ts: i64, tz: Tz) -> Option<String> {
     ))
 }
 
+/// Format a UTC Unix timestamp in `tz` in compact form without explicit UTC offset,
+/// e.g. `2026-11-08 11:00`, suited for narrow mobile Telegram card footers.
+pub fn format_local_timestamp_compact(ts: i64, tz: Tz) -> Option<String> {
+    let utc = Utc.timestamp_opt(ts, 0).single()?;
+    let local = utc.with_timezone(&tz);
+    Some(local.format("%Y-%m-%d %H:%M").to_string())
+}
+
 /// Parse `HH:MM` (also `24:00` as end-of-day) into minutes since midnight.
 pub fn parse_hhmm(raw: &str) -> Option<u32> {
     let (h, m) = raw.trim().split_once(':')?;

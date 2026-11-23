@@ -1,6 +1,7 @@
 import { useRoute, type Theme } from "vitepress";
 import DefaultTheme from "vitepress/theme";
 import { nextTick, onMounted, watch } from "vue";
+import PluginMarketplace from "./components/PluginMarketplace.vue";
 import "./custom.css";
 
 function syncCopyrightYear() {
@@ -15,6 +16,9 @@ function syncCopyrightYear() {
 
 export default {
   extends: DefaultTheme,
+  enhanceApp({ app }) {
+    app.component("PluginMarketplace", PluginMarketplace);
+  },
   setup() {
     const route = useRoute();
     onMounted(syncCopyrightYear);

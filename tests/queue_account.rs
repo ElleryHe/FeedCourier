@@ -251,7 +251,15 @@ async fn sent_texts(server: &MockServer) -> Vec<String> {
         .filter(|r| r.url.path().ends_with("/sendMessage"))
         .map(|r| {
             let v: Value = serde_json::from_slice(&r.body).unwrap();
-            v["text"].as_str().unwrap_or_default().to_string()
+            let text = v["text"].as_str().unwrap_or_default();
+            let btn = v["reply_markup"]["inline_keyboard"][0][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            if btn.is_empty() {
+                text.to_string()
+            } else {
+                format!("{text}\n[{btn}]")
+            }
         })
         .collect()
 }

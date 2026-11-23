@@ -53,8 +53,8 @@ When creating or editing a **Route** that targets a Telegram destination, you ca
 ### Rich Message Mode (`rich_message` — Default)
 
 Best for blogs, long-form articles, and technical writing (powered by [`telegram-rich 0.0.2`](https://crates.io/crates/telegram-rich)):
-- **Clean Mobile-Friendly Hierarchy**: Renders the article title as a linked **`<h2>`** (avoiding oversized `<h1>` headers), places **`Source · Author · Localized Publish Time`** (in the route's timezone, e.g. `2026-11-08 11:00 (UTC+08:00)`) in a native Telegram **`<footer>`** directly underneath, and separates header and body with a horizontal divider (`<hr>`).
-- **Automatic Body Heading Demotion**: Original headings inside the article body are demoted by two levels (`h1→h3`, `h2→h4`, …, capped at `h6`) so section headings stay visually subordinate to the article title.
+- **Clean Mobile-Friendly Hierarchy**: Renders the article title as a calm, plain-foreground **`<h3>`** (no oversized `<h1>`/`<h2>` or distracting full-title link blue), places **`Source · Author · Compact Publish Time`** (in the route's timezone, e.g. `2026-11-08 11:00`) in a native Telegram **`<footer>`** directly underneath, and separates header and body with a horizontal divider (`<hr>`).
+- **Automatic Body Heading Demotion**: Original headings inside the article body are demoted by three levels (`h1→h4`, `h2→h5`, `h3+→h6`) so section headings stay visually subordinate to the article title.
 - **Automatic Media Collages & Slideshows**: Two or more consecutive inline images in the article body are automatically grouped into a Telegram **collage** (or a **slideshow** when exceeding collage limits), alongside preserved lists, compact tables, expandable blockquotes, and syntax-highlighted code blocks.
 - **Read Original Button**: Appends a **"Read original"** button at the bottom of the message linking to the source article. Very long articles are cleanly shortened at paragraph/block boundaries with a notice above the button.
 - **Automatic Fallback on Older Bot API Servers**: If you connect `api_base_url` to an older self-hosted Local Bot API server that does not support Rich Message delivery, FeedCourier automatically falls back to **Compact Card** mode so messages are still delivered without failing.
@@ -62,8 +62,9 @@ Best for blogs, long-form articles, and technical writing (powered by [`telegram
 ### Compact Card Mode (`compact_card`)
 
 Best for high-frequency news feeds, release notes, or group chats where you want short notifications:
-- Sends a concise message containing the **bold article title**, **feed source and author**, **plain-text summary**, and **original article link**.
-- Includes a per-route **Link Preview (`link_preview`)** toggle so you can choose whether Telegram expands webpage preview cards below the message.
+- **Editorial Card Layout**: Renders the **bold article title** at top, wraps the plain-text summary inside a native Telegram **`<blockquote>`** (automatically upgrading to a collapsible **`<blockquote expandable>`** when longer than `300` UTF-16 code units, cleanly word/sentence-boundary truncated at `<= 800` units, and omitting the quote block when the summary duplicates the title), places italic **`Source · Author · YYYY-MM-DD HH:MM`** metadata at the bottom, and attaches a native inline URL button (**"Read original"** / **"阅读原文"**).
+- **Noise-Free Summary Text**: Automatically suppresses false-positive Telegram auto-highlighting on `/commands`, `@scoped/packages`, and code/doc filenames (such as `README.md`, `README.fr.md`, `sku.go`) while preserving real `http(s)://` URLs.
+- Includes a per-route **Link Preview (`link_preview`)** toggle so you can choose whether Telegram expands webpage preview cards below the message (always targeting the original canonical URL even when Link Rewrite shortens the button URL).
 
 ### Media Mode (`media_mode`)
 

@@ -23,6 +23,7 @@ import { AuthGateView } from "@/views/AuthGateView";
 import { ChannelsView } from "@/views/ChannelsView";
 import { FeedsView } from "@/views/FeedsView";
 import { OverviewView } from "@/views/OverviewView";
+import { PluginsView } from "@/views/PluginsView";
 import { RoutesView } from "@/views/RoutesView";
 import { SettingsView } from "@/views/SettingsView";
 import { TasksView } from "@/views/TasksView";
@@ -32,6 +33,7 @@ const VALID_SECTIONS: NavSection[] = [
   "feeds",
   "channels",
   "routes",
+  "plugins",
   "tasks",
   "settings",
 ];
@@ -238,6 +240,8 @@ export function App() {
       {section === "channels" && <ChannelsView />}
 
       {section === "routes" && <RoutesView />}
+
+      {section === "plugins" && <PluginsView />}
 
       {section === "tasks" && (
         <TasksView

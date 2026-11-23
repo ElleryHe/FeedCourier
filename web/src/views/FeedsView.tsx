@@ -15,6 +15,7 @@ import {
   Pencil,
   Play,
   Plus,
+  Puzzle,
   RefreshCw,
   Rss,
   Search,
@@ -41,6 +42,7 @@ import type {
   FeedHealthStatus,
   FeedPreviewPushRequest,
   FeedPreviewResponse,
+  PluginRouteOptionPropertySchema,
   SystemLocale,
   TelegramDeliveryMode,
   UpdateFeedRequest,
@@ -1309,8 +1311,24 @@ function FeedPreviewModal({
     queryKey: ["settings"],
     queryFn: () => api.settings.get(),
   });
+  const pluginsQuery = useQuery({
+    queryKey: ["plugins"],
+    queryFn: () => api.plugins.list(),
+    enabled: open,
+  });
   const systemTimezone = settingsQuery.data?.timezone ?? "UTC";
   const timeZones = useMemo(() => listTimeZones(), []);
+
+  const enabledPluginsWithOptions = useMemo(
+    () =>
+      (pluginsQuery.data ?? []).filter(
+        (p) =>
+          p.enabled &&
+          p.manifest.route_option_schema?.properties &&
+          Object.keys(p.manifest.route_option_schema.properties).length > 0,
+      ),
+    [pluginsQuery.data],
+  );
 
   const channels = channelsQuery.data ?? [];
   const channelsWithDestinations = useMemo(
@@ -1338,12 +1356,37 @@ function FeedPreviewModal({
   const [pushLinkPreview, setPushLinkPreview] = useState(true);
   const [pushLocale, setPushLocale] = useState<Locale>(uiLocale);
   const [pushTimezone, setPushTimezone] = useState("");
+  const [pushPluginOptions, setPushPluginOptions] = useState<
+    Record<string, Record<string, unknown>>
+  >({});
   const [pushingKey, setPushingKey] = useState<string | null>(null);
   const [pushResult, setPushResult] = useState<{
     ok: boolean;
     message: string;
     title: string;
   } | null>(null);
+
+  const updatePushPluginField = (
+    pluginId: string,
+    propKey: string,
+    value: unknown,
+  ) => {
+    setPushPluginOptions((prev) => {
+      const nextPluginObj = { ...(prev[pluginId] ?? {}) };
+      if (value === null || value === undefined || value === "") {
+        delete nextPluginObj[propKey];
+      } else {
+        nextPluginObj[propKey] = value;
+      }
+      const next = { ...prev };
+      if (Object.keys(nextPluginObj).length === 0) {
+        delete next[pluginId];
+      } else {
+        next[pluginId] = nextPluginObj;
+      }
+      return next;
+    });
+  };
 
   const activeDestinationId =
     pushDestinationId ?? allDestinations[0]?.destination.id ?? null;
@@ -1361,6 +1404,17 @@ function FeedPreviewModal({
       if (trimmedTz && !timeZones.includes(trimmedTz)) {
         throw new Error(m.feeds.preview.debugInvalidTimezone);
       }
+      const cleanedPlugins: Record<string, Record<string, unknown>> = {};
+      for (const [pluginId, obj] of Object.entries(pushPluginOptions)) {
+        const cleaned: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === null || v === undefined || v === "") continue;
+          cleaned[k] = v;
+        }
+        if (Object.keys(cleaned).length > 0) {
+          cleanedPlugins[pluginId] = cleaned;
+        }
+      }
       const locale: SystemLocale = pushLocale;
       const options: NonNullable<FeedPreviewPushRequest["options"]> = {
         locale,
@@ -1371,6 +1425,9 @@ function FeedPreviewModal({
               link_preview:
                 pushMode === "compact_card" ? pushLinkPreview : undefined,
             }
+          : {}),
+        ...(Object.keys(cleanedPlugins).length > 0
+          ? { plugins: cleanedPlugins }
           : {}),
       };
       return api.feeds.previewPush({
@@ -1707,6 +1764,191 @@ function FeedPreviewModal({
                     </div>
                   )}
                 </div>
+
+                {enabledPluginsWithOptions.length > 0 && (
+                  <div className="space-y-2 border-t border-sky-200/70 pt-2.5 dark:border-sky-900/40">
+                    <div className="flex items-center gap-1.5 text-[11px] font-semibold text-zinc-600 dark:text-zinc-300">
+                      <Puzzle className="h-3 w-3 text-sky-600 dark:text-sky-400" />
+                      {m.feeds.preview.debugPluginsLabel}
+                    </div>
+                    <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
+                      {enabledPluginsWithOptions.flatMap((plugin) => {
+                        const propEntries = Object.entries(
+                          plugin.manifest.route_option_schema?.properties ?? {},
+                        ) as Array<[string, PluginRouteOptionPropertySchema]>;
+                        const currentCfg = pushPluginOptions[plugin.id] ?? {};
+
+                        return propEntries.map(([propKey, schema]) => {
+                          const fieldVal = currentCfg[propKey];
+                          const fieldId = `debug-push-plugin-${plugin.id}-${propKey}`;
+                          const fieldLabel =
+                            propEntries.length === 1
+                              ? plugin.manifest.name
+                              : `${plugin.manifest.name} · ${schema.title || propKey}`;
+
+                          if (
+                            schema.type === "select" &&
+                            schema.source === "plugin_instances"
+                          ) {
+                            const selectedId =
+                              typeof fieldVal === "number" ? fieldVal : null;
+                            return (
+                              <div key={`${plugin.id}.${propKey}`}>
+                                <Label htmlFor={fieldId}>{fieldLabel}</Label>
+                                <Select
+                                  id={fieldId}
+                                  value={
+                                    selectedId !== null
+                                      ? String(selectedId)
+                                      : ""
+                                  }
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    updatePushPluginField(
+                                      plugin.id,
+                                      propKey,
+                                      raw ? Number(raw) : null,
+                                    );
+                                  }}
+                                  className="mt-1 h-8 text-xs"
+                                >
+                                  {schema.nullable !== false && (
+                                    <option value="">
+                                      {plugin.instances.length === 0
+                                        ? `${m.common.disabled} (${m.feeds.preview.debugPluginNoProviders})`
+                                        : m.common.disabled}
+                                    </option>
+                                  )}
+                                  {plugin.instances.map((inst) => (
+                                    <option key={inst.id} value={inst.id}>
+                                      {inst.name}
+                                      {!inst.enabled
+                                        ? ` (${m.common.disabled})`
+                                        : ""}
+                                    </option>
+                                  ))}
+                                </Select>
+                              </div>
+                            );
+                          }
+
+                          if (
+                            schema.type === "select" &&
+                            Array.isArray(schema.enum)
+                          ) {
+                            return (
+                              <div key={`${plugin.id}.${propKey}`}>
+                                <Label htmlFor={fieldId}>{fieldLabel}</Label>
+                                <Select
+                                  id={fieldId}
+                                  value={
+                                    typeof fieldVal === "string" ? fieldVal : ""
+                                  }
+                                  onChange={(e) =>
+                                    updatePushPluginField(
+                                      plugin.id,
+                                      propKey,
+                                      e.target.value || null,
+                                    )
+                                  }
+                                  className="mt-1 h-8 text-xs"
+                                >
+                                  {schema.nullable !== false && (
+                                    <option value="">
+                                      {m.common.disabled}
+                                    </option>
+                                  )}
+                                  {schema.enum.map((opt) => (
+                                    <option key={opt} value={opt}>
+                                      {opt}
+                                    </option>
+                                  ))}
+                                </Select>
+                              </div>
+                            );
+                          }
+
+                          if (schema.type === "boolean") {
+                            return (
+                              <div
+                                key={`${plugin.id}.${propKey}`}
+                                className="flex items-end pb-1"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <Switch
+                                    id={fieldId}
+                                    checked={
+                                      typeof fieldVal === "boolean"
+                                        ? fieldVal
+                                        : Boolean(schema.default)
+                                    }
+                                    onCheckedChange={(checked) =>
+                                      updatePushPluginField(
+                                        plugin.id,
+                                        propKey,
+                                        checked,
+                                      )
+                                    }
+                                  />
+                                  <label
+                                    htmlFor={fieldId}
+                                    className="cursor-pointer text-xs font-medium"
+                                  >
+                                    {fieldLabel}
+                                  </label>
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div key={`${plugin.id}.${propKey}`}>
+                              <Label htmlFor={fieldId}>{fieldLabel}</Label>
+                              <Input
+                                id={fieldId}
+                                type={
+                                  schema.type === "number" ? "number" : "text"
+                                }
+                                value={
+                                  fieldVal !== undefined && fieldVal !== null
+                                    ? String(fieldVal)
+                                    : ""
+                                }
+                                onChange={(e) => {
+                                  const raw = e.target.value;
+                                  if (!raw) {
+                                    updatePushPluginField(
+                                      plugin.id,
+                                      propKey,
+                                      null,
+                                    );
+                                  } else if (schema.type === "number") {
+                                    const num = Number(raw);
+                                    if (!Number.isNaN(num)) {
+                                      updatePushPluginField(
+                                        plugin.id,
+                                        propKey,
+                                        num,
+                                      );
+                                    }
+                                  } else {
+                                    updatePushPluginField(
+                                      plugin.id,
+                                      propKey,
+                                      raw,
+                                    );
+                                  }
+                                }}
+                                placeholder={schema.placeholder}
+                                className="mt-1 h-8 text-xs"
+                              />
+                            </div>
+                          );
+                        });
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   {activeChannel?.kind === "telegram" &&

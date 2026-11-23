@@ -35,6 +35,7 @@ use crate::channels::{
 use crate::config::{APP_NAME, VERSION};
 use crate::db::models::{Entry, Feed, unix_to_rfc3339};
 use crate::error::{AppError, AppResult};
+use crate::plugins::RenderOverrides;
 
 /// Pinned Notion REST API version header (`2026-03-11`).
 pub const NOTION_API_VERSION: &str = "2026-03-11";
@@ -102,13 +103,14 @@ pub struct NotionInitDbResponse {
     pub column_mapping: NotionColumnMapping,
 }
 
-/// Canonical standard column identifiers for FeedCourier's 7-column Notion schema.
+/// Canonical standard column identifiers for FeedCourier's Notion schema (including optional `Short URL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotionStandardFieldKey {
     Title,
     FcId,
     Link,
+    ShortUrl,
     Source,
     Published,
     State,
@@ -122,6 +124,7 @@ impl NotionStandardFieldKey {
             Self::Title => "Title",
             Self::FcId => "FC-ID",
             Self::Link => "Link",
+            Self::ShortUrl => "Short URL",
             Self::Source => "Source",
             Self::Published => "Published",
             Self::State => "State",
@@ -135,6 +138,7 @@ impl NotionStandardFieldKey {
             Self::Title => "title",
             Self::FcId => "rich_text",
             Self::Link => "url",
+            Self::ShortUrl => "url",
             Self::Source => "select",
             Self::Published => "date",
             Self::State => "select",
@@ -147,11 +151,12 @@ impl NotionStandardFieldKey {
         matches!(self, Self::Title | Self::FcId)
     }
 
-    /// Ordered list of all 7 standard columns.
-    pub const ALL: [Self; 7] = [
+    /// Ordered list of all 8 standard columns (`Short URL` is optional for link-rewrite archival).
+    pub const ALL: [Self; 8] = [
         Self::Title,
         Self::FcId,
         Self::Link,
+        Self::ShortUrl,
         Self::Source,
         Self::Published,
         Self::State,
@@ -441,15 +446,24 @@ pub fn html_to_notion_markdown_v2(html: &str, canonical_url: Option<&str>) -> No
 /// Extract and normalize the best available body for a feed `Entry` (`content_html`, falling back
 /// to `summary_text` or `first_sentence`).
 pub fn entry_to_notion_markdown_v2(entry: &Entry) -> NormalizedMarkdown {
+    entry_to_notion_markdown_v2_with_overrides(entry, &RenderOverrides::default())
+}
+
+/// Extract and normalize the best available body for a feed `Entry`, applying any `on_render`
+/// HTML overrides (so rewritten body links propagate to Notion Markdown while `entry.canonical_url`
+/// remains preserved for truncation footer / `Link` column).
+pub fn entry_to_notion_markdown_v2_with_overrides(
+    entry: &Entry,
+    overrides: &RenderOverrides,
+) -> NormalizedMarkdown {
     let canonical = entry
         .canonical_url
         .as_deref()
         .map(str::trim)
         .filter(|u| !u.is_empty());
 
-    if let Some(html) = entry
-        .content_html
-        .as_deref()
+    if let Some(html) = overrides
+        .effective_content_html(entry)
         .filter(|s| !s.trim().is_empty())
     {
         let converted = html_to_markdown(html);
@@ -1135,7 +1149,6 @@ fn parse_markdown_segments(markdown: &str) -> Vec<MarkdownSegment> {
 pub struct NotionSender {
     api_base_url: String,
     direct_client: reqwest::Client,
-    env_proxy_client: reqwest::Client,
     outbound_proxy: RwLock<Option<(String, reqwest::Client)>>,
     request_timeout: Duration,
     async_poll_delay: Duration,
@@ -1164,7 +1177,6 @@ impl NotionSender {
         }
 
         let direct_client = build_reqwest_client(DEFAULT_REQUEST_TIMEOUT, None, false)?;
-        let env_proxy_client = build_reqwest_client(DEFAULT_REQUEST_TIMEOUT, None, true)?;
         let proxy_pair = match outbound_proxy
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1180,7 +1192,6 @@ impl NotionSender {
         Ok(Self {
             api_base_url: base,
             direct_client,
-            env_proxy_client,
             outbound_proxy: RwLock::new(proxy_pair),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             async_poll_delay: DEFAULT_ASYNC_POLL_DELAY,
@@ -1222,16 +1233,18 @@ impl NotionSender {
         Ok(())
     }
 
-    fn client_for(&self, use_proxy: bool) -> reqwest::Client {
+    fn client_for(&self, use_proxy: bool) -> AppResult<reqwest::Client> {
         if !use_proxy {
-            return self.direct_client.clone();
+            return Ok(self.direct_client.clone());
         }
         if let Ok(guard) = self.outbound_proxy.read()
             && let Some((_, ref client)) = *guard
         {
-            return client.clone();
+            return Ok(client.clone());
         }
-        self.env_proxy_client.clone()
+        Err(AppError::Validation(
+            "use_proxy is enabled, but no global OUTBOUND_PROXY is configured".to_string(),
+        ))
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -1246,14 +1259,17 @@ impl NotionSender {
         secret: &str,
         use_proxy: bool,
         body: Option<&Value>,
-    ) -> Result<NotionRawResponse, reqwest::Error> {
+    ) -> AppResult<NotionRawResponse> {
         let headers = build_notion_headers(secret);
-        let client = self.client_for(use_proxy);
+        let client = self.client_for(use_proxy)?;
         let mut req = client.request(method, self.endpoint(path)).headers(headers);
         if let Some(payload) = body {
             req = req.json(payload);
         }
-        let resp = req.send().await?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
         let status = resp.status();
         let retry_after_secs = parse_retry_after_header(resp.headers());
         let raw_text = resp.text().await.unwrap_or_default();
@@ -1278,8 +1294,7 @@ impl NotionSender {
         }
         let resp = self
             .execute_json(Method::GET, "/v1/users/me", secret, use_proxy, None)
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
         if !resp.status.is_success() {
             return Err(resp.into_app_error("GET /v1/users/me"));
         }
@@ -1357,8 +1372,7 @@ impl NotionSender {
                 req.use_proxy,
                 Some(&payload),
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if !resp.status.is_success() {
             return Err(resp.into_app_error("POST /v1/databases"));
@@ -1392,12 +1406,7 @@ impl NotionSender {
                     req.use_proxy,
                     None,
                 )
-                .await
-                .map_err(|err| {
-                    AppError::Upstream(format!(
-                        "failed to fetch newly created Notion database '{database_id}': {err}"
-                    ))
-                })?;
+                .await?;
 
             if !get_db.status.is_success() {
                 return Err(get_db.into_app_error("GET /v1/databases/{id}"));
@@ -1467,13 +1476,7 @@ impl NotionSender {
                         req.use_proxy,
                         Some(&patch_payload),
                     )
-                    .await
-                    .map_err(|err| {
-                        AppError::Upstream(format!(
-                            "failed to PATCH Notion data source '{}': {err}",
-                            ds.data_source_id
-                        ))
-                    })?;
+                    .await?;
 
                 if !patch_resp.status.is_success() {
                     return Err(patch_resp.into_app_error("PATCH /v1/data_sources/{id}"));
@@ -1530,8 +1533,7 @@ impl NotionSender {
                 use_proxy,
                 None,
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if ds_resp.status.is_success() {
             return Ok(parse_data_source_object(&ds_resp.body, id, None, None));
@@ -1553,8 +1555,7 @@ impl NotionSender {
                 use_proxy,
                 None,
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if !db_resp.status.is_success() {
             return Err(db_resp.into_app_error("GET /v1/databases/{id}"));
@@ -1581,8 +1582,7 @@ impl NotionSender {
                 use_proxy,
                 None,
             )
-            .await
-            .map_err(|err| AppError::Upstream(format!("failed to reach Notion API: {err}")))?;
+            .await?;
 
         if !resolved_ds.status.is_success() {
             return Err(resolved_ds.into_app_error("GET /v1/data_sources/{id}"));
@@ -1628,6 +1628,9 @@ impl NotionSender {
                 .await
             {
                 Ok(r) => r,
+                Err(AppError::Validation(msg)) => {
+                    return AsyncPollResolution::Failed(msg);
+                }
                 Err(err) => {
                     return AsyncPollResolution::TransientError {
                         status_code: None,
@@ -1764,6 +1767,13 @@ impl NotionSender {
             .await
         {
             Ok(r) => r,
+            Err(AppError::Validation(msg)) => {
+                return FcIdLookupOutcome::PermanentFailure(DeliveryOutcome::PermanentFailure {
+                    status_code: None,
+                    checkpoint,
+                    diagnostic: msg,
+                });
+            }
             Err(err) => {
                 return FcIdLookupOutcome::Retry(DeliveryOutcome::Retry {
                     retry_after_secs: None,
@@ -1985,7 +1995,25 @@ impl ChannelSender for NotionSender {
                     .await
                     && resolved.data_source_id != data_source_id
                 {
-                    data_source_id = resolved.data_source_id;
+                    let original_id = data_source_id.clone();
+                    data_source_id = resolved.data_source_id.clone();
+                    if let Some(sink) = ctx.checkpoint_sink {
+                        let mut updated = dest.clone();
+                        updated.data_source_id = data_source_id.clone();
+                        if updated.database_id.is_none() {
+                            updated.database_id = resolved.database_id.or(Some(original_id));
+                        }
+                        if let Err(err) = sink
+                            .update_destination_config(&DestinationConfig::Notion(updated))
+                            .await
+                        {
+                            tracing::warn!(
+                                destination_id = ctx.destination.id,
+                                error = %err,
+                                "failed to persist resolved Notion data_source_id back to destination config"
+                            );
+                        }
+                    }
                     lookup = self
                         .query_existing_page_by_fc_id(
                             secret,
@@ -2053,7 +2081,8 @@ impl ChannelSender for NotionSender {
         }
 
         // 3. Build minimalist `POST /v1/pages` payload (`markdown_version: "v2"`).
-        let page_payload = build_create_page_payload(dest, &data_source_id, ctx.entry, ctx.feed);
+        let page_payload =
+            build_create_page_payload(dest, &data_source_id, ctx.entry, ctx.feed, &ctx.overrides);
 
         let mut create_resp = match self
             .execute_json(
@@ -2066,6 +2095,7 @@ impl ChannelSender for NotionSender {
             .await
         {
             Ok(r) => r,
+            Err(err @ AppError::Validation(_)) => return Err(err),
             Err(err) => {
                 return Ok(DeliveryOutcome::Retry {
                     retry_after_secs: None,
@@ -2078,7 +2108,9 @@ impl ChannelSender for NotionSender {
         };
 
         // Lazy `database_id` -> `data_source_id` resolution when a destination was created with a
-        // Notion database ID instead of its primary data source ID (zero extra calls on happy path).
+        // Notion database ID instead of its primary data source ID (zero extra calls on happy path),
+        // writing the resolved `data_source_id` back to the destination config so future sends
+        // skip the extra 404 round-trip.
         if (create_resp.status == StatusCode::NOT_FOUND
             || create_resp.error_code().as_deref() == Some("object_not_found"))
             && !tried_db_fallback
@@ -2087,9 +2119,32 @@ impl ChannelSender for NotionSender {
                 .await
             && resolved.data_source_id != data_source_id
         {
-            data_source_id = resolved.data_source_id;
-            let retry_payload =
-                build_create_page_payload(dest, &data_source_id, ctx.entry, ctx.feed);
+            let original_id = data_source_id.clone();
+            data_source_id = resolved.data_source_id.clone();
+            if let Some(sink) = ctx.checkpoint_sink {
+                let mut updated = dest.clone();
+                updated.data_source_id = data_source_id.clone();
+                if updated.database_id.is_none() {
+                    updated.database_id = resolved.database_id.or(Some(original_id));
+                }
+                if let Err(err) = sink
+                    .update_destination_config(&DestinationConfig::Notion(updated))
+                    .await
+                {
+                    tracing::warn!(
+                        destination_id = ctx.destination.id,
+                        error = %err,
+                        "failed to persist resolved Notion data_source_id back to destination config"
+                    );
+                }
+            }
+            let retry_payload = build_create_page_payload(
+                dest,
+                &data_source_id,
+                ctx.entry,
+                ctx.feed,
+                &ctx.overrides,
+            );
             match self
                 .execute_json(
                     Method::POST,
@@ -2150,12 +2205,16 @@ impl ChannelSender for NotionSender {
                             if let Some(sink) = ctx.checkpoint_sink {
                                 sink.save_checkpoint(&done_cp).await?;
                             }
+                            let mut diag =
+                                format!("Created Notion page {page_id} via async task '{task_id}'");
+                            if !ctx.overrides.warnings.is_empty() {
+                                diag.push_str(" | ");
+                                diag.push_str(&ctx.overrides.warnings.join(" | "));
+                            }
                             return Ok(DeliveryOutcome::Delivered {
                                 status_code: Some(200),
                                 checkpoint: Some(done_cp),
-                                diagnostic: Some(format!(
-                                    "Created Notion page {page_id} via async task '{task_id}'"
-                                )),
+                                diagnostic: Some(diag),
                                 updated_capabilities: None,
                             });
                         }
@@ -2243,10 +2302,15 @@ impl ChannelSender for NotionSender {
                 sink.save_checkpoint(&done_cp).await?;
             }
 
+            let mut diag = format!("Created Notion page {page_id}");
+            if !ctx.overrides.warnings.is_empty() {
+                diag.push_str(" | ");
+                diag.push_str(&ctx.overrides.warnings.join(" | "));
+            }
             return Ok(DeliveryOutcome::Delivered {
                 status_code: Some(status_code),
                 checkpoint: Some(done_cp),
-                diagnostic: Some(format!("Created Notion page {page_id}")),
+                diagnostic: Some(diag),
                 updated_capabilities: None,
             });
         }
@@ -2311,20 +2375,48 @@ impl ChannelSender for NotionSender {
         destination_config.validate()?;
 
         let secret = cfg.integration_secret.trim();
-        let data_source_id = normalize_notion_id(&dest.data_source_id)?;
+        let (msg, _) = self
+            .send_test_with_resolved(secret, dest, use_proxy)
+            .await?;
+        Ok(msg)
+    }
+}
 
+impl NotionSender {
+    /// Verify Notion data source connectivity and column mapping, additionally returning an
+    /// updated [`NotionDestinationConfig`] if `dest.data_source_id` was lazily resolved from a
+    /// `database_id` so the caller can persist it back to SQLite.
+    pub async fn send_test_with_resolved(
+        &self,
+        secret: &str,
+        dest: &NotionDestinationConfig,
+        use_proxy: bool,
+    ) -> AppResult<(String, Option<NotionDestinationConfig>)> {
+        let data_source_id = normalize_notion_id(&dest.data_source_id)?;
         let ds = self
             .resolve_data_source_metadata(secret, &data_source_id, use_proxy)
             .await?;
         let verified_cols = verify_configured_mapping(&ds.properties, &dest.column_mapping)?;
         let ds_label = ds.title.as_deref().unwrap_or("Untitled Data Source");
 
-        Ok(format!(
+        let updated_cfg = if ds.data_source_id != data_source_id {
+            let mut next = dest.clone();
+            next.data_source_id = ds.data_source_id.clone();
+            if next.database_id.is_none() {
+                next.database_id = ds.database_id.or(Some(data_source_id));
+            }
+            Some(next)
+        } else {
+            None
+        };
+
+        let msg = format!(
             "Connected to Notion data source \"{ds_label}\" ({}) via API {NOTION_API_VERSION}; verified {} mapped columns ({}).",
             ds.data_source_id,
             verified_cols.len(),
             verified_cols.join(", ")
-        ))
+        );
+        Ok((msg, updated_cfg))
     }
 }
 
@@ -2463,7 +2555,7 @@ fn standard_7_column_schema_json(keys: &[NotionStandardFieldKey]) -> Value {
     for key in keys {
         let def = match key {
             NotionStandardFieldKey::Title => json!({ "title": {} }),
-            NotionStandardFieldKey::Link => json!({ "url": {} }),
+            NotionStandardFieldKey::Link | NotionStandardFieldKey::ShortUrl => json!({ "url": {} }),
             NotionStandardFieldKey::Source => json!({ "select": { "options": [] } }),
             NotionStandardFieldKey::Published => json!({ "date": {} }),
             NotionStandardFieldKey::State => json!({
@@ -2622,6 +2714,7 @@ fn evaluate_schema_columns(properties: &BTreeMap<String, String>) -> SchemaEvalu
         title: String::new(),
         fc_id: String::new(),
         link: None,
+        short_url: None,
         source: None,
         published: None,
         state: None,
@@ -2746,6 +2839,9 @@ fn evaluate_schema_columns(properties: &BTreeMap<String, String>) -> SchemaEvalu
                 NotionStandardFieldKey::Title => suggested_mapping.title = mapped.clone(),
                 NotionStandardFieldKey::FcId => suggested_mapping.fc_id = mapped.clone(),
                 NotionStandardFieldKey::Link => suggested_mapping.link = Some(mapped.clone()),
+                NotionStandardFieldKey::ShortUrl => {
+                    suggested_mapping.short_url = Some(mapped.clone());
+                }
                 NotionStandardFieldKey::Source => suggested_mapping.source = Some(mapped.clone()),
                 NotionStandardFieldKey::Published => {
                     suggested_mapping.published = Some(mapped.clone());
@@ -2774,10 +2870,11 @@ fn verify_configured_mapping(
     mapping: &NotionColumnMapping,
 ) -> AppResult<Vec<String>> {
     let mut verified = Vec::new();
-    let checks: [(Option<&str>, &str, bool); 7] = [
+    let checks: [(Option<&str>, &str, bool); 8] = [
         (Some(mapping.title.as_str()), "title", true),
         (Some(mapping.fc_id.as_str()), "rich_text", true),
         (mapping.link.as_deref(), "url", false),
+        (mapping.short_url.as_deref(), "url", false),
         (mapping.source.as_deref(), "select", false),
         (mapping.published.as_deref(), "date", false),
         (mapping.state.as_deref(), "select", false),
@@ -2847,9 +2944,10 @@ fn build_create_page_payload(
     data_source_id: &str,
     entry: &Entry,
     feed: &Feed,
+    overrides: &RenderOverrides,
 ) -> Value {
     let mapping = &dest.column_mapping;
-    let normalized = entry_to_notion_markdown_v2(entry);
+    let normalized = entry_to_notion_markdown_v2_with_overrides(entry, overrides);
 
     let title_text = entry
         .title
@@ -2883,6 +2981,8 @@ fn build_create_page_payload(
         }),
     );
 
+    // Durable archival invariant (v0.3.0 Q15): `Link` ALWAYS preserves the original canonical URL;
+    // when a plugin produced a rewritten short link and `Short URL` is mapped, store it separately.
     if let Some(link_col) = mapping
         .link
         .as_deref()
@@ -2895,6 +2995,20 @@ fn build_create_page_payload(
             .filter(|u| is_valid_http_url(u))
     {
         properties.insert(link_col.to_string(), json!({ "url": url }));
+    }
+
+    if let Some(short_col) = mapping
+        .short_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(short_url) = overrides
+            .primary_link
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| is_valid_http_url(u))
+    {
+        properties.insert(short_col.to_string(), json!({ "url": short_url }));
     }
 
     if let Some(source_col) = mapping

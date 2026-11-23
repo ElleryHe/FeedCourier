@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   ArrowRight,
   CalendarDays,
+  ChevronDown,
+  ChevronRight,
   Clock,
   FileText,
   Filter,
@@ -13,6 +15,7 @@ import {
   MessageSquareText,
   Pencil,
   Plus,
+  Puzzle,
   RotateCcw,
   Trash2,
 } from "lucide-react";
@@ -25,12 +28,15 @@ import type {
   ChannelKind,
   CreateRouteRequest,
   FeedDto,
+  PluginDto,
+  PluginRouteOptionPropertySchema,
   RouteDto,
   RouteOptions,
   SystemLocale,
   TelegramDeliveryMode,
   UpdateRouteRequest,
 } from "@/api/types";
+import { PluginIcon } from "@/components/plugins/PluginIcon";
 import {
   Badge,
   Button,
@@ -82,6 +88,44 @@ function formatWindow(w: ActiveWindow, allDay: string): string {
   return w.start === w.end ? allDay : `${w.start}–${w.end}`;
 }
 
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
+function extractConfiguredRoutePlugins(
+  pluginsMap?: Record<string, Record<string, unknown> | null>,
+): Array<[string, Record<string, unknown>]> {
+  if (!pluginsMap) return [];
+  const entries: Array<[string, Record<string, unknown>]> = [];
+  for (const [pluginId, raw] of Object.entries(pluginsMap)) {
+    if (!isPlainObject(raw)) continue;
+    const hasActiveVal = Object.values(raw).some(
+      (v) => v !== null && v !== undefined && v !== "",
+    );
+    if (hasActiveVal) {
+      entries.push([pluginId, raw]);
+    }
+  }
+  return entries;
+}
+
+function cleanPluginOptionsForSubmit(
+  draft: Record<string, Record<string, unknown>>,
+): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const [pluginId, obj] of Object.entries(draft)) {
+    const cleaned: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v === null || v === undefined || v === "") continue;
+      cleaned[k] = v;
+    }
+    if (Object.keys(cleaned).length > 0) {
+      out[pluginId] = cleaned;
+    }
+  }
+  return out;
+}
+
 export function RoutesView() {
   const { m, locale: uiLocale } = useI18n();
   const toast = useToast();
@@ -115,7 +159,19 @@ export function RoutesView() {
     queryFn: () => api.channels.list(),
   });
 
+  const pluginsQuery = useQuery({
+    queryKey: ["plugins"],
+    queryFn: () => api.plugins.list(),
+  });
+
   const channels = channelsQuery.data ?? [];
+  const plugins = pluginsQuery.data ?? [];
+
+  const pluginsById = useMemo(() => {
+    const map = new Map<string, PluginDto>();
+    for (const p of plugins) map.set(p.id, p);
+    return map;
+  }, [plugins]);
 
   const feedsById = useMemo(() => {
     const map = new Map<number, FeedDto>();
@@ -348,6 +404,9 @@ export function RoutesView() {
               route.exclude_keywords.length > 0 ||
               Boolean(route.include_regex) ||
               Boolean(route.exclude_regex);
+            const configuredPlugins = extractConfiguredRoutePlugins(
+              route.options.plugins,
+            );
 
             return (
               <Card key={route.id} className="p-4">
@@ -486,6 +545,89 @@ export function RoutesView() {
                         )}
                       </div>
                     )}
+
+                    {/* Compact Configured Plugin Badges */}
+                    {configuredPlugins.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                        {configuredPlugins.map(([pluginId, pluginCfg]) => {
+                          const plugin = pluginsById.get(pluginId);
+                          const providerId =
+                            typeof pluginCfg.provider_id === "number"
+                              ? pluginCfg.provider_id
+                              : null;
+                          const instance =
+                            providerId !== null
+                              ? plugin?.instances.find(
+                                  (i) => i.id === providerId,
+                                )
+                              : undefined;
+
+                          const warningReasons: string[] = [];
+                          if (!plugin) {
+                            warningReasons.push(
+                              m.routes.editor.pluginWarningPluginMissing,
+                            );
+                          } else if (!plugin.enabled) {
+                            warningReasons.push(
+                              m.routes.editor.pluginWarningPluginDisabled,
+                            );
+                          }
+                          if (providerId !== null) {
+                            if (!instance) {
+                              warningReasons.push(
+                                m.routes.editor.pluginWarningProviderMissing,
+                              );
+                            } else if (!instance.enabled) {
+                              warningReasons.push(
+                                m.routes.editor.pluginWarningProviderDisabled,
+                              );
+                            }
+                          }
+
+                          const hasWarning = warningReasons.length > 0;
+                          const pluginName = plugin?.manifest.name ?? pluginId;
+                          const baseTooltip = instance
+                            ? `${pluginName} · ${instance.name}`
+                            : providerId !== null
+                              ? `${pluginName} · #${providerId}`
+                              : pluginName;
+                          const tooltip = hasWarning
+                            ? `${baseTooltip} (${warningReasons.join(", ")})`
+                            : baseTooltip;
+                          const shortLabel = instance
+                            ? instance.name
+                            : providerId !== null
+                              ? `#${providerId}`
+                              : pluginName;
+
+                          return (
+                            <Badge
+                              key={pluginId}
+                              variant={hasWarning ? "warning" : "outline"}
+                              title={tooltip}
+                              className={`gap-1 py-0.5 text-[11px] ${
+                                hasWarning ? "opacity-80" : ""
+                              }`}
+                            >
+                              <PluginIcon
+                                icon={plugin?.manifest.icon}
+                                className={`h-3 w-3 shrink-0 ${
+                                  hasWarning
+                                    ? ""
+                                    : "text-emerald-600 dark:text-emerald-400"
+                                }`}
+                              />
+                              <span className="max-w-[160px] truncate">
+                                {shortLabel}
+                              </span>
+                              {hasWarning && (
+                                <AlertTriangle className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400" />
+                              )}
+                            </Badge>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
 
                   {/* Controls */}
@@ -533,6 +675,7 @@ export function RoutesView() {
           route={editingRoute}
           feeds={feedsQuery.data ?? []}
           channels={channels}
+          plugins={plugins}
           knownTags={allFeedTags}
           systemTimezone={systemTimezone}
           legacyLocale={legacyLocale}
@@ -565,6 +708,7 @@ function RouteEditorModal({
   route,
   feeds,
   channels,
+  plugins,
   knownTags,
   systemTimezone,
   legacyLocale,
@@ -574,6 +718,7 @@ function RouteEditorModal({
   route: RouteDto | null;
   feeds: FeedDto[];
   channels: ChannelDto[];
+  plugins: PluginDto[];
   knownTags: string[];
   systemTimezone: string;
   legacyLocale: Locale | null;
@@ -647,8 +792,67 @@ function RouteEditorModal({
   const [activeWeekdays, setActiveWeekdays] = useState<number[]>(
     route?.options.active_weekdays ?? [],
   );
+  const [initialPluginIds] = useState<ReadonlySet<string>>(
+    () =>
+      new Set(
+        extractConfiguredRoutePlugins(route?.options.plugins).map(
+          ([pid]) => pid,
+        ),
+      ),
+  );
+  const [pluginOptions, setPluginOptions] = useState<
+    Record<string, Record<string, unknown>>
+  >(() => {
+    const initial: Record<string, Record<string, unknown>> = {};
+    for (const [pid, cfg] of extractConfiguredRoutePlugins(
+      route?.options.plugins,
+    )) {
+      initial[pid] = { ...cfg };
+    }
+    return initial;
+  });
+  const [pluginsSectionOpen, setPluginsSectionOpen] = useState<boolean>(
+    () => extractConfiguredRoutePlugins(route?.options.plugins).length > 0,
+  );
   const [enabled, setEnabled] = useState<boolean>(route?.enabled ?? true);
   const [formError, setFormError] = useState<string | null>(null);
+
+  const visiblePlugins = useMemo(
+    () =>
+      plugins.filter(
+        (p) =>
+          p.enabled ||
+          pluginOptions[p.id] !== undefined ||
+          initialPluginIds.has(p.id),
+      ),
+    [plugins, pluginOptions, initialPluginIds],
+  );
+  const activePluginCount = useMemo(
+    () => Object.keys(cleanPluginOptionsForSubmit(pluginOptions)).length,
+    [pluginOptions],
+  );
+
+  const updatePluginField = (
+    pluginId: string,
+    propKey: string,
+    value: unknown,
+  ) => {
+    setPluginOptions((prev) => {
+      const nextPluginObj = { ...(prev[pluginId] ?? {}) };
+      if (value === null || value === undefined || value === "") {
+        delete nextPluginObj[propKey];
+      } else {
+        nextPluginObj[propKey] = value;
+      }
+      const next = { ...prev };
+      if (Object.keys(nextPluginObj).length === 0) {
+        delete next[pluginId];
+      } else {
+        next[pluginId] = nextPluginObj;
+      }
+      return next;
+    });
+  };
 
   const selectedChannel = destinationsById.get(effectiveDestinationId)?.channel;
 
@@ -704,6 +908,7 @@ function RouteEditorModal({
         timezone: trimmedTz || null,
         active_windows: activeWindows,
         active_weekdays: [...activeWeekdays].sort((a, b) => a - b),
+        plugins: cleanPluginOptionsForSubmit(pluginOptions),
       };
 
       if (isEdit && route) {
@@ -1279,6 +1484,246 @@ function RouteEditorModal({
               />
             </div>
           </div>
+        </div>
+
+        {/* Collapsible Plugins Section */}
+        <div className="rounded-xl border border-zinc-200 dark:border-zinc-800">
+          <button
+            type="button"
+            onClick={() => setPluginsSectionOpen((openState) => !openState)}
+            className="flex w-full cursor-pointer items-center justify-between px-4 py-3 text-left transition-colors hover:bg-zinc-50/70 dark:hover:bg-zinc-950/40"
+          >
+            <div className="flex items-center gap-2">
+              {pluginsSectionOpen ? (
+                <ChevronDown className="h-3.5 w-3.5 text-zinc-400" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 text-zinc-400" />
+              )}
+              <Puzzle className="h-3.5 w-3.5 text-zinc-500" />
+              <span className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+                {m.routes.editor.pluginsHeading}
+              </span>
+            </div>
+            {activePluginCount > 0 && (
+              <Badge variant="info">
+                {m.routes.editor.pluginsActiveCount(activePluginCount)}
+              </Badge>
+            )}
+          </button>
+
+          {pluginsSectionOpen && (
+            <div className="space-y-3 border-t border-zinc-100 p-4 dark:border-zinc-800">
+              {visiblePlugins.length === 0 ? (
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {m.routes.editor.pluginsNoneEnabled}
+                </p>
+              ) : (
+                visiblePlugins.map((plugin) => {
+                  const properties =
+                    plugin.manifest.route_option_schema?.properties ?? {};
+                  const propEntries = Object.entries(properties) as Array<
+                    [string, PluginRouteOptionPropertySchema]
+                  >;
+                  const currentCfg = pluginOptions[plugin.id] ?? {};
+
+                  return (
+                    <div
+                      key={plugin.id}
+                      className="space-y-2.5 rounded-lg border border-zinc-200/80 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-950/50"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <PluginIcon
+                            icon={plugin.manifest.icon}
+                            className="h-3.5 w-3.5 text-zinc-600 dark:text-zinc-300"
+                          />
+                          <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                            {plugin.manifest.name}
+                          </span>
+                          {!plugin.enabled && (
+                            <Badge variant="warning">
+                              {m.routes.editor.pluginsGloballyDisabled}
+                            </Badge>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="grid gap-2.5 sm:grid-cols-2">
+                        {propEntries.map(([propKey, schema]) => {
+                          const fieldVal = currentCfg[propKey];
+                          const fieldId = `route-plugin-${plugin.id}-${propKey}`;
+
+                          if (
+                            schema.type === "select" &&
+                            schema.source === "plugin_instances"
+                          ) {
+                            const selectedId =
+                              typeof fieldVal === "number" ? fieldVal : null;
+                            const missingSelected =
+                              selectedId !== null &&
+                              !plugin.instances.some(
+                                (i) => i.id === selectedId,
+                              );
+
+                            return (
+                              <div key={propKey} className="sm:col-span-2">
+                                <Label htmlFor={fieldId}>
+                                  {schema.title || propKey}
+                                </Label>
+                                <Select
+                                  id={fieldId}
+                                  value={
+                                    selectedId !== null
+                                      ? String(selectedId)
+                                      : ""
+                                  }
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    updatePluginField(
+                                      plugin.id,
+                                      propKey,
+                                      raw ? Number(raw) : null,
+                                    );
+                                  }}
+                                  className="mt-1 h-8 text-xs"
+                                >
+                                  {schema.nullable !== false && (
+                                    <option value="">
+                                      {m.common.disabled}
+                                    </option>
+                                  )}
+                                  {missingSelected && selectedId !== null && (
+                                    <option value={String(selectedId)}>
+                                      {m.routes.editor.pluginsMissingProvider(
+                                        selectedId,
+                                      )}
+                                    </option>
+                                  )}
+                                  {plugin.instances.map((inst) => (
+                                    <option key={inst.id} value={inst.id}>
+                                      {inst.name}
+                                      {!inst.enabled
+                                        ? ` (${m.common.disabled})`
+                                        : ""}
+                                    </option>
+                                  ))}
+                                </Select>
+                                {plugin.instances.length === 0 && (
+                                  <FieldHint>
+                                    {m.routes.editor.pluginsNoProviders}
+                                  </FieldHint>
+                                )}
+                              </div>
+                            );
+                          }
+
+                          if (
+                            schema.type === "select" &&
+                            Array.isArray(schema.enum)
+                          ) {
+                            return (
+                              <div key={propKey}>
+                                <Label htmlFor={fieldId}>
+                                  {schema.title || propKey}
+                                </Label>
+                                <Select
+                                  id={fieldId}
+                                  value={
+                                    typeof fieldVal === "string" ? fieldVal : ""
+                                  }
+                                  onChange={(e) =>
+                                    updatePluginField(
+                                      plugin.id,
+                                      propKey,
+                                      e.target.value || null,
+                                    )
+                                  }
+                                  className="mt-1 h-8 text-xs"
+                                >
+                                  {schema.nullable !== false && (
+                                    <option value="">
+                                      {m.common.disabled}
+                                    </option>
+                                  )}
+                                  {schema.enum.map((opt) => (
+                                    <option key={opt} value={opt}>
+                                      {opt}
+                                    </option>
+                                  ))}
+                                </Select>
+                              </div>
+                            );
+                          }
+
+                          if (schema.type === "boolean") {
+                            return (
+                              <div key={propKey} className="sm:col-span-2">
+                                <Switch
+                                  id={fieldId}
+                                  checked={
+                                    typeof fieldVal === "boolean"
+                                      ? fieldVal
+                                      : Boolean(schema.default)
+                                  }
+                                  onCheckedChange={(checked) =>
+                                    updatePluginField(
+                                      plugin.id,
+                                      propKey,
+                                      checked,
+                                    )
+                                  }
+                                  label={schema.title || propKey}
+                                  description={schema.description}
+                                />
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div key={propKey}>
+                              <Label htmlFor={fieldId}>
+                                {schema.title || propKey}
+                              </Label>
+                              <Input
+                                id={fieldId}
+                                type={
+                                  schema.type === "number" ? "number" : "text"
+                                }
+                                value={
+                                  fieldVal !== undefined && fieldVal !== null
+                                    ? String(fieldVal)
+                                    : ""
+                                }
+                                onChange={(e) => {
+                                  const raw = e.target.value;
+                                  if (!raw) {
+                                    updatePluginField(plugin.id, propKey, null);
+                                  } else if (schema.type === "number") {
+                                    const num = Number(raw);
+                                    if (!Number.isNaN(num)) {
+                                      updatePluginField(
+                                        plugin.id,
+                                        propKey,
+                                        num,
+                                      );
+                                    }
+                                  } else {
+                                    updatePluginField(plugin.id, propKey, raw);
+                                  }
+                                }}
+                                placeholder={schema.placeholder}
+                                className="mt-1 h-8 text-xs"
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
         </div>
 
         <div className="rounded-lg border border-zinc-200/80 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-950/60">

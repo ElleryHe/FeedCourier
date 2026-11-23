@@ -14,7 +14,7 @@ FeedCourier uses a **two-layer Delivery Channel model** (**Channel Account** + m
 
 Every delivery target is organized into two layers:
 
-- **Channel Account** (configured once under **Channels**): stores encrypted credentials, outbound proxy toggle (`use_proxy`), pacing (`min_interval_secs`, `jitter_max_secs`), rolling quotas (`hourly_quota`, `daily_quota`), and downstream rate-limit cooldowns (`cooldown_until`).
+- **Channel Account** (configured once under **Channels**): stores encrypted credentials, outbound proxy toggle (`use_proxy`, for HTTP-based Telegram and Notion accounts; SMTP uses native TCP/TLS direct connections), pacing (`min_interval_secs`, `jitter_max_secs`), rolling quotas (`hourly_quota`, `daily_quota`), and downstream rate-limit cooldowns (`cooldown_until`).
 - **Destinations** (one or more attached to each account): stores target-specific routing settings (Telegram `chat_id` + `message_thread_id`, SMTP `to_addresses` + `reply_to`, or Notion `data_source_id` + `column_mapping`). Each destination can be enabled, disabled, or tested independently.
 
 Instead of combining multiple articles into a digest, FeedCourier creates one delivery task for each new article and each matching route (pointing to a specific **Destination**):
@@ -73,7 +73,7 @@ Every confirmed delivery appends a lightweight record (`credential_group_key`, `
 
 ## 5. Route Matching, Filters & WebUI Filtering
 
-In the WebUI under **Routes** (or via the [`configure_route`](/mcp/tools#5-configure-route) MCP tool), you control which feeds and articles are routed to a specific **Destination**.
+In the WebUI under **Routes** (or via the [`configure_route`](/mcp/tools#6-configure-route) MCP tool), you control which feeds and articles are routed to a specific **Destination**.
 
 ### Organizing Channels & Routes in the WebUI
 
@@ -99,7 +99,7 @@ For matched feeds, the route evaluates filters against the article's **title and
 | **`include_regex`** | Regular expression. When set, the title or text must match this pattern. |
 
 ::: tip Previewing Filters Before Saving
-You can test keyword and regex rules against live feed entries without creating delivery tasks by using the **Feed Preview** drawer in the WebUI or the [`preview_feed_latest` MCP tool](/mcp/tools#3-preview-feed-latest). Each preview item shows whether it matched (`matched_filter`) and which rule accepted or rejected it (`filter_reason`).
+You can test keyword and regex rules against live feed entries without creating delivery tasks by using the **Feed Preview** drawer in the WebUI or the [`preview_feed_latest` MCP tool](/mcp/tools#4-preview-feed-latest). Each preview item shows whether it matched (`matched_filter`) and which rule accepted or rejected it (`filter_reason`).
 :::
 
 ---
@@ -147,9 +147,9 @@ Localized article timestamps are formatted with an explicit UTC offset—for exa
 
 ## 8. Debug Push from the Feed Preview {#debug-push-from-the-feed-preview}
 
-To check how an article will look in a destination without subscribing or touching the queue, open the **Feed Preview** for a URL (or for an existing feed) and use the **Debug push** bar: choose a target **Destination**, (for Telegram) the delivery mode and link preview, the delivery language, and an optional timezone override, then click **Push latest** or **Push this item** on a specific preview item.
+To check how an article will look in a destination without subscribing or touching the queue, open the **Feed Preview** for a URL (or for an existing feed) and use the **Debug push** bar: choose a target **Destination**, (for Telegram) the delivery mode and link preview, the delivery language, an optional timezone override, and optional route plugins (such as Link Rewrite), then click **Push latest** or **Push this item** on a specific preview item.
 
-A debug push is **stateless**: it does not create fingerprints, does not enter the queue, ignores route filters, time windows, and quotas, and does not count against account limits. Notion pages created this way use a `test-` prefixed `FC-ID`, so they never collide with real deliveries. Failures are reported in the result message. The MCP equivalent is [`test_push_feed_entry`](/mcp/tools#9-test-push-feed-entry).
+A debug push is **stateless**: it does not create fingerprints, does not enter the queue, ignores route filters, time windows, and quotas, and does not count against account limits. For SMTP destinations, debug push strictly delivers only to **`verified`** recipients via isolated single-`To:` envelopes with compliance headers (returning an error when 0 verified recipients exist). Notion pages created this way use a `test-` prefixed `FC-ID`, so they never collide with real deliveries. Failures are reported in the result message. The MCP equivalent is [`test_push_feed_entry`](/mcp/tools#10-test-push-feed-entry).
 
 ---
 

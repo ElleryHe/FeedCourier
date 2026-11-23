@@ -6,6 +6,7 @@ pub mod notion;
 pub mod smtp;
 pub mod telegram;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{compute_credential_group_key, sha256_hex};
 use crate::db::models::{AppLocale, Channel, ChannelDestination, DeliveryTask, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
+use crate::plugins::RenderOverrides;
 
 /// Supported trusted delivery channel types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
@@ -85,6 +87,9 @@ pub struct SmtpChannelConfig {
     pub security: SmtpSecurity,
     /// Fixed SPF/DKIM/DMARC-aligned sender address (`Force-From`).
     pub from_address: String,
+    /// Optional sender identity / physical contact line appended to email footers (CAN-SPAM compliance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_identity: Option<String>,
 }
 
 /// Decrypted SMTP destination recipients & optional Reply-To stored encrypted in
@@ -147,6 +152,10 @@ pub struct NotionColumnMapping {
     /// Notion `url` property name (default `Some("Link")`).
     #[serde(default)]
     pub link: Option<String>,
+    /// Optional Notion `url` property name for shortened link written by Link Rewrite plugin
+    /// (default `Some("Short URL")` for newly initialized databases; `None` on legacy mappings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_url: Option<String>,
     /// Notion `select` property name for feed title (default `Some("Source")`).
     #[serde(default)]
     pub source: Option<String>,
@@ -162,18 +171,31 @@ pub struct NotionColumnMapping {
 }
 
 impl Default for NotionColumnMapping {
+    /// Conservative default for manual/legacy 7-column Notion DB bindings (`short_url: None` so
+    /// routes using Link Rewrite won't write to a missing `Short URL` column and 400-dead-letter).
+    /// Newly provisioned databases via `init-db` use [`Self::standard`] (all 8 columns).
     fn default() -> Self {
-        Self::standard()
+        Self {
+            title: "Title".to_string(),
+            fc_id: "FC-ID".to_string(),
+            link: Some("Link".to_string()),
+            short_url: None,
+            source: Some("Source".to_string()),
+            published: Some("Published".to_string()),
+            state: Some("State".to_string()),
+            tag: Some("Tag".to_string()),
+        }
     }
 }
 
 impl NotionColumnMapping {
-    /// Standard 7-column Notion schema created by `init-db`.
+    /// Standard 8-column Notion schema created by `init-db` (including optional `Short URL`).
     pub fn standard() -> Self {
         Self {
             title: "Title".to_string(),
             fc_id: "FC-ID".to_string(),
             link: Some("Link".to_string()),
+            short_url: Some("Short URL".to_string()),
             source: Some("Source".to_string()),
             published: Some("Published".to_string()),
             state: Some("State".to_string()),
@@ -339,10 +361,17 @@ impl ChannelConfig {
                         "SMTP port must be greater than 0".to_string(),
                     ));
                 }
-                if cfg.from_address.trim().is_empty() {
+                let from_trimmed = cfg.from_address.trim();
+                if from_trimmed.is_empty() {
                     return Err(AppError::Validation(
                         "SMTP from_address must not be empty".to_string(),
                     ));
+                }
+                let from_ascii = crate::crypto::email_to_ascii_punycode(from_trimmed);
+                if from_ascii.parse::<lettre::Address>().is_err() {
+                    return Err(AppError::Validation(format!(
+                        "invalid SMTP from_address '{from_trimmed}'"
+                    )));
                 }
                 Ok(())
             }
@@ -385,6 +414,7 @@ impl ChannelConfig {
                 "has_password": cfg.password.as_ref().is_some_and(|p| !p.is_empty()),
                 "security": cfg.security,
                 "from_address": cfg.from_address,
+                "sender_identity": cfg.sender_identity,
             }),
             Self::Telegram(cfg) => serde_json::json!({
                 "kind": "telegram",
@@ -402,6 +432,7 @@ impl ChannelConfig {
 /// Decrypted destination configuration stored encrypted in `channel_destinations.encrypted_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum DestinationConfig {
     Smtp(SmtpDestinationConfig),
     Telegram(TelegramDestinationConfig),
@@ -428,6 +459,30 @@ impl DestinationConfig {
                     return Err(AppError::Validation(
                         "SMTP to_addresses must contain at least one recipient".to_string(),
                     ));
+                }
+                for raw in &cfg.to_addresses {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        let ascii = crate::crypto::email_to_ascii_punycode(trimmed);
+                        if ascii.parse::<lettre::message::Mailbox>().is_err() {
+                            return Err(AppError::Validation(format!(
+                                "invalid SMTP recipient address '{trimmed}'"
+                            )));
+                        }
+                    }
+                }
+                if let Some(rt) = cfg
+                    .reply_to
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let rt_ascii = crate::crypto::email_to_ascii_punycode(rt);
+                    if rt_ascii.parse::<lettre::message::Mailbox>().is_err() {
+                        return Err(AppError::Validation(format!(
+                            "invalid SMTP reply_to address '{rt}'"
+                        )));
+                    }
                 }
                 Ok(())
             }
@@ -535,6 +590,7 @@ impl LegacyChannelConfig {
                     password,
                     security,
                     from_address,
+                    sender_identity: None,
                 }),
                 DestinationConfig::Smtp(SmtpDestinationConfig {
                     to_addresses,
@@ -657,6 +713,9 @@ pub struct RouteOptions {
     /// ISO weekdays (`1` = Monday … `7` = Sunday) on which windows start (empty = every day).
     #[serde(default)]
     pub active_weekdays: Vec<u8>,
+    /// Per-plugin route options keyed by plugin ID (e.g. `{"link-rewrite": {"provider_id": 3}}`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, serde_json::Value>,
 }
 
 const fn default_true() -> bool {
@@ -672,6 +731,7 @@ impl Default for RouteOptions {
             timezone: None,
             active_windows: Vec::new(),
             active_weekdays: Vec::new(),
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -682,6 +742,9 @@ impl Default for RouteOptions {
 pub enum DeliveryCheckpoint {
     Smtp {
         message_id: String,
+        /// `address_hmac` entries of recipients already delivered in a multi-recipient SMTP task.
+        #[serde(default)]
+        sent_recipients: Vec<String>,
     },
     Telegram {
         /// Index of the next media batch (groups of 10) to send in `media_mode`.
@@ -706,12 +769,49 @@ pub enum DeliveryCheckpoint {
     },
 }
 
-/// Callback interface allowing `ChannelSender::send` to flush intermediate checkpoints
-/// (e.g. before `POST /v1/pages`, after `202 async_task_id`, or after each `sendMediaGroup` batch)
-/// directly to SQLite prior to returning.
+/// Individual verified SMTP recipient prepared for single-recipient compliant delivery.
+#[derive(Debug, Clone)]
+pub struct SmtpDeliveryRecipient {
+    pub recipient_id: i64,
+    pub email: String,
+    pub address_hmac: String,
+    /// Optional RFC 8058 one-click unsubscribe URL (`{PUBLIC_URL}/u/{token}`).
+    pub unsubscribe_url: Option<String>,
+}
+
+/// Compliance delivery plan attached to [`DeliveryContext`] for verified per-recipient SMTP sends.
+#[derive(Debug, Clone)]
+pub struct SmtpDeliveryPlan {
+    pub recipients: Vec<SmtpDeliveryRecipient>,
+    /// Delay between individual recipients within the same task (default `1s`; `0` in fast tests).
+    pub per_recipient_delay: std::time::Duration,
+}
+
+/// Callback interface allowing `ChannelSender::send` to flush intermediate checkpoints,
+/// write back lazily resolved destination configs (e.g. Notion `database_id -> data_source_id`),
+/// renew task leases during multi-recipient sends, and record SMTP hard bounces.
 #[async_trait]
 pub trait CheckpointSink: Send + Sync {
     async fn save_checkpoint(&self, checkpoint: &DeliveryCheckpoint) -> AppResult<()>;
+
+    /// Persist a lazily resolved/updated destination config (e.g. Notion `data_source_id`).
+    async fn update_destination_config(&self, _config: &DestinationConfig) -> AppResult<()> {
+        Ok(())
+    }
+
+    /// Extend the active outbox task lease during long multi-recipient sends.
+    async fn renew_lease(&self) -> AppResult<()> {
+        Ok(())
+    }
+
+    /// Mark an SMTP recipient row as `bounced` after receiving a synchronous 5xx SMTP failure.
+    async fn record_smtp_hard_bounce(
+        &self,
+        _recipient_id: i64,
+        _diagnostic: &str,
+    ) -> AppResult<()> {
+        Ok(())
+    }
 }
 
 /// Full immutable context supplied to a `ChannelSender` for executing a single outbox task.
@@ -728,6 +828,25 @@ pub struct DeliveryContext<'a> {
     pub timezone: Tz,
     pub checkpoint: Option<DeliveryCheckpoint>,
     pub checkpoint_sink: Option<&'a dyn CheckpointSink>,
+    /// Optional content/link mutations produced by enabled `on_render` plugins.
+    pub overrides: RenderOverrides,
+    /// Optional per-recipient SMTP compliance delivery plan (set by outbox scheduler).
+    pub smtp_delivery: Option<SmtpDeliveryPlan>,
+}
+
+impl<'a> DeliveryContext<'a> {
+    /// Effective HTML body honoring any `on_render` plugin override.
+    pub fn effective_content_html(&self) -> Option<&str> {
+        self.overrides.effective_content_html(self.entry)
+    }
+
+    /// Effective primary article link honoring any `on_render` plugin override.
+    ///
+    /// Note: Telegram `link_preview_options.url` and Notion's `Link` property intentionally read
+    /// `self.entry.canonical_url` directly so link previews and archive references remain durable.
+    pub fn effective_primary_link(&self) -> Option<&str> {
+        self.overrides.effective_primary_link(self.entry)
+    }
 }
 
 /// Result of attempting a single delivery task via a `ChannelSender`.

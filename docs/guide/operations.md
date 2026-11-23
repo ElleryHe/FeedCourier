@@ -183,6 +183,10 @@ You can trigger content cleanup at any time in the WebUI (**Settings → Run Pay
 
 When exposing the WebUI or `/mcp` endpoint beyond `localhost`, place FeedCourier behind a reverse proxy with HTTPS such as **Caddy** or **Nginx**.
 
+::: tip Enable `TRUST_PROXY=true` Behind a Reverse Proxy
+Set `TRUST_PROXY=true` in FeedCourier's environment when running behind Caddy, Nginx, or another trusted reverse proxy so public unsubscribe (`/u/{token}`) and verification (`/v/{token}`) rate limiting tracks each visitor's real client IP instead of `127.0.0.1`. When `TRUST_PROXY=true`, FeedCourier reads the **rightmost** hop of `X-Forwarded-For` first (appended by your proxy) and falls back to `X-Real-IP` only when `X-Forwarded-For` is absent. Leave `TRUST_PROXY=false` (the default) when FeedCourier is exposed directly without a proxy.
+:::
+
 ### Caddy (`Caddyfile`)
 
 ```txt

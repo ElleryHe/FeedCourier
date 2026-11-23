@@ -343,10 +343,15 @@ impl ProtectedHttpClient {
                 .state
                 .read()
                 .expect("ProtectedHttpClient state RwLock poisoned");
-            if req.use_proxy
-                && let Some((proxied, mode)) = &guard.ssrf_proxied_client
-            {
-                (proxied.clone(), Some(*mode))
+            if req.use_proxy {
+                if let Some((proxied, mode)) = &guard.ssrf_proxied_client {
+                    (proxied.clone(), Some(*mode))
+                } else {
+                    return Err(AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                            .to_string(),
+                    ));
+                }
             } else {
                 (guard.ssrf_direct_client.clone(), None)
             }
@@ -505,6 +510,117 @@ impl ProtectedHttpClient {
             "exceeded maximum redirect hops ({})",
             req.max_redirects
         )))
+    }
+
+    /// Execute an SSRF-guarded `POST application/x-www-form-urlencoded` request (used by plugins
+    /// such as YOURLS link rewriting). Redirects are disallowed to prevent POST credential leakage.
+    pub async fn post_form_bytes(
+        &self,
+        url: &str,
+        form: &[(String, String)],
+        use_proxy: bool,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> AppResult<FetchedResponse> {
+        let parsed_url = Url::parse(url.trim())?;
+
+        let (client, proxy_dns_mode) = {
+            let guard = self
+                .inner
+                .state
+                .read()
+                .expect("ProtectedHttpClient state RwLock poisoned");
+            if use_proxy {
+                if let Some((proxied, mode)) = &guard.ssrf_proxied_client {
+                    (proxied.clone(), Some(*mode))
+                } else {
+                    return Err(AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                (guard.ssrf_direct_client.clone(), None)
+            }
+        };
+
+        {
+            let policy = self
+                .inner
+                .policy
+                .read()
+                .expect("SSRF policy RwLock poisoned")
+                .clone();
+            let remote_proxy_dns = matches!(proxy_dns_mode, Some(ProxyDnsMode::Remote));
+            policy.validate_url_hop(&parsed_url, remote_proxy_dns)?;
+        }
+
+        if matches!(proxy_dns_mode, Some(ProxyDnsMode::Local))
+            && let Some(host_str) = parsed_url.host_str()
+        {
+            self.inner.resolver.resolve_and_validate(host_str).await?;
+        }
+
+        let resp = client
+            .post(parsed_url.clone())
+            .timeout(timeout)
+            .form(form)
+            .send()
+            .await
+            .map_err(|err| map_reqwest_error(&parsed_url, err))?;
+
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(AppError::SsrfBlocked(format!(
+                "redirect (HTTP {}) is disallowed on outbound plugin POST to '{parsed_url}'",
+                status.as_u16()
+            )));
+        }
+
+        let etag = header_string(resp.headers(), header::ETAG);
+        let last_modified = header_string(resp.headers(), header::LAST_MODIFIED);
+        let content_type = header_string(resp.headers(), header::CONTENT_TYPE);
+        let retry_after_secs = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_secs);
+
+        if let Some(declared_len) = resp.content_length()
+            && declared_len > max_bytes as u64
+        {
+            return Err(AppError::Upstream(format!(
+                "response Content-Length ({declared_len} bytes) from '{parsed_url}' exceeds maximum allowed size ({max_bytes} bytes)"
+            )));
+        }
+
+        let initial_cap = resp
+            .content_length()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(4 * 1024)
+            .min(max_bytes)
+            .min(64 * 1024);
+        let mut buf = BytesMut::with_capacity(initial_cap);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.map_err(|err| map_reqwest_error(&parsed_url, err))?;
+            if buf.len().saturating_add(chunk.len()) > max_bytes {
+                return Err(AppError::Upstream(format!(
+                    "streamed response body from '{parsed_url}' exceeded maximum allowed size ({max_bytes} bytes)"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        Ok(FetchedResponse {
+            status,
+            final_url: parsed_url,
+            etag,
+            last_modified,
+            retry_after_secs,
+            content_type,
+            bytes: buf.freeze(),
+        })
     }
 }
 

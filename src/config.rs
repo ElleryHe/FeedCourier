@@ -58,6 +58,14 @@ pub struct AppConfig {
     pub timezone: Option<String>,
     /// One-shot emergency removal of the administrator TOTP secret and recovery codes (`RESET_2FA`).
     pub reset_2fa: bool,
+    /// Optional public base URL (e.g. `https://feeds.example.com`) enabling RFC 8058 one-click
+    /// SMTP unsubscribe links (`/u/{token}`) and double-opt-in verification links (`/v/{token}`).
+    pub public_url: Option<String>,
+    /// Optional custom plugin marketplace `index.json` URL (`PLUGIN_INDEX_URL`).
+    pub plugin_index_url: Option<String>,
+    /// Whether to trust reverse-proxy client IP headers (`X-Real-IP` / rightmost `X-Forwarded-For`)
+    /// on public compliance endpoints (`/u/`, `/v/`). Defaults to `false` (use TCP `SocketAddr`).
+    pub trust_proxy: bool,
 }
 
 impl Default for AppConfig {
@@ -77,6 +85,9 @@ impl Default for AppConfig {
             admin_username: None,
             timezone: None,
             reset_2fa: false,
+            public_url: None,
+            plugin_index_url: None,
+            trust_proxy: false,
         }
     }
 }
@@ -178,6 +189,33 @@ impl AppConfig {
             )
         });
 
+        let public_url = match non_empty("PUBLIC_URL") {
+            Some(raw) => Some(validate_public_url(&raw)?),
+            None => None,
+        };
+
+        let plugin_index_url = match non_empty("PLUGIN_INDEX_URL") {
+            Some(raw) => {
+                let parsed = url::Url::parse(&raw).map_err(|err| {
+                    AppError::Config(format!("invalid PLUGIN_INDEX_URL '{raw}': {err}"))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                    return Err(AppError::Config(format!(
+                        "invalid PLUGIN_INDEX_URL '{raw}': must be an http/https URL with a host"
+                    )));
+                }
+                Some(raw)
+            }
+            None => None,
+        };
+
+        let trust_proxy = non_empty("TRUST_PROXY").is_some_and(|raw| {
+            matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+
         Ok(Self {
             data_dir,
             listen_addr,
@@ -191,6 +229,9 @@ impl AppConfig {
             admin_username,
             timezone,
             reset_2fa,
+            public_url,
+            plugin_index_url,
+            trust_proxy,
         })
     }
 
@@ -232,4 +273,34 @@ pub fn validate_admin_username(raw: &str) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate and normalize `PUBLIC_URL` (must be an absolute `http://` or `https://` URL with
+/// host and without embedded userinfo, query string, or fragment; trailing `/` is stripped).
+pub fn validate_public_url(raw: &str) -> AppResult<String> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|err| AppError::Validation(format!("invalid PUBLIC_URL '{trimmed}': {err}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::Validation(format!(
+            "PUBLIC_URL must use http or https scheme, got '{}'",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(AppError::Validation(
+            "PUBLIC_URL must include a hostname".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::Validation(
+            "PUBLIC_URL must not contain embedded credentials".to_string(),
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::Validation(
+            "PUBLIC_URL must not contain query parameters or fragments".to_string(),
+        ));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }

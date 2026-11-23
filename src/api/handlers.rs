@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
 use sqlx::QueryBuilder;
@@ -18,32 +18,42 @@ use url::Url;
 use crate::api::AppState;
 use crate::api::dto::{
     ActionAckResponse, ChannelCooldownSummary, ChannelDestinationDto, ChannelDto,
-    ClearFeedCacheRequest, ClearFeedCacheResponse, CreateChannelRequest, CreateDestinationRequest,
-    CreateFeedRequest, CreateMcpTokenRequest, CreateMcpTokenResponse, CreateRouteRequest,
-    DebugPushRequest, DebugPushResponse, DeliveryTaskDto, FeedDto, FeedPreviewRequest, GcResponse,
-    ListTasksQuery, McpTokenDto, OpmlImportRequest, OpmlImportResponse, OverviewResponse,
-    PollFeedResponse, QueueStateDto, RetryTasksRequest, RetryTasksResponse, RouteDto,
-    SystemSettingsDto, TestChannelRequest, TestChannelResponse, UpdateChannelRequest,
-    UpdateDestinationRequest, UpdateFeedRequest, UpdateQueueRequest, UpdateRouteRequest,
-    UpdateSystemSettingsRequest, normalize_channel_config_on_create,
+    ClearFeedCacheRequest, ClearFeedCacheResponse, ClearPluginCacheResponse, CreateChannelRequest,
+    CreateDestinationRequest, CreateFeedRequest, CreateMcpTokenRequest, CreateMcpTokenResponse,
+    CreatePluginInstanceRequest, CreateRouteRequest, DebugPushRequest, DebugPushResponse,
+    DeleteCascadeQuery, DeliveryTaskDto, FeedDto, FeedPreviewRequest, GcResponse, ListTasksQuery,
+    MarketPluginItemDto, MarketQuery, MarketResponse, McpTokenDto, OpmlImportRequest,
+    OpmlImportResponse, OverviewResponse, PluginDto, PluginInstanceDto, PollFeedResponse,
+    QueueStateDto, ReferencingConflictBody, RetryTasksRequest, RetryTasksResponse, RouteDto,
+    RouteReferenceDto, SendVerificationResponse, SmtpRecipientDto, SystemSettingsDto,
+    TestChannelRequest, TestChannelResponse, TestPluginInstanceResponse, UpdateChannelRequest,
+    UpdateDestinationRequest, UpdateFeedRequest, UpdatePluginInstanceRequest, UpdatePluginRequest,
+    UpdateQueueRequest, UpdateRouteRequest, UpdateSystemSettingsRequest,
+    VerifyRecipientCodeRequest, normalize_channel_config_on_create,
     normalize_destination_config_on_create, normalize_opt_string, normalize_string_vec,
 };
 use crate::channels::notion::{
     NotionInitDbRequest, NotionInitDbResponse, NotionInspectSchemaRequest,
     NotionInspectSchemaResponse,
 };
-use crate::channels::{ChannelConfig, ChannelKind, ChannelSender, DestinationConfig, RouteOptions};
-use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION};
-use crate::crypto::hash_token;
+use crate::channels::{
+    ChannelConfig, ChannelKind, ChannelSender, DestinationConfig, RouteOptions,
+    SmtpDeliveryRecipient,
+};
+use crate::config::{APP_NAME, LICENSE_SPDX, REPO_URL, VERSION, validate_public_url};
+use crate::crypto::{constant_time_eq, hash_token, mask_email_address, sha256_hex};
 use crate::db::models::{
     AppLocale, Channel, ChannelDestination, DeliveryTaskStatus, FeedHealthStatus, NewChannel,
     NewDestination, NewFeed, NewRoute, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL,
-    SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE, UpdateChannel, UpdateDestination, UpdateFeed,
-    UpdateRoute, now_unix, unix_to_rfc3339,
+    SETTING_PUBLIC_URL, SETTING_SSRF_ALLOWLIST, SETTING_TIMEZONE, SmtpRecipientRow,
+    SmtpRecipientStatus, UpdateChannel, UpdateDestination, UpdateFeed, UpdateRoute, now_unix,
+    unix_to_rfc3339,
 };
+use crate::db::repo::DeleteGuardOutcome;
 use crate::error::{AppError, AppResult};
 use crate::ingest::{ContentFilterRules, FeedPreviewResponse};
 use crate::net::NetSettings;
+use crate::plugins::link_rewrite::LINK_REWRITE_PLUGIN_ID;
 use crate::schedule::{OutboxQueueState, parse_timezone, validate_schedule};
 use crate::scheduler::{DebugPushParams, load_persisted_locale, normalize_net_settings};
 
@@ -323,9 +333,15 @@ pub async fn debug_push_feed(
         link_preview: req.options.link_preview.unwrap_or(true),
         locale: req.options.locale,
         timezone: req.options.timezone,
+        plugins: req.options.plugins.unwrap_or_default(),
         ..RouteOptions::default()
     };
     validate_schedule(&mut options)?;
+    state
+        .runtime()
+        .plugins()
+        .validate_route_plugins(state.db(), &options.plugins)
+        .await?;
     let result = state
         .runtime()
         .debug_push(DebugPushParams {
@@ -404,7 +420,7 @@ pub async fn list_channels(State(state): State<AppState>) -> AppResult<Json<Vec<
     let mut out = Vec::with_capacity(channels.len());
     for ch in channels {
         let dests = dests_by_channel.remove(&ch.id).unwrap_or_default();
-        out.push(ChannelDto::from_model(ch, dests, state.master_key())?);
+        out.push(build_channel_dto(&state, ch, dests).await?);
     }
     Ok(Json(out))
 }
@@ -420,6 +436,12 @@ pub async fn create_channel(
             req.kind,
             req.config.kind()
         )));
+    }
+    if req.kind == ChannelKind::Smtp && req.use_proxy {
+        return Err(AppError::Validation(
+            "SMTP channels use direct TCP/TLS connections and do not support outbound HTTP/SOCKS proxies"
+                .to_string(),
+        ));
     }
     validate_pacing_and_quotas(
         Some(req.min_interval_secs),
@@ -546,11 +568,7 @@ pub async fn create_channel(
 
     Ok((
         StatusCode::CREATED,
-        Json(ChannelDto::from_model(
-            created,
-            created_dests,
-            state.master_key(),
-        )?),
+        Json(build_channel_dto(&state, created, created_dests).await?),
     ))
 }
 
@@ -571,6 +589,12 @@ pub async fn update_channel(
     {
         return Err(AppError::Validation(
             "Channel name must not be empty".to_string(),
+        ));
+    }
+    if existing.kind == ChannelKind::Smtp && req.use_proxy == Some(true) {
+        return Err(AppError::Validation(
+            "SMTP channels use direct TCP/TLS connections and do not support outbound HTTP/SOCKS proxies"
+                .to_string(),
         ));
     }
 
@@ -633,31 +657,54 @@ pub async fn update_channel(
     }
 
     let dests = state.db().list_destinations_for_channel(updated.id).await?;
-    Ok(Json(ChannelDto::from_model(
-        updated,
-        dests,
-        state.master_key(),
-    )?))
+    Ok(Json(build_channel_dto(&state, updated, dests).await?))
 }
 
 /// `DELETE /api/v1/channels/{id}`
+///
+/// Refuses deletion with `409 Conflict` listing referencing routes unless `?cascade=true` is passed.
 pub async fn delete_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<i64>,
-) -> AppResult<Json<ActionAckResponse>> {
-    if !state.db().delete_channel(channel_id).await? {
-        return Err(AppError::NotFound(format!(
+    Query(query): Query<DeleteCascadeQuery>,
+) -> AppResult<Response> {
+    match state
+        .db()
+        .delete_channel_guarded(channel_id, query.cascade.unwrap_or(false))
+        .await?
+    {
+        DeleteGuardOutcome::NotFound => Err(AppError::NotFound(format!(
             "channel {channel_id} not found"
-        )));
+        ))),
+        DeleteGuardOutcome::Conflict(refs) => {
+            let names: Vec<&str> = refs.iter().map(|(_, n)| n.as_str()).collect();
+            let msg = format!(
+                "Channel {channel_id} is referenced by {} route(s): {}. Pass ?cascade=true to delete it together with those routes.",
+                refs.len(),
+                names.join(", ")
+            );
+            let body = ReferencingConflictBody {
+                error: msg.clone(),
+                code: "conflict",
+                message: msg,
+                referencing_routes: refs
+                    .into_iter()
+                    .map(|(id, name)| RouteReferenceDto { id, name })
+                    .collect(),
+            };
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        DeleteGuardOutcome::Deleted => {
+            Ok((StatusCode::OK, Json(ActionAckResponse::ok())).into_response())
+        }
     }
-    Ok(Json(ActionAckResponse::ok()))
 }
 
 /// `POST /api/v1/channels/{id}/test`
 ///
 /// When `destination_id` is passed in the request body, sends a full test delivery to that
 /// destination; otherwise verifies account-level credentials (`getMe` + `sendRichMessage` probe
-/// for Telegram, `GET /v1/users/me` for Notion, `EHLO`/`AUTH` connection test for SMTP).
+/// for Telegram, `GET /v1/users/me` for Notion, self-test email to `from_address` for SMTP).
 pub async fn test_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<i64>,
@@ -689,7 +736,12 @@ pub async fn test_channel(
     let cfg: ChannelConfig = state.master_key().decrypt_json(&channel.encrypted_config)?;
     match &cfg {
         ChannelConfig::Smtp(smtp_cfg) => {
-            let message = state.runtime().smtp_sender().test_account(smtp_cfg).await?;
+            let effective_locale = req.locale.unwrap_or_else(|| state.runtime().locale());
+            let message = state
+                .runtime()
+                .smtp_sender()
+                .send_test_self(smtp_cfg, effective_locale)
+                .await?;
             Ok(Json(TestChannelResponse {
                 ok: true,
                 message,
@@ -748,11 +800,7 @@ pub async fn list_channel_destinations(
     let dests = state.db().list_destinations_for_channel(channel_id).await?;
     let mut out = Vec::with_capacity(dests.len());
     for d in dests {
-        out.push(ChannelDestinationDto::from_model(
-            d,
-            channel.kind,
-            state.master_key(),
-        )?);
+        out.push(build_destination_dto(&state, d, channel.kind).await?);
     }
     Ok(Json(out))
 }
@@ -783,11 +831,7 @@ pub async fn create_destination(
 
     Ok((
         StatusCode::CREATED,
-        Json(ChannelDestinationDto::from_model(
-            created,
-            channel.kind,
-            state.master_key(),
-        )?),
+        Json(build_destination_dto(&state, created, channel.kind).await?),
     ))
 }
 
@@ -822,40 +866,72 @@ pub async fn update_destination(
         ..UpdateDestination::default()
     };
 
+    let mut merged_smtp_cfg: Option<DestinationConfig> = None;
     if let Some(ref cfg_patch) = req.config {
         let current_cfg: DestinationConfig = state
             .master_key()
             .decrypt_json(&existing.encrypted_config)?;
         let merged = cfg_patch.apply_to(&current_cfg)?;
         patch.encrypted_config = Some(state.master_key().encrypt_json(&merged)?);
+        if matches!(merged, DestinationConfig::Smtp(_)) {
+            merged_smtp_cfg = Some(merged);
+        }
     }
 
     let updated = state
         .db()
         .update_destination(destination_id, &patch)
         .await?;
+    if let Some(ref smtp_cfg) = merged_smtp_cfg {
+        sync_smtp_destination_recipients(&state, updated.id, smtp_cfg).await?;
+    }
     if req.enabled == Some(true) {
         state.runtime().notify_outbox();
     }
 
-    Ok(Json(ChannelDestinationDto::from_model(
-        updated,
-        channel.kind,
-        state.master_key(),
-    )?))
+    Ok(Json(
+        build_destination_dto(&state, updated, channel.kind).await?,
+    ))
 }
 
 /// `DELETE /api/v1/destinations/{id}`
+///
+/// Refuses deletion with `409 Conflict` listing referencing routes unless `?cascade=true` is passed.
 pub async fn delete_destination(
     State(state): State<AppState>,
     Path(destination_id): Path<i64>,
-) -> AppResult<Json<ActionAckResponse>> {
-    if !state.db().delete_destination(destination_id).await? {
-        return Err(AppError::NotFound(format!(
+    Query(query): Query<DeleteCascadeQuery>,
+) -> AppResult<Response> {
+    match state
+        .db()
+        .delete_destination_guarded(destination_id, query.cascade.unwrap_or(false))
+        .await?
+    {
+        DeleteGuardOutcome::NotFound => Err(AppError::NotFound(format!(
             "destination {destination_id} not found"
-        )));
+        ))),
+        DeleteGuardOutcome::Conflict(refs) => {
+            let names: Vec<&str> = refs.iter().map(|(_, n)| n.as_str()).collect();
+            let msg = format!(
+                "Destination {destination_id} is referenced by {} route(s): {}. Pass ?cascade=true to delete it together with those routes.",
+                refs.len(),
+                names.join(", ")
+            );
+            let body = ReferencingConflictBody {
+                error: msg.clone(),
+                code: "conflict",
+                message: msg,
+                referencing_routes: refs
+                    .into_iter()
+                    .map(|(id, name)| RouteReferenceDto { id, name })
+                    .collect(),
+            };
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        DeleteGuardOutcome::Deleted => {
+            Ok((StatusCode::OK, Json(ActionAckResponse::ok())).into_response())
+        }
     }
-    Ok(Json(ActionAckResponse::ok()))
 }
 
 /// `POST /api/v1/destinations/{id}/test`
@@ -899,7 +975,7 @@ async fn create_destination_for_channel(
     };
 
     let encrypted_config = state.master_key().encrypt_json(&req.config)?;
-    state
+    let created = state
         .db()
         .create_destination(&NewDestination {
             channel_id: channel.id,
@@ -907,7 +983,68 @@ async fn create_destination_for_channel(
             encrypted_config,
             enabled: req.enabled,
         })
+        .await?;
+    if matches!(req.config, DestinationConfig::Smtp(_)) {
+        sync_smtp_destination_recipients(state, created.id, &req.config).await?;
+    }
+    Ok(created)
+}
+
+async fn sync_smtp_destination_recipients(
+    state: &AppState,
+    destination_id: i64,
+    dest_cfg: &DestinationConfig,
+) -> AppResult<Vec<SmtpRecipientRow>> {
+    let DestinationConfig::Smtp(smtp_dest) = dest_cfg else {
+        return Ok(Vec::new());
+    };
+    let mut hmacs: Vec<String> = Vec::new();
+    for addr in &smtp_dest.to_addresses {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let h = state.master_key().smtp_recipient_hmac(trimmed);
+        if !hmacs.contains(&h) {
+            hmacs.push(h);
+        }
+    }
+    state
+        .db()
+        .sync_smtp_recipients_for_destination(
+            destination_id,
+            &hmacs,
+            SmtpRecipientStatus::Unverified,
+            None,
+        )
         .await
+}
+
+async fn build_destination_dto(
+    state: &AppState,
+    dest: ChannelDestination,
+    kind: ChannelKind,
+) -> AppResult<ChannelDestinationDto> {
+    let smtp_summary = if kind == ChannelKind::Smtp {
+        Some(state.db().get_smtp_recipient_summary(dest.id).await?)
+    } else {
+        None
+    };
+    ChannelDestinationDto::from_model_with_summary(dest, kind, state.master_key(), smtp_summary)
+}
+
+async fn build_channel_dto(
+    state: &AppState,
+    channel: Channel,
+    destinations: Vec<ChannelDestination>,
+) -> AppResult<ChannelDto> {
+    let mut dto = ChannelDto::from_model(channel.clone(), Vec::new(), state.master_key())?;
+    let mut dest_dtos = Vec::with_capacity(destinations.len());
+    for d in destinations {
+        dest_dtos.push(build_destination_dto(state, d, channel.kind).await?);
+    }
+    dto.destinations = dest_dtos;
+    Ok(dto)
 }
 
 async fn derive_default_destination_name(
@@ -943,7 +1080,7 @@ async fn derive_default_destination_name(
             .iter()
             .map(|s| s.trim())
             .find(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
+            .map(mask_email_address)
             .unwrap_or_else(|| "SMTP Recipient".to_string())),
         (ChannelConfig::Notion(n_acc), DestinationConfig::Notion(n_dest)) => {
             match state
@@ -984,12 +1121,54 @@ async fn run_destination_test(
 
     match channel.kind {
         ChannelKind::Smtp => {
-            let sender = match test_locale {
-                Some(loc) => state.runtime().smtp_sender().for_locale(loc),
-                None => state.runtime().smtp_sender().clone(),
+            let (ChannelConfig::Smtp(smtp_cfg), DestinationConfig::Smtp(smtp_dest)) =
+                (&channel_cfg, &dest_cfg)
+            else {
+                return Err(AppError::Validation(
+                    "SMTP destination config kind mismatch".to_string(),
+                ));
             };
-            let message = sender
-                .send_test(&channel_cfg, &dest_cfg, channel.use_proxy)
+            let rows = sync_smtp_destination_recipients(state, dest.id, &dest_cfg).await?;
+            let mut hmac_to_email: HashMap<String, String> = HashMap::new();
+            for raw in &smtp_dest.to_addresses {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    let h = state.master_key().smtp_recipient_hmac(trimmed);
+                    hmac_to_email
+                        .entry(h)
+                        .or_insert_with(|| trimmed.to_string());
+                }
+            }
+            let (public_url, _) = state.db().get_effective_public_url(state.config()).await?;
+            let mut verified_recipients = Vec::new();
+            for row in rows {
+                if row.status == SmtpRecipientStatus::Verified
+                    && let Some(email) = hmac_to_email.get(&row.address_hmac)
+                {
+                    let unsubscribe_url = public_url.as_deref().map(|base| {
+                        let tok = state.master_key().sign_unsubscribe_token(dest.id, row.id);
+                        format!("{base}/u/{tok}")
+                    });
+                    verified_recipients.push(SmtpDeliveryRecipient {
+                        recipient_id: row.id,
+                        email: email.clone(),
+                        address_hmac: row.address_hmac,
+                        unsubscribe_url,
+                    });
+                }
+            }
+            let effective_locale = test_locale.unwrap_or_else(|| state.runtime().locale());
+            let message = state
+                .runtime()
+                .smtp_sender()
+                .send_test_to_verified(
+                    smtp_cfg,
+                    smtp_dest,
+                    dest.id,
+                    &dest.name,
+                    &verified_recipients,
+                    effective_locale,
+                )
                 .await?;
             Ok(TestChannelResponse {
                 ok: true,
@@ -1025,11 +1204,29 @@ async fn run_destination_test(
             })
         }
         ChannelKind::Notion => {
-            let message = state
+            let (ChannelConfig::Notion(n_cfg), DestinationConfig::Notion(n_dest)) =
+                (&channel_cfg, &dest_cfg)
+            else {
+                return Err(AppError::Validation(
+                    "Notion destination config kind mismatch".to_string(),
+                ));
+            };
+            let (message, updated_dest) = state
                 .runtime()
                 .notion_sender()
-                .send_test(&channel_cfg, &dest_cfg, channel.use_proxy)
+                .send_test_with_resolved(&n_cfg.integration_secret, n_dest, channel.use_proxy)
                 .await?;
+            if let Some(next_dest) = updated_dest {
+                let _ = state
+                    .db()
+                    .update_notion_destination_ids_atomic(
+                        dest.id,
+                        state.master_key(),
+                        &next_dest.data_source_id,
+                        next_dest.database_id.as_deref(),
+                    )
+                    .await;
+            }
             Ok(TestChannelResponse {
                 ok: true,
                 message,
@@ -1147,6 +1344,11 @@ pub async fn create_route(
 
     let mut options = req.options;
     validate_schedule(&mut options)?;
+    state
+        .runtime()
+        .plugins()
+        .validate_route_plugins(state.db(), &options.plugins)
+        .await?;
 
     let created = state
         .db()
@@ -1223,6 +1425,11 @@ pub async fn update_route(
     let options = match req.options {
         Some(mut opts) => {
             validate_schedule(&mut opts)?;
+            state
+                .runtime()
+                .plugins()
+                .validate_route_plugins(state.db(), &opts.plugins)
+                .await?;
             Some(opts)
         }
         None => None,
@@ -1384,11 +1591,15 @@ pub async fn update_queue_state(
 pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<SystemSettingsDto>> {
     let settings = state.http().settings();
     let locale = load_persisted_locale(state.config(), state.db()).await?;
+    let (public_url, public_url_env_managed) =
+        state.db().get_effective_public_url(state.config()).await?;
     Ok(Json(SystemSettingsDto {
         outbound_proxy_url: settings.outbound_proxy_url,
         ssrf_allowlist: settings.ssrf_allowlist,
         timezone: state.db().get_timezone().await.name().to_string(),
         locale,
+        public_url,
+        public_url_env_managed,
     }))
 }
 
@@ -1449,14 +1660,735 @@ pub async fn update_settings(
             .await?;
     }
 
+    if let Some(opt_public_url) = req.public_url {
+        if state.config().public_url.is_some() {
+            return Err(AppError::Validation(
+                "PUBLIC_URL is managed by the environment variable and cannot be changed from the WebUI".to_string(),
+            ));
+        }
+        let normalized_public_url = match opt_public_url {
+            Some(raw) if !raw.trim().is_empty() => Some(validate_public_url(&raw)?),
+            _ => None,
+        };
+        state
+            .db()
+            .set_setting_typed(SETTING_PUBLIC_URL, &normalized_public_url)
+            .await?;
+    }
+
     let persisted_locale = load_persisted_locale(state.config(), state.db()).await?;
+    let (public_url, public_url_env_managed) =
+        state.db().get_effective_public_url(state.config()).await?;
 
     Ok(Json(SystemSettingsDto {
         outbound_proxy_url: next_net.outbound_proxy_url,
         ssrf_allowlist: next_net.ssrf_allowlist,
         timezone: state.db().get_timezone().await.name().to_string(),
         locale: persisted_locale,
+        public_url,
+        public_url_env_managed,
     }))
+}
+
+// ===========================================================================
+// Plugins & Marketplace (`/api/v1/plugins*`)
+// ===========================================================================
+
+/// `GET /api/v1/plugins`
+pub async fn list_plugins(State(state): State<AppState>) -> AppResult<Json<Vec<PluginDto>>> {
+    let registry = state.runtime().plugins();
+    let rows = state.db().list_plugins().await?;
+    let row_by_id: HashMap<String, _> = rows.into_iter().map(|r| (r.id.clone(), r)).collect();
+
+    let mut out = Vec::new();
+    for plugin in registry.list() {
+        let manifest = plugin.manifest();
+        let raw_instances = state.db().list_plugin_instances(&manifest.id).await?;
+        let mut instances = Vec::with_capacity(raw_instances.len());
+        for inst in raw_instances {
+            instances.push(build_plugin_instance_dto(&state, plugin.as_ref(), inst).await?);
+        }
+        let (enabled, installed_version, settings, updated_at) = match row_by_id.get(&manifest.id) {
+            Some(row) => {
+                let settings: serde_json::Value = serde_json::from_str(&row.settings_json)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                (
+                    row.enabled,
+                    row.installed_version.clone(),
+                    settings,
+                    unix_to_rfc3339(row.updated_at),
+                )
+            }
+            None => (
+                false,
+                manifest.version.clone(),
+                serde_json::json!({}),
+                unix_to_rfc3339(now_unix()),
+            ),
+        };
+        out.push(PluginDto {
+            id: manifest.id.clone(),
+            manifest: manifest.clone(),
+            enabled,
+            installed_version,
+            settings,
+            instance_count: instances.len(),
+            instances,
+            updated_at,
+        });
+    }
+    Ok(Json(out))
+}
+
+/// `PATCH /api/v1/plugins/{id}`
+pub async fn update_plugin(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(req): Json<UpdatePluginRequest>,
+) -> AppResult<Json<PluginDto>> {
+    let registry = state.runtime().plugins();
+    let plugin = registry
+        .get(&plugin_id)
+        .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+    registry.sync_builtin_rows(state.db()).await?;
+
+    let settings_str = req
+        .settings
+        .map(|v| serde_json::to_string(&v))
+        .transpose()?;
+    let updated = state
+        .db()
+        .update_plugin(&plugin_id, req.enabled, settings_str.as_deref())
+        .await?;
+
+    let raw_instances = state.db().list_plugin_instances(&plugin_id).await?;
+    let mut instances = Vec::with_capacity(raw_instances.len());
+    for inst in raw_instances {
+        instances.push(build_plugin_instance_dto(&state, plugin.as_ref(), inst).await?);
+    }
+    let settings: serde_json::Value =
+        serde_json::from_str(&updated.settings_json).unwrap_or_else(|_| serde_json::json!({}));
+
+    Ok(Json(PluginDto {
+        id: updated.id,
+        manifest: plugin.manifest().clone(),
+        enabled: updated.enabled,
+        installed_version: updated.installed_version,
+        settings,
+        instance_count: instances.len(),
+        instances,
+        updated_at: unix_to_rfc3339(updated.updated_at),
+    }))
+}
+
+/// `GET /api/v1/plugins/{id}/instances`
+pub async fn list_plugin_instances(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+) -> AppResult<Json<Vec<PluginInstanceDto>>> {
+    let plugin = state
+        .runtime()
+        .plugins()
+        .get(&plugin_id)
+        .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+    let raw = state.db().list_plugin_instances(&plugin_id).await?;
+    let mut out = Vec::with_capacity(raw.len());
+    for inst in raw {
+        out.push(build_plugin_instance_dto(&state, plugin.as_ref(), inst).await?);
+    }
+    Ok(Json(out))
+}
+
+/// `POST /api/v1/plugins/{id}/instances`
+pub async fn create_plugin_instance(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(req): Json<CreatePluginInstanceRequest>,
+) -> AppResult<(StatusCode, Json<PluginInstanceDto>)> {
+    let registry = state.runtime().plugins();
+    let plugin = registry
+        .get(&plugin_id)
+        .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+    registry.sync_builtin_rows(state.db()).await?;
+
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Validation(
+            "Plugin provider name must not be empty".to_string(),
+        ));
+    }
+
+    let validated = plugin.validate_instance_config(&req.config)?;
+    let encrypted = state.master_key().encrypt_json(&validated)?;
+    let created = state
+        .db()
+        .create_plugin_instance(&plugin_id, &name, &encrypted, req.enabled)
+        .await?;
+    let dto = build_plugin_instance_dto(&state, plugin.as_ref(), created).await?;
+    Ok((StatusCode::CREATED, Json(dto)))
+}
+
+/// `PATCH /api/v1/plugins/{id}/instances/{iid}`
+pub async fn update_plugin_instance(
+    State(state): State<AppState>,
+    Path((plugin_id, instance_id)): Path<(String, i64)>,
+    Json(req): Json<UpdatePluginInstanceRequest>,
+) -> AppResult<Json<PluginInstanceDto>> {
+    let plugin = state
+        .runtime()
+        .plugins()
+        .get(&plugin_id)
+        .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+    let existing = state
+        .db()
+        .get_plugin_instance(instance_id)
+        .await?
+        .filter(|i| i.plugin_id == plugin_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "plugin instance {instance_id} not found for plugin '{plugin_id}'"
+            ))
+        })?;
+
+    if let Some(ref raw_name) = req.name
+        && raw_name.trim().is_empty()
+    {
+        return Err(AppError::Validation(
+            "Plugin provider name must not be empty".to_string(),
+        ));
+    }
+
+    let mut clear_link_cache = false;
+    let next_encrypted = if let Some(ref cfg_patch) = req.config {
+        let cur_cfg: serde_json::Value = state
+            .master_key()
+            .decrypt_json(&existing.encrypted_config)?;
+        let merged = plugin.merge_instance_config(&cur_cfg, cfg_patch)?;
+        if plugin_id == LINK_REWRITE_PLUGIN_ID {
+            let old_url = cur_cfg
+                .get("api_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim);
+            let new_url = merged
+                .get("api_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim);
+            if old_url != new_url {
+                clear_link_cache = true;
+            }
+        }
+        Some(state.master_key().encrypt_json(&merged)?)
+    } else {
+        None
+    };
+
+    let updated = state
+        .db()
+        .update_plugin_instance(
+            instance_id,
+            req.name.as_deref(),
+            next_encrypted.as_deref(),
+            req.enabled,
+        )
+        .await?;
+    if clear_link_cache {
+        state.db().clear_plugin_link_cache(instance_id).await?;
+    }
+    Ok(Json(
+        build_plugin_instance_dto(&state, plugin.as_ref(), updated).await?,
+    ))
+}
+
+/// `DELETE /api/v1/plugins/{id}/instances/{iid}`
+///
+/// Refuses deletion with `409 Conflict` listing referencing routes if any route selects this provider.
+pub async fn delete_plugin_instance(
+    State(state): State<AppState>,
+    Path((plugin_id, instance_id)): Path<(String, i64)>,
+) -> AppResult<Response> {
+    match state
+        .db()
+        .delete_plugin_instance_if_unreferenced(&plugin_id, instance_id)
+        .await?
+    {
+        DeleteGuardOutcome::NotFound => Err(AppError::NotFound(format!(
+            "plugin instance {instance_id} not found for plugin '{plugin_id}'"
+        ))),
+        DeleteGuardOutcome::Conflict(refs) => {
+            let names: Vec<&str> = refs.iter().map(|(_, n)| n.as_str()).collect();
+            let msg = format!(
+                "Plugin provider {instance_id} is referenced by {} route(s): {}. Unassign it from those routes before deleting.",
+                refs.len(),
+                names.join(", ")
+            );
+            let body = ReferencingConflictBody {
+                error: msg.clone(),
+                code: "conflict",
+                message: msg,
+                referencing_routes: refs
+                    .into_iter()
+                    .map(|(id, name)| RouteReferenceDto { id, name })
+                    .collect(),
+            };
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        DeleteGuardOutcome::Deleted => {
+            Ok((StatusCode::OK, Json(ActionAckResponse::ok())).into_response())
+        }
+    }
+}
+
+/// `POST /api/v1/plugins/{id}/instances/{iid}/test`
+pub async fn test_plugin_instance(
+    State(state): State<AppState>,
+    Path((plugin_id, instance_id)): Path<(String, i64)>,
+) -> AppResult<Json<TestPluginInstanceResponse>> {
+    let plugin = state
+        .runtime()
+        .plugins()
+        .get(&plugin_id)
+        .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+    let existing = state
+        .db()
+        .get_plugin_instance(instance_id)
+        .await?
+        .filter(|i| i.plugin_id == plugin_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "plugin instance {instance_id} not found for plugin '{plugin_id}'"
+            ))
+        })?;
+    let cfg: serde_json::Value = state
+        .master_key()
+        .decrypt_json(&existing.encrypted_config)?;
+    let message = plugin.test_instance(state.http(), &cfg).await?;
+    Ok(Json(TestPluginInstanceResponse { ok: true, message }))
+}
+
+/// `DELETE /api/v1/plugins/{id}/instances/{iid}/cache`
+pub async fn clear_plugin_instance_cache(
+    State(state): State<AppState>,
+    Path((plugin_id, instance_id)): Path<(String, i64)>,
+) -> AppResult<Json<ClearPluginCacheResponse>> {
+    let existing = state
+        .db()
+        .get_plugin_instance(instance_id)
+        .await?
+        .filter(|i| i.plugin_id == plugin_id);
+    if existing.is_none() {
+        return Err(AppError::NotFound(format!(
+            "plugin instance {instance_id} not found for plugin '{plugin_id}'"
+        )));
+    }
+    let cleared_entries = state.db().clear_plugin_link_cache(instance_id).await?;
+    Ok(Json(ClearPluginCacheResponse { cleared_entries }))
+}
+
+/// `GET /api/v1/plugins/market`
+pub async fn get_plugin_market(
+    State(state): State<AppState>,
+    Query(query): Query<MarketQuery>,
+) -> AppResult<Json<MarketResponse>> {
+    let registry = state.runtime().plugins();
+    let installed_rows: HashMap<String, bool> = state
+        .db()
+        .list_plugins()
+        .await?
+        .into_iter()
+        .map(|r| (r.id, r.enabled))
+        .collect();
+
+    let market_cache = state.runtime().market_cache();
+    let (doc, source) = market_cache
+        .get_index(state.http(), query.refresh.unwrap_or(false))
+        .await;
+
+    let plugins = doc
+        .plugins
+        .into_iter()
+        .map(|item| {
+            let is_builtin = registry.get(&item.id).is_some();
+            let enabled = installed_rows.get(&item.id).copied().unwrap_or(false);
+            MarketPluginItemDto {
+                id: item.id,
+                name: item.name,
+                version: item.version,
+                api_version: item.api_version,
+                kind: if is_builtin {
+                    "builtin".to_string()
+                } else {
+                    item.kind
+                },
+                min_core: item.min_core,
+                category: item.category,
+                icon: item.icon,
+                description: item.description,
+                homepage: item.homepage,
+                repository: item.repository,
+                hooks: item.hooks,
+                permissions: item.permissions,
+                installed: is_builtin,
+                enabled,
+            }
+        })
+        .collect();
+
+    Ok(Json(MarketResponse {
+        source: source.to_string(),
+        index_url: market_cache.index_url().to_string(),
+        generated_at: doc.generated_at,
+        plugins,
+    }))
+}
+
+async fn build_plugin_instance_dto(
+    state: &AppState,
+    plugin: &dyn crate::plugins::Plugin,
+    inst: crate::db::models::PluginInstanceRow,
+) -> AppResult<PluginInstanceDto> {
+    let decrypted: serde_json::Value = state.master_key().decrypt_json(&inst.encrypted_config)?;
+    let redacted = plugin.redact_instance_config(&decrypted);
+    let cache_entries = state
+        .db()
+        .count_plugin_link_cache_by_instance(inst.id)
+        .await?;
+    Ok(PluginInstanceDto {
+        id: inst.id,
+        plugin_id: inst.plugin_id,
+        name: inst.name,
+        config: redacted,
+        enabled: inst.enabled,
+        cache_entries,
+        created_at: unix_to_rfc3339(inst.created_at),
+        updated_at: unix_to_rfc3339(inst.updated_at),
+    })
+}
+
+// ===========================================================================
+// SMTP Per-Recipient Compliance (`/api/v1/destinations/{id}/recipients*`)
+// ===========================================================================
+
+const SMTP_VERIFY_CODE_TTL_SECS: i64 = 30 * 60;
+const SMTP_VERIFY_RESEND_COOLDOWN_SECS: i64 = 60;
+const SMTP_VERIFY_HOURLY_CAP: i64 = 5;
+const SMTP_VERIFY_MAX_ATTEMPTS: i64 = 5;
+
+async fn load_smtp_destination_and_map(
+    state: &AppState,
+    destination_id: i64,
+) -> AppResult<(
+    Channel,
+    ChannelDestination,
+    ChannelConfig,
+    HashMap<String, String>,
+)> {
+    let dest = state
+        .db()
+        .get_destination(destination_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("destination {destination_id} not found")))?;
+    let channel = state
+        .db()
+        .get_channel(dest.channel_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("channel {} not found", dest.channel_id)))?;
+    if channel.kind != ChannelKind::Smtp {
+        return Err(AppError::Validation(format!(
+            "destination {destination_id} belongs to a '{}' channel, expected 'smtp'",
+            channel.kind
+        )));
+    }
+    let channel_cfg: ChannelConfig = state.master_key().decrypt_json(&channel.encrypted_config)?;
+    let dest_cfg: DestinationConfig = state.master_key().decrypt_json(&dest.encrypted_config)?;
+    sync_smtp_destination_recipients(state, dest.id, &dest_cfg).await?;
+
+    let mut map = HashMap::new();
+    if let DestinationConfig::Smtp(smtp_dest) = dest_cfg {
+        for addr in smtp_dest.to_addresses {
+            let trimmed = addr.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let h = state.master_key().smtp_recipient_hmac(trimmed);
+            map.entry(h).or_insert_with(|| trimmed.to_string());
+        }
+    }
+    Ok((channel, dest, channel_cfg, map))
+}
+
+fn recipient_row_to_dto(row: SmtpRecipientRow, email: String) -> SmtpRecipientDto {
+    SmtpRecipientDto {
+        id: row.id,
+        destination_id: row.destination_id,
+        email,
+        status: row.status,
+        code_expires_at: row.code_expires_at.map(unix_to_rfc3339),
+        code_attempts: row.code_attempts,
+        last_code_sent_at: row.last_code_sent_at.map(unix_to_rfc3339),
+        consent_method: row.consent_method,
+        consented_at: row.consented_at.map(unix_to_rfc3339),
+        revoked_method: row.revoked_method,
+        revoked_at: row.revoked_at.map(unix_to_rfc3339),
+        bounce_diagnostic: row.bounce_diagnostic,
+        created_at: unix_to_rfc3339(row.created_at),
+        updated_at: unix_to_rfc3339(row.updated_at),
+    }
+}
+
+/// `GET /api/v1/destinations/{id}/recipients`
+pub async fn list_destination_recipients(
+    State(state): State<AppState>,
+    Path(destination_id): Path<i64>,
+) -> AppResult<Json<Vec<SmtpRecipientDto>>> {
+    let (_, _, _, email_by_hmac) = load_smtp_destination_and_map(&state, destination_id).await?;
+    let rows = state.db().list_smtp_recipients(destination_id).await?;
+    let out = rows
+        .into_iter()
+        .map(|r| {
+            let email = email_by_hmac
+                .get(&r.address_hmac)
+                .cloned()
+                .unwrap_or_else(|| "(unknown)".to_string());
+            recipient_row_to_dto(r, email)
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// `POST /api/v1/destinations/{id}/recipients/{rid}/send-verification`
+pub async fn send_recipient_verification(
+    State(state): State<AppState>,
+    Path((destination_id, recipient_id)): Path<(i64, i64)>,
+) -> AppResult<Json<SendVerificationResponse>> {
+    let (_, dest, channel_cfg, email_by_hmac) =
+        load_smtp_destination_and_map(&state, destination_id).await?;
+    let ChannelConfig::Smtp(smtp_cfg) = channel_cfg else {
+        return Err(AppError::Validation(
+            "expected SMTP channel config".to_string(),
+        ));
+    };
+
+    let now = now_unix();
+    let code_num: u32 = rand::random_range(0..1_000_000);
+    let code = format!("{code_num:06}");
+    let code_sha256 = sha256_hex(code.as_bytes());
+    let expires_at = now.saturating_add(SMTP_VERIFY_CODE_TTL_SECS);
+
+    // Atomically check recipient status + 60s resend cooldown + 5/h cap and reserve the slot on
+    // `write_pool` BEFORE talking to SMTP, eliminating concurrent double-click rate-limit bypass.
+    let (prev_row, reserved_row) = state
+        .db()
+        .reserve_smtp_recipient_verification_code(
+            destination_id,
+            recipient_id,
+            &code_sha256,
+            expires_at,
+            now,
+            SMTP_VERIFY_RESEND_COOLDOWN_SECS,
+            SMTP_VERIFY_HOURLY_CAP,
+        )
+        .await?;
+
+    let email = match email_by_hmac.get(&reserved_row.address_hmac).cloned() {
+        Some(e) => e,
+        None => {
+            let _ = state
+                .db()
+                .rollback_smtp_recipient_verification_reservation(&prev_row, &code_sha256)
+                .await;
+            return Err(AppError::NotFound(
+                "Recipient address no longer present in destination".to_string(),
+            ));
+        }
+    };
+
+    let (public_url, _) = match state.db().get_effective_public_url(state.config()).await {
+        Ok(res) => res,
+        Err(err) => {
+            let _ = state
+                .db()
+                .rollback_smtp_recipient_verification_reservation(&prev_row, &code_sha256)
+                .await;
+            return Err(err);
+        }
+    };
+    let verify_url = public_url.as_deref().map(|base| {
+        let tok = state.master_key().sign_verify_token(
+            destination_id,
+            recipient_id,
+            expires_at,
+            &code_sha256,
+        );
+        format!("{base}/v/{tok}")
+    });
+
+    let locale = state.runtime().locale();
+    let send_msg = match state
+        .runtime()
+        .smtp_sender()
+        .send_verification_email(
+            &smtp_cfg,
+            &email,
+            &dest.name,
+            &code,
+            verify_url.as_deref(),
+            locale,
+        )
+        .await
+    {
+        Ok(msg) => msg,
+        Err(err) => {
+            let _ = state
+                .db()
+                .rollback_smtp_recipient_verification_reservation(&prev_row, &code_sha256)
+                .await;
+            return Err(err);
+        }
+    };
+
+    Ok(Json(SendVerificationResponse {
+        ok: true,
+        message: send_msg,
+        recipient: recipient_row_to_dto(reserved_row, email),
+    }))
+}
+
+/// `POST /api/v1/destinations/{id}/recipients/{rid}/verify`
+pub async fn verify_recipient_code(
+    State(state): State<AppState>,
+    Path((destination_id, recipient_id)): Path<(i64, i64)>,
+    Json(req): Json<VerifyRecipientCodeRequest>,
+) -> AppResult<Json<SmtpRecipientDto>> {
+    let (_, _, _, email_by_hmac) = load_smtp_destination_and_map(&state, destination_id).await?;
+    let row = state
+        .db()
+        .get_smtp_recipient(recipient_id)
+        .await?
+        .filter(|r| r.destination_id == destination_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "SMTP recipient {recipient_id} not found on destination {destination_id}"
+            ))
+        })?;
+    let email = email_by_hmac
+        .get(&row.address_hmac)
+        .cloned()
+        .unwrap_or_else(|| "(unknown)".to_string());
+
+    if row.status == SmtpRecipientStatus::Verified {
+        return Ok(Json(recipient_row_to_dto(row, email)));
+    }
+    if row.status != SmtpRecipientStatus::Pending {
+        return Err(AppError::Validation(
+            "No active verification code for this recipient; send a verification email first"
+                .to_string(),
+        ));
+    }
+
+    let now = now_unix();
+    if row.code_expires_at.is_none_or(|exp| now > exp) {
+        return Err(AppError::Validation(
+            "Verification code has expired; please send a new verification email".to_string(),
+        ));
+    }
+    if row.code_attempts >= SMTP_VERIFY_MAX_ATTEMPTS {
+        return Err(AppError::RateLimited {
+            message: format!(
+                "Maximum verification attempts ({SMTP_VERIFY_MAX_ATTEMPTS}) exceeded; send a new verification code"
+            ),
+            retry_after_secs: None,
+        });
+    }
+
+    let provided_hash = sha256_hex(req.code.trim().as_bytes());
+    let expected_hash = row.code_sha256.as_deref().unwrap_or("");
+    if !constant_time_eq(provided_hash.as_bytes(), expected_hash.as_bytes()) {
+        let attempts = state
+            .db()
+            .increment_smtp_recipient_code_attempts_and_lock(recipient_id, SMTP_VERIFY_MAX_ATTEMPTS)
+            .await?;
+        let remaining = SMTP_VERIFY_MAX_ATTEMPTS.saturating_sub(attempts);
+        return Err(AppError::Validation(format!(
+            "Invalid verification code ({remaining} attempt(s) remaining)"
+        )));
+    }
+
+    let verified = state
+        .db()
+        .mark_smtp_recipient_verified(recipient_id, "code", now)
+        .await?;
+    state
+        .db()
+        .release_deferred_tasks_for_destination(destination_id, now)
+        .await?;
+    state.runtime().notify_outbox();
+
+    Ok(Json(recipient_row_to_dto(verified, email)))
+}
+
+/// `POST /api/v1/destinations/{id}/recipients/{rid}/reactivate`
+pub async fn reactivate_recipient(
+    State(state): State<AppState>,
+    Path((destination_id, recipient_id)): Path<(i64, i64)>,
+) -> AppResult<Json<SmtpRecipientDto>> {
+    let (_, _, _, email_by_hmac) = load_smtp_destination_and_map(&state, destination_id).await?;
+    let row = state
+        .db()
+        .get_smtp_recipient(recipient_id)
+        .await?
+        .filter(|r| r.destination_id == destination_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "SMTP recipient {recipient_id} not found on destination {destination_id}"
+            ))
+        })?;
+    if !matches!(
+        row.status,
+        SmtpRecipientStatus::Unsubscribed | SmtpRecipientStatus::Bounced
+    ) {
+        return Err(AppError::Validation(
+            "Only unsubscribed or bounced recipients can be reactivated".to_string(),
+        ));
+    }
+
+    let updated = state
+        .db()
+        .reactivate_smtp_recipient(recipient_id, now_unix())
+        .await?;
+    let email = email_by_hmac
+        .get(&updated.address_hmac)
+        .cloned()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    Ok(Json(recipient_row_to_dto(updated, email)))
+}
+
+/// `POST /api/v1/destinations/{id}/recipients/{rid}/unsubscribe`
+pub async fn unsubscribe_recipient_admin(
+    State(state): State<AppState>,
+    Path((destination_id, recipient_id)): Path<(i64, i64)>,
+) -> AppResult<Json<SmtpRecipientDto>> {
+    let (_, _, _, email_by_hmac) = load_smtp_destination_and_map(&state, destination_id).await?;
+    let existing = state
+        .db()
+        .get_smtp_recipient(recipient_id)
+        .await?
+        .filter(|r| r.destination_id == destination_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "SMTP recipient {recipient_id} not found on destination {destination_id}"
+            ))
+        })?;
+    let _ = existing;
+
+    let (updated, _) = state
+        .db()
+        .mark_smtp_recipient_unsubscribed(recipient_id, "admin", now_unix())
+        .await?;
+    let email = email_by_hmac
+        .get(&updated.address_hmac)
+        .cloned()
+        .unwrap_or_else(|| "(unknown)".to_string());
+    Ok(Json(recipient_row_to_dto(updated, email)))
 }
 
 /// `GET /api/v1/mcp-tokens`

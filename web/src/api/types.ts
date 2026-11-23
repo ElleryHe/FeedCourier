@@ -1,7 +1,8 @@
 /**
- * Canonical REST API Contract (`/api/v1`) for FeedCourier v0.2.0.
+ * Canonical REST API Contract (`/api/v1`) for FeedCourier v0.3.0.
  *
- * Aligned 1-to-1 with `src/channels/mod.rs`, `src/api/dto.rs`, and `src/db/models.rs`:
+ * Aligned 1-to-1 with `src/channels/mod.rs`, `src/api/dto.rs`, `src/plugins/mod.rs`,
+ * and `src/db/models.rs`:
  * - `ChannelAccountCreate` deserializes directly into `crate::channels::ChannelConfig`
  * - `ChannelAccountView` matches `ChannelConfig::redacted_view()`
  * - `DestinationConfigCreate` deserializes directly into `crate::channels::DestinationConfig`
@@ -17,11 +18,18 @@
 // Common & Error Envelope
 // ---------------------------------------------------------------------------
 
+/** Route reference returned inside 409 Conflict responses when deleting a referenced resource. */
+export interface RouteReferenceDto {
+  id: number;
+  name: string;
+}
+
 /** Standard JSON error body returned by Axum `AppError` on non-2xx responses. */
 export interface ApiErrorBody {
   error: string;
   code?: string;
   message?: string;
+  referencing_routes?: RouteReferenceDto[];
 }
 
 export interface ActionAckResponse {
@@ -34,7 +42,7 @@ export interface ActionAckResponse {
 
 export const DEFAULT_REPO_URL = "https://github.com/ElleryHe/FeedCourier";
 export const DEFAULT_LICENSE = "AGPL-3.0";
-export const DEFAULT_VERSION = "0.2.0";
+export const DEFAULT_VERSION = "0.3.0";
 
 /** `GET /api/v1/auth/status` */
 export interface AuthStatusResponse {
@@ -42,7 +50,7 @@ export interface AuthStatusResponse {
   setup_required: boolean;
   /** True when the current HttpOnly session cookie is valid. */
   authenticated: boolean;
-  /** Build version (e.g. `"0.2.0"`). */
+  /** Build version (e.g. `"0.3.0"`). */
   version: string;
   /** Source repository URL (AGPLv3 Section 13 compliance). */
   repo_url: string;
@@ -300,6 +308,15 @@ export interface ClearFeedCacheResponse {
   poll_error?: string;
 }
 
+/** Debug-push route option overrides (`POST /api/v1/feeds/preview/push`). */
+export interface DebugPushOptions {
+  telegram_mode?: TelegramDeliveryMode;
+  link_preview?: boolean;
+  locale?: SystemLocale;
+  timezone?: string | null;
+  plugins?: Record<string, Record<string, unknown> | null>;
+}
+
 /** `POST /api/v1/feeds/preview/push` (stateless debug push). */
 export interface FeedPreviewPushRequest {
   url: string;
@@ -310,12 +327,7 @@ export interface FeedPreviewPushRequest {
   use_proxy?: boolean;
   destination_id: number;
   channel_id?: number;
-  options?: {
-    telegram_mode?: TelegramDeliveryMode;
-    link_preview?: boolean;
-    locale?: SystemLocale;
-    timezone?: string | null;
-  };
+  options?: DebugPushOptions;
 }
 
 export interface FeedPreviewPushResponse {
@@ -354,7 +366,7 @@ export interface OpmlImportResponse {
 export type SmtpSecurity = "start_tls" | "tls" | "plain";
 
 /**
- * Standard 7-column Notion data source mapping (`crate::channels::NotionColumnMapping`).
+ * Standard 8-column Notion data source mapping (`crate::channels::NotionColumnMapping`).
  * `title` and `fc_id` are strictly required; optional columns may be `null` to skip.
  */
 export interface NotionColumnMapping {
@@ -364,6 +376,8 @@ export interface NotionColumnMapping {
   fc_id: string;
   /** Optional (`url`): canonical article link (standard name: `"Link"`). */
   link: string | null;
+  /** Optional (`url`): shortened article link written by Link Rewrite plugin (standard name: `"Short URL"`). */
+  short_url?: string | null;
   /** Optional (`select`): feed source title (standard name: `"Source"`). */
   source: string | null;
   /** Optional (`date`): published timestamp (standard name: `"Published"`). */
@@ -378,6 +392,7 @@ export const DEFAULT_NOTION_COLUMN_MAPPING: NotionColumnMapping = {
   title: "Title",
   fc_id: "FC-ID",
   link: "Link",
+  short_url: null,
   source: "Source",
   published: "Published",
   state: "State",
@@ -398,6 +413,7 @@ export type ChannelAccountView =
       has_password: boolean;
       security: SmtpSecurity;
       from_address: string;
+      sender_identity?: string | null;
     }
   | {
       kind: "telegram";
@@ -424,6 +440,7 @@ export type ChannelAccountCreate =
       password?: string | null;
       security: SmtpSecurity;
       from_address: string;
+      sender_identity?: string | null;
     }
   | {
       kind: "telegram";
@@ -451,6 +468,7 @@ export type ChannelAccountPatch =
       password?: string | null;
       security?: SmtpSecurity;
       from_address?: string;
+      sender_identity?: string | null;
     }
   | {
       kind: "telegram";
@@ -531,6 +549,45 @@ export type DestinationPatch =
       column_mapping?: NotionColumnMapping;
     };
 
+export type SmtpRecipientStatus =
+  | "unverified"
+  | "pending"
+  | "verified"
+  | "unsubscribed"
+  | "bounced";
+
+export interface SmtpRecipientSummary {
+  total: number;
+  verified: number;
+  pending: number;
+  unverified: number;
+  unsubscribed: number;
+  bounced: number;
+}
+
+export interface SmtpRecipientDto {
+  id: number;
+  destination_id: number;
+  email: string;
+  status: SmtpRecipientStatus;
+  code_expires_at: string | null;
+  code_attempts: number;
+  last_code_sent_at: string | null;
+  consent_method: string | null;
+  consented_at: string | null;
+  revoked_method: string | null;
+  revoked_at: string | null;
+  bounce_diagnostic: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SendVerificationResponse {
+  ok: boolean;
+  message: string;
+  recipient: SmtpRecipientDto;
+}
+
 export interface ChannelDestinationDto {
   id: number;
   channel_id: number;
@@ -538,6 +595,8 @@ export interface ChannelDestinationDto {
   kind: ChannelKind;
   config: DestinationConfigView;
   enabled: boolean;
+  auto_paused?: boolean;
+  smtp_summary?: SmtpRecipientSummary;
   created_at: string;
   updated_at: string;
 }
@@ -657,6 +716,7 @@ export type NotionStandardFieldKey =
   | "title"
   | "fc_id"
   | "link"
+  | "short_url"
   | "source"
   | "published"
   | "state"
@@ -735,6 +795,8 @@ export interface RouteOptions {
   active_windows?: ActiveWindow[];
   /** 1=Mon..7=Sun; empty = every day. */
   active_weekdays?: number[];
+  /** Per-plugin route options keyed by plugin ID (e.g. `{"link-rewrite": {"provider_id": 3}}`). */
+  plugins?: Record<string, Record<string, unknown> | null>;
 }
 
 export interface ActiveWindow {
@@ -803,6 +865,7 @@ export type DeliveryCheckpoint =
   | {
       kind: "smtp";
       message_id: string;
+      sent_recipients?: string[];
     }
   | {
       kind: "telegram";
@@ -886,6 +949,10 @@ export interface SystemSettingsDto {
   timezone: string;
   /** LEGACY fallback delivery language for routes without `options.locale`. Never written by the WebUI. */
   locale?: SystemLocale | null;
+  /** Optional public base URL (`PUBLIC_URL`) for RFC 8058 unsubscribe and verification links. */
+  public_url: string | null;
+  /** True when `PUBLIC_URL` is set via environment variable and locked from WebUI edits. */
+  public_url_env_managed: boolean;
 }
 
 /** Any subset; network fields are applied only when at least one is present. */
@@ -893,6 +960,134 @@ export interface UpdateSystemSettingsRequest {
   timezone?: string;
   outbound_proxy_url?: string | null;
   ssrf_allowlist?: string[];
+  public_url?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// 8. Plugins & Marketplace (`/api/v1/plugins*`)
+// ---------------------------------------------------------------------------
+
+export type HookKind = "on_render" | "on_ingest" | "on_delivered";
+
+export type PluginPermission = "network";
+
+export interface PluginRouteOptionPropertySchema {
+  type: "select" | "boolean" | "string" | "number" | string;
+  title?: string;
+  description?: string;
+  source?: "plugin_instances" | string;
+  nullable?: boolean;
+  enum?: string[];
+  default?: unknown;
+  placeholder?: string;
+}
+
+export interface PluginRouteOptionSchema {
+  type?: string;
+  properties?: Record<string, PluginRouteOptionPropertySchema>;
+}
+
+export interface PluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  api_version: string;
+  category: string;
+  icon: string;
+  description: string;
+  homepage: string;
+  hooks: HookKind[];
+  permissions: PluginPermission[];
+  instance_schema: Record<string, unknown>;
+  route_option_schema: PluginRouteOptionSchema;
+}
+
+export type YourlsAuthMode = "signature" | "timed_signature" | "password";
+
+export interface YourlsProviderConfigView {
+  api_url: string;
+  auth_mode: YourlsAuthMode;
+  has_signature: boolean;
+  signature_hint?: string | null;
+  username?: string | null;
+  has_password: boolean;
+  exclude_domains: string[];
+  strict_mode: boolean;
+  pass_title: boolean;
+  use_proxy: boolean;
+}
+
+export interface PluginInstanceDto {
+  id: number;
+  plugin_id: string;
+  name: string;
+  config: Record<string, unknown>;
+  enabled: boolean;
+  cache_entries: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PluginDto {
+  id: string;
+  manifest: PluginManifest;
+  enabled: boolean;
+  installed_version: string;
+  settings: Record<string, unknown>;
+  instance_count: number;
+  instances: PluginInstanceDto[];
+  updated_at: string;
+}
+
+export interface UpdatePluginRequest {
+  enabled?: boolean;
+  settings?: Record<string, unknown>;
+}
+
+export interface CreatePluginInstanceRequest {
+  name: string;
+  config: Record<string, unknown>;
+  enabled?: boolean;
+}
+
+export interface UpdatePluginInstanceRequest {
+  name?: string;
+  config?: Record<string, unknown>;
+  enabled?: boolean;
+}
+
+export interface TestPluginInstanceResponse {
+  ok: boolean;
+  message: string;
+}
+
+export interface ClearPluginCacheResponse {
+  cleared_entries: number;
+}
+
+export interface MarketPluginItemDto {
+  id: string;
+  name: string;
+  version: string;
+  api_version: string;
+  kind: "builtin" | "external" | "coming_soon" | string;
+  min_core: string | null;
+  category: string;
+  icon: string;
+  description: string;
+  homepage: string | null;
+  repository: string | null;
+  hooks: string[];
+  permissions: string[];
+  installed: boolean;
+  enabled: boolean;
+}
+
+export interface MarketResponse {
+  source: "remote" | "snapshot" | string;
+  index_url: string;
+  generated_at: string | null;
+  plugins: MarketPluginItemDto[];
 }
 
 export type McpTokenScope = "readonly" | "admin";

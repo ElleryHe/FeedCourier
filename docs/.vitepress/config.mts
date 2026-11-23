@@ -36,6 +36,14 @@ const enUserGuideSidebar: DefaultTheme.SidebarItem[] = [
     ],
   },
   {
+    text: "Plugins",
+    items: [
+      { text: "Overview & Marketplace", link: "/plugins/" },
+      { text: "Link Rewrite (YOURLS)", link: "/plugins/link-rewrite" },
+      { text: "Plugin Development", link: "/plugins/development" },
+    ],
+  },
+  {
     text: "MCP Integration",
     items: [
       { text: "Client Setup & Security", link: "/mcp/setup" },
@@ -81,6 +89,14 @@ const zhUserGuideSidebar: DefaultTheme.SidebarItem[] = [
       { text: "SMTP 邮件", link: "/zh/channels/smtp" },
       { text: "Telegram", link: "/zh/channels/telegram" },
       { text: "Notion", link: "/zh/channels/notion" },
+    ],
+  },
+  {
+    text: "插件",
+    items: [
+      { text: "插件概览与市场", link: "/zh/plugins/" },
+      { text: "链接替换 (YOURLS)", link: "/zh/plugins/link-rewrite" },
+      { text: "插件开发手册", link: "/zh/plugins/development" },
     ],
   },
   {
@@ -317,7 +333,7 @@ export default withMermaid(
             {
               text: "User Guide",
               link: "/guide/configuration",
-              activeMatch: "^/(guide/(configuration|operations)|channels/|mcp/)",
+              activeMatch: "^/(guide/(configuration|operations)|channels/|plugins/|mcp/)",
             },
             {
               text: "Architecture",
@@ -328,6 +344,7 @@ export default withMermaid(
           sidebar: {
             "/guide/": enUserGuideSidebar,
             "/channels/": enUserGuideSidebar,
+            "/plugins/": enUserGuideSidebar,
             "/mcp/": enUserGuideSidebar,
             "/reference/": enArchitectureSidebar,
           },
@@ -360,7 +377,7 @@ export default withMermaid(
             {
               text: "使用手册",
               link: "/zh/guide/configuration",
-              activeMatch: "^/zh/(guide/(configuration|operations)|channels/|mcp/)",
+              activeMatch: "^/zh/(guide/(configuration|operations)|channels/|plugins/|mcp/)",
             },
             {
               text: "架构手册",
@@ -371,6 +388,7 @@ export default withMermaid(
           sidebar: {
             "/zh/guide/": zhUserGuideSidebar,
             "/zh/channels/": zhUserGuideSidebar,
+            "/zh/plugins/": zhUserGuideSidebar,
             "/zh/mcp/": zhUserGuideSidebar,
             "/zh/reference/": zhArchitectureSidebar,
           },
@@ -418,7 +436,10 @@ function parseMarkdownDoc(
   srcDir: string,
   relLink: string,
 ): { title: string; description: string; body: string } {
-  const filePath = join(srcDir, `${relLink.replace(/^\//, "")}.md`);
+  const normalized = relLink.replace(/^\//, "");
+  const filePath = normalized.endsWith("/")
+    ? join(srcDir, normalized, "index.md")
+    : join(srcDir, `${normalized}.md`);
   const raw = readFileSync(filePath, "utf-8");
 
   let description = "";

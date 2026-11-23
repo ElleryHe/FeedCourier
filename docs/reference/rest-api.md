@@ -1,5 +1,5 @@
 ---
-description: "REST API reference for FeedCourier (/api/v1/*) covering username/password and 2FA authentication, account security, overview metrics, feeds (clear cache, debug push), OPML import/export, channel accounts and destinations, routes (language, timezone, time windows), tasks, global queue control, system settings, backups, and MCP tokens."
+description: "REST API reference for FeedCourier (/api/v1/*) covering authentication, 2FA, feeds, channels, destinations (409 guard), SMTP per-recipient verification, plugins & marketplace, routes, tasks, settings (PUBLIC_URL), MCP tokens, and public /u/{token} & /v/{token} compliance endpoints."
 ---
 
 # REST API Reference (`/api/v1/*`)
@@ -10,7 +10,7 @@ The embedded React 19 WebUI communicates with the Rust backend through a JSON RE
 
 ## Authentication & Session Cookie (`fc_session`)
 
-- **Public Endpoints**: `GET /api/v1/health`, `GET /api/v1/auth/status`, `POST /api/v1/auth/setup`, `POST /api/v1/auth/login`, `POST /api/v1/auth/login/2fa`, and `POST /api/v1/auth/logout`.
+- **Public Endpoints**: `GET /api/v1/health`, `GET /api/v1/auth/status`, `POST /api/v1/auth/setup`, `POST /api/v1/auth/login`, `POST /api/v1/auth/login/2fa`, `POST /api/v1/auth/logout`, plus unauthenticated SMTP compliance endpoints `GET`/`POST /u/{token}` and `GET`/`POST /v/{token}` (registered before the SPA fallback).
 - **Protected Endpoints**: All other `/api/v1/*` routes require a valid **`fc_session`** HttpOnly cookie (`SameSite=Lax`, `Path=/`, 30-day TTL / `2,592,000` seconds) issued by `/api/v1/auth/setup`, `/api/v1/auth/login` (when 2FA is off), or `/api/v1/auth/login/2fa`.
 - **Error Envelope**: Every non-2xx response returns a structured JSON error:
   ```json
@@ -30,7 +30,7 @@ Liveness probe and AGPLv3 compliance metadata endpoint.
   ```json
   {
     "name": "FeedCourier",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "license": "AGPL-3.0",
     "repo_url": "https://github.com/ElleryHe/FeedCourier",
     "status": "ok"
@@ -129,7 +129,7 @@ Executes an online `VACUUM INTO` snapshot and streams the resulting SQLite datab
 | `GET /api/v1/feeds/opml/export` | Export all subscribed feeds and their tags as an OPML 2.0 XML document. |
 
 ### `POST /api/v1/feeds/preview/push`
-Delivers a single feed entry to a trusted destination for testing. It is **stateless**: no fingerprints are written, nothing enters the outbox, and route filters, time windows, and quotas are not applied. Notion pages use a `test-` prefixed `FC-ID`.
+Delivers a single feed entry to a trusted destination for testing. It is **stateless**: no fingerprints are written, nothing enters the outbox, and route filters, time windows, and quotas are not applied. Notion pages use a `test-` prefixed `FC-ID`. For SMTP destinations, debug push strictly delivers **only to `verified` recipients** via isolated single-`To:` envelopes with RFC 8058 compliance headers (returning an error when `0` verified recipients exist).
 - **Body**:
   ```json
   {
@@ -143,7 +143,10 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
       "telegram_mode": "rich_message",
       "link_preview": true,
       "locale": "en",
-      "timezone": "Asia/Shanghai"
+      "timezone": "Asia/Shanghai",
+      "plugins": {
+        "link-rewrite": { "provider_id": 1 }
+      }
     }
   }
   ```
@@ -156,18 +159,44 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 
 | Method & Path | Description |
 | :--- | :--- |
-| `GET /api/v1/channels` | List all channel accounts (`ChannelDto[]`) with secrets redacted (`has_password`, `bot_token_hint`, `secret_hint`) and nested `destinations: ChannelDestinationDto[]` (see [Security & Isolation](/reference/security)). |
-| `POST /api/v1/channels` | Returns **`201 Created`**. Create and encrypt a new `smtp`, `telegram`, or `notion` **Channel Account** (`CreateChannelRequest`, with optional `name` auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me`, and optional `initial_destination`). Automatically probes Telegram Bot API capabilities on creation (Telegram `api_base_url` enforces SSRF validation and returns `403 ssrf_blocked` on disallowed targets). |
-| `PATCH /api/v1/channels/{id}` | Secret-preserving partial update for account credentials, proxy, pacing, quotas, or enabled flag (`UpdateChannelRequest`). Omitting `password` / `bot_token` / `integration_secret` preserves the existing encrypted credential intact; passing `"password": null` on an SMTP account explicitly clears an optional SMTP password. |
-| `DELETE /api/v1/channels/{id}` | Delete a channel account and cascade-delete its destinations, routes, and tasks. |
-| `POST /api/v1/channels/{id}/test` | When `destination_id` is omitted, verifies account-level credentials (`EHLO`/`AUTH` for SMTP, `getMe` + `sendRichMessage` probe for Telegram, `GET /v1/users/me` for Notion) without sending a delivery. Passing `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` sends a live test delivery to that destination. |
-| `GET /api/v1/channels/{id}/destinations` | List all destinations belonging to channel account `{id}` (`ChannelDestinationDto[]`). |
-| `POST /api/v1/channels/{id}/destinations` | Returns **`201 Created`**. Create and encrypt a new destination under channel account `{id}` (`CreateDestinationRequest`; optional `name` is auto-derived from Telegram `getChat`, SMTP first non-empty recipient, or Notion database title). |
-| `PATCH /api/v1/destinations/{id}` | Partially update a destination's label, target config (`DestinationPatch`), or `enabled` state. |
-| `DELETE /api/v1/destinations/{id}` | Delete a destination and cascade-delete its routes and tasks. |
-| `POST /api/v1/destinations/{id}/test` | Send an interactive test email, Telegram message, or Notion verification page to destination `{id}` (`TestChannelResponse`). Optional body `{ "locale"?: "en" \| "zh-CN" }` selects the test message language. |
-| `POST /api/v1/channels/notion/init-db` | Provision a new 7-column Notion database under a parent page (`Notion-Version: 2026-03-11`, `initial_data_source.properties`). |
+| `GET /api/v1/channels` | List all channel accounts (`ChannelDto[]`) with secrets redacted (`has_password`, `bot_token_hint`, `secret_hint`) and nested `destinations: ChannelDestinationDto[]` (each destination includes `enabled` and `auto_paused: bool`; SMTP destinations also include `smtp_summary` recipient counts; see [Security & Isolation](/reference/security)). |
+| `POST /api/v1/channels` | Returns **`201 Created`**. Create and encrypt a new `smtp`, `telegram`, or `notion` **Channel Account** (`CreateChannelRequest`, including optional SMTP `sender_identity`, optional `name` auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me`, and optional `initial_destination`). Automatically probes Telegram Bot API capabilities on creation (Telegram `api_base_url` enforces SSRF validation and returns `403 ssrf_blocked` on disallowed targets). SMTP accounts use direct TCP/TLS connections (outbound HTTP/SOCKS proxies do not apply). |
+| `PATCH /api/v1/channels/{id}` | Secret-preserving partial update for account credentials, `sender_identity`, proxy (HTTP-based channels), pacing, quotas, or enabled flag (`UpdateChannelRequest`). Omitting `password` / `bot_token` / `integration_secret` preserves the existing encrypted credential intact; passing `"password": null` on an SMTP account explicitly clears an optional SMTP password. |
+| `DELETE /api/v1/channels/{id}` | Atomically delete a channel account. If any routes still reference destinations under this account and `?cascade=true` is not set, returns **`409 Conflict`** with `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }` (matching `DELETE /api/v1/destinations/{id}`). Passing **`?cascade=true`** deletes the account together with its destinations, referencing routes, and tasks in a single transaction. |
+| `POST /api/v1/channels/{id}/test` | When `destination_id` is omitted, verifies account-level credentials (for SMTP, verifies connectivity/auth and sends a self-test email **only to `from_address`**; for Telegram, runs `getMe` + `sendRichMessage` probe; for Notion, calls `GET /v1/users/me`). Passing `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` runs a destination test (same compliance rules as `POST /api/v1/destinations/{id}/test`). |
+| `GET /api/v1/channels/{id}/destinations` | List all destinations belonging to channel account `{id}` (`ChannelDestinationDto[]`, including `auto_paused: bool`, and `smtp_summary` on SMTP destinations). |
+| `POST /api/v1/channels/{id}/destinations` | Returns **`201 Created`**. Create and encrypt a new destination under channel account `{id}` (`CreateDestinationRequest`; optional `name` is auto-derived from Telegram `getChat`, masked SMTP first non-empty recipient such as `a***e@example.com`, or Notion database title). |
+| `PATCH /api/v1/destinations/{id}` | Partially update a destination's label, target config (`DestinationPatch`), or `enabled` state (manually toggling `enabled` clears `auto_paused = false`). Modifying SMTP `to_addresses` syncs `smtp_recipients` (new addresses start `unverified`, removed addresses are deleted, retained addresses preserve status). |
+| `DELETE /api/v1/destinations/{id}` | Atomically delete a destination. If any routes still reference this destination and `?cascade=true` is not set, returns **`409 Conflict`** with `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`. Passing **`?cascade=true`** deletes the destination together with its referencing routes and tasks. |
+| `POST /api/v1/destinations/{id}/test` | Send an interactive test email, Telegram message, or Notion verification page to destination `{id}` (`TestChannelResponse`). Optional body `{ "locale"?: "en" \| "zh-CN" }` selects the test message language. For SMTP destinations, strictly delivers **only to `verified` recipients** via isolated single-`To:` envelopes with RFC 8058 compliance headers, returning an error when `0` verified recipients exist. |
+| `POST /api/v1/channels/notion/init-db` | Provision a new 8-column Notion database under a parent page (`Notion-Version: 2026-03-11`, `initial_data_source.properties`, including optional `Short URL`). |
 | `POST /api/v1/channels/notion/inspect-schema` | Inspect an existing Notion `data_source_id` (or database URL) and optionally auto-patch missing standard columns (`patch_missing: true`). |
+
+### SMTP Per-Recipient Compliance (`/api/v1/destinations/{id}/recipients*`)
+
+| Method & Path | Description |
+| :--- | :--- |
+| `GET /api/v1/destinations/{id}/recipients` | Decrypt the SMTP destination config and return `SmtpRecipientDto[]` with `id`, `email`, `status` (`unverified` / `pending` / `verified` / `unsubscribed` / `bounced`), `code_expires_at`, `code_attempts`, `last_code_sent_at`, consent/revocation audit fields (`consent_method`, `consented_at`, `revoked_method`, `revoked_at`), and redacted `bounce_diagnostic`. |
+| `POST /api/v1/destinations/{id}/recipients/{rid}/send-verification` | Atomically reserves the rate-limit slot in `write_pool` and immediately sends a verification email containing a 6-digit code (30-minute TTL, max 5 wrong attempts) plus an optional `/v/{token}` confirmation link when `PUBLIC_URL` is configured (bypasses outbox queue & quotas; rolls back reservation if SMTP send fails). Enforces a 60s resend cooldown and 5/hour cap, returning **`429 Too Many Requests`** with a **`Retry-After`** header (seconds remaining). Returns `SendVerificationResponse`. |
+| `POST /api/v1/destinations/{id}/recipients/{rid}/verify` | Body `{ "code": "123456" }`. Verifies the 6-digit code in constant time, transitions the recipient to `verified` (`consent_method: "code"`), automatically resumes the destination (`enabled = true, auto_paused = false`) if it was `auto_paused`, and immediately wakes any deferred outbox tasks for this destination. Reaching 5 wrong attempts atomically clears the active code (invalidating prior `/v/{token}` links with `410 Gone`). |
+| `POST /api/v1/destinations/{id}/recipients/{rid}/reactivate` | Resets an `unsubscribed` or `bounced` recipient back to `unverified` so it can be re-verified before receiving deliveries again. |
+| `POST /api/v1/destinations/{id}/recipients/{rid}/unsubscribe` | Administrator-initiated unsubscribe (`status: "unsubscribed"`, `revoked_method: "admin"`). |
+
+---
+
+## 5b. Plugins & Marketplace (`/api/v1/plugins*`)
+
+| Method & Path | Description |
+| :--- | :--- |
+| `GET /api/v1/plugins` | List installed plugins (`PluginDto[]`), including `manifest` (with `instance_schema` and `route_option_schema`), `enabled`, `installed_version`, `settings`, `instance_count`, and redacted `instances: PluginInstanceDto[]`. |
+| `PATCH /api/v1/plugins/{id}` | Body `{ "enabled"?: bool, "settings"?: object }`. Globally enable/disable a plugin or update plugin-level settings (disabling preserves route configs). |
+| `GET /api/v1/plugins/{id}/instances` | List configured provider instances (`PluginInstanceDto[]`) for plugin `{id}` with secret fields redacted (`has_signature`, `signature_hint`, `has_password`) and `cache_entries` count. |
+| `POST /api/v1/plugins/{id}/instances` | Returns **`201 Created`**. Validate, encrypt (`ChaCha20-Poly1305`), and store a new provider instance (`CreatePluginInstanceRequest`: `{ "name", "config", "enabled"?: true }`). |
+| `PATCH /api/v1/plugins/{id}/instances/{iid}` | Secret-preserving partial update of a provider instance (`UpdatePluginInstanceRequest`; omitting or sending `""` for `signature`/`password` preserves the stored secret). |
+| `DELETE /api/v1/plugins/{id}/instances/{iid}` | Delete a provider instance. If referenced by any route (`routes.options_json`), returns **`409 Conflict`** with `referencing_routes: [{ "id", "name" }]`. |
+| `POST /api/v1/plugins/{id}/instances/{iid}/test` | Execute a live connectivity test (for `link-rewrite`, shortens `https://feedcourier.ellery.me/` via `ProtectedHttpClient`). Returns `{ "ok": true, "message": "..." }`. |
+| `DELETE /api/v1/plugins/{id}/instances/{iid}/cache` | Clear all `plugin_link_cache` rows for provider `{iid}`. Returns `{ "cleared_entries": N }`. |
+| `GET /api/v1/plugins/market` | Fetch the plugin marketplace index via `ProtectedHttpClient` (6h in-memory cache; 60s negative-cache TTL on compiled snapshot fallback; preserves valid remote cache on transient refresh errors; pass `?refresh=true` to bypass cache). Returns `{ "source": "remote" \| "snapshot", "index_url", "generated_at", "plugins": MarketPluginItemDto[] }` annotated with `kind`, `installed`, and `enabled`, with `homepage`/`repository` restricted strictly to `http://` or `https://` URLs. |
 
 ---
 
@@ -196,7 +225,10 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
   "locale": "en",
   "timezone": "America/New_York",
   "active_windows": [{ "start": "22:00", "end": "06:00" }],
-  "active_weekdays": [1, 2, 3, 4, 5]
+  "active_weekdays": [1, 2, 3, 4, 5],
+  "plugins": {
+    "link-rewrite": { "provider_id": 1 }
+  }
 }
 ```
 
@@ -208,6 +240,7 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 | `timezone` | Optional per-route IANA timezone override (e.g., `"Asia/Shanghai"`, `"America/New_York"`; omit or pass `""` to inherit `settings.timezone`). Governs `active_windows` / `active_weekdays`, SMTP email article timestamps, and Telegram rich-message `<footer>` timestamps (`YYYY-MM-DD HH:MM (UTC±HH:MM)`). |
 | `active_windows` | Daily delivery windows (`HH:MM`) in the **route timezone** (inheriting system timezone), evaluated with DST-safe boundaries. `end` earlier than `start` wraps midnight; only `00:00`–`00:00` (or an empty list `[]`) means all day—any other `start == end` window returns **`400 Bad Request`**. |
 | `active_weekdays` | `1` (Monday) – `7` (Sunday); empty means every day. For a window wrapping midnight, the weekday of the day the window starts is used. |
+| `plugins` | Optional map of per-plugin route configuration keyed by plugin ID (e.g., `{"link-rewrite": {"provider_id": 1}}`). Validated on route create/update against installed plugins and provider instances. |
 
 Tasks outside the window or weekdays are **still queued**: their status stays `queued` / `deferred` and `next_attempt_at` is set to the next window start.
 
@@ -217,8 +250,21 @@ Tasks outside the window or weekdays are **still queued**: their status stays `q
 
 | Method & Path | Description |
 | :--- | :--- |
-| `GET /api/v1/settings` | Get runtime settings: `{ "outbound_proxy_url", "ssrf_allowlist", "timezone": "America/Los_Angeles", "locale" }`. `timezone` is an IANA name (default from `TIMEZONE` / `TZ`). `locale` is a **legacy fallback** delivery language for routes without their own `options.locale`; the WebUI no longer writes it or uses it as the interface language. |
-| `PUT /api/v1/settings` | Hot-update any subset of `timezone`, `outbound_proxy_url`, and `ssrf_allowlist`. Network fields are applied (and active runtime clients reloaded) only when at least one of them is present. An invalid IANA timezone returns `400`. |
+| `GET /api/v1/settings` | Get runtime settings: `{ "outbound_proxy_url", "ssrf_allowlist", "timezone": "America/Los_Angeles", "locale", "public_url", "public_url_env_managed" }`. `timezone` is an IANA name (default from `TIMEZONE` / `TZ`). `public_url_env_managed: true` indicates `PUBLIC_URL` is locked by the environment variable. `locale` is a **legacy fallback** delivery language for routes without their own `options.locale`. |
+| `PUT /api/v1/settings` | Hot-update any subset of `timezone`, `outbound_proxy_url`, `ssrf_allowlist`, and `public_url` (passing `null` or `""` clears `public_url` unless `PUBLIC_URL` is set in the environment, which returns `400`). Network fields are applied (and active runtime clients reloaded) only when at least one of them is present. An invalid IANA timezone or malformed `public_url` returns `400`. |
 | `GET /api/v1/mcp-tokens` | List issued MCP Bearer token metadata (`id`, `name`, `token_prefix`, `scope`, `last_used_at`, `created_at`). |
 | `POST /api/v1/mcp-tokens` | Returns **`201 Created`**. Issue a new `readonly` or `admin` MCP Bearer token (`CreateMcpTokenResponse`, returning the one-time `plaintext_token` and `client_config_json`). |
 | `DELETE /api/v1/mcp-tokens/{id}` | Revoke an MCP Bearer token immediately. |
+
+---
+
+## 8. Public SMTP Compliance Endpoints (`/u/{token}`, `/v/{token}`)
+
+Mounted directly at root scope (before the SPA fallback, including explicit public `404` handlers for bare `/u`, `/u/`, `/v`, `/v/` so they never fall through to the WebUI SPA), unauthenticated, capped to a **`4 KiB` (`4,096`-byte) request body limit**, rate-limited to **`30` requests / `60s` per IP** (bounded at **`8,192` buckets**, using `ConnectInfo<SocketAddr>` by default when `TRUST_PROXY=false`, or `X-Real-IP` / rightmost `X-Forwarded-For` when `TRUST_PROXY=true`), and served with `X-Robots-Tag: noindex, nofollow`, strict CSP, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store`:
+
+| Method & Path | Behavior |
+| :--- | :--- |
+| `GET /u/{token}` | **Strictly read-only** localized unsubscribe confirmation page displaying the destination name and a masked email (`a***e@example.com`) with a relative `action=""` `POST` form button (subpath `PUBLIC_URL` safe). Returns `404` on invalid/tampered tokens. |
+| `POST /u/{token}` | Idempotently marks the recipient `unsubscribed` (`revoked_method: "one_click"` when body contains `List-Unsubscribe=One-Click`, otherwise `"link"`). If all recipients on the destination are now `unsubscribed` or `bounced`, marks the destination `enabled = false, auto_paused = true`. Supports RFC 8058 one-click POST without authentication. |
+| `GET /v/{token}` | **Strictly read-only** localized double-opt-in confirmation page displaying a masked email and a relative `action=""` `POST` confirm button (prevents email link scanners from auto-verifying on prefetch). Returns `404` on tampered tokens and `410 Gone` if expired, locked after 5 wrong code attempts, or superseded by a newer code. |
+| `POST /v/{token}` | Marks the recipient `verified` (`consent_method: "link"`), automatically resumes the destination (`enabled = true, auto_paused = false`) if it was `auto_paused`, and immediately wakes any deferred outbox tasks for that destination. Returns `410 Gone` if expired, locked, or superseded. |

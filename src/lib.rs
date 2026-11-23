@@ -9,6 +9,7 @@ pub mod error;
 pub mod ingest;
 pub mod mcp;
 pub mod net;
+pub mod plugins;
 pub mod schedule;
 pub mod scheduler;
 pub mod totp;

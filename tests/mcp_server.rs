@@ -593,7 +593,7 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
         "readonly token last_used_at must be touched on authenticated request"
     );
 
-    // Verify `tools/list` exposes all 9 tools with valid JSON object schemas.
+    // Verify `tools/list` exposes all 10 tools with valid JSON object schemas.
     let tools = ro_client.list_tools().await;
     let mut tool_names: Vec<String> = tools
         .iter()
@@ -612,6 +612,7 @@ async fn mcp_readonly_token_inspects_safely_escapes_injections_and_blocks_mutati
             "configure_route",
             "inspect_failed_deliveries",
             "list_feeds_status",
+            "list_plugins",
             "manage_feed",
             "manage_outbox_queue",
             "preview_feed_latest",
@@ -1430,7 +1431,7 @@ async fn mcp_schema_lists_clear_cache_destinations_and_rejects_zero_dest_channel
 
     // 1. P3-04: Verify `tools/list` schema descriptions include `clear_cache` and `destinations`.
     let tools = admin.list_tools().await;
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 10);
     let manage_feed_tool = tools
         .iter()
         .find(|t| t["name"] == "manage_feed")

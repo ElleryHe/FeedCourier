@@ -1,11 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   Bot,
   Check,
   Copy,
   Clock,
   Globe,
   KeyRound,
+  Link2,
   Plus,
   Save,
   ShieldCheck,
@@ -42,6 +44,7 @@ import {
   errorMessage,
   formatDateTime,
   formatRelativeTime,
+  isValidHttpUrl,
   isValidProxyUrl,
 } from "@/lib/utils";
 import {
@@ -68,6 +71,8 @@ export function SettingsView() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [timezone, setTimezone] = useState("");
   const [timezoneError, setTimezoneError] = useState<string | null>(null);
+  const [publicUrl, setPublicUrl] = useState("");
+  const [publicUrlError, setPublicUrlError] = useState<string | null>(null);
   const timeZones = useMemo(() => listTimeZones(), []);
   const detectedZone = useMemo(() => browserTimeZone(), []);
 
@@ -76,8 +81,40 @@ export function SettingsView() {
       setTimezone(settingsQuery.data.timezone ?? "");
       setProxyUrl(settingsQuery.data.outbound_proxy_url ?? "");
       setSsrfAllowlist(settingsQuery.data.ssrf_allowlist);
+      setPublicUrl(settingsQuery.data.public_url ?? "");
     }
   }, [settingsQuery.data]);
+
+  const publicUrlEnvManaged =
+    settingsQuery.data?.public_url_env_managed === true;
+  const isNonHttpsPublicUrl = publicUrl
+    .trim()
+    .toLowerCase()
+    .startsWith("http://");
+
+  const savePublicUrlMutation = useMutation({
+    mutationFn: (nextUrl: string | null) =>
+      api.settings.update({ public_url: nextUrl }),
+    onSuccess: (updated) => {
+      toast.success(m.settings.toastPublicUrlSaved);
+      queryClient.setQueryData(["settings"], updated);
+    },
+    onError: (err) => {
+      setPublicUrlError(errorMessage(err));
+    },
+  });
+
+  const handleSavePublicUrl = (e: FormEvent) => {
+    e.preventDefault();
+    setPublicUrlError(null);
+    if (publicUrlEnvManaged) return;
+    const trimmed = publicUrl.trim();
+    if (trimmed && !isValidHttpUrl(trimmed)) {
+      setPublicUrlError(m.settings.errInvalidPublicUrl);
+      return;
+    }
+    savePublicUrlMutation.mutate(trimmed ? trimmed : null);
+  };
 
   const saveSettingsMutation = useMutation({
     mutationFn: () =>
@@ -303,7 +340,75 @@ export function SettingsView() {
         </CardContent>
       </Card>
 
-      {/* Section 0b: Account & Security */}
+      {/* Section 0b: Public Base URL (PUBLIC_URL) */}
+      <Card>
+        <CardHeader>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Link2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+              <CardTitle>{m.settings.publicUrlTitle}</CardTitle>
+            </div>
+            {publicUrlEnvManaged && (
+              <Badge variant="info">{m.settings.publicUrlEnvManagedBadge}</Badge>
+            )}
+          </div>
+          <CardDescription>{m.settings.publicUrlDesc}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSavePublicUrl} className="space-y-3">
+            <div>
+              <Label htmlFor="system-public-url">
+                {m.settings.publicUrlLabel}
+              </Label>
+              <Input
+                id="system-public-url"
+                value={publicUrl}
+                disabled={publicUrlEnvManaged}
+                onChange={(e) => {
+                  setPublicUrl(e.target.value);
+                  setPublicUrlError(null);
+                }}
+                placeholder={m.settings.publicUrlPlaceholder}
+                autoComplete="off"
+                spellCheck={false}
+                className="mt-1.5 font-mono text-xs"
+              />
+              <FieldHint>
+                {publicUrlEnvManaged
+                  ? m.settings.publicUrlEnvManagedHint
+                  : m.settings.publicUrlHint}
+              </FieldHint>
+            </div>
+
+            {isNonHttpsPublicUrl && (
+              <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                <span>{m.settings.publicUrlHttpWarning}</span>
+              </div>
+            )}
+
+            <FieldError message={publicUrlError} />
+
+            <div className="flex justify-end">
+              <Button
+                type="submit"
+                size="sm"
+                loading={savePublicUrlMutation.isPending}
+                disabled={
+                  !settingsQuery.data ||
+                  publicUrlEnvManaged ||
+                  publicUrl.trim() === (settingsQuery.data.public_url ?? "")
+                }
+              >
+                <Save className="h-3.5 w-3.5" />
+                {m.settings.savePublicUrl}
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      {/* Section 0c: Account & Security */}
       <AccountSecurityCard />
 
       {/* Section 1: Outbound Proxy & SSRF Guardrails */}

@@ -22,10 +22,11 @@
 ## Key Features
 
 - **Article Deduplication & Automatic Cleanup** — Stores SHA-256 article fingerprints in SQLite to prevent duplicate deliveries while automatically cleaning up sanitized HTML bodies and media metadata after the retention window (24 hours by default). Anti-hotlink media is relayed in memory.
-- **Multi-Channel Accounts & Destinations (SMTP / Telegram / Notion)** — Organizes delivery into **Channel Accounts** (credentials, proxy, pacing, quotas) with multiple **Destinations** per account: **SMTP Email** (responsive inline-CSS template with Outlook-safe image scaling and `Force-From` alignment), **Telegram** (Rich Message via `telegram-rich 0.0.2` with native footers and image collages, Compact Card, and Media Mode, with Local Bot API support), and **Notion** (automatic data source initialization, Markdown v2 conversion, and asynchronous long-page creation).
-- **Rate Pacing, Per-Route Timezones & Crash Recovery** — Enqueues an independent task per matched article and route (`1 Task = 1 Entry × 1 Route`), sharing minimum intervals, per-delivery random jitter, hourly/daily quotas, and `429` cooldowns across all destinations of an account, with lease recovery across restarts. Routes support their own delivery language, IANA timezone override (governing delivery windows and localized article timestamps), and weekdays; the global queue can be paused or scheduled to resume, delivering backlogs chronologically.
-- **Connect-Time DNS SSRF Protection & Per-Resource Proxy** — Validates resolved IPs before TCP connection and re-validates every `30x` redirect hop; supports CIDR/host allowlists, response size caps, optional Readability full-text extraction, and per-feed or per-account HTTP / SOCKS5 proxy routing.
-- **Embedded Web Console & `/mcp` Endpoint** — Ships the React management console (with Feeds tag filtering, persistent sorting & pagination, cascading Routes filters, and semantic Outbox status colors) and a Streamable HTTP `/mcp` server in a single binary, supporting `readonly` and `admin` Bearer tokens, encrypted credentials & destinations, username/password + optional TOTP 2FA, and 9 MCP tools with redacted destination discovery.
+- **Built-In Plugin Framework & YOURLS Link Rewrite** — Extensible Protocol v1 (`api_version: "1"`) delivery-time `on_render` hook chain with a built-in **Link Rewrite (YOURLS)** plugin (encrypted multi-provider instances, `signature`/`timed_signature`/`password` auth, 90-day SQLite short-link cache, domain exclusions, strict retry mode, media preservation) and live marketplace catalog powered by [`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins).
+- **Multi-Channel Accounts, Destinations & SMTP Compliance (SMTP / Telegram / Notion)** — Organizes delivery into **Channel Accounts** (credentials, proxy, pacing, quotas) with multiple **Destinations** per account: **SMTP Email** (per-recipient sending, manual-trigger double opt-in verification, RFC 8058 one-click unsubscribe `/u/{token}`, CAN-SPAM `sender_identity` footer, synchronous 5xx hard-bounce handling, responsive Outlook-safe templates, `Force-From`), **Telegram** (Rich Message via `telegram-rich 0.0.2` with native footers and image collages, Compact Card, and Media Mode, with Local Bot API support), and **Notion** (8-column database auto-init with optional `Short URL`, automatic `404` `data_source_id` writeback, Markdown v2 conversion, and asynchronous long-page creation).
+- **Rate Pacing, Per-Route Timezones & Crash Recovery** — Enqueues an independent task per matched article and route (`1 Task = 1 Entry × 1 Route`), sharing minimum intervals, per-delivery random jitter, hourly/daily quotas, and `429` cooldowns across all destinations of an account, with lease recovery across restarts. Routes support their own delivery language, IANA timezone override (governing delivery windows and localized article timestamps), weekdays, and plugin bindings; the global queue can be paused or scheduled to resume, delivering backlogs chronologically.
+- **Connect-Time DNS SSRF Protection & Per-Resource Proxy** — Validates resolved IPs before TCP connection and re-validates every `30x` redirect hop across feeds, Telegram Bot API, plugins, and marketplace fetches; supports `SSRF_ALLOWLIST`, response size caps, optional Readability full-text extraction, and per-feed/account/provider HTTP / SOCKS5 proxy routing.
+- **Embedded Web Console & `/mcp` Endpoint** — Ships the React management console (with Plugins & Marketplace, SMTP recipient verification management, Feeds tag filtering/sorting/pagination, cascading Routes filters, and semantic Outbox status colors) and a Streamable HTTP `/mcp` server in a single binary, supporting `readonly` and `admin` Bearer tokens, encrypted credentials & destinations, username/password + optional TOTP 2FA, and **10 MCP tools** (including secret-free `list_plugins` and redacted destination discovery).
 
 ```mermaid
 flowchart LR
@@ -52,7 +53,7 @@ docker run -d \
   -v "$(pwd)/data:/data" \
   -e TZ=America/Los_Angeles \
   elleryhe/feedcourier:latest
-  # Or pin an exact release: elleryhe/feedcourier:0.2.0
+  # Or pin an exact release: elleryhe/feedcourier:0.3.0
 ```
 
 ### Docker Compose
@@ -60,7 +61,7 @@ docker run -d \
 ```yaml
 services:
   feedcourier:
-    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.2.0
+    image: elleryhe/feedcourier:latest # or elleryhe/feedcourier:0.3.0
     container_name: feedcourier
     restart: unless-stopped
     ports:
@@ -86,6 +87,7 @@ Full bilingual documentation is hosted at **[feedcourier.ellery.me](https://feed
 | :--- | :--- | :--- |
 | **User Guide** | **Getting Started** | [Project Overview](https://feedcourier.ellery.me/guide/introduction) · [Quick Start](https://feedcourier.ellery.me/guide/quick-start) · [Configuration & Proxy](https://feedcourier.ellery.me/guide/configuration) · [Backup & Maintenance](https://feedcourier.ellery.me/guide/operations) |
 | **User Guide** | **Delivery Channels** | [Send Rate, Quotas, Windows & Filters](https://feedcourier.ellery.me/channels/pacing-and-quotas) · [SMTP Email](https://feedcourier.ellery.me/channels/smtp) · [Telegram](https://feedcourier.ellery.me/channels/telegram) · [Notion](https://feedcourier.ellery.me/channels/notion) |
+| **User Guide** | **Plugins** | [Overview & Marketplace](https://feedcourier.ellery.me/plugins/) · [Link Rewrite (YOURLS)](https://feedcourier.ellery.me/plugins/link-rewrite) · [Plugin Development](https://feedcourier.ellery.me/plugins/development) |
 | **User Guide** | **MCP Integration** | [Client Setup & Security](https://feedcourier.ellery.me/mcp/setup) · [Tools Overview](https://feedcourier.ellery.me/mcp/tools) |
 | **Architecture Manual** | **Architecture & Development** | [System Architecture](https://feedcourier.ellery.me/reference/architecture) · [Channel Protocols & Delivery](https://feedcourier.ellery.me/reference/channel-protocols) · [Security & Isolation](https://feedcourier.ellery.me/reference/security) · [Database Schema](https://feedcourier.ellery.me/reference/database-schema) · [REST API](https://feedcourier.ellery.me/reference/rest-api) · [Build & Release Pipeline](https://feedcourier.ellery.me/reference/releasing) |
 

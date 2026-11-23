@@ -1,5 +1,5 @@
 ---
-description: "Security design of FeedCourier: ChaCha20-Poly1305 credential encryption, Argon2id password hashing, TOTP two-factor authentication with recovery codes, MCP Destination Lock, prompt-injection isolation, and SSRF protection."
+description: "Security design of FeedCourier: ChaCha20-Poly1305 credential encryption, Argon2id + TOTP 2FA, MCP Destination Lock, prompt-injection isolation, connect-time DNS SSRF guards, HMAC-SHA256 public SMTP compliance tokens, and plugin secret redaction."
 ---
 
 # Security & Isolation
@@ -45,7 +45,7 @@ Optional second factor for the WebUI administrator (managed under **Settings →
 | Interface | Output Struct | Credential & Destination Exposure Policy |
 | :--- | :--- | :--- |
 | **WebUI REST API**<br>(`GET /api/v1/channels`, `/api/v1/channels/{id}/destinations`) | `ChannelDto`, `ChannelDestinationDto`<br>(`src/api/dto.rs`) | Returns non-secret account fields (`host`, `from_address`, `api_base_url`) and nested destination target fields (`to_addresses`, `chat_id`, `data_source_id`) while replacing secrets with masked indicators: `has_password: bool`, `bot_token_hint: "123456...abcd"`, `secret_hint: "ntn_12...ef"`. `PATCH /api/v1/channels/{id}` preserves existing encrypted secrets when secret fields are omitted. |
-| **MCP Endpoint**<br>(`list_feeds_status`) | `McpChannelSummary`, `McpDestinationSummary`<br>(`src/mcp/tools.rs`) | **Omits all secrets and destination identifiers**: returns redacted `channels` (`{ id, name, kind, enabled, cooldown_until, destinations }`) and top-level `destinations` (`{ id, channel_id, name, kind, enabled }`). MCP clients never see SMTP passwords or recipient emails, Telegram `bot_token` or `chat_id`, or Notion `integration_secret` or `data_source_id`. |
+| **MCP Endpoint**<br>(`list_feeds_status`, `list_plugins`) | `McpChannelSummary`, `McpDestinationSummary`, `McpPluginSummary`<br>(`src/mcp/tools.rs`) | **Omits all secrets, endpoints, and destination identifiers**: returns redacted `channels` (`{ id, name, kind, enabled, cooldown_until, destinations }`), top-level `destinations` (`{ id, channel_id, name, kind, enabled }`), and plugins/provider instances (`{ id, name, enabled }`). MCP clients never see SMTP passwords or recipient emails, Telegram `bot_token` or `chat_id`, Notion `integration_secret` or `data_source_id`, or plugin provider URLs/signatures/passwords. |
 
 ---
 
@@ -57,8 +57,8 @@ FeedCourier prevents this through the **Destination Lock** boundary:
 1. **No Account or Destination Mutation Tools on `/mcp`**: The MCP server exposes zero tools for creating, updating, or deleting channel accounts or destinations, and no tool that accepts credentials or target addresses. Channel and destination lifecycle operations exist exclusively in the `fc_session`-authenticated WebUI REST API (`/api/v1/channels*`, `/api/v1/destinations*`).
 2. **Integer `destination_id` Lookup in `configure_route` & `test_push_feed_entry`**: When an `admin`-scoped MCP client calls `configure_route` or `test_push_feed_entry`, the target parameter accepts only an integer `destination_id` (or a legacy `channel_id` when that account owns exactly 1 destination). Before proceeding, the handler calls `db.resolve_destination_target(destination_id, channel_id)` to verify that the target references an existing WebUI-created row in `channel_destinations` and `channels`.
 3. **Dual-Scope Bearer Token Separation (`readonly` vs. `admin`)**:
-   - `readonly` tokens are restricted to `list_feeds_status`, `inspect_failed_deliveries`, and `preview_feed_latest`;
-   - `admin` tokens additionally permit `manage_feed` (including `clear_cache`), `configure_route`, `reset_and_poll_feed`, `retry_dead_tasks`, `manage_outbox_queue`, and `test_push_feed_entry`, while remaining strictly bound to existing WebUI-created `destination_id` rows. `test_push_feed_entry` only sends an entry to an existing destination; it cannot create or alter destinations.
+   - `readonly` tokens are restricted to `list_feeds_status`, `list_plugins`, `inspect_failed_deliveries`, and `preview_feed_latest`;
+   - `admin` tokens additionally permit `manage_feed` (including `clear_cache`), `configure_route` (including binding existing WebUI-created plugin provider IDs), `reset_and_poll_feed`, `retry_dead_tasks`, `manage_outbox_queue`, and `test_push_feed_entry`, while remaining strictly bound to existing WebUI-created `destination_id` and `provider_id` rows. Plugin provider management and SMTP recipient verification remain WebUI-only.
 
 ---
 
@@ -156,3 +156,48 @@ When a feed is added via MCP `manage_feed(action = "add")` or REST API `POST /ap
 - **Connect-Time DNS & No Redirects**: Every Bot API call—both to official `https://api.telegram.org` and to custom `api_base_url` / self-hosted Local Bot API servers—resolves through `SsrfDnsResolver` with `redirect::Policy::none()` (and validates literal IP / `localhost` hops when routed via `OUTBOUND_PROXY`).
 - **Strict `api_base_url` Validation**: `ChannelConfig::validate` and channel patch handlers allow only `http://` and `https://` URLs with no embedded userinfo (`user:pass@`), query string, or fragment. Account creation, updates, and probes blocked by SSRF policy return HTTP `403` (`ssrf_blocked`).
 - **No Automatic Allowlisting**: Existing internal/private Local Bot API endpoints are **not** auto-allowlisted when upgrading to `v0.2.0`; operators must add their hostname or IP/CIDR to `SSRF_ALLOWLIST`.
+
+### 6. Fail-Closed Outbound Proxy (`use_proxy`)
+Whenever a feed, HTTP-based channel account (Telegram or Notion), feed preview, or plugin instance explicitly configures `use_proxy = true` while **no global `OUTBOUND_PROXY`** (or fallback proxy URL) is configured, `ProtectedHttpClient` and plugin HTTP callers **fail closed** with an explicit configuration error rather than silently falling back to a direct host connection and leaking the host's egress IP. SMTP accounts use native TCP/TLS direct connections and do not accept HTTP/SOCKS outbound proxies.
+
+---
+
+## 5. Public SMTP Compliance Endpoints, Email Template Escaping & Zero-PII Masking (`src/api/public.rs`, `src/channels/smtp.rs`, `src/crypto.rs`)
+
+When `PUBLIC_URL` is configured, FeedCourier exposes only two unauthenticated compliance routes (`/u/{token}` and `/v/{token}`), registered ahead of the SPA fallback so reverse proxies can expose **only `/u/` and `/v/`** publicly while keeping `/api/v1/*`, `/mcp`, and the WebUI private:
+
+### 1. Domain-Separated HKDF-SHA256 Subkeys & Zero-PII Tokens
+`MasterKey::derive_subkey` derives independent 256-bit subkeys via RFC 5869 HKDF-SHA256 (`salt = 0^32`, `ikm = master_key`, domain-separated `info`) so compromise or misuse of one context cannot forge another:
+
+| Purpose | HKDF `info` Context | Layout / Properties |
+| :--- | :--- | :--- |
+| **Recipient Address Key** (`smtp_recipients.address_hmac`) | `fc-smtp-addr-v1` | `hex(HMAC-SHA256(subkey, normalize(email)))` (ASCII lowercase + IDNA Punycode domain normalization). Allows tracking verification/unsubscribe state per recipient without storing plaintext email addresses in `smtp_recipients`. |
+| **Unsubscribe Token** (`/u/{token}`) | `fc-unsub-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| HMAC-SHA256[..16])` (32 raw bytes). Non-expiring (so old emails remain unsubscribable), contains **zero plaintext PII**, and verified in constant time (`std::hint::black_box`). |
+| **Verification Token** (`/v/{token}`) | `fc-verify-v1` | `base64url_no_pad(dest_id_be_8 \|\| recipient_id_be_8 \|\| expires_at_be_8 \|\| code_sha256[..8] \|\| HMAC-SHA256[..16])` (48 raw bytes). Time-bounded (30-minute TTL) and cryptographically bound to the active verification code hash prefix so re-sending or hitting 5 wrong code attempts (which atomically clears `code_sha256` and `code_expires_at`) invalidates older links immediately (`410 Gone`). |
+
+### 2. Strict `GET` Read-Only / `POST` Mutating Invariant
+- Corporate email security gateways (Microsoft Safe Links, Proofpoint, Mimecast) routinely pre-fetch URLs embedded in incoming emails via `GET`.
+- Both **`GET /u/{token}`** and **`GET /v/{token}`** are strictly **read-only**, rendering a minimal localized confirmation page showing only a masked email address (`a***e@example.com`) and a relative `action=""` form button (compatible with subpath `PUBLIC_URL` deployments); neither endpoint ever changes database state on `GET`.
+- State transitions happen exclusively on **`POST /u/{token}`** (supporting both browser confirmation forms and unauthenticated RFC 8058 `List-Unsubscribe=One-Click` POST idempotently) and **`POST /v/{token}`**.
+
+### 3. `ConnectInfo<SocketAddr>` / `TRUST_PROXY` Rate Limiting, Body Limit & Response Hardening
+- **Spoof-Resistant Client IP Resolution**: By default (**`TRUST_PROXY=false`**), every `/u/*` and `/v/*` request is rate-limited strictly by the direct TCP socket peer address (`ConnectInfo<SocketAddr>`), ignoring client-supplied `X-Forwarded-For` / `X-Real-IP` headers so attackers cannot bypass limits by randomizing headers. Only when **`TRUST_PROXY=true`** is explicitly set behind a trusted reverse proxy does FeedCourier read `X-Real-IP` or the **rightmost** proxy-appended IP in `X-Forwarded-For` (resisting spoofed leftmost client values).
+- **Bounded-Memory Limiter & `4 KiB` Body Limit**: The in-memory per-IP sliding-window rate limiter (**`30` requests per `60` seconds**) enforces a hard **`8,192`-bucket** capacity cap (pruning expired entries first, then evicting the oldest active bucket when full) to eliminate unbounded memory growth under IP churn. Both `/u/{token}` and `/v/{token}` attach **`DefaultBodyLimit::max(4096)` (`4 KiB`)**.
+- **Public 404 Isolation & Security Headers**: Bare `/u`, `/u/`, `/v`, and `/v/` routes return generic public `404` HTML pages instead of falling through to the WebUI SPA; tampered or unknown tokens likewise return generic `404` HTML without revealing whether a destination or recipient exists. All public responses attach:
+  - `X-Robots-Tag: noindex, nofollow`
+  - `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`
+  - `Referrer-Policy: no-referrer`
+  - `Cache-Control: no-store`
+
+### 4. Strict `minijinja` Email Auto-Escaping & Zero-PII Masking
+- **Strict `AutoEscape::Html` on Email Templates**: `template_env()` registers `"email.html"` with explicit `minijinja::AutoEscape::Html`. Only the `ammonia`-sanitized article body fragment (`body_html`) uses `| safe`; all untrusted metadata (`subject`, `entry_title`, `feed_title`, `meta_line`, `original_url`, `continue_url`, `unsubscribe_url`, `route_name`, `destination_name`, `sender_identity`) is uniformly HTML-escaped across delivered, verification, and test emails—preventing HTML/XSS injection in email clients without double-escaping.
+- **Zero-PII Masking Across Diagnostics & Default Names**: `delivery_tasks.diagnostic_log`, `smtp_recipients.bounce_diagnostic` (regex-redacting email addresses in angle brackets or server responses), and auto-derived default SMTP destination names (`derive_default_destination_name`) all pass through `mask_email_address` (`a***e@example.com`), ensuring zero plaintext recipient email addresses leak into unencrypted SQLite columns or read-only MCP tool outputs.
+
+---
+
+## 6. Plugin SSRF Protection, URL Validation & Credential Redaction (`src/plugins/`)
+
+- **Mandatory `ProtectedHttpClient` & Fail-Closed `use_proxy`**: Every outbound HTTP request made by plugins—including YOURLS `action=shorturl` calls (`64 KiB` response cap, `5s` timeout, `4` concurrency) and remote marketplace index fetches (`PLUGIN_INDEX_URL`, `1 MiB` response cap, `8s` timeout)—runs through `ProtectedHttpClient` with connect-time `SsrfDnsResolver` validation and `SSRF_ALLOWLIST` enforcement. Self-hosted LAN/Docker YOURLS instances are blocked until explicitly allowlisted, and enabling `use_proxy = true` without a configured global `OUTBOUND_PROXY` fails closed instead of leaking the host's direct egress IP.
+- **Marketplace `http(s)://` URL Validation & Cache Hygiene**: Both backend marketplace index loading and WebUI rendering strictly accept only `http://` or `https://` URLs for `homepage` and `repository` fields (stripping unsafe schemes such as `javascript:` or `data:`). `MarketIndexCache` preserves existing valid remote cache on transient refresh failures and applies a shortened **`60s`** negative-cache TTL when falling back to the compiled snapshot (vs. `6h` for valid remote responses).
+- **Encrypted Provider Vault & Redaction**: Plugin provider configurations (`plugin_instances.encrypted_config`) are encrypted at rest with the same 256-bit `MasterKey` ChaCha20-Poly1305 AEAD scheme as channels. REST API responses (`/api/v1/plugins*`) mask secrets (`has_signature`, `signature_hint`, `has_password`), `PATCH` preserves stored secrets when omitted or empty (and clears stale credentials from inactive `auth_mode`s when switching modes), and MCP `list_plugins` exposes strictly `{ id, name, enabled }` with zero credentials or API URLs.
+- **HTML5 State-Machine Attribute Rewriting**: `link-rewrite` parses `<a ...>` opening tags with an HTML5 attribute state machine (skipping `<script>` and `<style>` RawText ranges, handling apostrophes in unquoted attributes, preserving trailing `/` on unquoted `href`, and applying semicolon-aware HTML5 entity decoding) and rewrites only `http://` / `https://` `href` attributes—never modifying media `src`, `mailto:`, or compliance links.

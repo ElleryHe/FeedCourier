@@ -6,6 +6,7 @@ import {
   Menu,
   Monitor,
   Moon,
+  Puzzle,
   Radio,
   Rss,
   Settings,
@@ -22,6 +23,7 @@ export type NavSection =
   | "feeds"
   | "channels"
   | "routes"
+  | "plugins"
   | "tasks"
   | "settings";
 
@@ -230,6 +232,12 @@ export function AppShell({
       label: m.shell.nav.routes.label,
       subtitle: m.shell.nav.routes.subtitle,
       icon: GitFork,
+    },
+    {
+      id: "plugins",
+      label: m.shell.nav.plugins.label,
+      subtitle: m.shell.nav.plugins.subtitle,
+      icon: Puzzle,
     },
     {
       id: "tasks",

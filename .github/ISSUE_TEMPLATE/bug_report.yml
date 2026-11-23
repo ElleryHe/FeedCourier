@@ -13,7 +13,7 @@ body:
     attributes:
       label: Version / Tag / Image
       description: Exact git tag, binary release version, or Docker image tag/digest.
-      placeholder: "v0.1.0 / elleryhe/feedcourier:0.1.0"
+      placeholder: "v0.3.0 / elleryhe/feedcourier:0.3.0"
     validations:
       required: true
   - type: dropdown
@@ -32,9 +32,10 @@ body:
       label: Affected Component
       options:
         - Ingest / Readability
-        - SMTP Channel
+        - SMTP Channel / Compliance
         - Telegram Channel
         - Notion Channel
+        - Plugins
         - Scheduler / Outbox
         - WebUI / REST API
         - MCP Server (/mcp)

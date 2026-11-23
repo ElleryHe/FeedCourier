@@ -1,7 +1,7 @@
-//! MCP `ServerHandler`, AGPLv3 Section 13 `ServerConfig` (`ServerInfo`), and all 9 FeedCourier
+//! MCP `ServerHandler`, AGPLv3 Section 13 `ServerConfig` (`ServerInfo`), and all 10 FeedCourier
 //! inspection, orchestration, and operational tools (`feedcourier.md` Section 六).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -225,7 +225,14 @@ pub struct ConfigureRouteParams {
     pub active_windows: Option<Vec<McpTimeWindow>>,
     /// ISO weekdays (1 = Monday … 7 = Sunday) on which windows start (empty array = every day).
     pub active_weekdays: Option<Vec<u8>>,
+    /// Per-plugin route options keyed by plugin ID (e.g. `{"link-rewrite": {"provider_id": 1}}`;
+    /// pass `{}` or `{"link-rewrite": {"provider_id": null}}` to disable).
+    pub plugins: Option<BTreeMap<String, serde_json::Value>>,
 }
+
+/// Parameters for `list_plugins` (`readonly` + `admin`; empty input).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ListPluginsParams {}
 
 /// Parameters for `reset_and_poll_feed` (`admin` scope ONLY).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -288,6 +295,7 @@ pub struct McpRouteSummary {
     pub timezone: Option<String>,
     pub active_windows: Vec<DeliveryTimeWindow>,
     pub active_weekdays: Vec<u8>,
+    pub plugins: BTreeMap<String, serde_json::Value>,
     pub enabled: bool,
 }
 
@@ -311,9 +319,30 @@ impl From<&Route> for McpRouteSummary {
             timezone: opts.timezone,
             active_windows: opts.active_windows,
             active_weekdays: opts.active_weekdays,
+            plugins: opts.plugins,
             enabled: route.enabled,
         }
     }
+}
+
+/// Secret-free plugin provider instance summary exposed via `list_plugins`.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpPluginInstanceSummary {
+    pub id: i64,
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// Secret-free installed plugin summary exposed via `list_plugins`.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpPluginSummary {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub api_version: String,
+    pub enabled: bool,
+    pub hooks: Vec<crate::plugins::HookKind>,
+    pub instances: Vec<McpPluginInstanceSummary>,
 }
 
 /// Feed status view with untrusted external strings wrapped in `<untrusted_feed_content>`.
@@ -608,6 +637,72 @@ impl McpServer {
             routes,
             feeds,
         })
+    }
+
+    /// List installed plugins and their secret-free provider instances (`readonly` + `admin`).
+    #[rmcp::tool(
+        name = "list_plugins",
+        description = "List installed plugins and their configured provider instances (ID, name, enabled status only; never exposes YOURLS signatures, passwords, or API credentials).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_plugins(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(_params): Parameters<ListPluginsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(res) = ensure_authenticated(&ctx) {
+            return Ok(res);
+        }
+
+        let db = self.state.db();
+        let registry = crate::plugins::PluginRegistry::with_builtins();
+
+        let rows = match db.list_plugins().await {
+            Ok(r) => r,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+        let row_by_id: HashMap<String, _> = rows.into_iter().map(|r| (r.id.clone(), r)).collect();
+
+        let all_instances = match db.list_all_plugin_instances().await {
+            Ok(i) => i,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+        let mut inst_by_plugin: HashMap<String, Vec<McpPluginInstanceSummary>> = HashMap::new();
+        for inst in all_instances {
+            inst_by_plugin
+                .entry(inst.plugin_id)
+                .or_default()
+                .push(McpPluginInstanceSummary {
+                    id: inst.id,
+                    name: inst.name,
+                    enabled: inst.enabled,
+                });
+        }
+
+        let plugins: Vec<McpPluginSummary> = registry
+            .list()
+            .iter()
+            .map(|p| {
+                let m = p.manifest();
+                let enabled = row_by_id.get(&m.id).is_some_and(|r| r.enabled);
+                McpPluginSummary {
+                    id: m.id.clone(),
+                    name: m.name.clone(),
+                    version: m.version.clone(),
+                    api_version: m.api_version.clone(),
+                    enabled,
+                    hooks: m.hooks.clone(),
+                    instances: inst_by_plugin.remove(&m.id).unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        tool_ok(&serde_json::json!({ "plugins": plugins }))
     }
 
     /// Inspect outbox delivery tasks in `dead_letter`, `retrying`, `deferred`, `queued`, or `all` states.
@@ -1182,8 +1277,12 @@ impl McpServer {
                         })
                         .collect(),
                     active_weekdays: params.active_weekdays.clone().unwrap_or_default(),
+                    plugins: params.plugins.clone().unwrap_or_default(),
                 };
                 if let Err(err) = validate_schedule(&mut options) {
+                    return Ok(tool_error_from_app(err));
+                }
+                if let Err(err) = validate_mcp_route_plugins(db, &options.plugins).await {
                     return Ok(tool_error_from_app(err));
                 }
 
@@ -1300,6 +1399,7 @@ impl McpServer {
                     || params.timezone.is_some()
                     || params.active_windows.is_some()
                     || params.active_weekdays.is_some()
+                    || params.plugins.is_some()
                 {
                     let mut current_opts = existing.options();
                     if let Some(mode) = params.telegram_mode {
@@ -1329,7 +1429,13 @@ impl McpServer {
                     if let Some(days) = params.active_weekdays.clone() {
                         current_opts.active_weekdays = days;
                     }
+                    if let Some(plugins_map) = params.plugins.clone() {
+                        current_opts.plugins = plugins_map;
+                    }
                     if let Err(err) = validate_schedule(&mut current_opts) {
+                        return Ok(tool_error_from_app(err));
+                    }
+                    if let Err(err) = validate_mcp_route_plugins(db, &current_opts.plugins).await {
                         return Ok(tool_error_from_app(err));
                     }
                     Some(current_opts)
@@ -1784,4 +1890,32 @@ fn normalize_optional_pattern(pattern: Option<String>) -> Option<String> {
     pattern
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+async fn validate_mcp_route_plugins(
+    db: &crate::db::Database,
+    route_plugins: &BTreeMap<String, serde_json::Value>,
+) -> crate::error::AppResult<()> {
+    let registry = crate::plugins::PluginRegistry::with_builtins();
+    registry.validate_route_plugins(db, route_plugins).await?;
+    for (plugin_id, opt_val) in route_plugins {
+        if opt_val.is_null() {
+            continue;
+        }
+        if let Some(provider_id) = opt_val.get("provider_id").and_then(|v| v.as_i64()) {
+            let plugin_row = db.get_plugin(plugin_id).await?;
+            if !plugin_row.is_some_and(|r| r.enabled) {
+                return Err(AppError::Validation(format!(
+                    "plugin '{plugin_id}' is not enabled; enable it in the WebUI before assigning a provider via MCP"
+                )));
+            }
+            let inst = db.get_plugin_instance(provider_id).await?;
+            if !inst.is_some_and(|i| i.enabled) {
+                return Err(AppError::Validation(format!(
+                    "plugin provider instance {provider_id} is disabled"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

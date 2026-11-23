@@ -11,11 +11,13 @@ import type {
   ChannelDto,
   ClearFeedCacheRequest,
   ClearFeedCacheResponse,
+  ClearPluginCacheResponse,
   CreateChannelRequest,
   CreateDestinationRequest,
   CreateFeedRequest,
   CreateMcpTokenRequest,
   CreateMcpTokenResponse,
+  CreatePluginInstanceRequest,
   CreateRouteRequest,
   DeliveryTaskDto,
   FeedDto,
@@ -25,6 +27,7 @@ import type {
   FeedPreviewResponse,
   GcResponse,
   ListTasksParams,
+  MarketResponse,
   McpTokenDto,
   NotionInitDbRequest,
   NotionInitDbResponse,
@@ -33,6 +36,8 @@ import type {
   OpmlImportRequest,
   OpmlImportResponse,
   OverviewResponse,
+  PluginDto,
+  PluginInstanceDto,
   PollFeedResponse,
   QueueStateDto,
   RecoveryCodesResponse,
@@ -40,10 +45,14 @@ import type {
   RetryTasksRequest,
   RetryTasksResponse,
   RouteDto,
+  RouteReferenceDto,
+  SendVerificationResponse,
+  SmtpRecipientDto,
   SystemSettingsDto,
   TestChannelRequest,
   TestChannelResponse,
   TestDestinationRequest,
+  TestPluginInstanceResponse,
   TotpDisableRequest,
   TotpEnableRequest,
   TotpSetupRequest,
@@ -52,6 +61,8 @@ import type {
   UpdateChannelRequest,
   UpdateDestinationRequest,
   UpdateFeedRequest,
+  UpdatePluginInstanceRequest,
+  UpdatePluginRequest,
   UpdateQueueRequest,
   UpdateRouteRequest,
   UpdateSystemSettingsRequest,
@@ -63,13 +74,54 @@ const API_BASE = "/api/v1";
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly referencing_routes?: RouteReferenceDto[];
+  readonly retry_after_secs?: number;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(
+    status: number,
+    message: string,
+    code?: string,
+    referencingRoutes?: RouteReferenceDto[],
+    retryAfterSecs?: number,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.referencing_routes = referencingRoutes;
+    this.retry_after_secs = retryAfterSecs;
   }
+}
+
+function parseRetryAfterSecs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (!trimmed) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    const secs = Number(trimmed);
+    return Number.isFinite(secs) && secs > 0 ? secs : undefined;
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (Number.isFinite(parsedDate)) {
+    const delta = Math.ceil((parsedDate - Date.now()) / 1000);
+    return delta > 0 ? delta : undefined;
+  }
+  return undefined;
+}
+
+/** Extract referencing routes from a structured HTTP 409 Conflict `ApiError`, if present. */
+export function getReferencingRoutesConflict(
+  err: unknown,
+): RouteReferenceDto[] | null {
+  if (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    Array.isArray(err.referencing_routes) &&
+    err.referencing_routes.length > 0
+  ) {
+    return err.referencing_routes;
+  }
+  return null;
 }
 
 type UnauthorizedListener = () => void;
@@ -89,6 +141,7 @@ function notifyUnauthorized(): void {
 }
 
 async function parseErrorResponse(res: Response): Promise<ApiError> {
+  const retryAfterSecs = parseRetryAfterSecs(res.headers.get("retry-after"));
   const contentType = res.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     try {
@@ -97,7 +150,22 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
         data.message?.trim() ||
         data.error?.trim() ||
         getMessages().common.requestFailedHttp(res.status);
-      return new ApiError(res.status, message, data.code);
+      const referencingRoutes = Array.isArray(data.referencing_routes)
+        ? data.referencing_routes.filter(
+            (r): r is RouteReferenceDto =>
+              typeof r === "object" &&
+              r !== null &&
+              typeof r.id === "number" &&
+              typeof r.name === "string",
+          )
+        : undefined;
+      return new ApiError(
+        res.status,
+        message,
+        data.code,
+        referencingRoutes,
+        retryAfterSecs,
+      );
     } catch {
       // Fall through to text fallback
     }
@@ -108,6 +176,9 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
     text.length > 0 && text.length < 300
       ? text
       : getMessages().common.requestFailedHttp(res.status),
+    undefined,
+    undefined,
+    retryAfterSecs,
   );
 }
 
@@ -352,10 +423,13 @@ export const api = {
       request<ChannelDto>("/channels", { method: "POST", body: payload }),
     update: (id: number, payload: UpdateChannelRequest) =>
       request<ChannelDto>(`/channels/${id}`, { method: "PATCH", body: payload }),
-    remove: (id: number) =>
-      request<ActionAckResponse | undefined>(`/channels/${id}`, {
-        method: "DELETE",
-      }),
+    remove: (id: number, cascade = false) =>
+      request<ActionAckResponse | undefined>(
+        `/channels/${id}${cascade ? "?cascade=true" : ""}`,
+        {
+          method: "DELETE",
+        },
+      ),
     test: (id: number, payload?: TestChannelRequest) =>
       request<TestChannelResponse>(`/channels/${id}/test`, {
         method: "POST",
@@ -388,15 +462,114 @@ export const api = {
         method: "PATCH",
         body: payload,
       }),
-    remove: (id: number) =>
-      request<ActionAckResponse | undefined>(`/destinations/${id}`, {
-        method: "DELETE",
-      }),
+    remove: (id: number, cascade = false) =>
+      request<ActionAckResponse | undefined>(
+        `/destinations/${id}${cascade ? "?cascade=true" : ""}`,
+        {
+          method: "DELETE",
+        },
+      ),
     test: (id: number, payload?: TestDestinationRequest) =>
       request<TestChannelResponse>(`/destinations/${id}/test`, {
         method: "POST",
         body: payload,
       }),
+    listRecipients: (destId: number) =>
+      request<SmtpRecipientDto[]>(`/destinations/${destId}/recipients`, {
+        method: "GET",
+      }),
+    sendRecipientVerification: (destId: number, rid: number) =>
+      request<SendVerificationResponse>(
+        `/destinations/${destId}/recipients/${rid}/send-verification`,
+        {
+          method: "POST",
+        },
+      ),
+    verifyRecipientCode: (destId: number, rid: number, code: string) =>
+      request<SmtpRecipientDto>(
+        `/destinations/${destId}/recipients/${rid}/verify`,
+        {
+          method: "POST",
+          body: { code },
+        },
+      ),
+    reactivateRecipient: (destId: number, rid: number) =>
+      request<SmtpRecipientDto>(
+        `/destinations/${destId}/recipients/${rid}/reactivate`,
+        {
+          method: "POST",
+        },
+      ),
+    unsubscribeRecipientAdmin: (destId: number, rid: number) =>
+      request<SmtpRecipientDto>(
+        `/destinations/${destId}/recipients/${rid}/unsubscribe`,
+        {
+          method: "POST",
+        },
+      ),
+  },
+
+  // -------------------------------------------------------------------------
+  // Plugins & Marketplace
+  // -------------------------------------------------------------------------
+  plugins: {
+    list: () => request<PluginDto[]>("/plugins", { method: "GET" }),
+    update: (id: string, payload: UpdatePluginRequest) =>
+      request<PluginDto>(`/plugins/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: payload,
+      }),
+    listInstances: (id: string) =>
+      request<PluginInstanceDto[]>(
+        `/plugins/${encodeURIComponent(id)}/instances`,
+        { method: "GET" },
+      ),
+    createInstance: (id: string, payload: CreatePluginInstanceRequest) =>
+      request<PluginInstanceDto>(
+        `/plugins/${encodeURIComponent(id)}/instances`,
+        {
+          method: "POST",
+          body: payload,
+        },
+      ),
+    updateInstance: (
+      id: string,
+      iid: number,
+      payload: UpdatePluginInstanceRequest,
+    ) =>
+      request<PluginInstanceDto>(
+        `/plugins/${encodeURIComponent(id)}/instances/${iid}`,
+        {
+          method: "PATCH",
+          body: payload,
+        },
+      ),
+    deleteInstance: (id: string, iid: number) =>
+      request<ActionAckResponse | undefined>(
+        `/plugins/${encodeURIComponent(id)}/instances/${iid}`,
+        {
+          method: "DELETE",
+        },
+      ),
+    testInstance: (id: string, iid: number) =>
+      request<TestPluginInstanceResponse>(
+        `/plugins/${encodeURIComponent(id)}/instances/${iid}/test`,
+        {
+          method: "POST",
+        },
+      ),
+    clearInstanceCache: (id: string, iid: number) =>
+      request<ClearPluginCacheResponse>(
+        `/plugins/${encodeURIComponent(id)}/instances/${iid}/cache`,
+        {
+          method: "DELETE",
+        },
+      ),
+    market: (refresh = false) =>
+      request<MarketResponse>(
+        `/plugins/market${refresh ? "?refresh=true" : ""}`,
+        { method: "GET" },
+      ),
   },
 
   // -------------------------------------------------------------------------
@@ -459,3 +632,24 @@ export const api = {
       }),
   },
 };
+
+// Convenience named exports for v0.3.0 endpoints
+export const deleteChannel = api.channels.remove;
+export const deleteDestination = api.destinations.remove;
+export const listDestinationRecipients = api.destinations.listRecipients;
+export const sendRecipientVerification =
+  api.destinations.sendRecipientVerification;
+export const verifyRecipientCode = api.destinations.verifyRecipientCode;
+export const reactivateRecipient = api.destinations.reactivateRecipient;
+export const unsubscribeRecipientAdmin =
+  api.destinations.unsubscribeRecipientAdmin;
+
+export const listPlugins = api.plugins.list;
+export const updatePlugin = api.plugins.update;
+export const listPluginInstances = api.plugins.listInstances;
+export const createPluginInstance = api.plugins.createInstance;
+export const updatePluginInstance = api.plugins.updateInstance;
+export const deletePluginInstance = api.plugins.deleteInstance;
+export const testPluginInstance = api.plugins.testInstance;
+export const clearPluginInstanceCache = api.plugins.clearInstanceCache;
+export const getPluginMarket = api.plugins.market;

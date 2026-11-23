@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-23T00:00:00Z",
+  "plugins": [
+    {
+      "id": "link-rewrite",
+      "name": "Link Rewrite (YOURLS)",
+      "version": "0.3.0",
+      "api_version": "1",
+      "kind": "builtin",
+      "min_core": "0.3.0",
+      "category": "links",
+      "icon": "link",
+      "description": "Rewrite outgoing article links using one or more self-hosted YOURLS short-link providers at delivery time, with SQLite caching, domain exclusions, and optional strict retry mode.",
+      "homepage": "https://feedcourier.ellery.me/plugins/link-rewrite",
+      "repository": "https://github.com/ElleryHe/FeedCourier",
+      "hooks": ["on_render"],
+      "permissions": ["network"]
+    }
+  ]
+}
