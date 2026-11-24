@@ -1036,6 +1036,8 @@ export const en = {
       registerBridgeBtn: "Register Bridge",
       composeSnippetToggle: "Docker Compose snippet",
       incompatibleBadge: "Incompatible",
+      incompatibleNotice: (reason: string) =>
+        `Runtime execution is paused because this plugin is incompatible with the running FeedCourier core (${reason}).`,
     },
     bridge: {
       addBtn: "Add Bridge Plugin",

@@ -987,6 +987,8 @@ export const zhCN: Messages = {
       registerBridgeBtn: "登记桥接",
       composeSnippetToggle: "Docker Compose 示例",
       incompatibleBadge: "不兼容",
+      incompatibleNotice: (reason: string) =>
+        `该插件与当前 FeedCourier 核心版本不兼容（${reason}），后台运行时执行已自动暂停。`,
     },
     bridge: {
       addBtn: "添加桥接插件",

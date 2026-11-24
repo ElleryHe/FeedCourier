@@ -60,12 +60,14 @@ const SENSITIVE_FIELD_KEYWORDS = [
   "secret",
   "signature",
   "api_key",
+  "api-key",
   "apikey",
   "authorization",
   "cookie",
   "credential",
   "bearer",
   "private_key",
+  "private-key",
 ] as const;
 
 export function isSchemaSecretProperty(

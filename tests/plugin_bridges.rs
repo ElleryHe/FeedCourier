@@ -1636,3 +1636,117 @@ async fn schema_merge_null_clears_defaulted_field_and_route_validation_checks_or
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn incompatible_persisted_channel_bridge_reports_incompatibility_not_disabled() {
+    let h = BridgeHarness::new().await;
+    let bridge = MockServer::start().await;
+    let secret = "incompat-test-secret";
+
+    let manifest = json!({
+        "id": "compat-chan",
+        "name": "Compat Channel",
+        "version": "1.0.0",
+        "api_version": "1",
+        "kind": "channel",
+        "min_core": "0.3.0",
+        "hooks": [],
+        "account_schema": { "type": "object", "properties": {} },
+        "destination_schema": { "type": "object", "properties": {} }
+    });
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(manifest.clone()))
+        .mount(&bridge)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&bridge)
+        .await;
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/bridges",
+            Some(json!({ "bridge_url": bridge.uri(), "bridge_secret": secret, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "compat-chan", "config": {} },
+                "initial_destination": { "config": { "kind": "plugin", "config": {} } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+
+    // Simulate a core downgrade / persisted manifest requiring future core >= 99.0.0 while DB enabled=1.
+    let mut future_manifest = manifest;
+    future_manifest["min_core"] = json!("99.0.0");
+    sqlx::query("UPDATE plugins SET manifest_json = ?1 WHERE id = 'compat-chan'")
+        .bind(serde_json::to_string(&future_manifest).unwrap())
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+    h.dispatcher
+        .plugins()
+        .reload_from_db(&h.db, h.dispatcher.master_key())
+        .await
+        .unwrap();
+
+    // Creating a new channel, testing account, and testing destination must all report incompatibility
+    // (including "99.0.0" / "incompatible"), NOT misleading "is disabled".
+    let (st, body) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "compat-chan", "config": {} }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("incompatible") && msg.contains("99.0.0"),
+        "expected incompatibility error on create_channel, got: {body}"
+    );
+
+    let (st, body) = h
+        .req(
+            Method::POST,
+            &format!("/api/v1/channels/{ch_id}/test"),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("incompatible") && msg.contains("99.0.0"),
+        "expected incompatibility error on test_channel, got: {body}"
+    );
+
+    let (st, body) = h
+        .req(
+            Method::POST,
+            &format!("/api/v1/destinations/{dest_id}/test"),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let msg = body["error"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("incompatible") && msg.contains("99.0.0"),
+        "expected incompatibility error on test_destination, got: {body}"
+    );
+}

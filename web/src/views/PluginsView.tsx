@@ -525,6 +525,12 @@ export function PluginsView() {
                             <Badge variant="mono">
                               v{plugin.installed_version}
                             </Badge>
+                            {!plugin.compatible && (
+                              <Badge variant="danger">
+                                {plugin.compatibility_reason ||
+                                  m.plugins.market.incompatibleBadge}
+                              </Badge>
+                            )}
                             {!plugin.enabled && (
                               <Badge variant="default">
                                 {m.common.disabled}
@@ -1546,6 +1552,16 @@ function PluginDetailView({
       </div>
 
       {/* Plugin Header Card */}
+      {!plugin.compatible && (
+        <div className="flex items-start gap-2.5 rounded-xl border border-rose-200 bg-rose-50/80 px-3.5 py-2.5 text-xs text-rose-800 dark:border-rose-900/70 dark:bg-rose-950/40 dark:text-rose-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+          <span className="leading-relaxed">
+            {m.plugins.market.incompatibleNotice(
+              plugin.compatibility_reason || m.plugins.market.incompatibleBadge,
+            )}
+          </span>
+        </div>
+      )}
       <Card className="p-4">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="flex min-w-0 items-start gap-3">
@@ -1559,6 +1575,12 @@ function PluginDetailView({
                 </h1>
                 <Badge variant="mono">v{plugin.installed_version}</Badge>
                 <Badge variant="outline">{plugin.manifest.category}</Badge>
+                {!plugin.compatible && (
+                  <Badge variant="danger">
+                    {plugin.compatibility_reason ||
+                      m.plugins.market.incompatibleBadge}
+                  </Badge>
+                )}
                 {!plugin.enabled && (
                   <Badge variant="default">{m.common.disabled}</Badge>
                 )}

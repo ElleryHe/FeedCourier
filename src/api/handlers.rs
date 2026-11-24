@@ -428,6 +428,36 @@ pub async fn list_channels(State(state): State<AppState>) -> AppResult<Json<Vec<
     Ok(Json(out))
 }
 
+/// Validate that a registered bridge plugin is a compatible, enabled `channel` plugin before
+/// creating, updating, or testing channel accounts or destinations.
+fn ensure_channel_bridge_usable(
+    bridge: &crate::plugins::BridgePluginEntry,
+    plugin_id: &str,
+    disabled_suffix: &str,
+) -> AppResult<()> {
+    if bridge.manifest.kind != PluginKind::Channel {
+        return Err(AppError::Validation(format!(
+            "Plugin '{plugin_id}' is a '{}' plugin, not a channel plugin",
+            bridge.manifest.kind.as_str()
+        )));
+    }
+    if !bridge.compatible {
+        return Err(AppError::Validation(format!(
+            "Channel plugin '{plugin_id}' is incompatible with current core: {}",
+            bridge
+                .compatibility_reason
+                .as_deref()
+                .unwrap_or("version mismatch")
+        )));
+    }
+    if !bridge.enabled {
+        return Err(AppError::Validation(format!(
+            "Channel plugin '{plugin_id}' is disabled{disabled_suffix}"
+        )));
+    }
+    Ok(())
+}
+
 /// `POST /api/v1/channels`
 pub async fn create_channel(
     State(state): State<AppState>,
@@ -557,19 +587,11 @@ pub async fn create_channel(
                         plugin_cfg.plugin_id
                     ))
                 })?;
-            if bridge.manifest.kind != PluginKind::Channel {
-                return Err(AppError::Validation(format!(
-                    "Plugin '{}' is a '{}' plugin, not a channel plugin",
-                    plugin_cfg.plugin_id,
-                    bridge.manifest.kind.as_str()
-                )));
-            }
-            if !bridge.enabled {
-                return Err(AppError::Validation(format!(
-                    "Channel plugin '{}' is disabled; enable it before creating accounts",
-                    plugin_cfg.plugin_id
-                )));
-            }
+            ensure_channel_bridge_usable(
+                &bridge,
+                &plugin_cfg.plugin_id,
+                "; enable it before creating accounts",
+            )?;
             let locally_validated = validate_config_against_schema(
                 &bridge.manifest.account_schema,
                 &plugin_cfg.config,
@@ -688,6 +710,7 @@ pub async fn update_channel(
                     p_cfg.plugin_id
                 ))
             })?;
+            ensure_channel_bridge_usable(&bridge, &p_cfg.plugin_id, "")?;
             p_cfg.config = bridge
                 .client
                 .validate_remote("account", &p_cfg.config)
@@ -867,12 +890,7 @@ pub async fn test_channel(
                         plugin_cfg.plugin_id
                     ))
                 })?;
-            if !bridge.enabled {
-                return Err(AppError::Validation(format!(
-                    "Channel plugin '{}' is disabled",
-                    plugin_cfg.plugin_id
-                )));
-            }
+            ensure_channel_bridge_usable(&bridge, &plugin_cfg.plugin_id, "")?;
             let message = bridge
                 .client
                 .test_remote(&serde_json::json!({
@@ -993,6 +1011,7 @@ pub async fn update_destination(
             let bridge = plugin_bridge.ok_or_else(|| {
                 AppError::Validation("Parent channel plugin is not installed".to_string())
             })?;
+            ensure_channel_bridge_usable(&bridge, &bridge.manifest.id, "")?;
             p_dest.config = bridge
                 .client
                 .validate_remote("destination", &p_dest.config)
@@ -1101,12 +1120,7 @@ async fn create_destination_for_channel(
                     acct_cfg.plugin_id
                 ))
             })?;
-        if !bridge.enabled {
-            return Err(AppError::Validation(format!(
-                "Channel plugin '{}' is disabled",
-                acct_cfg.plugin_id
-            )));
-        }
+        ensure_channel_bridge_usable(&bridge, &acct_cfg.plugin_id, "")?;
         let locally_validated =
             validate_config_against_schema(&bridge.manifest.destination_schema, &dest_cfg.config)?;
         dest_cfg.config = bridge

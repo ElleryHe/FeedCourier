@@ -39,7 +39,9 @@ services:
     restart: unless-stopped
 
   feedcourier-ntfy:
-    build: https://github.com/ElleryHe/FeedCourier-Plugins.git#main:channels/ntfy
+    image: ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest
+    # Or build directly from source:
+    # build: https://github.com/ElleryHe/FeedCourier-Plugins.git#main:channels/ntfy
     environment:
       BRIDGE_SECRET: "replace-with-a-long-random-secret"
       PORT: "8787"
@@ -66,6 +68,7 @@ services:
 
 ## Lifecycle Operations
 
+- **Edit Connection & Rotate Secret**: To migrate the sidecar host/port or rotate `BRIDGE_SECRET` in place without deleting existing channel accounts or routes, click **Edit Connection** (`PATCH /api/v1/plugins/{id}`). FeedCourier performs a mandatory live HMAC-signed `GET /manifest` probe (verifying `id`, `kind`, and core compatibility) before atomically saving the new endpoint/secret and syncing channel capabilities.
 - **Refresh Manifest**: After upgrading a bridge sidecar container, click **Refresh Manifest** (`POST /api/v1/plugins/{id}/refresh-manifest`) to pull updated version numbers, schemas, or capabilities without re-entering the secret.
 - **Disable / Pause**: Toggling a channel plugin off defers pending outbox tasks cleanly (`status = 'deferred'`) without losing attempts or dead-lettering them.
 - **Safe Deletion**: Deleting a bridge plugin still referenced by channels or routes returns **`409 Conflict`** listing all referencing channels and routes, requiring explicit `?cascade=true` confirmation.

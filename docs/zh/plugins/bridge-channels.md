@@ -39,7 +39,9 @@ services:
     restart: unless-stopped
 
   feedcourier-ntfy:
-    build: https://github.com/ElleryHe/FeedCourier-Plugins.git#main:channels/ntfy
+    image: ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest
+    # 或直接从源码上下文构建：
+    # build: https://github.com/ElleryHe/FeedCourier-Plugins.git#main:channels/ntfy
     environment:
       BRIDGE_SECRET: "replace-with-a-long-random-secret"
       PORT: "8787"
@@ -66,6 +68,7 @@ services:
 
 ## 生命周期管理
 
+- **编辑连接与轮换密钥**：当 sidecar 迁移主机/端口或需要轮换 `BRIDGE_SECRET` 时，点击 **编辑连接**（`PATCH /api/v1/plugins/{id}`）即可原位更新，无需删除关联通道账号或路由。保存前会强制使用新地址/密钥执行一次实时 HMAC 签名 `GET /manifest` 探活（校验 `id`、`kind` 与核心版本兼容），通过后再原子落盘并同步通道 `capabilities`。
 - **刷新 Manifest**：升级 sidecar 镜像后，点击插件卡片上的 **刷新桥接 Manifest**（`POST /api/v1/plugins/{id}/refresh-manifest`）即可同步最新版本与字段 Schema，无需重新输入密钥。
 - **停用保护**：全局停用某个通道插件时，发往该插件的待投递任务会自动顺延（`deferred`），不消耗重试次数也不会误入死信。
 - **级联删除保护**：删除仍被通道账号或路由引用的桥接插件会返回 **`409 Conflict`** 并列出引用的通道与路由清单，需显式确认级联删除（`?cascade=true`）。

@@ -2060,7 +2060,7 @@ function ChannelAccountModal({
   const queryClient = useQueryClient();
   const isEdit = channel !== null;
   const enabledChannelPlugins = useMemo(
-    () => channelPlugins.filter((p) => p.enabled),
+    () => channelPlugins.filter((p) => p.enabled && p.compatible),
     [channelPlugins],
   );
 

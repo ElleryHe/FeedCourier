@@ -1001,12 +1001,16 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             )}
                           </span>
                         )}
-                        {(task.status === "deferred" ||
-                          task.status === "retrying") &&
-                          task.next_attempt_at && (
+                        {!task.completed_at &&
+                          task.next_attempt_at &&
+                          !(
+                            (task.status === "queued" ||
+                              task.status === "deferred") &&
+                            isFuture(task.next_attempt_at)
+                          ) && (
                             <span title={formatDateTime(task.next_attempt_at)}>
                               {m.tasks.nextPrefix(
-                                formatDateTime(task.next_attempt_at),
+                                formatRelativeTime(task.next_attempt_at),
                               )}
                             </span>
                           )}

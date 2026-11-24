@@ -851,7 +851,7 @@ function RouteEditorModal({
     const filtered = plugins.filter(
       (p) =>
         p.kind !== "channel" &&
-        (p.enabled ||
+        ((p.enabled && p.compatible) ||
           pluginOptions[p.id] !== undefined ||
           initialPluginIds.has(p.id)),
     );
@@ -886,10 +886,54 @@ function RouteEditorModal({
 
   const toggleRoutePlugin = (pluginId: string, enabledOnRoute: boolean) => {
     if (enabledOnRoute) {
+      const targetPlugin = plugins.find((p) => p.id === pluginId);
       setPluginOptions((prev) => {
-        const current = { ...(prev[pluginId] ?? {}) };
+        const current: Record<string, unknown> = { ...(prev[pluginId] ?? {}) };
         if (current.enabled === false) {
           delete current.enabled;
+        }
+        const rawSchema = targetPlugin?.manifest.route_option_schema as
+          | {
+              required?: unknown;
+              properties?: Record<
+                string,
+                {
+                  type?: string;
+                  source?: string;
+                  enum?: unknown[];
+                  default?: unknown;
+                  nullable?: boolean;
+                }
+              >;
+            }
+          | undefined;
+        const requiredSet = new Set<string>(
+          Array.isArray(rawSchema?.required)
+            ? rawSchema.required.filter((k): k is string => typeof k === "string")
+            : [],
+        );
+        const props = rawSchema?.properties ?? {};
+        for (const [propKey, propSchema] of Object.entries(props)) {
+          if (current[propKey] !== undefined) continue;
+          if (propSchema.default !== undefined && propSchema.default !== null) {
+            current[propKey] = propSchema.default;
+          } else if (
+            Array.isArray(propSchema.enum) &&
+            propSchema.enum.length > 0 &&
+            (requiredSet.has(propKey) || propSchema.nullable === false)
+          ) {
+            current[propKey] = propSchema.enum[0];
+          } else if (
+            propSchema.source === "plugin_instances" &&
+            (requiredSet.has(propKey) || propSchema.nullable === false) &&
+            targetPlugin &&
+            targetPlugin.instances.length > 0
+          ) {
+            const preferred =
+              targetPlugin.instances.find((i) => i.enabled) ??
+              targetPlugin.instances[0];
+            current[propKey] = preferred.id;
+          }
         }
         return { ...prev, [pluginId]: current };
       });
@@ -1770,7 +1814,8 @@ function RouteEditorModal({
                               }
 
                               if (
-                                schema.type === "select" &&
+                                (schema.type === "select" ||
+                                  schema.type === "string") &&
                                 Array.isArray(schema.enum)
                               ) {
                                 return (

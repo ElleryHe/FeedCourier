@@ -1336,6 +1336,23 @@ impl ChannelSender for BridgeChannelSender {
                     acct_cfg.plugin_id
                 ))
             })?;
+        if bridge.manifest.kind != PluginKind::Channel {
+            return Err(AppError::Validation(format!(
+                "Plugin '{}' is a '{}' plugin, not a channel plugin",
+                acct_cfg.plugin_id,
+                bridge.manifest.kind.as_str()
+            )));
+        }
+        if !bridge.compatible {
+            return Err(AppError::Validation(format!(
+                "Channel plugin '{}' is incompatible with current core: {}",
+                acct_cfg.plugin_id,
+                bridge
+                    .compatibility_reason
+                    .as_deref()
+                    .unwrap_or("version mismatch")
+            )));
+        }
         if !bridge.enabled {
             return Err(AppError::Validation(format!(
                 "Channel plugin '{}' is disabled",
