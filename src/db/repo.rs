@@ -3804,4 +3804,227 @@ impl Database {
         .ok_or_else(|| AppError::NotFound(format!("SMTP recipient {recipient_id} not found")))?;
         Ok(row)
     }
+
+    /// Aggregate runtime queue, feed health, failure hotspot, and cooldown diagnostics.
+    pub async fn get_debug_runtime_db_stats(&self, now: i64) -> AppResult<DebugRuntimeDbStats> {
+        let mut queue_by_status = std::collections::BTreeMap::new();
+        let status_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM delivery_tasks GROUP BY status")
+                .fetch_all(&self.read_pool)
+                .await?;
+        for (status, count) in status_rows {
+            queue_by_status.insert(status, count);
+        }
+
+        let oldest_due_at: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT MIN(next_attempt_at)
+            FROM delivery_tasks
+            WHERE status IN ('queued', 'retrying', 'deferred')
+              AND next_attempt_at <= ?1
+            "#,
+        )
+        .bind(now)
+        .fetch_one(&self.read_pool)
+        .await?;
+        let oldest_due_wait_secs = oldest_due_at.map(|ts| now.saturating_sub(ts).max(0));
+
+        let expired_lease_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_tasks WHERE status = 'delivering' AND lease_until IS NOT NULL AND lease_until <= ?1",
+        )
+        .bind(now)
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        let mut feeds_by_health = std::collections::BTreeMap::new();
+        let health_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT health_status, COUNT(*) FROM feeds GROUP BY health_status")
+                .fetch_all(&self.read_pool)
+                .await?;
+        for (health, count) in health_rows {
+            feeds_by_health.insert(health, count);
+        }
+
+        let since_24h = now.saturating_sub(86_400);
+        let failing_feed_rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, title, consecutive_failures, last_error
+            FROM feeds
+            WHERE consecutive_failures > 0 AND updated_at >= ?1
+            ORDER BY consecutive_failures DESC, updated_at DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(since_24h)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let top_failing_feeds = failing_feed_rows
+            .into_iter()
+            .map(
+                |(feed_id, title, consecutive_failures, last_error)| DebugFailingFeed {
+                    feed_id,
+                    title,
+                    consecutive_failures,
+                    last_error,
+                },
+            )
+            .collect();
+
+        let failing_dest_rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            r#"
+            SELECT dt.destination_id, cd.name, c.kind, COUNT(*) AS fail_cnt
+            FROM delivery_tasks dt
+            JOIN channel_destinations cd ON cd.id = dt.destination_id
+            JOIN channels c ON c.id = dt.channel_id
+            WHERE dt.status IN ('retrying', 'dead_letter')
+              AND dt.created_at >= ?1
+            GROUP BY dt.destination_id, cd.name, c.kind
+            ORDER BY fail_cnt DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(since_24h)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let top_failing_destinations = failing_dest_rows
+            .into_iter()
+            .map(
+                |(destination_id, destination_name, channel_kind, failure_count)| {
+                    DebugFailingDestination {
+                        destination_id,
+                        destination_name,
+                        channel_kind,
+                        failure_count,
+                    }
+                },
+            )
+            .collect();
+
+        let cooldown_rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            r#"
+            SELECT id, name, kind, cooldown_until
+            FROM channels
+            WHERE cooldown_until IS NOT NULL AND cooldown_until > ?1
+            ORDER BY cooldown_until ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let active_cooldowns = cooldown_rows
+            .into_iter()
+            .map(
+                |(channel_id, channel_name, channel_kind, cooldown_until)| DebugCooldownChannel {
+                    channel_id,
+                    channel_name,
+                    channel_kind,
+                    cooldown_until,
+                },
+            )
+            .collect();
+
+        Ok(DebugRuntimeDbStats {
+            queue_by_status,
+            oldest_due_wait_secs,
+            expired_lease_count,
+            feeds_by_health,
+            top_failing_feeds,
+            top_failing_destinations,
+            active_cooldowns,
+        })
+    }
+
+    /// Fetch enriched metadata for a single delivery task (used by internal task tracing).
+    pub async fn get_delivery_task_detail(
+        &self,
+        task_id: i64,
+    ) -> AppResult<Option<DebugTaskDetail>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                dt.*,
+                e.feed_id AS joined_feed_id,
+                e.title AS joined_entry_title,
+                f.title AS joined_feed_title,
+                r.name AS joined_route_name,
+                c.name AS joined_channel_name,
+                c.kind AS joined_channel_kind,
+                cd.name AS joined_destination_name
+            FROM delivery_tasks dt
+            LEFT JOIN entries e ON e.id = dt.entry_id
+            LEFT JOIN feeds f ON f.id = e.feed_id
+            LEFT JOIN routes r ON r.id = dt.route_id
+            LEFT JOIN channels c ON c.id = dt.channel_id
+            LEFT JOIN channel_destinations cd ON cd.id = dt.destination_id
+            WHERE dt.id = ?1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.read_pool)
+        .await?
+        .map(|r| -> Result<DebugTaskDetail, sqlx::Error> {
+            use sqlx::{FromRow, Row};
+            let task = DeliveryTask::from_row(&r)?;
+            Ok(DebugTaskDetail {
+                task,
+                feed_id: r.try_get("joined_feed_id")?,
+                entry_title: r.try_get("joined_entry_title")?,
+                feed_title: r.try_get("joined_feed_title")?,
+                route_name: r.try_get("joined_route_name")?,
+                channel_name: r.try_get("joined_channel_name")?,
+                channel_kind: r.try_get("joined_channel_kind")?,
+                destination_name: r.try_get("joined_destination_name")?,
+            })
+        })
+        .transpose()?;
+
+        Ok(row)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugFailingFeed {
+    pub feed_id: i64,
+    pub title: String,
+    pub consecutive_failures: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugFailingDestination {
+    pub destination_id: i64,
+    pub destination_name: String,
+    pub channel_kind: String,
+    pub failure_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugCooldownChannel {
+    pub channel_id: i64,
+    pub channel_name: String,
+    pub channel_kind: String,
+    pub cooldown_until: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugRuntimeDbStats {
+    pub queue_by_status: std::collections::BTreeMap<String, i64>,
+    pub oldest_due_wait_secs: Option<i64>,
+    pub expired_lease_count: i64,
+    pub feeds_by_health: std::collections::BTreeMap<String, i64>,
+    pub top_failing_feeds: Vec<DebugFailingFeed>,
+    pub top_failing_destinations: Vec<DebugFailingDestination>,
+    pub active_cooldowns: Vec<DebugCooldownChannel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugTaskDetail {
+    pub task: DeliveryTask,
+    pub feed_id: Option<i64>,
+    pub entry_title: Option<String>,
+    pub feed_title: Option<String>,
+    pub route_name: Option<String>,
+    pub channel_name: Option<String>,
+    pub channel_kind: Option<String>,
+    pub destination_name: Option<String>,
 }

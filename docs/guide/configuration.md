@@ -28,6 +28,16 @@ FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment
 | `RETENTION_HOURS` | `24` | Hours after discovery to retain article HTML and media metadata once all delivery tasks for that entry have finished. |
 | `DB_READ_MAX_CONNECTIONS` | `8` | Maximum concurrent connections in the read-only SQLite connection pool (minimum `1`). |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | Log level filter (supports `debug`, `warn`, `error`, or module targets such as `feedcourier::scheduler=debug`). |
+| `LOG_FORMAT` | `text` | Stdout (`docker logs`) format: `text` (human-readable) or `json` (structured single-line JSON). Sensitive fields, emails, tokens, and URL query strings are automatically redacted in both stdout and stored logs. |
+| `LOG_STORE` | `sqlite` | Internal structured log backend: `sqlite` (isolated `<DATA_DIR>/logs.db` WAL database), `clickhouse` (HTTP `JSONEachRow` sink for high-volume deployments), or `off`. |
+| `LOG_STORE_LEVEL` | `info` | Minimum log level persisted into the log store (`trace`, `debug`, `info`, `warn`, `error`). |
+| `LOG_RETENTION_DAYS` | `7` | Retention window in days for stored logs (pruned hourly in SQLite; enforced via table `TTL` in ClickHouse; minimum `1`). |
+| `LOG_MAX_ROWS` | `100000` | Maximum number of rows kept in SQLite `<DATA_DIR>/logs.db` (minimum `100`; ignored when `LOG_STORE=clickhouse`). |
+| `LOG_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint URL (e.g. `http://clickhouse:8123`; required when `LOG_STORE=clickhouse`). Treated as an operator-trusted internal address (not blocked by `SSRF_ALLOWLIST`; redirects remain disabled). |
+| `LOG_CLICKHOUSE_DATABASE` | `feedcourier` | ClickHouse target database name (created automatically if missing). |
+| `LOG_CLICKHOUSE_TABLE` | `logs` | ClickHouse `MergeTree` target table name (created automatically with `TTL ts + INTERVAL LOG_RETENTION_DAYS DAY`). |
+| `LOG_CLICKHOUSE_USER` | *(unset)* | Optional ClickHouse HTTP username (`X-ClickHouse-User`). |
+| `LOG_CLICKHOUSE_PASSWORD` | *(unset)* | Optional ClickHouse HTTP password (`X-ClickHouse-Key`). |
 
 ::: warning Environment Overrides vs. Persisted Settings
 - If **`ADMIN_PASSWORD`** is set in the environment, FeedCourier updates the administrator password on **every startup**, which can also be used to recover access if you forget your password. **`ADMIN_USERNAME`** behaves the same way for the username; while it is set, the WebUI shows a hint that the username is managed by the environment.

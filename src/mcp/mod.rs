@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::Database;
 use crate::ingest::IngestEngine;
+use crate::logging::LogStoreHandle;
 use crate::scheduler::DeliveryDispatcher;
 
 pub use self::auth::{
@@ -38,6 +39,7 @@ pub struct McpState {
     ingest: IngestEngine,
     outbox_notify: Option<Arc<Notify>>,
     runtime: Option<DeliveryDispatcher>,
+    log_store: LogStoreHandle,
     cancellation_token: CancellationToken,
 }
 
@@ -49,6 +51,7 @@ impl McpState {
             ingest,
             outbox_notify: None,
             runtime: None,
+            log_store: LogStoreHandle::disabled(),
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -66,8 +69,18 @@ impl McpState {
         self
     }
 
+    /// Attach the persistent log store handle.
+    pub fn with_log_store(mut self, log_store: LogStoreHandle) -> Self {
+        self.log_store = log_store;
+        self
+    }
+
     pub fn runtime(&self) -> Option<&DeliveryDispatcher> {
         self.runtime.as_ref()
+    }
+
+    pub fn log_store(&self) -> &LogStoreHandle {
+        &self.log_store
     }
 
     /// Attach an optional outbox dispatcher wakeup handle.

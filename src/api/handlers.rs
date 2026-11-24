@@ -2421,6 +2421,12 @@ pub async fn create_mcp_token(
         .db()
         .create_mcp_token(&name, &token_hash, &token_prefix, req.scope)
         .await?;
+    tracing::info!(
+        token_id = created.id,
+        token_name = %created.name,
+        scope = created.scope.as_str(),
+        "issued MCP bearer token"
+    );
 
     let mcp_url = resolve_mcp_endpoint_url(&state, &headers);
     let snippet = serde_json::json!({
@@ -2456,6 +2462,7 @@ pub async fn delete_mcp_token(
             "MCP token {token_id} not found"
         )));
     }
+    tracing::info!(token_id, "revoked MCP bearer token");
     Ok(Json(ActionAckResponse::ok()))
 }
 

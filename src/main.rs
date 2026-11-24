@@ -2,26 +2,21 @@
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 use feedcourier::api::{AppState, bootstrap_env_settings, build_full_router};
 use feedcourier::config::{APP_NAME, AppConfig, LICENSE_SPDX, REPO_URL, VERSION};
 use feedcourier::crypto::MasterKey;
 use feedcourier::db::Database;
 use feedcourier::error::AppResult;
+use feedcourier::logging::init_logging;
 use feedcourier::mcp::McpState;
 use feedcourier::scheduler::DeliveryDispatcher;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("feedcourier=info,tower_http=info")),
-        )
-        .init();
-
     let config = AppConfig::from_env()?;
+    let log_store = init_logging(&config).await;
+
     let master_key = MasterKey::from_config(&config)?;
     let db = Database::from_config(&config).await?;
 
@@ -51,7 +46,8 @@ async fn main() -> AppResult<()> {
 
     let runtime =
         DeliveryDispatcher::from_db_settings(config.clone(), db.clone(), master_key.clone())
-            .await?;
+            .await?
+            .with_log_store(log_store.clone());
     let scheduler_handle = runtime.spawn();
     if reclaimed > 0 {
         runtime.outbox_notify().notify_one();
@@ -61,6 +57,7 @@ async fn main() -> AppResult<()> {
     let mcp_state = McpState::new(db.clone(), runtime.ingest().clone())
         .with_outbox_notify(runtime.outbox_notify())
         .with_runtime(runtime.clone())
+        .with_log_store(log_store.clone())
         .with_cancellation_token(mcp_cancel.clone());
     let app_state = AppState::new(runtime);
     let app = build_full_router(app_state, mcp_state);
@@ -74,6 +71,8 @@ async fn main() -> AppResult<()> {
         repo = REPO_URL,
         listen_addr = %bound_addr,
         data_dir = %config.data_dir.display(),
+        log_store = log_store.backend_name(),
+        log_format = config.logging.format.as_str(),
         "starting FeedCourier full-stack server"
     );
 
@@ -88,6 +87,7 @@ async fn main() -> AppResult<()> {
     scheduler_handle.shutdown().await;
     db.close().await;
     tracing::info!("FeedCourier shut down cleanly");
+    log_store.shutdown().await;
 
     Ok(())
 }

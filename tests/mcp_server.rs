@@ -1431,7 +1431,7 @@ async fn mcp_schema_lists_clear_cache_destinations_and_rejects_zero_dest_channel
 
     // 1. P3-04: Verify `tools/list` schema descriptions include `clear_cache` and `destinations`.
     let tools = admin.list_tools().await;
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 13);
     let manage_feed_tool = tools
         .iter()
         .find(|t| t["name"] == "manage_feed")

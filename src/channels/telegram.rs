@@ -808,13 +808,24 @@ impl TelegramSender {
                         api_err.description
                     )),
                 };
+                tracing::warn!(
+                    task_id = ctx.task.id,
+                    channel_id = ctx.channel.id,
+                    destination_id = ctx.destination.id,
+                    status_code = api_err.status_code,
+                    error = %api_err.description,
+                    "Telegram sendRichMessage unsupported; auto-degrading channel to compact_card"
+                );
                 let updated_val = serde_json::to_value(updated)?;
                 self.send_compact_mode(ctx, cfg, dest, true, Some(updated_val))
                     .await
             }
             Err(api_err) if api_err.is_rich_content_error() => {
                 tracing::warn!(
+                    task_id = ctx.task.id,
+                    channel_id = ctx.channel.id,
                     destination_id = ctx.destination.id,
+                    status_code = api_err.status_code,
                     error = %api_err.description,
                     "Telegram sendRichMessage returned 400 content error; falling back once to compact_card"
                 );

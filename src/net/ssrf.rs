@@ -522,6 +522,11 @@ impl Resolve for SsrfDnsResolver {
                         .strip_prefix("SSRF guard blocked target: ")
                         .unwrap_or(&msg)
                         .to_string();
+                    tracing::warn!(
+                        host = %host,
+                        reason = %detail,
+                        "outbound request blocked by SSRF policy"
+                    );
                     Err(Box::new(SsrfBlockedError(detail)) as Box<dyn StdError + Send + Sync>)
                 }
                 Err(other) => Err(Box::new(std::io::Error::other(other.to_string()))

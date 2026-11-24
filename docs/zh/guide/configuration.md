@@ -28,6 +28,16 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 | `RETENTION_HOURS` | `24` | 无符号整数（`u64`） | 已完成投递或未命中路由的文章正文与媒体元数据保留小时数，到期后由后台定时任务清理。 |
 | `DB_READ_MAX_CONNECTIONS` | `8` | 正整数（`u32 >= 1`） | SQLite WAL 只读连接池的最大连接数（写连接池固定为 `1`）。 |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | 日志过滤指令 | 日志级别控制，排查问题时可设为 `feedcourier=debug,tower_http=debug`。 |
+| `LOG_FORMAT` | `text` | `text` / `json` | 标准输出（`docker logs`）格式：`text`（人类可读）或 `json`（结构化单行 JSON）。标准输出与日志库共用统一脱敏规则，自动掩码邮箱、密钥字段、Bot Token 及 URL 查询参数。 |
+| `LOG_STORE` | `sqlite` | `sqlite` / `clickhouse` / `off` | 内部结构化日志存储后端：`sqlite`（独立的 `<DATA_DIR>/logs.db`，不与业务库争写锁）、`clickhouse`（HTTP 批量写入，适合大规模部署）或 `off`。 |
+| `LOG_STORE_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` | 写入日志库的最低日志级别。 |
+| `LOG_RETENTION_DAYS` | `7` | 正整数（`>= 1`） | 日志保留天数（SQLite 每小时清理；ClickHouse 自动设为表 `TTL`）。 |
+| `LOG_MAX_ROWS` | `100000` | 整数（`>= 100`） | SQLite `logs.db` 保留的最大行数上限（ClickHouse 模式下忽略）。 |
+| `LOG_CLICKHOUSE_URL` | *（未设置）* | `http://` 或 `https://` URL | ClickHouse HTTP 接口地址（如 `http://clickhouse:8123`，`LOG_STORE=clickhouse` 时必填）。视为运维可信地址，不走 SSRF 拦截但禁止重定向。 |
+| `LOG_CLICKHOUSE_DATABASE` | `feedcourier` | 标识符 | ClickHouse 目标数据库名（启动时自动创建）。 |
+| `LOG_CLICKHOUSE_TABLE` | `logs` | 标识符 | ClickHouse 目标 `MergeTree` 表名（启动时自动建表并按 `LOG_RETENTION_DAYS` 设置 `TTL`）。 |
+| `LOG_CLICKHOUSE_USER` | *（未设置）* | 字符串 | 可选的 ClickHouse 用户名（`X-ClickHouse-User`）。 |
+| `LOG_CLICKHOUSE_PASSWORD` | *（未设置）* | 字符串 | 可选的 ClickHouse 密码（`X-ClickHouse-Key`）。 |
 
 > [!NOTE]
 > `TIMEZONE`/`TZ`、`OUTBOUND_PROXY` 与 `SSRF_ALLOWLIST` 会在首次启动时写入数据库的 `system_settings` 表。此后在 WebUI **Settings** 页面修改时区、代理与白名单时，新配置会立即生效并持久化保存，无需重启服务。

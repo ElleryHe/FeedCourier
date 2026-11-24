@@ -30,6 +30,96 @@ pub const DEFAULT_RETENTION_HOURS: u64 = 24;
 /// Default maximum concurrent SQLite read connections.
 pub const DEFAULT_READ_POOL_MAX_CONNECTIONS: u32 = 8;
 
+/// Default log retention window in days (`LOG_RETENTION_DAYS`).
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
+
+/// Default maximum rows kept in SQLite `logs.db` (`LOG_MAX_ROWS`).
+pub const DEFAULT_LOG_MAX_ROWS: u64 = 100_000;
+
+/// Default ClickHouse database name (`LOG_CLICKHOUSE_DATABASE`).
+pub const DEFAULT_LOG_CLICKHOUSE_DATABASE: &str = "feedcourier";
+
+/// Default ClickHouse table name (`LOG_CLICKHOUSE_TABLE`).
+pub const DEFAULT_LOG_CLICKHOUSE_TABLE: &str = "logs";
+
+/// Stdout log serialization format (`LOG_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// Internal log storage backend (`LOG_STORE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogStoreKind {
+    #[default]
+    Sqlite,
+    ClickHouse,
+    Off,
+}
+
+impl LogStoreKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::ClickHouse => "clickhouse",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Logging output, persistence, retention, and optional ClickHouse configuration.
+#[derive(Debug, Clone)]
+pub struct LogConfig {
+    /// Stdout output format (`LOG_FORMAT=text|json`).
+    pub format: LogFormat,
+    /// Persistent log store backend (`LOG_STORE=sqlite|clickhouse|off`).
+    pub store: LogStoreKind,
+    /// Minimum level persisted into the log store (`LOG_STORE_LEVEL`, default `"info"`).
+    pub store_level: String,
+    /// Retention window in days for SQLite GC and ClickHouse table TTL (`LOG_RETENTION_DAYS`).
+    pub retention_days: u32,
+    /// Maximum rows retained in SQLite `logs.db` (`LOG_MAX_ROWS`, ignored by ClickHouse).
+    pub max_rows: u64,
+    /// ClickHouse HTTP endpoint URL (`LOG_CLICKHOUSE_URL`, e.g. `http://clickhouse:8123`).
+    pub clickhouse_url: Option<String>,
+    /// ClickHouse database name (`LOG_CLICKHOUSE_DATABASE`, default `"feedcourier"`).
+    pub clickhouse_database: String,
+    /// ClickHouse table name (`LOG_CLICKHOUSE_TABLE`, default `"logs"`).
+    pub clickhouse_table: String,
+    /// Optional ClickHouse username (`LOG_CLICKHOUSE_USER`).
+    pub clickhouse_user: Option<String>,
+    /// Optional ClickHouse password (`LOG_CLICKHOUSE_PASSWORD`).
+    pub clickhouse_password: Option<String>,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::Text,
+            store: LogStoreKind::Sqlite,
+            store_level: "info".to_string(),
+            retention_days: DEFAULT_LOG_RETENTION_DAYS,
+            max_rows: DEFAULT_LOG_MAX_ROWS,
+            clickhouse_url: None,
+            clickhouse_database: DEFAULT_LOG_CLICKHOUSE_DATABASE.to_string(),
+            clickhouse_table: DEFAULT_LOG_CLICKHOUSE_TABLE.to_string(),
+            clickhouse_user: None,
+            clickhouse_password: None,
+        }
+    }
+}
+
 /// Runtime configuration resolved from environment variables (with safe defaults).
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -66,6 +156,8 @@ pub struct AppConfig {
     /// Whether to trust reverse-proxy client IP headers (`X-Real-IP` / rightmost `X-Forwarded-For`)
     /// on public compliance endpoints (`/u/`, `/v/`). Defaults to `false` (use TCP `SocketAddr`).
     pub trust_proxy: bool,
+    /// Structured logging format, persistent log storage, retention, and optional ClickHouse config.
+    pub logging: LogConfig,
 }
 
 impl Default for AppConfig {
@@ -88,6 +180,7 @@ impl Default for AppConfig {
             public_url: None,
             plugin_index_url: None,
             trust_proxy: false,
+            logging: LogConfig::default(),
         }
     }
 }
@@ -216,6 +309,124 @@ impl AppConfig {
             )
         });
 
+        let log_format = match non_empty("LOG_FORMAT") {
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "text" => LogFormat::Text,
+                "json" => LogFormat::Json,
+                _ => {
+                    return Err(AppError::Config(format!(
+                        "invalid LOG_FORMAT '{raw}' (expected 'text' or 'json')"
+                    )));
+                }
+            },
+            None => LogFormat::Text,
+        };
+
+        let log_store = match non_empty("LOG_STORE") {
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "sqlite" => LogStoreKind::Sqlite,
+                "clickhouse" => LogStoreKind::ClickHouse,
+                "off" | "none" | "disabled" => LogStoreKind::Off,
+                _ => {
+                    return Err(AppError::Config(format!(
+                        "invalid LOG_STORE '{raw}' (expected 'sqlite', 'clickhouse', or 'off')"
+                    )));
+                }
+            },
+            None => LogStoreKind::Sqlite,
+        };
+
+        let log_store_level = match non_empty("LOG_STORE_LEVEL") {
+            Some(raw) => {
+                let lower = raw.to_ascii_lowercase();
+                if !matches!(
+                    lower.as_str(),
+                    "trace" | "debug" | "info" | "warn" | "error"
+                ) {
+                    return Err(AppError::Config(format!(
+                        "invalid LOG_STORE_LEVEL '{raw}' (expected trace, debug, info, warn, or error)"
+                    )));
+                }
+                lower
+            }
+            None => "info".to_string(),
+        };
+
+        let log_retention_days = match non_empty("LOG_RETENTION_DAYS") {
+            Some(raw) => {
+                let parsed = raw.parse::<u32>().map_err(|err| {
+                    AppError::Config(format!("invalid LOG_RETENTION_DAYS '{raw}': {err}"))
+                })?;
+                if parsed == 0 {
+                    return Err(AppError::Config(
+                        "LOG_RETENTION_DAYS must be at least 1".to_string(),
+                    ));
+                }
+                parsed
+            }
+            None => DEFAULT_LOG_RETENTION_DAYS,
+        };
+
+        let log_max_rows = match non_empty("LOG_MAX_ROWS") {
+            Some(raw) => {
+                let parsed = raw.parse::<u64>().map_err(|err| {
+                    AppError::Config(format!("invalid LOG_MAX_ROWS '{raw}': {err}"))
+                })?;
+                if parsed < 100 {
+                    return Err(AppError::Config(
+                        "LOG_MAX_ROWS must be at least 100".to_string(),
+                    ));
+                }
+                parsed
+            }
+            None => DEFAULT_LOG_MAX_ROWS,
+        };
+
+        let clickhouse_url = match non_empty("LOG_CLICKHOUSE_URL") {
+            Some(raw) => {
+                let parsed = url::Url::parse(&raw).map_err(|err| {
+                    AppError::Config(format!("invalid LOG_CLICKHOUSE_URL '{raw}': {err}"))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                    return Err(AppError::Config(format!(
+                        "invalid LOG_CLICKHOUSE_URL '{raw}': must be an http/https URL with a host"
+                    )));
+                }
+                Some(raw.trim_end_matches('/').to_string())
+            }
+            None => None,
+        };
+
+        if log_store == LogStoreKind::ClickHouse && clickhouse_url.is_none() {
+            return Err(AppError::Config(
+                "LOG_CLICKHOUSE_URL is required when LOG_STORE=clickhouse".to_string(),
+            ));
+        }
+
+        let clickhouse_database = non_empty("LOG_CLICKHOUSE_DATABASE")
+            .unwrap_or_else(|| DEFAULT_LOG_CLICKHOUSE_DATABASE.to_string());
+        validate_clickhouse_ident("LOG_CLICKHOUSE_DATABASE", &clickhouse_database)?;
+
+        let clickhouse_table = non_empty("LOG_CLICKHOUSE_TABLE")
+            .unwrap_or_else(|| DEFAULT_LOG_CLICKHOUSE_TABLE.to_string());
+        validate_clickhouse_ident("LOG_CLICKHOUSE_TABLE", &clickhouse_table)?;
+
+        let clickhouse_user = non_empty("LOG_CLICKHOUSE_USER");
+        let clickhouse_password = lookup("LOG_CLICKHOUSE_PASSWORD").filter(|v| !v.is_empty());
+
+        let logging = LogConfig {
+            format: log_format,
+            store: log_store,
+            store_level: log_store_level,
+            retention_days: log_retention_days,
+            max_rows: log_max_rows,
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_table,
+            clickhouse_user,
+            clickhouse_password,
+        };
+
         Ok(Self {
             data_dir,
             listen_addr,
@@ -232,6 +443,7 @@ impl AppConfig {
             public_url,
             plugin_index_url,
             trust_proxy,
+            logging,
         })
     }
 
@@ -246,6 +458,11 @@ impl AppConfig {
     /// Path to the SQLite database file (`<data_dir>/feedcourier.db`).
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("feedcourier.db")
+    }
+
+    /// Path to the separate SQLite log database file (`<data_dir>/logs.db`).
+    pub fn logs_db_path(&self) -> PathBuf {
+        self.data_dir.join("logs.db")
     }
 
     /// Path to the auto-generated master key file (`<data_dir>/master.key`).
@@ -303,4 +520,21 @@ pub fn validate_public_url(raw: &str) -> AppResult<String> {
         ));
     }
     Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+/// Strictly validate ClickHouse database/table identifiers (`^[A-Za-z_][A-Za-z0-9_]{0,63}$`).
+pub fn validate_clickhouse_ident(env_name: &str, raw: &str) -> AppResult<()> {
+    let bytes = raw.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if !valid {
+        return Err(AppError::Config(format!(
+            "invalid {env_name} '{raw}': must match ^[A-Za-z_][A-Za-z0-9_]{{0,63}}$"
+        )));
+    }
+    Ok(())
 }

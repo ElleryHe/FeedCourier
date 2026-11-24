@@ -230,6 +230,11 @@ struct DispatcherInner {
     media_fetcher: Arc<ProtectedMediaFetcher>,
     plugins: PluginRegistry,
     market_cache: MarketIndexCache,
+    log_store: crate::logging::LogStoreHandle,
+    started_at: i64,
+    poller_panics: Arc<std::sync::atomic::AtomicU64>,
+    outbox_panics: Arc<std::sync::atomic::AtomicU64>,
+    maintenance_panics: Arc<std::sync::atomic::AtomicU64>,
     smtp_per_recipient_delay: Duration,
     /// In-memory per-`credential_group_key` next allowed send timestamp (`min_interval_secs + jitter`).
     pacing_next_allowed_at: Mutex<HashMap<String, i64>>,
@@ -269,6 +274,11 @@ impl Clone for DispatcherInner {
             media_fetcher: Arc::clone(&self.media_fetcher),
             plugins: self.plugins.clone(),
             market_cache: self.market_cache.clone(),
+            log_store: self.log_store.clone(),
+            started_at: self.started_at,
+            poller_panics: Arc::clone(&self.poller_panics),
+            outbox_panics: Arc::clone(&self.outbox_panics),
+            maintenance_panics: Arc::clone(&self.maintenance_panics),
             smtp_per_recipient_delay: self.smtp_per_recipient_delay,
             pacing_next_allowed_at: Mutex::new(pacing),
             poller_wakeup: Arc::clone(&self.poller_wakeup),
@@ -348,6 +358,11 @@ impl DeliveryDispatcher {
                 media_fetcher,
                 plugins,
                 market_cache,
+                log_store: crate::logging::LogStoreHandle::disabled(),
+                started_at: now_unix(),
+                poller_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                outbox_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                maintenance_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 smtp_per_recipient_delay: Duration::from_secs(1),
                 pacing_next_allowed_at: Mutex::new(HashMap::new()),
                 poller_wakeup: Arc::new(Notify::new()),
@@ -361,6 +376,34 @@ impl DeliveryDispatcher {
                 maintenance_tick: DEFAULT_MAINTENANCE_TICK,
             }),
         })
+    }
+
+    /// Attach the initialized log store handle so maintenance prunes stored logs and
+    /// runtime diagnostics can inspect log store health/size.
+    pub fn with_log_store(self, log_store: crate::logging::LogStoreHandle) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.log_store = log_store;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn log_store(&self) -> &crate::logging::LogStoreHandle {
+        &self.inner.log_store
+    }
+
+    pub fn started_at(&self) -> i64 {
+        self.inner.started_at
+    }
+
+    /// Return `(poller_panics, outbox_panics, maintenance_panics)`.
+    pub fn panic_counts(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.inner.poller_panics.load(Ordering::Relaxed),
+            self.inner.outbox_panics.load(Ordering::Relaxed),
+            self.inner.maintenance_panics.load(Ordering::Relaxed),
+        )
     }
 
     /// Construct a [`DeliveryDispatcher`] resolving initial [`NetSettings`] and [`AppLocale`]
@@ -1084,6 +1127,17 @@ impl DeliveryDispatcher {
         };
 
         if let Some(retry) = plugin_retry {
+            warn!(
+                task_id = task.id,
+                feed_id = feed.id,
+                route_id = route.id,
+                channel_id = channel.id,
+                destination_id = destination.id,
+                plugin_id = %retry.plugin_id,
+                retry_after_secs = retry.retry_after_secs,
+                diagnostic = %retry.diagnostic,
+                "on_render plugin requested delivery retry"
+            );
             self.handle_transient_retry(
                 &task,
                 &channel,
@@ -1098,6 +1152,7 @@ impl DeliveryDispatcher {
             return Ok(true);
         }
 
+        let send_started = std::time::Instant::now();
         let checkpoint_sink = self.inner.db.rich_checkpoint_sink(
             task.id,
             destination.id,
@@ -1129,21 +1184,34 @@ impl DeliveryDispatcher {
             }
             ChannelKind::Notion => self.inner.notion_sender.send(&ctx).await,
         };
+        let duration_ms = send_started.elapsed().as_millis() as u64;
 
         let completed_now = now_unix();
         match send_result {
             Ok(outcome) => {
                 self.apply_delivery_outcome(
                     &task,
+                    feed.id,
                     &channel,
                     effective_min_interval,
                     effective_jitter_max,
                     completed_now,
+                    duration_ms,
                     outcome,
                 )
                 .await?;
             }
             Err(err) => {
+                warn!(
+                    task_id = task.id,
+                    feed_id = feed.id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    duration_ms,
+                    error = %err,
+                    "delivery adapter returned unexpected error"
+                );
                 self.apply_unexpected_send_error(&task, &channel, completed_now, err)
                     .await?;
             }
@@ -1457,6 +1525,7 @@ impl DeliveryDispatcher {
     ///
     /// Returns the number of entry payloads purged.
     pub async fn run_maintenance_once(&self) -> AppResult<u64> {
+        let started = std::time::Instant::now();
         let now = now_unix();
         let purged_entries = self
             .inner
@@ -1466,6 +1535,13 @@ impl DeliveryDispatcher {
         let purged_sessions = self.inner.db.purge_expired_sessions(now).await?;
         let purged_ledger = self.inner.db.purge_expired_quota_ledger(now).await?;
         let purged_link_cache = self.inner.db.purge_stale_plugin_link_cache(now).await?;
+        let purged_logs = match self.inner.log_store.prune().await {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(error = %err, "failed to prune stored logs during maintenance");
+                0
+            }
+        };
         self.inner.db.run_pragma_optimize().await?;
 
         {
@@ -1477,11 +1553,14 @@ impl DeliveryDispatcher {
             guard.retain(|_, ts| *ts > now);
         }
 
-        debug!(
+        let duration_ms = started.elapsed().as_millis() as u64;
+        info!(
             purged_entries,
             purged_sessions,
             purged_ledger,
             purged_link_cache,
+            purged_logs,
+            duration_ms,
             "completed scheduled database maintenance cycle"
         );
         Ok(purged_entries)
@@ -1521,6 +1600,10 @@ impl DeliveryDispatcher {
                             warn!(error = %err, "poller loop tick failed");
                         }
                         Err(_) => {
+                            dispatcher
+                                .inner
+                                .poller_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             error!("poller loop caught unexpected panic; continuing next tick");
                         }
                     }
@@ -1563,6 +1646,10 @@ impl DeliveryDispatcher {
                                 break;
                             }
                             Err(_) => {
+                                dispatcher
+                                    .inner
+                                    .outbox_panics
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 error!(
                                     "outbox dispatcher loop caught unexpected panic; continuing next tick"
                                 );
@@ -1600,6 +1687,10 @@ impl DeliveryDispatcher {
                             warn!(error = %err, "maintenance loop tick failed");
                         }
                         Err(_) => {
+                            dispatcher
+                                .inner
+                                .maintenance_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             error!(
                                 "maintenance loop caught unexpected panic; continuing next tick"
                             );
@@ -1683,13 +1774,16 @@ impl DeliveryDispatcher {
         *slot = (*slot).max(next_allowed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_delivery_outcome(
         &self,
         task: &DeliveryTask,
+        feed_id: i64,
         channel: &Channel,
         effective_min_interval: i64,
         effective_jitter_max: i64,
         completed_now: i64,
+        duration_ms: u64,
         outcome: DeliveryOutcome,
     ) -> AppResult<()> {
         match outcome {
@@ -1721,6 +1815,18 @@ impl DeliveryDispatcher {
                     effective_jitter_max,
                     completed_now,
                 );
+                info!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    channel_kind = %channel.kind,
+                    attempt = task.attempt_count,
+                    status_code,
+                    duration_ms,
+                    "outbox task delivered"
+                );
             }
             DeliveryOutcome::Deferred {
                 next_window_at,
@@ -1738,6 +1844,17 @@ impl DeliveryDispatcher {
                     .db
                     .mark_task_deferred(task.id, target_window, None, checkpoint.as_ref(), &diag)
                     .await?;
+                info!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    next_attempt_at = target_window,
+                    duration_ms,
+                    reason = %diagnostic,
+                    "outbox task deferred"
+                );
             }
             DeliveryOutcome::PermanentFailure {
                 status_code,
@@ -1754,6 +1871,19 @@ impl DeliveryDispatcher {
                         &diagnostic,
                     )
                     .await?;
+                error!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    channel_kind = %channel.kind,
+                    attempt = task.attempt_count,
+                    status_code,
+                    duration_ms,
+                    diagnostic = %diagnostic,
+                    "outbox task permanently failed (dead_letter)"
+                );
             }
             DeliveryOutcome::Retry {
                 retry_after_secs,
@@ -1782,9 +1912,34 @@ impl DeliveryDispatcher {
                             &diagnostic,
                         )
                         .await?;
+                    debug!(
+                        task_id = task.id,
+                        feed_id,
+                        route_id = task.route_id,
+                        channel_id = channel.id,
+                        destination_id = task.destination_id,
+                        status_code = 202,
+                        poll_delay_secs = poll_delay,
+                        duration_ms,
+                        "outbox task deferred for Notion async poll"
+                    );
                     return Ok(());
                 }
 
+                warn!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    channel_kind = %channel.kind,
+                    attempt = task.attempt_count,
+                    status_code,
+                    cooldown = cooldown_credential_group,
+                    duration_ms,
+                    diagnostic = %diagnostic,
+                    "outbox task transient failure; scheduling retry"
+                );
                 self.handle_transient_retry(
                     task,
                     channel,

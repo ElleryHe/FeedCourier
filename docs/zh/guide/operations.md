@@ -162,6 +162,15 @@ services:
 
 ---
 
+## 结构化日志与日志库（`logs.db` / ClickHouse） {#structured-logging-and-storage}
+
+FeedCourier 会将脱敏后的结构化日志同时输出到**标准输出**（`docker logs`，支持 `LOG_FORMAT=text` 或 `json`），并异步批量写入独立的日志存储，避免与主业务库争抢写锁：
+
+- **默认 SQLite 日志库（`LOG_STORE=sqlite`）**：写入 `<DATA_DIR>/logs.db`（与 `feedcourier.db` 物理分离）。默认保留 **`LOG_RETENTION_DAYS=7`** 天且最多 **`LOG_MAX_ROWS=100000`** 条，由每小时维护任务自动清理；如仅需 `docker logs` 且不希望在 `/data` 中生成额外文件，可设为 `LOG_STORE=off`。
+- **ClickHouse 后端（`LOG_STORE=clickhouse`）**：大规模部署可配置 `LOG_CLICKHOUSE_URL`（及可选的 `_DATABASE` / `_TABLE` / `_USER` / `_PASSWORD`）。启动时自动创建带 `TTL` 的 `MergeTree` 表并通过 HTTP `JSONEachRow` 批量写入；若 ClickHouse 暂时不可达，日志缓冲溢出后自动丢弃并限频告警，绝不阻塞启动或投递。
+
+---
+
 ## 自动与手动清理正文缓存（GC）
 
 - **后台定时清理**：每间隔 1 小时自动运行一次：

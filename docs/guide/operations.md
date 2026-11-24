@@ -183,6 +183,15 @@ services:
 
 ---
 
+## Structured Logging & Storage (`logs.db` / ClickHouse) {#structured-logging-and-storage}
+
+FeedCourier emits redacted, structured logs to **stdout** (`docker logs`, switchable between `LOG_FORMAT=text` and `LOG_FORMAT=json`) and asynchronously persists them into a dedicated log store so log I/O never competes with the main SQLite write lock:
+
+- **Default SQLite store (`LOG_STORE=sqlite`)**: Writes batches asynchronously into `<DATA_DIR>/logs.db` (separate from `feedcourier.db`). Retention defaults to **`LOG_RETENTION_DAYS=7`** and **`LOG_MAX_ROWS=100000`**, pruned automatically every hour during maintenance. Set `LOG_STORE=off` if you only want `docker logs` and zero extra disk files under `/data`.
+- **ClickHouse backend (`LOG_STORE=clickhouse`)**: For high-volume deployments, set `LOG_CLICKHOUSE_URL` (plus optional `LOG_CLICKHOUSE_DATABASE`, `LOG_CLICKHOUSE_TABLE`, `LOG_CLICKHOUSE_USER`, and `LOG_CLICKHOUSE_PASSWORD`). FeedCourier creates the `MergeTree` table with automatic `TTL` on startup and writes batches via HTTP `JSONEachRow`. If ClickHouse is temporarily unreachable, buffered records drop cleanly without blocking startup or feed delivery.
+
+---
+
 ## Automatic Maintenance & Content Cleanup
 
 A background task runs every **1 hour** and performs four maintenance tasks:
