@@ -17,20 +17,21 @@ use url::Url;
 
 use crate::api::AppState;
 use crate::api::dto::{
-    ActionAckResponse, BridgeManifestPreviewResponse, ChannelCooldownSummary,
-    ChannelDestinationDto, ChannelDto, ChannelReferenceDto, ClearFeedCacheRequest,
-    ClearFeedCacheResponse, ClearPluginCacheResponse, CreateChannelRequest,
-    CreateDestinationRequest, CreateFeedRequest, CreateMcpTokenRequest, CreateMcpTokenResponse,
-    CreatePluginInstanceRequest, CreateRouteRequest, DebugPushRequest, DebugPushResponse,
-    DeleteCascadeQuery, DeliveryTaskDto, FeedDto, FeedPreviewRequest, GcResponse, ListTasksQuery,
-    MarketPluginItemDto, MarketQuery, MarketResponse, McpTokenDto, OpmlImportRequest,
-    OpmlImportResponse, OverviewResponse, PluginConflictBody, PluginDto, PluginInstanceDto,
-    PollFeedResponse, QueueStateDto, ReferencingConflictBody, RegisterBridgePluginRequest,
-    RetryTasksRequest, RetryTasksResponse, RouteDto, RouteReferenceDto, SendVerificationResponse,
-    SmtpRecipientDto, SystemSettingsDto, TestChannelRequest, TestChannelResponse,
-    TestPluginInstanceResponse, UpdateChannelRequest, UpdateDestinationRequest, UpdateFeedRequest,
-    UpdatePluginInstanceRequest, UpdatePluginRequest, UpdateQueueRequest, UpdateRouteRequest,
-    UpdateSystemSettingsRequest, VerifyRecipientCodeRequest, normalize_channel_config_on_create,
+    ActionAckResponse, ChannelCooldownSummary, ChannelDestinationDto, ChannelDto,
+    ChannelReferenceDto, ClearFeedCacheRequest, ClearFeedCacheResponse, ClearPluginCacheResponse,
+    CreateChannelRequest, CreateDestinationRequest, CreateFeedRequest, CreateMcpTokenRequest,
+    CreateMcpTokenResponse, CreatePluginInstanceRequest, CreateRouteRequest, DebugPushRequest,
+    DebugPushResponse, DeleteCascadeQuery, DeliveryTaskDto, FeedDto, FeedPreviewRequest,
+    GcResponse, InstallMarketPluginRequest, JsPluginPreviewResponse, ListTasksQuery,
+    MarketPluginItemDto, MarketPluginVersionDto, MarketQuery, MarketResponse, McpTokenDto,
+    OpmlImportRequest, OpmlImportResponse, OverviewResponse, PluginConflictBody, PluginDto,
+    PluginInstanceDto, PluginSourceResponse, PollFeedResponse, QueueStateDto,
+    ReferencingConflictBody, RetryTasksRequest, RetryTasksResponse, RouteDto, RouteReferenceDto,
+    SendVerificationResponse, SmtpRecipientDto, SystemSettingsDto, TestChannelRequest,
+    TestChannelResponse, TestPluginInstanceResponse, UpdateChannelRequest,
+    UpdateDestinationRequest, UpdateFeedRequest, UpdatePluginInstanceRequest, UpdatePluginRequest,
+    UpdateQueueRequest, UpdateRouteRequest, UpdateSystemSettingsRequest, UploadJsPluginRequest,
+    VerifyRecipientCodeRequest, normalize_channel_config_on_create,
     normalize_destination_config_on_create, normalize_opt_string, normalize_string_vec,
 };
 use crate::channels::notion::{
@@ -54,9 +55,9 @@ use crate::db::repo::DeleteGuardOutcome;
 use crate::error::{AppError, AppResult};
 use crate::ingest::{ContentFilterRules, FeedPreviewResponse};
 use crate::net::NetSettings;
-use crate::plugins::bridge::{BridgeClient, validate_bridge_url, validate_config_against_schema};
+use crate::plugins::js_runtime::{compile_js_plugin, ensure_compiled_plugin_compatible};
 use crate::plugins::link_rewrite::LINK_REWRITE_PLUGIN_ID;
-use crate::plugins::{PluginKind, PluginRuntime, check_plugin_compatibility};
+use crate::plugins::{PluginKind, PluginRuntime, check_plugin_compatibility, parse_semver_triple};
 use crate::schedule::{OutboxQueueState, parse_timezone, validate_schedule};
 use crate::scheduler::{DebugPushParams, load_persisted_locale, normalize_net_settings};
 
@@ -428,29 +429,29 @@ pub async fn list_channels(State(state): State<AppState>) -> AppResult<Json<Vec<
     Ok(Json(out))
 }
 
-/// Validate that a registered bridge plugin is a compatible, enabled `channel` plugin before
+/// Validate that an installed JS plugin is a compatible, enabled `channel` plugin before
 /// creating, updating, or testing channel accounts or destinations.
-fn ensure_channel_bridge_usable(
-    bridge: &crate::plugins::BridgePluginEntry,
+fn ensure_channel_plugin_usable(
+    plugin: &crate::plugins::JsPluginEntry,
     plugin_id: &str,
     disabled_suffix: &str,
 ) -> AppResult<()> {
-    if bridge.manifest.kind != PluginKind::Channel {
+    if plugin.runtime.manifest.kind != PluginKind::Channel {
         return Err(AppError::Validation(format!(
             "Plugin '{plugin_id}' is a '{}' plugin, not a channel plugin",
-            bridge.manifest.kind.as_str()
+            plugin.runtime.manifest.kind.as_str()
         )));
     }
-    if !bridge.compatible {
+    if !plugin.compatible {
         return Err(AppError::Validation(format!(
             "Channel plugin '{plugin_id}' is incompatible with current core: {}",
-            bridge
+            plugin
                 .compatibility_reason
                 .as_deref()
                 .unwrap_or("version mismatch")
         )));
     }
-    if !bridge.enabled {
+    if !plugin.enabled {
         return Err(AppError::Validation(format!(
             "Channel plugin '{plugin_id}' is disabled{disabled_suffix}"
         )));
@@ -473,12 +474,6 @@ pub async fn create_channel(
     if req.kind == ChannelKind::Smtp && req.use_proxy {
         return Err(AppError::Validation(
             "SMTP channels use direct TCP/TLS connections and do not support outbound HTTP/SOCKS proxies"
-                .to_string(),
-        ));
-    }
-    if req.kind == ChannelKind::Plugin && req.use_proxy {
-        return Err(AppError::Validation(
-            "Bridge channel plugins connect directly to their registered sidecar and do not support outbound HTTP/SOCKS proxies"
                 .to_string(),
         ));
     }
@@ -577,33 +572,29 @@ pub async fn create_channel(
             (bot_name, "{}".to_string())
         }
         ChannelConfig::Plugin(plugin_cfg) => {
-            let bridge = state
+            let js_plugin = state
                 .runtime()
                 .plugins()
-                .get_bridge(&plugin_cfg.plugin_id)
+                .get_js(&plugin_cfg.plugin_id)
                 .ok_or_else(|| {
                     AppError::Validation(format!(
                         "Channel plugin '{}' is not installed",
                         plugin_cfg.plugin_id
                     ))
                 })?;
-            ensure_channel_bridge_usable(
-                &bridge,
+            ensure_channel_plugin_usable(
+                &js_plugin,
                 &plugin_cfg.plugin_id,
                 "; enable it before creating accounts",
             )?;
-            let locally_validated = validate_config_against_schema(
-                &bridge.manifest.account_schema,
-                &plugin_cfg.config,
-            )?;
-            let normalized = bridge
-                .client
-                .validate_remote("account", &locally_validated)
+            let normalized = js_plugin
+                .runtime
+                .validate_config(state.http(), "account", &plugin_cfg.config, req.use_proxy)
                 .await?;
             plugin_cfg.config = normalized;
             (
-                bridge.manifest.name.clone(),
-                serde_json::to_string(&bridge.manifest.capabilities)?,
+                js_plugin.runtime.manifest.name.clone(),
+                serde_json::to_string(&js_plugin.runtime.manifest.capabilities)?,
             )
         }
     };
@@ -666,12 +657,6 @@ pub async fn update_channel(
                 .to_string(),
         ));
     }
-    if existing.kind == ChannelKind::Plugin && req.use_proxy == Some(true) {
-        return Err(AppError::Validation(
-            "Bridge channel plugins connect directly to their registered sidecar and do not support outbound HTTP/SOCKS proxies"
-                .to_string(),
-        ));
-    }
 
     validate_pacing_and_quotas(
         req.min_interval_secs,
@@ -695,25 +680,32 @@ pub async fn update_channel(
         let current_cfg: ChannelConfig = state
             .master_key()
             .decrypt_json(&existing.encrypted_config)?;
-        let plugin_bridge = match &current_cfg {
-            ChannelConfig::Plugin(p) => state.runtime().plugins().get_bridge(&p.plugin_id),
+        let plugin_entry = match &current_cfg {
+            ChannelConfig::Plugin(p) => state.runtime().plugins().get_js(&p.plugin_id),
             _ => None,
         };
         let (mut merged_cfg, tg_endpoint_changed) = cfg_patch.apply_to_with_schema(
             &current_cfg,
-            plugin_bridge.as_ref().map(|b| &b.manifest.account_schema),
+            plugin_entry
+                .as_ref()
+                .map(|p| &p.runtime.manifest.account_schema),
         )?;
         if let ChannelConfig::Plugin(ref mut p_cfg) = merged_cfg {
-            let bridge = plugin_bridge.ok_or_else(|| {
+            let js_plugin = plugin_entry.ok_or_else(|| {
                 AppError::Validation(format!(
                     "Channel plugin '{}' is not installed",
                     p_cfg.plugin_id
                 ))
             })?;
-            ensure_channel_bridge_usable(&bridge, &p_cfg.plugin_id, "")?;
-            p_cfg.config = bridge
-                .client
-                .validate_remote("account", &p_cfg.config)
+            ensure_channel_plugin_usable(&js_plugin, &p_cfg.plugin_id, "")?;
+            p_cfg.config = js_plugin
+                .runtime
+                .validate_config(
+                    state.http(),
+                    "account",
+                    &p_cfg.config,
+                    req.use_proxy.unwrap_or(existing.use_proxy),
+                )
                 .await?;
         }
 
@@ -880,28 +872,34 @@ pub async fn test_channel(
             }))
         }
         ChannelConfig::Plugin(plugin_cfg) => {
-            let bridge = state
+            let js_plugin = state
                 .runtime()
                 .plugins()
-                .get_bridge(&plugin_cfg.plugin_id)
+                .get_js(&plugin_cfg.plugin_id)
                 .ok_or_else(|| {
                     AppError::NotFound(format!(
                         "Channel plugin '{}' is not installed",
                         plugin_cfg.plugin_id
                     ))
                 })?;
-            ensure_channel_bridge_usable(&bridge, &plugin_cfg.plugin_id, "")?;
-            let message = bridge
-                .client
-                .test_remote(&serde_json::json!({
-                    "scope": "account",
-                    "account": plugin_cfg.config,
-                }))
+            ensure_channel_plugin_usable(&js_plugin, &plugin_cfg.plugin_id, "")?;
+            let effective_locale = req.locale.unwrap_or_else(|| state.runtime().locale());
+            let message = js_plugin
+                .runtime
+                .test_config(
+                    state.http(),
+                    "account",
+                    Some(&plugin_cfg.config),
+                    None,
+                    None,
+                    channel.use_proxy,
+                    effective_locale.as_str(),
+                )
                 .await?;
             Ok(Json(TestChannelResponse {
                 ok: true,
                 message,
-                capabilities: Some(bridge.manifest.capabilities.clone()),
+                capabilities: Some(js_plugin.runtime.manifest.capabilities.clone()),
             }))
         }
     }
@@ -991,11 +989,11 @@ pub async fn update_destination(
         let current_cfg: DestinationConfig = state
             .master_key()
             .decrypt_json(&existing.encrypted_config)?;
-        let plugin_bridge = if channel.kind == ChannelKind::Plugin {
+        let plugin_entry = if channel.kind == ChannelKind::Plugin {
             let acct_cfg: ChannelConfig =
                 state.master_key().decrypt_json(&channel.encrypted_config)?;
             match acct_cfg {
-                ChannelConfig::Plugin(p) => state.runtime().plugins().get_bridge(&p.plugin_id),
+                ChannelConfig::Plugin(p) => state.runtime().plugins().get_js(&p.plugin_id),
                 _ => None,
             }
         } else {
@@ -1003,18 +1001,23 @@ pub async fn update_destination(
         };
         let mut merged = cfg_patch.apply_to_with_schema(
             &current_cfg,
-            plugin_bridge
+            plugin_entry
                 .as_ref()
-                .map(|b| &b.manifest.destination_schema),
+                .map(|p| &p.runtime.manifest.destination_schema),
         )?;
         if let DestinationConfig::Plugin(ref mut p_dest) = merged {
-            let bridge = plugin_bridge.ok_or_else(|| {
+            let js_plugin = plugin_entry.ok_or_else(|| {
                 AppError::Validation("Parent channel plugin is not installed".to_string())
             })?;
-            ensure_channel_bridge_usable(&bridge, &bridge.manifest.id, "")?;
-            p_dest.config = bridge
-                .client
-                .validate_remote("destination", &p_dest.config)
+            ensure_channel_plugin_usable(&js_plugin, &js_plugin.runtime.manifest.id, "")?;
+            p_dest.config = js_plugin
+                .runtime
+                .validate_config(
+                    state.http(),
+                    "destination",
+                    &p_dest.config,
+                    channel.use_proxy,
+                )
                 .await?;
         }
         patch.encrypted_config = Some(state.master_key().encrypt_json(&merged)?);
@@ -1110,22 +1113,25 @@ async fn create_destination_for_channel(
     if let (ChannelConfig::Plugin(acct_cfg), DestinationConfig::Plugin(dest_cfg)) =
         (account_cfg, &mut req.config)
     {
-        let bridge = state
+        let js_plugin = state
             .runtime()
             .plugins()
-            .get_bridge(&acct_cfg.plugin_id)
+            .get_js(&acct_cfg.plugin_id)
             .ok_or_else(|| {
                 AppError::Validation(format!(
                     "Channel plugin '{}' is not installed",
                     acct_cfg.plugin_id
                 ))
             })?;
-        ensure_channel_bridge_usable(&bridge, &acct_cfg.plugin_id, "")?;
-        let locally_validated =
-            validate_config_against_schema(&bridge.manifest.destination_schema, &dest_cfg.config)?;
-        dest_cfg.config = bridge
-            .client
-            .validate_remote("destination", &locally_validated)
+        ensure_channel_plugin_usable(&js_plugin, &acct_cfg.plugin_id, "")?;
+        dest_cfg.config = js_plugin
+            .runtime
+            .validate_config(
+                state.http(),
+                "destination",
+                &dest_cfg.config,
+                channel.use_proxy,
+            )
             .await?;
     }
 
@@ -1207,8 +1213,8 @@ async fn build_destination_dto(
                 ChannelConfig::Plugin(p) => state
                     .runtime()
                     .plugins()
-                    .get_bridge(&p.plugin_id)
-                    .map(|b| b.manifest.destination_schema),
+                    .get_js(&p.plugin_id)
+                    .map(|j| j.runtime.manifest.destination_schema.clone()),
                 _ => None,
             })
     } else {
@@ -1239,11 +1245,14 @@ async fn build_channel_dto(
             .decrypt_json::<ChannelConfig>(&channel.encrypted_config)
             .ok()
             .and_then(|cfg| match cfg {
-                ChannelConfig::Plugin(p) => state
-                    .runtime()
-                    .plugins()
-                    .get_bridge(&p.plugin_id)
-                    .map(|b| (b.manifest.account_schema, b.manifest.destination_schema)),
+                ChannelConfig::Plugin(p) => {
+                    state.runtime().plugins().get_js(&p.plugin_id).map(|j| {
+                        (
+                            j.runtime.manifest.account_schema.clone(),
+                            j.runtime.manifest.destination_schema.clone(),
+                        )
+                    })
+                }
                 _ => None,
             })
     } else {
@@ -1357,8 +1366,8 @@ async fn derive_default_destination_name(
             let fallback = state
                 .runtime()
                 .plugins()
-                .get_bridge(&acct.plugin_id)
-                .map(|b| format!("{} Target", b.manifest.name))
+                .get_js(&acct.plugin_id)
+                .map(|j| format!("{} Target", j.runtime.manifest.name))
                 .unwrap_or_else(|| "Plugin Target".to_string());
             Ok(fallback)
         }
@@ -1490,10 +1499,16 @@ async fn run_destination_test(
             })
         }
         ChannelKind::Plugin => {
+            let effective_locale = test_locale.unwrap_or_else(|| state.runtime().locale());
             let message = state
                 .runtime()
                 .plugin_sender()
-                .send_test(&channel_cfg, &dest_cfg, channel.use_proxy)
+                .send_test_with_locale(
+                    &channel_cfg,
+                    &dest_cfg,
+                    channel.use_proxy,
+                    effective_locale.as_str(),
+                )
                 .await?;
             Ok(TestChannelResponse {
                 ok: true,
@@ -1966,7 +1981,7 @@ async fn build_plugin_dto_for_manifest(
     state: &AppState,
     manifest: crate::plugins::PluginManifest,
     source: &str,
-    bridge_url: Option<String>,
+    script_sha256: Option<String>,
     row: Option<&crate::db::models::PluginRow>,
 ) -> AppResult<PluginDto> {
     let registry = state.runtime().plugins();
@@ -1999,12 +2014,14 @@ async fn build_plugin_dto_for_manifest(
     };
     let (compatible, compatibility_reason) =
         check_plugin_compatibility(&manifest.api_version, manifest.min_core.as_deref());
+    let allowed_hosts = manifest.allowed_hosts.clone();
     Ok(PluginDto {
         id: manifest.id.clone(),
         source: source.to_string(),
         kind: manifest.kind,
         runtime: manifest.runtime,
-        bridge_url,
+        script_sha256,
+        allowed_hosts,
         compatible,
         compatibility_reason,
         manifest,
@@ -2029,14 +2046,15 @@ pub async fn list_plugins(State(state): State<AppState>) -> AppResult<Json<Vec<P
         let row = row_by_id.get(&manifest.id);
         out.push(build_plugin_dto_for_manifest(&state, manifest, "builtin", None, row).await?);
     }
-    for bridge in registry.list_bridges() {
-        let row = row_by_id.get(&bridge.manifest.id);
+    for js_plugin in registry.list_js() {
+        let manifest = js_plugin.runtime.manifest.clone();
+        let row = row_by_id.get(&manifest.id);
         out.push(
             build_plugin_dto_for_manifest(
                 &state,
-                bridge.manifest,
-                "bridge",
-                Some(bridge.bridge_url),
+                manifest,
+                &js_plugin.source,
+                Some(js_plugin.runtime.script_sha256.clone()),
                 row,
             )
             .await?,
@@ -2045,84 +2063,8 @@ pub async fn list_plugins(State(state): State<AppState>) -> AppResult<Json<Vec<P
     Ok(Json(out))
 }
 
-/// `POST /api/v1/plugins/bridges`
-///
-/// When `dry_run: true`, performs a signed `GET /manifest` against `bridge_url`, validates
-/// Protocol v1 compatibility, and returns a preview without persisting.
-/// When `dry_run: false`, encrypts `bridge_secret`, persists the bridge plugin row, reloads
-/// the in-memory plugin registry cache, and returns `201 Created`.
-pub async fn register_bridge_plugin(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterBridgePluginRequest>,
-) -> AppResult<Response> {
-    let normalized_url = validate_bridge_url(&req.bridge_url)?;
-    let secret = req.bridge_secret.trim().to_string();
-    if secret.is_empty() {
-        return Err(AppError::Validation(
-            "bridge_secret must not be empty".to_string(),
-        ));
-    }
-
-    let probe_client = BridgeClient::new(normalized_url.clone(), secret.clone(), "pending".into())?;
-    let manifest = probe_client.fetch_manifest().await?;
-    let (compatible, compatibility_reason) =
-        check_plugin_compatibility(&manifest.api_version, manifest.min_core.as_deref());
-
-    if req.dry_run {
-        return Ok((
-            StatusCode::OK,
-            Json(BridgeManifestPreviewResponse {
-                bridge_url: normalized_url,
-                manifest,
-                compatible,
-                compatibility_reason,
-            }),
-        )
-            .into_response());
-    }
-
-    let registry = state.runtime().plugins();
-    if registry.is_builtin(&manifest.id) || state.db().get_plugin(&manifest.id).await?.is_some() {
-        return Err(AppError::Conflict(format!(
-            "Plugin '{}' is already installed",
-            manifest.id
-        )));
-    }
-
-    let encrypted_secret = state.master_key().encrypt_json(&secret)?;
-    let manifest_json = serde_json::to_string(&manifest)?;
-    let row = state
-        .db()
-        .register_bridge_plugin(
-            &manifest.id,
-            manifest.kind.as_str(),
-            &manifest.version,
-            &normalized_url,
-            &encrypted_secret,
-            &manifest_json,
-            req.enabled,
-        )
-        .await?;
-    registry
-        .reload_from_db(state.db(), state.master_key())
-        .await?;
-
-    tracing::info!(
-        plugin_id = %manifest.id,
-        plugin_kind = manifest.kind.as_str(),
-        version = %manifest.version,
-        enabled = req.enabled,
-        "registered HTTP bridge plugin"
-    );
-
-    let dto =
-        build_plugin_dto_for_manifest(&state, manifest, "bridge", Some(normalized_url), Some(&row))
-            .await?;
-    Ok((StatusCode::CREATED, Json(dto)).into_response())
-}
-
 /// Synchronize `channels.capabilities_json` across all existing `ChannelKind::Plugin` accounts
-/// belonging to `plugin_id` after a manifest refresh or bridge endpoint update.
+/// belonging to `plugin_id` after installing or upgrading a channel plugin.
 async fn sync_plugin_channel_capabilities(
     state: &AppState,
     plugin_id: &str,
@@ -2143,75 +2085,322 @@ async fn sync_plugin_channel_capabilities(
     Ok(())
 }
 
-/// `POST /api/v1/plugins/{id}/refresh-manifest`
-pub async fn refresh_bridge_plugin_manifest(
+/// `POST /api/v1/plugins/install`
+///
+/// One-click install, upgrade, or version switch from the official plugin marketplace index.
+/// Downloads `plugin.js`, verifies SHA-256 against `index.json`, compiles & validates `meta`
+/// inside the Boa sandbox, and either returns a preview (`dry_run: true`) or persists & hot-loads.
+pub async fn install_market_plugin(
     State(state): State<AppState>,
-    Path(plugin_id): Path<String>,
-) -> AppResult<Json<PluginDto>> {
-    let registry = state.runtime().plugins();
-    if registry.is_builtin(&plugin_id) {
+    Json(req): Json<InstallMarketPluginRequest>,
+) -> AppResult<Response> {
+    let plugin_id = req.plugin_id.trim().to_string();
+    if plugin_id.is_empty() {
         return Err(AppError::Validation(
-            "Built-in plugins do not have a remote bridge manifest to refresh".to_string(),
+            "plugin_id must not be empty".to_string(),
         ));
     }
-    let bridge = registry
-        .get_bridge(&plugin_id)
-        .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{plugin_id}' not found")))?;
-
-    let refreshed = bridge.client.fetch_manifest().await?;
-    if refreshed.id != plugin_id {
+    let registry = state.runtime().plugins();
+    if registry.is_builtin(&plugin_id) {
         return Err(AppError::Validation(format!(
-            "Bridge manifest id '{}' does not match registered plugin id '{plugin_id}'",
-            refreshed.id
+            "Plugin '{plugin_id}' is built into FeedCourier and does not need marketplace installation"
         )));
     }
-    if refreshed.kind != bridge.manifest.kind {
+
+    let market_cache = state.runtime().market_cache();
+    let (mut doc, _) = market_cache.get_index(state.http(), false).await;
+    let mut found = doc.plugins.iter().find(|p| p.id == plugin_id).cloned();
+    if found.is_none() {
+        let (refreshed_doc, _) = market_cache.get_index(state.http(), true).await;
+        doc = refreshed_doc;
+        found = doc.plugins.iter().find(|p| p.id == plugin_id).cloned();
+    }
+    let market_item = found.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Plugin '{plugin_id}' was not found in the plugin marketplace index"
+        ))
+    })?;
+
+    if market_item.versions.is_empty() {
         return Err(AppError::Validation(format!(
-            "Bridge manifest kind changed from '{}' to '{}'; cross-kind mutation is not allowed on an installed plugin",
-            bridge.manifest.kind.as_str(),
-            refreshed.kind.as_str()
+            "Marketplace plugin '{plugin_id}' does not publish any installable JS versions"
         )));
     }
-    let manifest_json = serde_json::to_string(&refreshed)?;
-    let updated = state
-        .db()
-        .refresh_bridge_plugin_manifest(
-            &plugin_id,
-            refreshed.kind.as_str(),
-            &refreshed.version,
-            &manifest_json,
-        )
-        .await?;
-    if refreshed.kind == PluginKind::Channel {
-        sync_plugin_channel_capabilities(&state, &plugin_id, &refreshed.capabilities).await?;
-    }
-    registry
-        .reload_from_db(state.db(), state.master_key())
-        .await?;
 
-    tracing::info!(
-        plugin_id = %plugin_id,
-        version = %refreshed.version,
-        "refreshed HTTP bridge plugin manifest"
+    let target_ver_str = req
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(market_item.latest.as_deref())
+        .unwrap_or(market_item.version.as_str());
+
+    let ver_entry = market_item
+        .versions
+        .iter()
+        .find(|v| v.version == target_ver_str)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Version '{target_ver_str}' of marketplace plugin '{plugin_id}' was not found"
+            ))
+        })?;
+
+    let script_js = market_cache
+        .fetch_plugin_script(state.http(), &ver_entry.path, &ver_entry.sha256)
+        .await?;
+    let compiled = compile_js_plugin(script_js.clone()).await?;
+
+    if compiled.manifest.id != market_item.id {
+        return Err(AppError::Validation(format!(
+            "Downloaded script meta.id '{}' does not match marketplace plugin id '{}'",
+            compiled.manifest.id, market_item.id
+        )));
+    }
+    if compiled.manifest.version != ver_entry.version {
+        return Err(AppError::Validation(format!(
+            "Downloaded script meta.version '{}' does not match marketplace version '{}'",
+            compiled.manifest.version, ver_entry.version
+        )));
+    }
+
+    let existing = state.db().get_plugin(&compiled.manifest.id).await?;
+    if let Some(ref cur) = existing {
+        if cur.source == "builtin" {
+            return Err(AppError::Conflict(format!(
+                "Built-in plugin '{}' cannot be overwritten",
+                compiled.manifest.id
+            )));
+        }
+        if cur.kind != compiled.manifest.kind.as_str() {
+            return Err(AppError::Validation(format!(
+                "Plugin kind changed from '{}' to '{}'; cross-kind mutation is not allowed on an installed plugin",
+                cur.kind,
+                compiled.manifest.kind.as_str()
+            )));
+        }
+    }
+
+    let (compatible, compatibility_reason) = check_plugin_compatibility(
+        &compiled.manifest.api_version,
+        compiled.manifest.min_core.as_deref(),
     );
 
-    Ok(Json(
-        build_plugin_dto_for_manifest(
-            &state,
-            refreshed,
-            "bridge",
-            Some(bridge.bridge_url),
-            Some(&updated),
+    if req.dry_run {
+        let preview = JsPluginPreviewResponse {
+            source: "market".to_string(),
+            allowed_hosts: compiled.manifest.allowed_hosts.clone(),
+            manifest: compiled.manifest,
+            script_sha256: compiled.script_sha256,
+            compatible,
+            compatibility_reason,
+            already_installed: existing.is_some(),
+            installed_version: existing.map(|r| r.installed_version),
+            changelog: ver_entry.changelog.clone(),
+        };
+        return Ok((StatusCode::OK, Json(preview)).into_response());
+    }
+
+    ensure_compiled_plugin_compatible(&compiled.manifest)?;
+
+    let was_installed = existing.is_some();
+    let manifest_json = serde_json::to_string(&compiled.manifest)?;
+    let row = state
+        .db()
+        .upsert_js_plugin(
+            &compiled.manifest.id,
+            "market",
+            compiled.manifest.kind.as_str(),
+            &compiled.manifest.version,
+            &script_js,
+            &compiled.script_sha256,
+            &manifest_json,
+            req.enabled,
         )
-        .await?,
-    ))
+        .await?;
+    if compiled.manifest.kind == PluginKind::Channel {
+        sync_plugin_channel_capabilities(
+            &state,
+            &compiled.manifest.id,
+            &compiled.manifest.capabilities,
+        )
+        .await?;
+    }
+    registry.reload_from_db(state.db()).await?;
+    state.runtime().notify_outbox();
+    state.runtime().notify_plugin_events();
+
+    tracing::info!(
+        plugin_id = %compiled.manifest.id,
+        plugin_kind = compiled.manifest.kind.as_str(),
+        version = %compiled.manifest.version,
+        sha256 = %compiled.script_sha256,
+        upgraded = was_installed,
+        "installed JS plugin from marketplace"
+    );
+
+    let dto = build_plugin_dto_for_manifest(
+        &state,
+        compiled.manifest,
+        "market",
+        Some(compiled.script_sha256),
+        Some(&row),
+    )
+    .await?;
+    let status = if was_installed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(dto)).into_response())
+}
+
+/// `POST /api/v1/plugins/upload`
+///
+/// Compile, preview (`dry_run: true`), or install/overwrite a custom single-file `plugin.js`.
+pub async fn upload_js_plugin(
+    State(state): State<AppState>,
+    Json(req): Json<UploadJsPluginRequest>,
+) -> AppResult<Response> {
+    let compiled = compile_js_plugin(req.script_js.clone()).await?;
+    let registry = state.runtime().plugins();
+    if registry.is_builtin(&compiled.manifest.id) {
+        return Err(AppError::Conflict(format!(
+            "Built-in plugin '{}' cannot be overwritten by a custom JS plugin",
+            compiled.manifest.id
+        )));
+    }
+
+    let existing = state.db().get_plugin(&compiled.manifest.id).await?;
+    if let Some(ref cur) = existing
+        && cur.kind != compiled.manifest.kind.as_str()
+    {
+        return Err(AppError::Validation(format!(
+            "Plugin kind changed from '{}' to '{}'; cross-kind mutation is not allowed on an installed plugin",
+            cur.kind,
+            compiled.manifest.kind.as_str()
+        )));
+    }
+
+    let (compatible, compatibility_reason) = check_plugin_compatibility(
+        &compiled.manifest.api_version,
+        compiled.manifest.min_core.as_deref(),
+    );
+
+    if req.dry_run {
+        let preview = JsPluginPreviewResponse {
+            source: "custom".to_string(),
+            allowed_hosts: compiled.manifest.allowed_hosts.clone(),
+            manifest: compiled.manifest,
+            script_sha256: compiled.script_sha256,
+            compatible,
+            compatibility_reason,
+            already_installed: existing.is_some(),
+            installed_version: existing.map(|r| r.installed_version),
+            changelog: None,
+        };
+        return Ok((StatusCode::OK, Json(preview)).into_response());
+    }
+
+    ensure_compiled_plugin_compatible(&compiled.manifest)?;
+
+    if let Some(ref cur) = existing
+        && !req.allow_overwrite
+    {
+        return Err(AppError::Conflict(format!(
+            "Plugin '{}' (v{}) is already installed; confirm overwrite to replace it",
+            compiled.manifest.id, cur.installed_version
+        )));
+    }
+
+    let was_installed = existing.is_some();
+    let manifest_json = serde_json::to_string(&compiled.manifest)?;
+    let row = state
+        .db()
+        .upsert_js_plugin(
+            &compiled.manifest.id,
+            "custom",
+            compiled.manifest.kind.as_str(),
+            &compiled.manifest.version,
+            &req.script_js,
+            &compiled.script_sha256,
+            &manifest_json,
+            req.enabled,
+        )
+        .await?;
+    if compiled.manifest.kind == PluginKind::Channel {
+        sync_plugin_channel_capabilities(
+            &state,
+            &compiled.manifest.id,
+            &compiled.manifest.capabilities,
+        )
+        .await?;
+    }
+    registry.reload_from_db(state.db()).await?;
+    state.runtime().notify_outbox();
+    state.runtime().notify_plugin_events();
+
+    tracing::info!(
+        plugin_id = %compiled.manifest.id,
+        plugin_kind = compiled.manifest.kind.as_str(),
+        version = %compiled.manifest.version,
+        sha256 = %compiled.script_sha256,
+        overwritten = was_installed,
+        "installed custom JS plugin"
+    );
+
+    let dto = build_plugin_dto_for_manifest(
+        &state,
+        compiled.manifest,
+        "custom",
+        Some(compiled.script_sha256),
+        Some(&row),
+    )
+    .await?;
+    let status = if was_installed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(dto)).into_response())
+}
+
+/// `GET /api/v1/plugins/{id}/source`
+pub async fn get_plugin_source(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+) -> AppResult<Json<PluginSourceResponse>> {
+    if state.runtime().plugins().is_builtin(&plugin_id) {
+        return Err(AppError::Validation(
+            "Built-in Rust plugins do not have a JavaScript source script".to_string(),
+        ));
+    }
+    let row = state
+        .db()
+        .get_plugin(&plugin_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+    let script_js = row.script_js.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "JS source is not available for plugin '{plugin_id}'"
+        ))
+    })?;
+    let script_sha256 = row
+        .script_sha256
+        .unwrap_or_else(|| sha256_hex(script_js.as_bytes()));
+    Ok(Json(PluginSourceResponse {
+        id: row.id,
+        source: row.source,
+        version: row.installed_version,
+        script_sha256,
+        script_js,
+    }))
 }
 
 /// `DELETE /api/v1/plugins/{id}`
 ///
-/// Refuses deletion of built-in plugins (`400`) and refuses deletion of referenced bridge plugins
+/// Refuses deletion of built-in plugins (`400`) and refuses deletion of referenced JS plugins
 /// (`409 Conflict` listing referencing channels/routes) unless `?cascade=true` is passed.
-pub async fn delete_bridge_plugin(
+pub async fn delete_js_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
     Query(query): Query<DeleteCascadeQuery>,
@@ -2227,9 +2416,9 @@ pub async fn delete_bridge_plugin(
             "plugin '{plugin_id}' not found"
         )));
     };
-    if row.source != "bridge" {
+    if !matches!(row.source.as_str(), "market" | "custom") {
         return Err(AppError::Validation(
-            "Only registered HTTP bridge plugins can be deleted".to_string(),
+            "Only installed JS plugins can be deleted".to_string(),
         ));
     }
 
@@ -2262,7 +2451,7 @@ pub async fn delete_bridge_plugin(
 
     if (!ref_channels.is_empty() || !ref_routes.is_empty()) && !query.cascade.unwrap_or(false) {
         let msg = format!(
-            "Bridge plugin '{plugin_id}' is referenced by {} channel(s) and {} route(s). Pass ?cascade=true to remove it together with those references.",
+            "Plugin '{plugin_id}' is referenced by {} channel(s) and {} route(s). Pass ?cascade=true to remove it together with those references.",
             ref_channels.len(),
             ref_routes.len()
         );
@@ -2284,16 +2473,14 @@ pub async fn delete_bridge_plugin(
 
     state
         .db()
-        .delete_bridge_plugin(&plugin_id, &ref_ch_ids, &strip_route_ids)
+        .delete_js_plugin(&plugin_id, &ref_ch_ids, &strip_route_ids)
         .await?;
-    registry
-        .reload_from_db(state.db(), state.master_key())
-        .await?;
+    registry.reload_from_db(state.db()).await?;
 
     tracing::info!(
         plugin_id = %plugin_id,
         cascade = query.cascade.unwrap_or(false),
-        "deleted HTTP bridge plugin"
+        "deleted JS plugin"
     );
 
     Ok((StatusCode::OK, Json(ActionAckResponse::ok())).into_response())
@@ -2310,11 +2497,6 @@ pub async fn update_plugin(
         .get_manifest(&plugin_id)
         .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
     if registry.is_builtin(&plugin_id) {
-        if req.bridge_url.is_some() || req.bridge_secret.is_some() {
-            return Err(AppError::Validation(
-                "Built-in plugins do not have a bridge_url or bridge_secret".to_string(),
-            ));
-        }
         registry.sync_builtin_rows(state.db()).await?;
     }
 
@@ -2323,111 +2505,28 @@ pub async fn update_plugin(
         .map(|v| serde_json::to_string(&v))
         .transpose()?;
 
-    let wants_bridge_update = req.bridge_url.is_some()
-        || req
-            .bridge_secret
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty());
-
-    let (updated, final_manifest) = if wants_bridge_update {
-        let row = state
-            .db()
-            .get_plugin(&plugin_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
-        if row.source != "bridge" {
-            return Err(AppError::Validation(
-                "Only HTTP bridge plugins support updating bridge_url or rotating bridge_secret"
-                    .to_string(),
-            ));
-        }
-        let next_url = match req.bridge_url.as_deref() {
-            Some(raw) => validate_bridge_url(raw)?,
-            None => row.bridge_url.clone().ok_or_else(|| {
-                AppError::Validation("bridge_url is missing on stored plugin".to_string())
-            })?,
-        };
-        let next_secret = match req
-            .bridge_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(new_sec) => new_sec.to_string(),
-            None => {
-                let enc = row.encrypted_bridge_secret.as_deref().ok_or_else(|| {
-                    AppError::Validation("bridge_secret is missing on stored plugin".to_string())
-                })?;
-                state.master_key().decrypt_json::<String>(enc)?
-            }
-        };
-
-        // Mandatory live signed GET /manifest probe before persisting the rotated secret / URL.
-        let probe_client =
-            BridgeClient::new(next_url.clone(), next_secret.clone(), plugin_id.clone())?;
-        let probed = probe_client.fetch_manifest().await?;
-        if probed.id != plugin_id {
-            return Err(AppError::Validation(format!(
-                "Bridge manifest id '{}' does not match registered plugin id '{plugin_id}'",
-                probed.id
-            )));
-        }
-        if probed.kind != existing_manifest.kind {
-            return Err(AppError::Validation(format!(
-                "Bridge manifest kind changed from '{}' to '{}'; cross-kind mutation is not allowed on an installed plugin",
-                existing_manifest.kind.as_str(),
-                probed.kind.as_str()
-            )));
-        }
-
-        let encrypted_secret = state.master_key().encrypt_json(&next_secret)?;
-        let manifest_json = serde_json::to_string(&probed)?;
-        let updated_row = state
-            .db()
-            .update_bridge_plugin_connection(
-                &plugin_id,
-                &next_url,
-                &encrypted_secret,
-                &probed.version,
-                &manifest_json,
-                req.enabled,
-                settings_str.as_deref(),
-            )
-            .await?;
-        if probed.kind == PluginKind::Channel {
-            sync_plugin_channel_capabilities(&state, &plugin_id, &probed.capabilities).await?;
-        }
-        tracing::info!(
-            plugin_id = %plugin_id,
-            version = %probed.version,
-            rotated_secret = req
-                .bridge_secret
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty()),
-            "updated HTTP bridge plugin connection after live manifest probe"
-        );
-        (updated_row, probed)
-    } else {
-        let updated_row = state
-            .db()
-            .update_plugin(&plugin_id, req.enabled, settings_str.as_deref())
-            .await?;
-        (updated_row, existing_manifest)
-    };
-
-    registry
-        .reload_from_db(state.db(), state.master_key())
+    let updated = state
+        .db()
+        .update_plugin(&plugin_id, req.enabled, settings_str.as_deref())
         .await?;
-    if req.enabled == Some(true) || wants_bridge_update {
+
+    registry.reload_from_db(state.db()).await?;
+    if req.enabled == Some(true) {
         state.runtime().notify_outbox();
         state.runtime().notify_plugin_events();
     }
 
-    let bridge_url = updated.bridge_url.clone();
     let source = updated.source.clone();
+    let script_sha256 = updated.script_sha256.clone();
     Ok(Json(
-        build_plugin_dto_for_manifest(&state, final_manifest, &source, bridge_url, Some(&updated))
-            .await?,
+        build_plugin_dto_for_manifest(
+            &state,
+            existing_manifest,
+            &source,
+            script_sha256,
+            Some(&updated),
+        )
+        .await?,
     ))
 }
 
@@ -2469,10 +2568,14 @@ pub async fn create_plugin_instance(
     }
 
     let mut validated = plugin.validate_instance_config(&req.config)?;
-    if let Some(bridge) = registry.get_bridge(&plugin_id) {
-        validated = bridge
-            .client
-            .validate_remote("instance", &validated)
+    if let Some(js_plugin) = registry.get_js(&plugin_id) {
+        let use_proxy = validated
+            .get("use_proxy")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        validated = js_plugin
+            .runtime
+            .validate_config(state.http(), "instance", &validated, use_proxy)
             .await?;
     }
     let encrypted = state.master_key().encrypt_json(&validated)?;
@@ -2520,8 +2623,15 @@ pub async fn update_plugin_instance(
             .master_key()
             .decrypt_json(&existing.encrypted_config)?;
         let mut merged = plugin.merge_instance_config(&cur_cfg, cfg_patch)?;
-        if let Some(bridge) = state.runtime().plugins().get_bridge(&plugin_id) {
-            merged = bridge.client.validate_remote("instance", &merged).await?;
+        if let Some(js_plugin) = state.runtime().plugins().get_js(&plugin_id) {
+            let use_proxy = merged
+                .get("use_proxy")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            merged = js_plugin
+                .runtime
+                .validate_config(state.http(), "instance", &merged, use_proxy)
+                .await?;
         }
         if plugin_id == LINK_REWRITE_PLUGIN_ID {
             let old_url = cur_cfg
@@ -2649,12 +2759,12 @@ pub async fn get_plugin_market(
     Query(query): Query<MarketQuery>,
 ) -> AppResult<Json<MarketResponse>> {
     let registry = state.runtime().plugins();
-    let installed_rows: HashMap<String, bool> = state
+    let installed_rows: HashMap<String, (bool, String)> = state
         .db()
         .list_plugins()
         .await?
         .into_iter()
-        .map(|r| (r.id, r.enabled))
+        .map(|r| (r.id, (r.enabled, r.installed_version)))
         .collect();
 
     let market_cache = state.runtime().market_cache();
@@ -2667,21 +2777,53 @@ pub async fn get_plugin_market(
         .into_iter()
         .map(|item| {
             let is_builtin = registry.is_builtin(&item.id);
-            let is_installed = is_builtin || installed_rows.contains_key(&item.id);
-            let enabled = installed_rows.get(&item.id).copied().unwrap_or(false);
+            let installed_info = installed_rows.get(&item.id);
+            let is_installed = is_builtin || installed_info.is_some();
+            let enabled = installed_info.is_some_and(|(e, _)| *e);
+            let installed_version = if is_builtin {
+                Some(VERSION.to_string())
+            } else {
+                installed_info.map(|(_, v)| v.clone())
+            };
+            let latest_version = item.latest.clone().unwrap_or_else(|| item.version.clone());
+            let update_available = !is_builtin
+                && installed_version.as_deref().is_some_and(|cur_v| {
+                    match (
+                        parse_semver_triple(&latest_version),
+                        parse_semver_triple(cur_v),
+                    ) {
+                        (Some(lat), Some(cur)) => lat > cur,
+                        _ => latest_version != cur_v,
+                    }
+                });
             let (compatible, compatibility_reason) =
                 check_plugin_compatibility(&item.api_version, item.min_core.as_deref());
             let runtime = item.runtime.or_else(|| {
                 if is_builtin || item.kind == "builtin" {
                     Some(PluginRuntime::Builtin.as_str().to_string())
+                } else if !item.versions.is_empty() {
+                    Some(PluginRuntime::Js.as_str().to_string())
                 } else {
                     None
                 }
             });
+            let versions = item
+                .versions
+                .into_iter()
+                .map(|v| MarketPluginVersionDto {
+                    version: v.version,
+                    min_core: v.min_core,
+                    path: v.path,
+                    sha256: v.sha256,
+                    changelog_path: v.changelog_path,
+                    changelog: v.changelog,
+                })
+                .collect();
             MarketPluginItemDto {
                 id: item.id,
                 name: item.name,
                 version: item.version,
+                latest: Some(latest_version),
                 api_version: item.api_version,
                 kind: if is_builtin {
                     "builtin".to_string()
@@ -2693,15 +2835,18 @@ pub async fn get_plugin_market(
                 category: item.category,
                 icon: item.icon,
                 description: item.description,
+                description_i18n: item.description_i18n,
                 homepage: item.homepage,
                 repository: item.repository,
-                image: item.image,
-                compose_snippet: item.compose_snippet,
+                allowed_hosts: item.allowed_hosts,
                 hooks: item.hooks,
                 permissions: item.permissions,
+                versions,
                 compatible,
                 compatibility_reason,
                 installed: is_installed,
+                installed_version,
+                update_available,
                 enabled,
             }
         })

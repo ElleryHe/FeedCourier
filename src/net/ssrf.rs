@@ -21,6 +21,9 @@ use crate::error::{AppError, AppResult};
 /// Cloud metadata IPv4 endpoint (`169.254.169.254`) used by AWS, GCP, Azure, OpenStack, etc.
 pub const CLOUD_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
+/// Alibaba Cloud ECS metadata IPv4 endpoint (`100.100.100.200`).
+pub const ALIBABA_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
 /// AWS IMDSv2 IPv6 endpoint (`fd00:ec2::254`).
 pub const CLOUD_METADATA_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
 
@@ -532,6 +535,142 @@ impl Resolve for SsrfDnsResolver {
                 Err(other) => Err(Box::new(std::io::Error::other(other.to_string()))
                     as Box<dyn StdError + Send + Sync>),
             }
+        })
+    }
+}
+
+/// Unconditionally reject cloud metadata, unspecified (`0.0.0.0/8`, `::`), and broadcast IPs
+/// for JS plugin `fc.fetch` calls (even when targeting an admin-configured `format: "uri"` origin).
+pub fn check_hard_blocked_plugin_ip(hostname: &str, raw_ip: IpAddr) -> AppResult<()> {
+    match canonicalize_ip(raw_ip) {
+        IpAddr::V4(v4) => {
+            if v4 == CLOUD_METADATA_IPV4 {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to cloud metadata address 169.254.169.254"
+                )));
+            }
+            if v4 == ALIBABA_METADATA_IPV4 {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to cloud metadata address 100.100.100.200"
+                )));
+            }
+            if v4.octets()[0] == 0 {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to unspecified network ({raw_ip})"
+                )));
+            }
+            if v4.is_broadcast() {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to broadcast address ({raw_ip})"
+                )));
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6 == CLOUD_METADATA_IPV6 {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to cloud metadata address fd00:ec2::254"
+                )));
+            }
+            if v6.is_unspecified() {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to unspecified IPv6 address (::)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pre-flight URL validation for JS plugin `fc.fetch`: enforces `http`/`https`, forbids embedded
+/// credentials (`user:pass@`), and unconditionally blocks cloud metadata hostnames & literal IPs.
+pub fn check_hard_blocked_plugin_url(url: &Url) -> AppResult<()> {
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(AppError::SsrfBlocked(format!(
+                "disallowed URL scheme '{other}' in plugin fetch (only http and https are permitted)"
+            )));
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::SsrfBlocked(
+            "plugin fetch URL must not contain embedded user:pass@ credentials".to_string(),
+        ));
+    }
+    let Some(host) = url.host() else {
+        return Err(AppError::Validation(format!(
+            "plugin fetch URL '{url}' is missing a valid host"
+        )));
+    };
+    match host {
+        Host::Ipv4(v4) => check_hard_blocked_plugin_ip(&v4.to_string(), IpAddr::V4(v4)),
+        Host::Ipv6(v6) => check_hard_blocked_plugin_ip(&v6.to_string(), IpAddr::V6(v6)),
+        Host::Domain(domain) => {
+            let norm = normalize_hostname(domain);
+            if norm.is_empty() {
+                return Err(AppError::Validation(format!(
+                    "plugin fetch URL '{url}' has an empty domain"
+                )));
+            }
+            if norm == "metadata.google.internal"
+                || norm == "metadata.goog"
+                || norm == "instance-data"
+                || norm == "instance-data.ec2.internal"
+            {
+                return Err(AppError::SsrfBlocked(format!(
+                    "cloud metadata hostname '{domain}' is unconditionally blocked"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Connect-time DNS resolver used for admin-configured `format: "uri"` plugin origins (e.g.,
+/// self-hosted LAN/Docker `ntfy` or `Bark` servers): allows private/loopback/Docker hostnames
+/// while STILL rejecting cloud metadata, unspecified, and broadcast IPs at connect time.
+#[derive(Clone, Debug, Default)]
+pub struct PluginMetadataGuardDnsResolver;
+
+impl Resolve for PluginMetadataGuardDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let clean = host
+                .trim()
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(host.trim());
+            let ips: Vec<IpAddr> = if let Ok(ip) = IpAddr::from_str(clean) {
+                vec![ip]
+            } else {
+                let addrs = tokio::net::lookup_host((clean, 0u16))
+                    .await
+                    .map_err(|err| {
+                        Box::new(std::io::Error::other(format!(
+                            "DNS lookup failed for '{clean}': {err}"
+                        ))) as Box<dyn StdError + Send + Sync>
+                    })?;
+                addrs.map(|sa| sa.ip()).collect()
+            };
+            if ips.is_empty() {
+                return Err(Box::new(SsrfBlockedError(format!(
+                    "hostname '{clean}' resolved to zero IP addresses"
+                ))) as Box<dyn StdError + Send + Sync>);
+            }
+            for &ip in &ips {
+                if let Err(AppError::SsrfBlocked(msg)) = check_hard_blocked_plugin_ip(clean, ip) {
+                    let detail = msg
+                        .strip_prefix("SSRF guard blocked target: ")
+                        .unwrap_or(&msg)
+                        .to_string();
+                    return Err(
+                        Box::new(SsrfBlockedError(detail)) as Box<dyn StdError + Send + Sync>
+                    );
+                }
+            }
+            let addrs: Addrs = Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+            Ok(addrs)
         })
     }
 }

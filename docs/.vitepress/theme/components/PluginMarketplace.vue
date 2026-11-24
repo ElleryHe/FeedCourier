@@ -13,37 +13,47 @@ const props = withDefaults(
 
 const isZh = computed(() => props.locale === "zh");
 
+function resolveDescription(plugin: MarketPlugin): string {
+  const i18n = plugin.description_i18n;
+  if (!i18n) return plugin.description;
+  if (isZh.value) {
+    return i18n["zh-CN"] || i18n.zh || plugin.description;
+  }
+  return i18n.en || plugin.description;
+}
+
 function kindLabel(plugin: MarketPlugin): string {
   if (plugin.kind === "builtin") return isZh.value ? "内置" : "Built-in";
-  if (plugin.runtime === "bridge" && plugin.kind === "channel") {
-    return isZh.value ? "桥接 · 通道" : "Bridge · Channel";
+  if (plugin.runtime === "js" && plugin.kind === "channel") {
+    return isZh.value ? "JS · 通道" : "JS · Channel";
   }
-  if (plugin.runtime === "bridge") {
-    return isZh.value ? "桥接 · 处理" : "Bridge · Processor";
+  if (plugin.runtime === "js") {
+    return isZh.value ? "JS · 处理" : "JS · Processor";
   }
   if (plugin.kind === "coming_soon") return isZh.value ? "即将支持" : "Coming Soon";
-  return isZh.value ? "第三方" : "External";
+  return isZh.value ? "外部扩展" : "External";
 }
 
 function kindClass(plugin: MarketPlugin): string {
   if (plugin.kind === "builtin") return "fc-badge-builtin";
-  if (plugin.runtime === "bridge") return "fc-badge-builtin";
+  if (plugin.runtime === "js") return "fc-badge-external";
   if (plugin.kind === "coming_soon") return "fc-badge-soon";
   return "fc-badge-external";
 }
 
 function resolveHomepage(plugin: MarketPlugin): string | undefined {
   if (!plugin.homepage) return undefined;
-  if (isZh.value && plugin.homepage.startsWith("https://feedcourier.ellery.me/plugins/")) {
-    return plugin.homepage.replace(
+  let target = plugin.homepage.replace("/plugins/bridge-channels", "/plugins/js-plugins");
+  if (isZh.value && target.startsWith("https://feedcourier.ellery.me/plugins/")) {
+    return target.replace(
       "https://feedcourier.ellery.me/plugins/",
       "/zh/plugins/",
     );
   }
-  if (!isZh.value && plugin.homepage.startsWith("https://feedcourier.ellery.me/plugins/")) {
-    return plugin.homepage.replace("https://feedcourier.ellery.me", "");
+  if (!isZh.value && target.startsWith("https://feedcourier.ellery.me/plugins/")) {
+    return target.replace("https://feedcourier.ellery.me", "");
   }
-  return plugin.homepage;
+  return target;
 }
 
 function isExternalUrl(url?: string): boolean {
@@ -93,10 +103,10 @@ function isExternalUrl(url?: string): boolean {
           </span>
         </div>
 
-        <p class="fc-plugin-desc">{{ plugin.description }}</p>
+        <p class="fc-plugin-desc">{{ resolveDescription(plugin) }}</p>
 
         <div class="fc-plugin-tags">
-          <span class="fc-tag">v{{ plugin.version }}</span>
+          <span class="fc-tag">v{{ plugin.latest || plugin.version }}</span>
           <span v-if="plugin.min_core" class="fc-tag">
             {{ isZh ? `核心 >= ${plugin.min_core}` : `Core >= ${plugin.min_core}` }}
           </span>
@@ -104,7 +114,10 @@ function isExternalUrl(url?: string): boolean {
           <span v-for="hook in plugin.hooks" :key="hook" class="fc-tag fc-tag-hook">
             {{ hook }}
           </span>
-          <span v-for="perm in plugin.permissions" :key="perm" class="fc-tag fc-tag-perm">
+          <span v-for="host in plugin.allowed_hosts" :key="host" class="fc-tag fc-tag-perm">
+            {{ host }}
+          </span>
+          <span v-for="perm in plugin.permissions" :key="perm" class="fc-tag">
             {{ isZh ? `权限:${perm}` : `perm:${perm}` }}
           </span>
         </div>

@@ -458,7 +458,7 @@ impl ChannelDestinationDto {
         let config_view = match (&decrypted, plugin_dest_schema) {
             (DestinationConfig::Plugin(p), Some(schema)) => serde_json::json!({
                 "kind": "plugin",
-                "config": crate::plugins::bridge::redact_config_with_schema(schema, &p.config),
+                "config": crate::plugins::js_runtime::redact_config_with_schema(schema, &p.config),
             }),
             _ => decrypted.view(),
         };
@@ -623,7 +623,7 @@ impl DestinationPatch {
                 let next_cfg = match config {
                     Some(patch_val) => {
                         let empty = serde_json::json!({});
-                        crate::plugins::bridge::merge_config_against_schema(
+                        crate::plugins::js_runtime::merge_config_against_schema(
                             plugin_schema.unwrap_or(&empty),
                             &cur.config,
                             patch_val,
@@ -694,7 +694,7 @@ impl ChannelDto {
             (ChannelConfig::Plugin(p), Some(schema)) => serde_json::json!({
                 "kind": "plugin",
                 "plugin_id": p.plugin_id,
-                "config": crate::plugins::bridge::redact_config_with_schema(schema, &p.config),
+                "config": crate::plugins::js_runtime::redact_config_with_schema(schema, &p.config),
             }),
             _ => decrypted.redacted_view(),
         };
@@ -901,7 +901,7 @@ impl ChannelTargetPatch {
                 let next_cfg = match config {
                     Some(patch_val) => {
                         let empty = serde_json::json!({});
-                        crate::plugins::bridge::merge_config_against_schema(
+                        crate::plugins::js_runtime::merge_config_against_schema(
                             plugin_schema.unwrap_or(&empty),
                             &cur.config,
                             patch_val,
@@ -1239,7 +1239,9 @@ pub struct PluginDto {
     pub kind: PluginKind,
     pub runtime: PluginRuntime,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bridge_url: Option<String>,
+    pub script_sha256: Option<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     pub compatible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_reason: Option<String>,
@@ -1253,22 +1255,51 @@ pub struct PluginDto {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RegisterBridgePluginRequest {
-    pub bridge_url: String,
-    pub bridge_secret: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+pub struct InstallMarketPluginRequest {
+    pub plugin_id: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadJsPluginRequest {
+    pub script_js: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub allow_overwrite: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeManifestPreviewResponse {
-    pub bridge_url: String,
+pub struct JsPluginPreviewResponse {
+    pub source: String,
     pub manifest: PluginManifest,
+    pub script_sha256: String,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     pub compatible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_reason: Option<String>,
+    pub already_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSourceResponse {
+    pub id: String,
+    pub source: String,
+    pub version: String,
+    pub script_sha256: String,
+    pub script_js: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1292,10 +1323,6 @@ pub struct UpdatePluginRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub settings: Option<Value>,
-    #[serde(default)]
-    pub bridge_url: Option<String>,
-    #[serde(default)]
-    pub bridge_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1334,10 +1361,25 @@ pub struct MarketQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketPluginVersionDto {
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_core: Option<String>,
+    pub path: String,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPluginItemDto {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
     pub api_version: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1346,18 +1388,23 @@ pub struct MarketPluginItemDto {
     pub category: String,
     pub icon: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
     pub homepage: Option<String>,
     pub repository: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compose_snippet: Option<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     pub hooks: Vec<String>,
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub versions: Vec<MarketPluginVersionDto>,
     pub compatible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_reason: Option<String>,
     pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    pub update_available: bool,
     pub enabled: bool,
 }
 

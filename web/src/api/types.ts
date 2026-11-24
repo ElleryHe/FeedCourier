@@ -24,7 +24,7 @@ export interface RouteReferenceDto {
   name: string;
 }
 
-/** Channel reference returned inside 409 Conflict responses when deleting a referenced bridge plugin. */
+/** Channel reference returned inside 409 Conflict responses when deleting a referenced plugin. */
 export interface ChannelReferenceDto {
   id: number;
   name: string;
@@ -1012,7 +1012,9 @@ export type PluginPermission = "network";
 
 export type PluginKind = "processor" | "channel";
 
-export type PluginRuntime = "builtin" | "bridge";
+export type PluginRuntime = "builtin" | "js";
+
+export type PluginSource = "builtin" | "market" | "custom";
 
 export interface PluginRouteOptionPropertySchema {
   type: "select" | "boolean" | "string" | "number" | string;
@@ -1030,7 +1032,7 @@ export interface PluginRouteOptionSchema {
   properties?: Record<string, PluginRouteOptionPropertySchema>;
 }
 
-export interface PluginManifest {
+export interface PluginManifestDto {
   id: string;
   name: string;
   version: string;
@@ -1041,15 +1043,20 @@ export interface PluginManifest {
   category: string;
   icon: string;
   description: string;
+  description_i18n?: Record<string, string>;
   homepage: string;
   hooks: HookKind[];
   permissions: PluginPermission[];
+  allowed_hosts?: string[];
   instance_schema: Record<string, unknown>;
   route_option_schema: PluginRouteOptionSchema;
   account_schema?: Record<string, unknown>;
   destination_schema?: Record<string, unknown>;
   capabilities?: Record<string, unknown>;
 }
+
+/** Alias retained for readability across WebUI modules. */
+export type PluginManifest = PluginManifestDto;
 
 export type YourlsAuthMode = "signature" | "timed_signature" | "password";
 
@@ -1079,13 +1086,14 @@ export interface PluginInstanceDto {
 
 export interface PluginDto {
   id: string;
-  source: "builtin" | "bridge" | string;
+  source: PluginSource;
   kind: PluginKind;
   runtime: PluginRuntime;
-  bridge_url?: string | null;
+  script_sha256?: string | null;
+  allowed_hosts: string[];
   compatible: boolean;
   compatibility_reason?: string | null;
-  manifest: PluginManifest;
+  manifest: PluginManifestDto;
   enabled: boolean;
   installed_version: string;
   settings: Record<string, unknown>;
@@ -1094,25 +1102,43 @@ export interface PluginDto {
   updated_at: string;
 }
 
-export interface RegisterBridgePluginRequest {
-  bridge_url: string;
-  bridge_secret: string;
+export interface InstallMarketPluginRequest {
+  plugin_id: string;
+  version?: string;
   enabled?: boolean;
   dry_run?: boolean;
 }
 
-export interface BridgeManifestPreviewResponse {
-  bridge_url: string;
-  manifest: PluginManifest;
+export interface UploadJsPluginRequest {
+  script_js: string;
+  enabled?: boolean;
+  dry_run?: boolean;
+  allow_overwrite?: boolean;
+}
+
+export interface JsPluginPreviewResponse {
+  source: "market" | "custom";
+  manifest: PluginManifestDto;
+  script_sha256: string;
+  allowed_hosts: string[];
   compatible: boolean;
   compatibility_reason?: string | null;
+  already_installed: boolean;
+  installed_version?: string | null;
+  changelog?: string | null;
+}
+
+export interface PluginSourceResponse {
+  id: string;
+  source: PluginSource;
+  version: string;
+  script_sha256: string;
+  script_js: string;
 }
 
 export interface UpdatePluginRequest {
   enabled?: boolean;
   settings?: Record<string, unknown>;
-  bridge_url?: string;
-  bridge_secret?: string;
 }
 
 export interface CreatePluginInstanceRequest {
@@ -1136,26 +1162,39 @@ export interface ClearPluginCacheResponse {
   cleared_entries: number;
 }
 
+export interface MarketPluginVersionDto {
+  version: string;
+  min_core?: string | null;
+  path: string;
+  sha256: string;
+  changelog_path?: string | null;
+  changelog?: string | null;
+}
+
 export interface MarketPluginItemDto {
   id: string;
   name: string;
   version: string;
   api_version: string;
   kind: "builtin" | "processor" | "channel" | "external" | "coming_soon" | string;
-  runtime?: "builtin" | "bridge" | string | null;
+  runtime?: PluginRuntime | string | null;
   min_core: string | null;
   category: string;
   icon: string;
   description: string;
+  description_i18n?: Record<string, string>;
   homepage: string | null;
   repository: string | null;
-  image?: string | null;
-  compose_snippet?: string | null;
   hooks: string[];
   permissions: string[];
+  allowed_hosts: string[];
+  latest?: string | null;
+  versions: MarketPluginVersionDto[];
   compatible: boolean;
   compatibility_reason?: string | null;
   installed: boolean;
+  installed_version?: string | null;
+  update_available: boolean;
   enabled: boolean;
 }
 

@@ -741,11 +741,10 @@ pub struct PluginRow {
     pub settings_json: String,
     pub source: String,
     pub kind: String,
-    pub bridge_url: Option<String>,
-    #[serde(skip_serializing)]
-    pub encrypted_bridge_secret: Option<Vec<u8>>,
+    pub script_js: Option<String>,
+    pub script_sha256: Option<String>,
     pub manifest_json: Option<String>,
-    pub manifest_fetched_at: Option<i64>,
+    pub installed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }

@@ -1,132 +1,183 @@
 ---
-description: "FeedCourier Plugin Protocol v1 specification: manifest.schema.json, HTTP Bridge wire protocol (bridge-protocol.schema.json), HMAC-SHA256 signing, channel-template starter kit, and registry submissions."
+description: "FeedCourier Plugin API v1 (plugin.js) specification: single-file ES module exports, globalThis.fc host utilities, boa_engine sandbox limits, manifest schema, node --test workflow, and registry submissions."
 ---
 
-# Plugin Development & Protocol v1
+# Plugin Development & API v1 (`plugin.js`)
 
-FeedCourier defines a stable **Plugin Protocol v1 (`api_version: "1"`)** shared by first-party compiled plugins, out-of-process **HTTP Bridge Plugins** (`v0.3.1+`), and the public marketplace registry ([`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)).
+FeedCourier defines a stable **Plugin API v1 (`api_version: "1"`)** shared by first-party compiled Rust plugins, in-process sandboxed **JS Plugins** (`runtime: "js"`, powered by `boa_engine` in `v0.3.1+`), and the public marketplace registry ([`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)).
+
+Each JS plugin is a **single self-contained ES module (`plugin.js`)** with zero external runtime dependencies — deployable with one click from the WebUI Marketplace or via custom `.js` upload.
 
 ---
 
-## 1. HTTP Bridge Protocol v1 (`schema/bridge-protocol.schema.json`)
+## 1. Single-File `plugin.js` Exports
 
-Out-of-process bridge plugins are standalone HTTP(S) services (typically deployed as a Docker Compose sidecar in any language — Rust, Go, Python, Node.js, etc.).
+A `plugin.js` module exports a static `meta` object plus the handler functions matching its `kind` and `hooks`:
 
-### Request Authentication (HMAC-SHA256)
-
-Every request sent by FeedCourier carries:
-
-| Header | Description |
-| :--- | :--- |
-| `X-FeedCourier-Timestamp` | Unix epoch seconds when FeedCourier signed the request. |
-| `X-FeedCourier-Signature` | `v1=<hex(HMAC-SHA256(BRIDGE_SECRET, "{timestamp}.{raw_body}"))>` |
-| `X-FeedCourier-Plugin-Id` | Registered plugin ID (`"pending"` during initial `GET /manifest`). |
-| `X-FeedCourier-Idempotency-Key` | Deterministic SHA-256 key on `/deliver`, `/hooks/on_render`, and `/hooks/on_delivered`. |
-
-Bridge servers **MUST** verify the signature using constant-time comparison and reject requests whose timestamp falls outside a **`±300s`** replay window.
-
-### Endpoints & Limits
-
-| Endpoint | Kind | Timeout | Purpose |
-| :--- | :---: | :---: | :--- |
-| `GET /manifest` | All | `10s` | Return runtime `PluginManifest` JSON (`id`, `name`, `version`, `api_version: "1"`, `kind: "channel" \| "processor"`, `min_core`, `hooks`, schemas, `capabilities`). |
-| `POST /validate` | All | `10s` | Validate `{ scope: "account" \| "destination" \| "instance", config }`; return `{ ok: true, normalized_config? }` or `400 { ok: false, error }`. |
-| `POST /test` | All | `10s` | Execute an interactive connectivity test for `{ scope, account?, destination?, config? }`; return `{ ok: true, message }`. |
-| `POST /deliver` | `channel` | `30s` | Deliver a rendered article to the custom channel. |
-| `POST /hooks/on_render` | `processor` | `10s` | Transform `content_html` / `primary_link` before channel rendering (15s per-plugin total hook budget). |
-| `POST /hooks/on_delivered` | Any declaring `on_delivered` | `10s` | Receive persistent at-least-once post-delivery notifications. |
-
-**Hard Core Boundaries**:
-- Response body cap: **`1 MiB`** on all endpoints.
-- Redirects are strictly rejected (`redirect::Policy::none()`) and `OUTBOUND_PROXY` is never applied to bridges.
-- HTML returned by `POST /hooks/on_render` is **always re-sanitized through `ammonia`** before entering any downstream renderer.
-- Serialized `checkpoint` JSON returned by `POST /deliver` is capped at **`16 KiB`**.
-
-### `POST /deliver` Contract (`kind: "channel"`)
-
-**Request body**:
-
-```json
-{
-  "idempotency_key": "<sha256>",
-  "task_id": 42,
-  "attempt": 1,
-  "account": { "server_url": "https://ntfy.sh", "access_token": "tk_..." },
-  "destination": { "topic": "feedcourier-alerts", "priority": "default" },
-  "entry": {
-    "title": "Article Title",
-    "url": "https://example.com/post",
-    "summary_text": "Concise summary",
-    "content_html": "<p>Sanitized HTML (post on_render)</p>",
-    "plain_text": "Plain text fallback",
-    "author": "Alice",
-    "published_at": 1732492800,
-    "media": []
+```js
+export const meta = {
+  id: "my-channel",
+  name: "My Custom Channel",
+  version: "0.1.0",
+  api_version: "1",
+  kind: "channel", // "channel" | "processor"
+  runtime: "js",
+  min_core: "0.3.1",
+  category: "delivery",
+  icon: "bell",
+  description: "Delivers FeedCourier articles to My Custom Channel.",
+  description_i18n: {
+    "zh-CN": "将 FeedCourier 文章推送至自定义通道。"
   },
-  "feed": { "id": 1, "title": "Blog", "url": "https://example.com/rss.xml" },
-  "route": { "id": 3, "name": "Alerts", "locale": "en", "timezone": "UTC" },
-  "checkpoint": null
+  homepage: "https://feedcourier.ellery.me/plugins/js-plugins",
+  hooks: [], // e.g. ["on_render"] or ["on_delivered"]
+  permissions: ["network"],
+  allowed_hosts: ["api.example.com"],
+  account_schema: {
+    type: "object",
+    required: ["server_url"],
+    properties: {
+      server_url: {
+        type: "string",
+        format: "uri",
+        title: "Server URL",
+        default: "https://api.example.com"
+      },
+      access_token: {
+        type: "string",
+        format: "password",
+        "x-secret": true,
+        title: "Access Token"
+      }
+    }
+  },
+  destination_schema: {
+    type: "object",
+    required: ["target"],
+    properties: {
+      target: { type: "string", title: "Target Room / Topic" }
+    }
+  }
+};
+
+export function validate(input) {
+  // input: { scope: "account" | "destination" | "instance", config }
+  return { ok: true, normalized_config: input.config };
+}
+
+export function test(input) {
+  // input: { scope, account?, destination?, instance?, config?, locale? }
+  const res = fc.fetch({ method: "GET", url: "https://api.example.com/ping", timeoutMs: 8000 });
+  return { ok: res.ok, message: res.ok ? "Connected" : `HTTP ${res.status}` };
+}
+
+export function deliver(input) {
+  // input: { idempotency_key, task_id, attempt, account, destination, entry, feed, route, checkpoint }
+  const body = fc.truncateUtf8Bytes(input.entry.summary_text || input.entry.title || "", 3500);
+  const res = fc.fetch({
+    method: "POST",
+    url: `${input.account.server_url.replace(/\/+$/, "")}/send`,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target: input.destination.target, title: input.entry.title, body }),
+    timeoutMs: 15000
+  });
+  if (res.status === 429) return { outcome: "retry", status_code: 429, retry_after_secs: 60 };
+  if (res.status >= 500) return { outcome: "retry", status_code: res.status, diagnostic: `Upstream HTTP ${res.status}` };
+  if (!res.ok) return { outcome: "permanent_failure", status_code: res.status, diagnostic: `HTTP ${res.status}` };
+  return { outcome: "delivered", status_code: res.status };
 }
 ```
 
-**Response body (`200 OK`)**:
+### Supported Exported Functions
 
-```json
-{
-  "outcome": "delivered",
-  "external_id": "msg-123",
-  "checkpoint": { "cursor": "optional-state" },
-  "diagnostic": "Optional human-readable note"
-}
-```
+| Export | Kind / Hook | Budget | Contract |
+| :--- | :---: | :---: | :--- |
+| `meta` | All (required) | Compile-time | Static manifest object describing `id`, `name`, `version`, `api_version: "1"`, `kind`, `min_core`, `allowed_hosts`, schemas, and `hooks`. |
+| `validate(input)` | All (optional) | `10s` | Validates `{ scope: "account" \| "destination" \| "instance", config }`; returns `{ ok: true, normalized_config? }` or `{ ok: false, error }`. |
+| `test(input)` | All (optional) | `10s` | Runs an interactive connectivity test for `{ scope, account?, destination?, instance?, locale? }`; returns `{ ok: true \| false, message?, error? }`. |
+| `deliver(input)` | `kind: "channel"` | `30s` | Delivers a rendered article to the custom channel. Returns `{ outcome, status_code?, external_id?, checkpoint?, retry_after_secs?, next_window_at?, diagnostic? }`. |
+| `onRender(input)` | `hooks: ["on_render"]` | `15s` | Transforms `content_html` / `primary_link` before channel rendering. Returned HTML is **always re-sanitized through `ammonia`**. |
+| `onDelivered(input)` | `hooks: ["on_delivered"]` | `10s` | Receives persistent at-least-once post-delivery notifications dispatched from `plugin_events` (up to 5 attempts with exponential backoff). |
 
-- `outcome`: `"delivered"` | `"retry"` (with optional `retry_after_secs`) | `"permanent_failure"` | `"deferred"` (with optional `next_window_at` or `retry_after_secs`).
-- Non-2xx HTTP fallback mapping: HTTP **`429`** → `retry` (honors `Retry-After` and triggers credential-group cooldown); **`5xx`** and network/timeout errors → `retry`; other **`4xx`** → `permanent_failure`.
+### `deliver(input)` Payload & Outcomes
 
-### `POST /hooks/on_delivered` Contract
-
-When a delivery succeeds, FeedCourier inserts one row into `plugin_events` **inside the same SQLite transaction** as marking `delivery_tasks.status = 'delivered'` for every enabled bridge plugin subscribed to `on_delivered` on that route or channel. A dedicated background worker dispatches events with `X-FeedCourier-Idempotency-Key` and retries failures with exponential backoff (`15s, 30s, 60s, 120s`, max **5 attempts**) without affecting delivery status or channel quotas.
+- **`input` fields**:
+  - `idempotency_key`: deterministic SHA-256 string (unique per debug push)
+  - `task_id`, `attempt`: outbox task metadata
+  - `account`, `destination`: decrypted account & destination configs
+  - `entry`: `{ title, url, summary_text, plain_text, content_html, author, published_at, published_local, media }` (`published_local` formatted as `YYYY-MM-DD HH:MM` in the route timezone)
+  - `feed`: `{ id, title, url, site_url, favicon_url }`
+  - `route`: `{ id, name, locale, timezone }`
+  - `checkpoint`: prior checkpoint JSON or `null`
+- **Returned `outcome`**:
+  - `"delivered"` — delivery succeeded (optional `status_code`, `external_id`, `checkpoint`, `diagnostic`)
+  - `"retry"` — transient error; honors optional `retry_after_secs` (and triggers account-group cooldown on `429` or `retry_after_secs`)
+  - `"permanent_failure"` — non-retryable failure (moves task to `dead_letter`)
+  - `"deferred"` — postpones delivery without consuming an attempt (optional `next_window_at` or `retry_after_secs`)
 
 ---
 
-## 2. Starter Kit & Reference Channel (`FeedCourier-Plugins`)
+## 2. Host Utilities (`globalThis.fc`)
 
-Start a new channel plugin in seconds from **[`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)**:
+FeedCourier injects a read-only `globalThis.fc` namespace into every sandboxed execution (plugins must use pure ECMAScript + `globalThis.fc` only — no `import`, `fetch`, `URL`, `Buffer`, or `TextEncoder`):
 
-- **`channels/channel-template/`**: Zero-dependency **Node.js 24** template (`node:http` + `node:crypto`), implementing HMAC-SHA256 verification, all 4 endpoints, `mapUpstreamStatusToOutcome()`, a `Dockerfile`, and `node:test` unit tests.
-- **`channels/ntfy/`**: Production-ready reference channel plugin for `ntfy.sh` / self-hosted ntfy servers.
+| Function | Signature | Description |
+| :--- | :--- | :--- |
+| `fc.fetch` | `fc.fetch({ method?, url, headers?, body?, timeoutMs? }) -> { status, ok, headers, body }` | Synchronous HTTP(S) client (max 4 calls per channel/validate/test/onDelivered hook, 10 per `onRender`; `timeoutMs` clamped to `100..=15000`; `1 MiB` response cap; redirects disabled; lowercase response header keys). Enforces the dual allowlist (`meta.allowed_hosts` via `ProtectedHttpClient` SSRF guard + exact `(scheme, host, port)` admin-configured `format: "uri"` origins) and hard-blocks cloud metadata IPs. Honors channel/instance `use_proxy`. |
+| `fc.sha256` | `fc.sha256(input: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | SHA-256 digest of UTF-8 input (defaults to lowercase `"hex"`). |
+| `fc.hmacSha256` | `fc.hmacSha256(message: string, secret: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | HMAC-SHA256 signature (defaults to lowercase `"hex"`). |
+| `fc.md5` | `fc.md5(input: string) -> string` | Lowercase hex MD5 digest (useful for legacy API signatures). |
+| `fc.base64Encode` | `fc.base64Encode(input: string) -> string` | Standard Base64 encoding of UTF-8 text (useful for `Basic` auth or RFC 2047 headers). |
+| `fc.base64Decode` | `fc.base64Decode(b64: string) -> string` | Decodes Standard or URL-safe Base64 back to UTF-8 text. |
+| `fc.base64UrlEncode` | `fc.base64UrlEncode(input: string) -> string` | URL-safe Base64 without padding (`RFC 4648`). |
+| `fc.utf8ByteLength` | `fc.utf8ByteLength(str: string) -> number` | Exact UTF-8 byte length of a string. |
+| `fc.truncateUtf8Bytes` | `fc.truncateUtf8Bytes(str: string, maxBytes: number) -> string` | Truncates a string to at most `maxBytes` UTF-8 bytes on a valid Unicode scalar boundary (ideal for ntfy / APNs / Bark 4 KB payload caps). |
+| `fc.htmlToText` | `fc.htmlToText(html: string) -> string` | Converts HTML fragments to clean plain text. |
+| `fc.unixNow` | `fc.unixNow() -> number` | Current UTC Unix epoch timestamp in seconds. |
+| `fc.uuid` | `fc.uuid() -> string` | Generates a random RFC 4122 UUID v4 string. |
+
+---
+
+## 3. Sandbox & Core Safety Boundaries
+
+- **Isolated Pure-Rust Engine (`boa_engine`)**: No filesystem, `process`, `env`, native addons, `import` statements (`IdleModuleLoader`), or raw sockets exist inside the sandbox. All hooks must execute synchronously (returning a `Promise` is rejected).
+- **Dual Network Allowlist Enforcement**: Any `fc.fetch()` attempt to a hostname not listed in `meta.allowed_hosts` or an administrator-configured `format: "uri"` field is rejected immediately before DNS resolution (`403 ssrf_blocked`). Cloud metadata IPs (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`, `0.0.0.0`, `::`, `metadata.google.internal`) and HTTP `3xx` redirects are unconditionally blocked.
+- **Resource Caps**:
+  - Script source size is capped at **`512 KiB`**; HTTP response bodies are capped at **`1 MiB`**.
+  - Each invocation runs under hard VM limits (`loop_iteration_limit = 200,000`, `recursion_limit = 128`, `stack_size_limit = 64 KiB`) and wall-clock timeouts (`5s` compile, `10s` validate/test/onDelivered, `15s` `onRender`, `30s` `deliver`).
+  - HTML returned by `onRender` is always re-sanitized via `ammonia`.
+  - Serialized `checkpoint` JSON returned by `deliver` is capped at **`16 KiB`**.
+- **Durable `on_delivered` Outbox**: When a delivery succeeds, FeedCourier inserts one row into `plugin_events` **inside the same SQLite transaction** as marking `delivery_tasks.status = 'delivered'` for every enabled plugin declaring `on_delivered`. A dedicated background worker invokes `onDelivered` with exponential backoff (`15s, 30s, 60s, 120s`, max **5 attempts**) without affecting delivery status or channel quotas.
+
+---
+
+## 4. Marketplace Registry & Testing (`ElleryHe/FeedCourier-Plugins`)
+
+Official and community JS plugins live in **[`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)** — including the reference **`ntfy`** and **`bark`** channel plugins — with zero-dependency unit tests runnable directly under Node.js 24+:
 
 ```bash
-cd FeedCourier-Plugins/channels/channel-template
-node --test server.test.mjs
-BRIDGE_SECRET="dev-secret" PORT=8787 node server.mjs
+cd FeedCourier-Plugins
+node --test tests/*.test.mjs
+node scripts/build-index.mjs --check --verify-index
 ```
 
----
-
-## 3. Marketplace Manifest Schema (`schema/manifest.schema.json`)
-
-Each plugin listing lives at `registry/<id>.json` in `ElleryHe/FeedCourier-Plugins` (Draft 2020-12):
+### Registry Entry & `index.json` Fields
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `id`, `name`, `version`, `api_version` | `string` | Unique kebab-case ID (`registry/<id>.json`), display name, SemVer version, `"1"`. |
-| `kind` | `string` | `"builtin"` \| `"processor"` \| `"channel"` \| `"external"` \| `"coming_soon"`. |
-| `runtime` | `string` | Optional `"builtin"` \| `"bridge"`. |
-| `min_core` | `string` | Minimum compatible FeedCourier version (checked by WebUI & API before install). |
-| `category`, `icon`, `description` | `string` | Marketplace filtering and card metadata. |
+| `id`, `name`, `version`, `api_version` | `string` | Unique kebab-case ID, display name, latest SemVer version, `"1"`. |
+| `kind` | `string` | `"builtin"` \| `"channel"` \| `"processor"` \| `"coming_soon"`. |
+| `runtime` | `string` | `"builtin"` \| `"js"`. |
+| `min_core` | `string` | Minimum compatible FeedCourier version (checked before install). |
+| `category`, `icon`, `description`, `description_i18n` | `string` / `object` | Marketplace filtering, icon key, and localized descriptions (`{ "en": "...", "zh": "..." }`). |
 | `homepage`, `repository` | `string` | Strict `https://` documentation and source links. |
-| `image`, `compose_snippet` | `string` | Optional container image and Docker Compose YAML snippet for bridge plugins. |
-| `hooks` | `string[]` | `"on_render"`, `"on_ingest"`, `"on_delivered"` (optional empty array `[]` for `kind: "channel"`). |
-| `permissions` | `string[]` | Declared capabilities (`["network"]`). |
-| `account_schema`, `destination_schema`, `capabilities` | `object` | Declarative JSON Schemas driving WebUI forms (`format: "password"` and `x-secret: true` fields are encrypted & masked automatically). |
+| `allowed_hosts` | `string[]` | Public hostnames the plugin may contact via `fc.fetch()` (displayed as security pills in WebUI). |
+| `latest`, `versions` | `string` / `object[]` | Version list (`{ version, min_core, path, sha256, changelog_path?, changelog? }`) verified by SHA-256 during 1-click install. |
+| `hooks`, `permissions` | `string[]` | Declared hooks (`on_render`, `on_delivered`) and capabilities (`["network"]`). |
+| `account_schema`, `destination_schema`, `instance_schema`, `route_option_schema` | `object` | JSON Schemas driving WebUI dynamic forms (`format: "password"` and `x-secret: true` fields are encrypted & masked automatically). |
 
-### Submitting to `ElleryHe/FeedCourier-Plugins`
+### Submitting a Plugin
 
-1. Fork `ElleryHe/FeedCourier-Plugins`, add `registry/<id>.json` (and optional channel source/tests under `channels/<id>/`).
-2. Validate locally with Node.js 24+:
-   ```bash
-   node scripts/build-index.mjs --check
-   node --test channels/*/*.test.mjs
-   ```
-3. **Do not manually edit `index.json` in your PR.** GitHub Actions validates PRs and automatically rebuilds `index.json` upon merge to `main`.
+1. Fork `ElleryHe/FeedCourier-Plugins`, add `plugins/<channels|processors>/<id>/<version>/plugin.js`, `CHANGELOG.md`, `plugins/<channels|processors>/<id>/README.md` (`README.zh-CN.md`), and `tests/<id>.test.mjs`.
+2. Validate locally with `node --test tests/*.test.mjs` and `node scripts/build-index.mjs --check`.
+3. **Do not manually edit `index.json` in your PR.** GitHub Actions validates every PR and automatically rebuilds `index.json` (including verified `sha256` digests) upon merge to `main`.

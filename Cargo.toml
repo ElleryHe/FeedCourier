@@ -103,6 +103,9 @@ rmcp = { version = "3.10", features = [
 ] }
 schemars = "1.2"
 
+# Embedded JavaScript plugin runtime (pure Rust ECMAScript sandbox)
+boa_engine = { version = "0.22.0", default-features = false }
+
 # Embedded WebUI assets
 rust-embed = { version = "8.14", features = ["interpolate-folder-path", "mime-guess"] }
 mime_guess = "2.0"

@@ -7,7 +7,6 @@ import type {
   AuthLoginResponse,
   AuthPasswordRequest,
   AuthStatusResponse,
-  BridgeManifestPreviewResponse,
   ChannelDestinationDto,
   ChannelDto,
   ChannelReferenceDto,
@@ -28,6 +27,8 @@ import type {
   FeedPreviewRequest,
   FeedPreviewResponse,
   GcResponse,
+  InstallMarketPluginRequest,
+  JsPluginPreviewResponse,
   ListTasksParams,
   MarketResponse,
   McpTokenDto,
@@ -40,11 +41,11 @@ import type {
   OverviewResponse,
   PluginDto,
   PluginInstanceDto,
+  PluginSourceResponse,
   PollFeedResponse,
   QueueStateDto,
   RecoveryCodesResponse,
   RegenerateRecoveryCodesRequest,
-  RegisterBridgePluginRequest,
   RetryTasksRequest,
   RetryTasksResponse,
   RouteDto,
@@ -69,6 +70,7 @@ import type {
   UpdateQueueRequest,
   UpdateRouteRequest,
   UpdateSystemSettingsRequest,
+  UploadJsPluginRequest,
 } from "./types";
 import { getMessages } from "@/i18n";
 
@@ -130,7 +132,7 @@ export function getReferencingRoutesConflict(
   return null;
 }
 
-/** Extract referencing channels & routes from a 409 Conflict when deleting a bridge plugin. */
+/** Extract referencing channels & routes from a 409 Conflict when uninstalling a plugin. */
 export function getPluginDeleteConflict(err: unknown): {
   channels: ChannelReferenceDto[];
   routes: RouteReferenceDto[];
@@ -545,21 +547,34 @@ export const api = {
   // -------------------------------------------------------------------------
   plugins: {
     list: () => request<PluginDto[]>("/plugins", { method: "GET" }),
-    previewBridge: (payload: Omit<RegisterBridgePluginRequest, "dry_run">) =>
-      request<BridgeManifestPreviewResponse>("/plugins/bridges", {
+    previewMarketInstall: (
+      req: Omit<InstallMarketPluginRequest, "dry_run">,
+    ) =>
+      request<JsPluginPreviewResponse>("/plugins/install", {
         method: "POST",
-        body: { ...payload, dry_run: true },
+        body: { ...req, dry_run: true },
       }),
-    registerBridge: (payload: Omit<RegisterBridgePluginRequest, "dry_run">) =>
-      request<PluginDto>("/plugins/bridges", {
+    installFromMarket: (req: Omit<InstallMarketPluginRequest, "dry_run">) =>
+      request<PluginDto>("/plugins/install", {
         method: "POST",
-        body: { ...payload, dry_run: false },
+        body: { ...req, dry_run: false },
       }),
-    refreshManifest: (id: string) =>
-      request<PluginDto>(`/plugins/${encodeURIComponent(id)}/refresh-manifest`, {
+    previewUpload: (req: Omit<UploadJsPluginRequest, "dry_run">) =>
+      request<JsPluginPreviewResponse>("/plugins/upload", {
         method: "POST",
+        body: { ...req, dry_run: true },
       }),
-    deleteBridge: (id: string, cascade = false) =>
+    upload: (req: Omit<UploadJsPluginRequest, "dry_run">) =>
+      request<PluginDto>("/plugins/upload", {
+        method: "POST",
+        body: { ...req, dry_run: false },
+      }),
+    getSource: (id: string) =>
+      request<PluginSourceResponse>(
+        `/plugins/${encodeURIComponent(id)}/source`,
+        { method: "GET" },
+      ),
+    remove: (id: string, cascade = false) =>
       request<ActionAckResponse | undefined>(
         `/plugins/${encodeURIComponent(id)}${cascade ? "?cascade=true" : ""}`,
         { method: "DELETE" },

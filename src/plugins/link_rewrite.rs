@@ -215,7 +215,18 @@ impl LinkRewritePlugin {
             category: "links".to_string(),
             icon: "link".to_string(),
             description: "Rewrite outgoing article links using self-hosted YOURLS short-link providers at delivery time with SQLite caching and per-route selection.".to_string(),
+            description_i18n: std::collections::BTreeMap::from([
+                (
+                    "en".to_string(),
+                    "Rewrite outgoing article links using self-hosted YOURLS short-link providers at delivery time with SQLite caching and per-route selection.".to_string(),
+                ),
+                (
+                    "zh".to_string(),
+                    "在投递时通过自建 YOURLS 短链服务改写文章外链，支持 SQLite 缓存与按路由选择。".to_string(),
+                ),
+            ]),
             homepage: "https://feedcourier.ellery.me/plugins/link-rewrite".to_string(),
+            allowed_hosts: vec![],
             hooks: vec![HookKind::OnRender],
             permissions: vec![PluginPermission::Network],
             instance_schema: json!({

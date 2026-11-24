@@ -4,12 +4,12 @@ description: "FeedCourier SQLite WAL 数据库表结构参考：涵盖 feedcouri
 
 # SQLite 数据库表结构参考
 
-FeedCourier 的全部业务持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，而结构化运行日志独立写入运维日志库（`<DATA_DIR>/logs.db` 或可选 ClickHouse，详见[第 9 节](#_9-独立运维日志存储-logs-db-与可选-clickhouse)）。编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql)、[`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql)、[`migrations/0003_plugins_and_smtp_compliance.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0003_plugins_and_smtp_compliance.sql) 与 [`migrations/0004_plugin_bridges.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0004_plugin_bridges.sql)。
+FeedCourier 的全部业务持久化状态存储于单文件 SQLite WAL 数据库（`<DATA_DIR>/feedcourier.db`）中，而结构化运行日志独立写入运维日志库（`<DATA_DIR>/logs.db` 或可选 ClickHouse，详见[第 9 节](#_9-独立运维日志存储-logs-db-与可选-clickhouse)）。编译期迁移脚本位于仓库 [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql)、[`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql)、[`migrations/0003_plugins_and_smtp_compliance.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0003_plugins_and_smtp_compliance.sql) 与 [`migrations/0004_js_plugins.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0004_js_plugins.sql)。
 
 对存量数据库执行重大 DDL 迁移前，`Database::connect` 会**先于 SQL 迁移执行** `VACUUM INTO` 生成在线热备快照，并在检测目标文件或伴生 `-wal` / `-shm` 文件冲突时自动追加 UTC 时间戳与序号后缀、备份完成后清理残留 sidecar 文件：
 - 升级 `v0.1.x` → `v0.2.0+`：先生成 `<DATA_DIR>/pre-v0.2.0-backup.db`，再执行 `0002_channel_destinations.sql` 与单事务迁移钩子 `Database::migrate_channels_to_v2`。
 - 升级 `v0.2.x` → `v0.3.0`：只要存量数据库已应用迁移 `0002`、待执行 `0003` 且**任意业务表（`feeds`、`channels` 或 `channel_destinations`）非空**，先生成 `<DATA_DIR>/pre-v0.3.0-backup.db`（若 `VACUUM INTO` 失败则主动清理半截备份文件与 `-wal`/`-shm` sidecar），再执行 `0003_plugins_and_smtp_compliance.sql` 与幂等启动回填 `Database::backfill_legacy_smtp_recipients`。
-- 升级 `v0.3.0` → `v0.3.1`：只要存量数据库已应用迁移 `0003`、待执行 `0004` 且 **`feeds` 或 `channels` 非空**，先经在线 `VACUUM INTO` 生成 `<DATA_DIR>/pre-v0.3.1-backup.db`，再执行 `0004_plugin_bridges.sql`（扩展 `plugins` 表、重建 `channels` 表以放行 `kind = 'plugin'` 并保留 `sqlite_sequence`、创建 `plugin_events` 持久化事件出队表）。
+- 升级 `v0.3.0` → `v0.3.1`：只要存量数据库已应用迁移 `0003`、待执行 `0004` 且 **`feeds` 或 `channels` 非空**，先经在线 `VACUUM INTO` 生成 `<DATA_DIR>/pre-v0.3.1-backup.db`，再执行 `0004_js_plugins.sql`（扩展 `plugins` 表以持久化进程内 JS 脚本与 SHA-256、重建 `channels` 表以放行 `kind = 'plugin'` 并保留 `sqlite_sequence`、创建 `plugin_events` 持久化事件出队表）。
 
 所有时间戳字段均采用 **UTC Unix 纪元秒（`INTEGER`，`unixepoch()`）** 存储，业务表外键关联均启用 **`ON DELETE CASCADE`** 级联清理（`delivery_quota_ledger` 刻意不设外键，确保删除操作不会清空配额计数）。
 
@@ -170,17 +170,17 @@ erDiagram
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 通道账号主键 ID（`0004_plugin_bridges.sql` 重建表时同步保留 `sqlite_sequence`，避免复用历史通道 ID）。 |
-| `name` | `TEXT` | `NOT NULL` | 账号显示名称（留空时自动取 Telegram `getMe` `@username`、SMTP `from_address`、Notion `/v1/users/me` 集成名或桥接通道插件名）。 |
-| `kind` | `TEXT` | `NOT NULL CHECK (kind IN ('smtp', 'telegram', 'notion', 'plugin'))` | 通道协议类型（`'plugin'` 于 `0004_plugin_bridges.sql` 通过表重建新增）。 |
-| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的账号级 `ChannelConfig` JSON 密文（`12B nonce \|\| ciphertext \|\| 16B tag`，含 SMTP / Telegram / Notion 或桥接 `PluginChannelConfig { plugin_id, config }`）。 |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 通道账号主键 ID（`0004_js_plugins.sql` 重建表时同步保留 `sqlite_sequence`，避免复用历史通道 ID）。 |
+| `name` | `TEXT` | `NOT NULL` | 账号显示名称（留空时自动取 Telegram `getMe` `@username`、SMTP `from_address`、Notion `/v1/users/me` 集成名或 JS 通道插件清单名称）。 |
+| `kind` | `TEXT` | `NOT NULL CHECK (kind IN ('smtp', 'telegram', 'notion', 'plugin'))` | 通道协议类型（`'plugin'` 于 `0004_js_plugins.sql` 通过表重建新增）。 |
+| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的账号级 `ChannelConfig` JSON 密文（`12B nonce \|\| ciphertext \|\| 16B tag`，含 SMTP / Telegram / Notion 或 `PluginChannelConfig { plugin_id, config }`）。 |
 | `credential_group_key` | `TEXT` | `NOT NULL` | 基于底层发信身份计算的 SHA-256 分组标识（SMTP 纳入密码的 SHA-256 摘要且不存明文，使共用用户名但不同 API Key 的账号如 SendGrid `apikey` 保持隔离；`plugin` 通道按 `plugin_id` 与规范化账号配置哈希分组），使同账号与同凭据组共享步进、配额与冷却时间。 |
-| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 探测到的平台能力快照（如 Telegram `supports_rich_message`、`bot_api_version`、`bot_username`、`fallback_reason`，或从桥接通道 `manifest_json` 同步的 `capabilities`）。 |
+| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 探测到的平台能力快照（如 Telegram `supports_rich_message`、`bot_api_version`、`bot_username`、`fallback_reason`，或从 JS 通道 `manifest_json` 同步的 `capabilities`）。 |
 | `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15 CHECK (>= 0)` | 账号下全部目的地共享的最小发信间隔秒数。 |
 | `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10 CHECK (>= 0)` | 每次投递后独立抽取的随机抖动上限秒数（仅存内存）。 |
 | `hourly_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每小时最大投递篇数上限（账号下全部目的地共享）。 |
 | `daily_quota` | `INTEGER` | `NULL CHECK (IS NULL OR > 0)` | 可选的滚动每日最大投递篇数上限（账号下全部目的地共享）。 |
-| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 该账号及其所有目的地的 HTTP 出站请求是否经由全局代理转发（适用于 Telegram 与 Notion；SMTP 使用原生 TCP/TLS 直连）。 |
+| `use_proxy` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 该账号及其所有目的地的 HTTP 出站请求是否经由全局代理转发（适用于 Telegram、Notion 与插件通道的公网 `allowed_hosts`；SMTP 使用原生 TCP/TLS 直连）。 |
 | `cooldown_until` | `INTEGER` | `NULL` | 触发下游 `429` / `Retry-After` 时的账号及同组冷却截止时间戳。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 账号启用开关。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
@@ -198,7 +198,7 @@ erDiagram
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 授信目的地主键 ID（`routes` 与 MCP `configure_route`/`test_push_feed_entry` 的主要目标标识）。 |
 | `channel_id` | `INTEGER` | `NOT NULL REFERENCES channels(id) ON DELETE CASCADE` | 所属父通道账号 ID。 |
 | `name` | `TEXT` | `NOT NULL` | 目的地备注名（留空时自动取 Telegram `getChat` 群/频道名、打码后的 SMTP 首个收件人如 `a***e@example.com` 或 Notion 数据库标题）。 |
-| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的 `DestinationConfig` JSON 密文（Telegram `chat_id`/`message_thread_id`、SMTP `to_addresses`/`reply_to`、Notion `data_source_id`/`column_mapping` 或桥接 `PluginDestinationConfig { config }`）。 |
+| `encrypted_config` | `BLOB` | `NOT NULL` | 使用 `MasterKey` 经 ChaCha20-Poly1305 加密后的 `DestinationConfig` JSON 密文（Telegram `chat_id`/`message_thread_id`、SMTP `to_addresses`/`reply_to`、Notion `data_source_id`/`column_mapping` 或 `PluginDestinationConfig { config }`）。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1 CHECK (IN (0, 1))` | 该目的地的独立启用开关。 |
 | `auto_paused` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 于 `0003_plugins_and_smtp_compliance.sql` 新增。当 SMTP 目的地下全部收件人均转为 `unsubscribed` 或 `bounced` 时同步置为 `enabled = 0, auto_paused = 1`；后续有任一收件人重新完成验证且 `auto_paused = 1` 时自动恢复为 `enabled = 1, auto_paused = 0` 并唤醒延迟任务。管理员手动切换 `enabled` 时会清零 `auto_paused = 0`，因此手动停用的目的地不会被自动恢复。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
@@ -313,22 +313,22 @@ erDiagram
 
 ## 7. 插件表族（`plugins`、`plugin_instances`、`plugin_link_cache`、`plugin_events`）
 
-在 `migrations/0003_plugins_and_smtp_compliance.sql` 中新增并在 `migrations/0004_plugin_bridges.sql` 中扩展，用于保存内置与 HTTP Bridge 插件注册元数据、加密服务商凭据、短链持久化缓存及 `on_delivered` 持久化事件出队表：
+在 `migrations/0003_plugins_and_smtp_compliance.sql` 中新增并在 `migrations/0004_js_plugins.sql` 中扩展，用于保存内置插件与进程内沙箱 JS 插件（`boa_engine`）源码与 SHA-256 摘要、编译清单、加密服务商凭据、短链持久化缓存及 `on_delivered` 持久化事件出队表：
 
 ### `plugins`（已安装插件表）
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `id` | `TEXT` | `PRIMARY KEY NOT NULL` | 插件唯一标识（如 `'link-rewrite'`、`'ntfy'`）。 |
+| `id` | `TEXT` | `PRIMARY KEY NOT NULL` | 插件唯一标识（如 `'link-rewrite'`、`'ntfy'`、`'bark'`）。 |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | 插件全局启用开关（禁用时跳过钩子并保留路由配置）。 |
 | `installed_version` | `TEXT` | `NOT NULL` | 已安装插件的语义化版本号。 |
 | `settings_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | 可选插件级 JSON 配置。 |
-| `source` | `TEXT` | `NOT NULL DEFAULT 'builtin' CHECK (source IN ('builtin', 'bridge'))` | 于 `0004_plugin_bridges.sql` 新增，区分内置插件与进程外 HTTP Bridge 插件。 |
-| `kind` | `TEXT` | `NOT NULL DEFAULT 'processor' CHECK (kind IN ('processor', 'channel'))` | 于 `0004_plugin_bridges.sql` 新增，标识处理器插件（`on_render`/`on_delivered`）或自定义投递通道插件。 |
-| `bridge_url` | `TEXT` | `NULL` | 于 `0004_plugin_bridges.sql` 新增，HTTP Bridge 服务根地址（内置插件为 `NULL`）。 |
-| `encrypted_bridge_secret` | `BLOB` | `NULL` | 于 `0004_plugin_bridges.sql` 新增，使用 `MasterKey` 经 ChaCha20-Poly1305 加密的 HMAC-SHA256 `BRIDGE_SECRET`。 |
-| `manifest_json` | `TEXT` | `NULL` | 于 `0004_plugin_bridges.sql` 新增，经签名 `GET /manifest` 拉取并缓存的 Protocol v1 清单 JSON。 |
-| `manifest_fetched_at` | `INTEGER` | `NULL` | 于 `0004_plugin_bridges.sql` 新增，最近一次成功拉取清单的 UTC Unix 秒时间戳。 |
+| `source` | `TEXT` | `NOT NULL DEFAULT 'builtin' CHECK (source IN ('builtin', 'market', 'custom'))` | 于 `0004_js_plugins.sql` 新增，区分官方内置插件、市场一键安装 JS 插件与自定义上传 JS 插件。 |
+| `kind` | `TEXT` | `NOT NULL DEFAULT 'processor' CHECK (kind IN ('processor', 'channel'))` | 于 `0004_js_plugins.sql` 新增，标识处理器插件（`on_render`/`on_delivered`）或自定义投递通道插件。 |
+| `script_js` | `TEXT` | `NULL` | 于 `0004_js_plugins.sql` 新增，持久化保存的单文件 `plugin.js` ES 模块源码（内置 Rust 插件为 `NULL`）。 |
+| `script_sha256` | `TEXT` | `NULL` | 于 `0004_js_plugins.sql` 新增，`script_js` 的 64 位小写十六进制 SHA-256 校验值（内置插件为 `NULL`）。 |
+| `manifest_json` | `TEXT` | `NULL` | 于 `0004_js_plugins.sql` 新增，编译 `export const meta` 提取并缓存的 Protocol v1 清单 JSON。 |
+| `installed_at` | `INTEGER` | `NULL` | 于 `0004_js_plugins.sql` 新增，JS 插件首次安装或最近一次升级的 UTC Unix 秒时间戳。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
 ### `plugin_instances`（加密插件服务商实例表）
@@ -357,16 +357,16 @@ erDiagram
 - **主键**：`PRIMARY KEY (instance_id, long_url_sha256)`
 - **索引**：`idx_plugin_link_cache_last_used ON plugin_link_cache (last_used_at)`
 
-### `plugin_events`（`on_delivered` 持久化事件出队表，`0004_plugin_bridges.sql`）
+### `plugin_events`（`on_delivered` 持久化事件出队表，`0004_js_plugins.sql`）
 
-用于向已注册的 HTTP Bridge 插件提供**至少一次（at-least-once）**的 `on_delivered` Webhook 异步投递保障（投递成功后落库，失败按指数退避重试）：
+用于向声明 `on_delivered` 的已启用 JS 插件提供**至少一次（at-least-once）**的异步回调保障（投递成功后同事务落库，失败按指数退避重试）：
 
 | 字段名 | 类型 | 约束与默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | 事件队列主键 ID。 |
-| `plugin_id` | `TEXT` | `NOT NULL REFERENCES plugins(id) ON DELETE CASCADE` | 目标桥接插件 ID。 |
+| `plugin_id` | `TEXT` | `NOT NULL REFERENCES plugins(id) ON DELETE CASCADE` | 目标 JS 插件 ID。 |
 | `event` | `TEXT` | `NOT NULL` | 生命周期事件类型（如 `'on_delivered'`）。 |
-| `idempotency_key` | `TEXT` | `NOT NULL` | 确定性幂等去重键（请求头 `X-FeedCourier-Idempotency-Key` 同步透传）。 |
+| `idempotency_key` | `TEXT` | `NOT NULL` | 确定性幂等去重键（传入 `onDelivered` 处理函数）。 |
 | `payload_json` | `TEXT` | `NOT NULL` | 序列化后的投递事件载荷 JSON（含 `task_id`、文章/订阅源/路由/通道/目的地元数据、`status_code` 与 `delivered_at`）。 |
 | `attempts` | `INTEGER` | `NOT NULL DEFAULT 0` | 已执行的分发尝试次数。 |
 | `next_attempt_at` | `INTEGER` | `NOT NULL` | 下次可被 Worker 领取分发的 UTC Unix 秒时间戳。 |

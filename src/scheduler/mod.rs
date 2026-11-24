@@ -36,7 +36,7 @@ use crate::db::models::{
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
-use crate::plugins::bridge::BridgeChannelSender;
+use crate::plugins::js_runtime::{JsChannelSender, extract_uri_origins};
 use crate::plugins::{MarketIndexCache, PluginRegistry};
 use crate::schedule::{has_schedule, next_allowed_at, resolve_route_timezone};
 
@@ -234,7 +234,7 @@ struct DispatcherInner {
     smtp_sender: SmtpSender,
     telegram_sender: RwLock<TelegramSender>,
     notion_sender: Arc<NotionSender>,
-    plugin_sender: BridgeChannelSender,
+    plugin_sender: JsChannelSender,
     media_fetcher: Arc<ProtectedMediaFetcher>,
     plugins: PluginRegistry,
     market_cache: MarketIndexCache,
@@ -358,7 +358,7 @@ impl DeliveryDispatcher {
         .with_locale(initial_locale);
         let notion_sender = Arc::new(NotionSender::new(net_settings.outbound_proxy_url)?);
         let plugins = PluginRegistry::with_builtins();
-        let plugin_sender = BridgeChannelSender::new(plugins.clone());
+        let plugin_sender = JsChannelSender::new(plugins.clone(), http.clone());
         let market_cache = MarketIndexCache::new(config.plugin_index_url.clone());
 
         Ok(Self {
@@ -448,7 +448,7 @@ impl DeliveryDispatcher {
         dispatcher
             .inner
             .plugins
-            .reload_from_db(&dispatcher.inner.db, &dispatcher.inner.master_key)
+            .reload_from_db(&dispatcher.inner.db)
             .await?;
         if let Some(locale) = persisted_locale {
             dispatcher.set_locale(locale);
@@ -594,7 +594,7 @@ impl DeliveryDispatcher {
         &self.inner.notion_sender
     }
 
-    pub fn plugin_sender(&self) -> &BridgeChannelSender {
+    pub fn plugin_sender(&self) -> &JsChannelSender {
         &self.inner.plugin_sender
     }
 
@@ -1651,17 +1651,17 @@ impl DeliveryDispatcher {
             if cancel.is_cancelled() {
                 break;
             }
-            let Some(bridge) = self.inner.plugins.get_bridge(&ev.plugin_id) else {
+            let Some(js_plugin) = self.inner.plugins.get_js(&ev.plugin_id) else {
                 processed += 1;
                 warn!(
                     plugin_id = %ev.plugin_id,
                     event_id = ev.id,
-                    "dropping on_delivered event for uninstalled bridge plugin"
+                    "dropping on_delivered event for uninstalled JS plugin"
                 );
                 let _ = self.inner.db.delete_plugin_event(ev.id).await;
                 continue;
             };
-            if !bridge.enabled {
+            if !js_plugin.enabled {
                 processed += 1;
                 let next_attempts = ev.attempts + 1;
                 if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
@@ -1682,10 +1682,51 @@ impl DeliveryDispatcher {
             }
             let payload: serde_json::Value =
                 serde_json::from_str(&ev.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+            let mut admin_origins = Vec::new();
+            let mut use_proxy = false;
+            if let Ok(instances) = self.inner.db.list_plugin_instances(&ev.plugin_id).await {
+                for inst in instances.into_iter().filter(|i| i.enabled) {
+                    if let Ok(cfg) = self
+                        .inner
+                        .master_key
+                        .decrypt_json::<serde_json::Value>(&inst.encrypted_config)
+                    {
+                        if cfg.get("use_proxy").and_then(serde_json::Value::as_bool) == Some(true) {
+                            use_proxy = true;
+                        }
+                        admin_origins.extend(extract_uri_origins(
+                            &js_plugin.runtime.manifest.instance_schema,
+                            &cfg,
+                        ));
+                    }
+                }
+            }
+            if let Some(ch_id) = payload
+                .get("channel")
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64)
+                && let Ok(Some(ch)) = self.inner.db.get_channel(ch_id).await
+                && ch.kind == ChannelKind::Plugin
+                && let Ok(ChannelConfig::Plugin(p)) =
+                    self.inner.master_key.decrypt_json(&ch.encrypted_config)
+                && p.plugin_id == ev.plugin_id
+            {
+                use_proxy = ch.use_proxy;
+                admin_origins.extend(extract_uri_origins(
+                    &js_plugin.runtime.manifest.account_schema,
+                    &p.config,
+                ));
+            }
             let send_outcome = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                res = bridge.client.send_on_delivered(&ev.idempotency_key, &payload) => res,
+                res = js_plugin.runtime.dispatch_on_delivered(
+                    &self.inner.http,
+                    &ev.idempotency_key,
+                    &payload,
+                    admin_origins,
+                    use_proxy,
+                ) => res,
             };
             processed += 1;
             match send_outcome {

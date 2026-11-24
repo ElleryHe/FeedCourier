@@ -2929,126 +2929,88 @@ impl Database {
         Ok(row)
     }
 
-    /// Insert a newly registered HTTP bridge plugin row (`source = 'bridge'`).
+    /// Insert or upgrade a JS plugin row (`source` in `'market' | 'custom'`).
+    /// Preserves `settings_json` and `created_at` on in-place upgrade/version switch; when `enabled`
+    /// is `Some(flag)`, applies that flag, otherwise preserves existing `enabled` (defaulting to
+    /// `true` for newly installed plugins).
     #[allow(clippy::too_many_arguments)]
-    pub async fn register_bridge_plugin(
+    pub async fn upsert_js_plugin(
         &self,
         id: &str,
+        source: &str,
         kind: &str,
         version: &str,
-        bridge_url: &str,
-        encrypted_bridge_secret: &[u8],
-        manifest_json: &str,
-        enabled: bool,
-    ) -> AppResult<PluginRow> {
-        let now = now_unix();
-        let row = sqlx::query_as::<_, PluginRow>(
-            r#"
-            INSERT INTO plugins (
-                id, enabled, installed_version, settings_json, source, kind,
-                bridge_url, encrypted_bridge_secret, manifest_json, manifest_fetched_at,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, '{}', 'bridge', ?4, ?5, ?6, ?7, ?8, ?8, ?8)
-            RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(enabled)
-        .bind(version)
-        .bind(kind)
-        .bind(bridge_url)
-        .bind(encrypted_bridge_secret)
-        .bind(manifest_json)
-        .bind(now)
-        .fetch_one(&self.write_pool)
-        .await?;
-        Ok(row)
-    }
-
-    /// Update a registered bridge plugin's refreshed manifest metadata and version.
-    pub async fn refresh_bridge_plugin_manifest(
-        &self,
-        id: &str,
-        kind: &str,
-        version: &str,
-        manifest_json: &str,
-    ) -> AppResult<PluginRow> {
-        let now = now_unix();
-        let row = sqlx::query_as::<_, PluginRow>(
-            r#"
-            UPDATE plugins
-            SET kind = ?1,
-                installed_version = ?2,
-                manifest_json = ?3,
-                manifest_fetched_at = ?4,
-                updated_at = ?4
-            WHERE id = ?5 AND source = 'bridge'
-            RETURNING *
-            "#,
-        )
-        .bind(kind)
-        .bind(version)
-        .bind(manifest_json)
-        .bind(now)
-        .bind(id)
-        .fetch_optional(&self.write_pool)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{id}' not found")))?;
-        Ok(row)
-    }
-
-    /// Atomically update a registered bridge plugin's endpoint URL, encrypted secret, manifest,
-    /// and optional enabled/settings fields after a live signed manifest probe succeeds.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_bridge_plugin_connection(
-        &self,
-        id: &str,
-        bridge_url: &str,
-        encrypted_bridge_secret: &[u8],
-        version: &str,
+        script_js: &str,
+        script_sha256: &str,
         manifest_json: &str,
         enabled: Option<bool>,
-        settings_json: Option<&str>,
     ) -> AppResult<PluginRow> {
-        let current = self
-            .get_plugin(id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{id}' not found")))?;
-        let next_enabled = enabled.unwrap_or(current.enabled);
-        let next_settings = settings_json.unwrap_or(&current.settings_json);
         let now = now_unix();
-        let row = sqlx::query_as::<_, PluginRow>(
-            r#"
-            UPDATE plugins
-            SET bridge_url = ?1,
-                encrypted_bridge_secret = ?2,
-                installed_version = ?3,
-                manifest_json = ?4,
-                manifest_fetched_at = ?5,
-                enabled = ?6,
-                settings_json = ?7,
-                updated_at = ?5
-            WHERE id = ?8 AND source = 'bridge'
-            RETURNING *
-            "#,
-        )
-        .bind(bridge_url)
-        .bind(encrypted_bridge_secret)
-        .bind(version)
-        .bind(manifest_json)
-        .bind(now)
-        .bind(next_enabled)
-        .bind(next_settings)
-        .bind(id)
-        .fetch_optional(&self.write_pool)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{id}' not found")))?;
+        let existing = self.get_plugin(id).await?;
+        let row = if let Some(cur) = existing {
+            if cur.source == "builtin" {
+                return Err(AppError::Conflict(format!(
+                    "Built-in plugin '{id}' cannot be overwritten by a JS plugin"
+                )));
+            }
+            let next_enabled = enabled.unwrap_or(cur.enabled);
+            sqlx::query_as::<_, PluginRow>(
+                r#"
+                UPDATE plugins
+                SET source = ?1,
+                    kind = ?2,
+                    installed_version = ?3,
+                    script_js = ?4,
+                    script_sha256 = ?5,
+                    manifest_json = ?6,
+                    enabled = ?7,
+                    installed_at = ?8,
+                    updated_at = ?8
+                WHERE id = ?9 AND source IN ('market', 'custom')
+                RETURNING *
+                "#,
+            )
+            .bind(source)
+            .bind(kind)
+            .bind(version)
+            .bind(script_js)
+            .bind(script_sha256)
+            .bind(manifest_json)
+            .bind(next_enabled)
+            .bind(now)
+            .bind(id)
+            .fetch_one(&self.write_pool)
+            .await?
+        } else {
+            let init_enabled = enabled.unwrap_or(true);
+            sqlx::query_as::<_, PluginRow>(
+                r#"
+                INSERT INTO plugins (
+                    id, enabled, installed_version, settings_json, source, kind,
+                    script_js, script_sha256, manifest_json, installed_at,
+                    created_at, updated_at
+                ) VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9)
+                RETURNING *
+                "#,
+            )
+            .bind(id)
+            .bind(init_enabled)
+            .bind(version)
+            .bind(source)
+            .bind(kind)
+            .bind(script_js)
+            .bind(script_sha256)
+            .bind(manifest_json)
+            .bind(now)
+            .fetch_one(&self.write_pool)
+            .await?
+        };
         Ok(row)
     }
 
-    /// Atomically delete a registered bridge plugin (`source = 'bridge'`), optionally cascading
-    /// deletion of referencing channel accounts and stripping route plugin bindings.
-    pub async fn delete_bridge_plugin(
+    /// Atomically delete an installed JS plugin (`source IN ('market', 'custom')`), optionally
+    /// cascading deletion of referencing channel accounts and stripping route plugin bindings.
+    pub async fn delete_js_plugin(
         &self,
         plugin_id: &str,
         referencing_channel_ids: &[i64],
@@ -3079,10 +3041,11 @@ impl Database {
                     .await?;
             }
         }
-        let res = sqlx::query("DELETE FROM plugins WHERE id = ?1 AND source = 'bridge'")
-            .bind(plugin_id)
-            .execute(&mut *tx)
-            .await?;
+        let res =
+            sqlx::query("DELETE FROM plugins WHERE id = ?1 AND source IN ('market', 'custom')")
+                .bind(plugin_id)
+                .execute(&mut *tx)
+                .await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }

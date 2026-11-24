@@ -782,9 +782,11 @@ impl McpServer {
             })
             .collect();
 
-        for bridge in registry.list_bridges() {
-            let m = &bridge.manifest;
-            let enabled = row_by_id.get(&m.id).map_or(bridge.enabled, |r| r.enabled);
+        for js_plugin in registry.list_js() {
+            let m = &js_plugin.runtime.manifest;
+            let enabled = row_by_id
+                .get(&m.id)
+                .map_or(js_plugin.enabled, |r| r.enabled);
             plugins.push(McpPluginSummary {
                 id: m.id.clone(),
                 name: m.name.clone(),

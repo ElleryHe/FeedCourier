@@ -531,9 +531,7 @@ export function ChannelsView() {
                           {!ch.enabled && (
                             <Badge variant="default">{m.common.disabled}</Badge>
                           )}
-                          {ch.kind !== "smtp" &&
-                            ch.kind !== "plugin" &&
-                            ch.use_proxy && (
+                          {ch.kind !== "smtp" && ch.use_proxy && (
                             <Badge variant="outline">
                               <Globe className="h-3 w-3" />
                               {m.common.proxy}
@@ -2055,7 +2053,7 @@ function ChannelAccountModal({
   channelPlugins: PluginDto[];
   pluginsLoading: boolean;
 }) {
-  const { m } = useI18n();
+  const { m, locale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const isEdit = channel !== null;
@@ -2138,9 +2136,7 @@ function ChannelAccountModal({
       : "",
   );
   const [useProxy, setUseProxy] = useState<boolean>(
-    channel?.kind === "smtp" || channel?.kind === "plugin"
-      ? false
-      : (channel?.use_proxy ?? false),
+    channel?.kind === "smtp" ? false : (channel?.use_proxy ?? false),
   );
   const [enabled, setEnabled] = useState<boolean>(channel?.enabled ?? true);
 
@@ -2199,7 +2195,7 @@ function ChannelAccountModal({
     const defaults = kindDefaults(nextKind);
     setMinIntervalSecs(defaults.defaultInterval);
     setJitterMaxSecs(defaults.defaultJitter);
-    if (nextKind === "smtp" || nextKind === "plugin") {
+    if (nextKind === "smtp") {
       setUseProxy(false);
     }
     if (nextKind === "plugin" && plugin) {
@@ -2268,7 +2264,7 @@ function ChannelAccountModal({
           jitter_max_secs: jitterMaxSecs,
           hourly_quota: parsedHourly,
           daily_quota: parsedDaily,
-          use_proxy: kind === "smtp" || kind === "plugin" ? false : useProxy,
+          use_proxy: kind === "smtp" ? false : useProxy,
           enabled,
         };
         return api.channels.update(channel.id, payload);
@@ -2355,7 +2351,7 @@ function ChannelAccountModal({
         jitter_max_secs: jitterMaxSecs,
         hourly_quota: parsedHourly,
         daily_quota: parsedDaily,
-        use_proxy: kind === "smtp" || kind === "plugin" ? false : useProxy,
+        use_proxy: kind === "smtp" ? false : useProxy,
         enabled,
       };
       return api.channels.create(payload);
@@ -2384,7 +2380,7 @@ function ChannelAccountModal({
     if (kind === "plugin") {
       if (pluginsLoading) return;
       if (!selectedPlugin) {
-        setFormError(m.plugins.bridge.errSelectPlugin);
+        setFormError(m.plugins.js.errSelectPlugin);
         return;
       }
       const acctRes = buildValidatedSchemaConfig(
@@ -2570,7 +2566,7 @@ function ChannelAccountModal({
                   ? m.channels.wizard.namePlaceholderTg
                   : kind === "notion"
                     ? m.channels.wizard.namePlaceholderNotion
-                    : m.plugins.bridge.pluginNamePlaceholder(
+                    : m.plugins.js.pluginNamePlaceholder(
                         selectedPlugin?.manifest.name ?? "Plugin",
                       )
             }
@@ -2763,11 +2759,20 @@ function ChannelAccountModal({
             </div>
           ) : selectedPlugin ? (
             <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-              <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-                {m.plugins.bridge.pluginAccountHeading(
-                  selectedPlugin.manifest.name,
+              <div>
+                <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+                  {m.plugins.js.pluginAccountHeading(
+                    selectedPlugin.manifest.name,
+                  )}
+                </h3>
+                {(selectedPlugin.manifest.description_i18n?.[locale] ||
+                  selectedPlugin.manifest.description) && (
+                  <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                    {selectedPlugin.manifest.description_i18n?.[locale] ||
+                      selectedPlugin.manifest.description}
+                  </p>
                 )}
-              </h3>
+              </div>
               <SchemaFormFields
                 idPrefix="ch-plugin-acct"
                 schema={selectedPlugin.manifest.account_schema}
@@ -2834,15 +2839,11 @@ function ChannelAccountModal({
             </div>
           </div>
 
-          {kind === "smtp" || kind === "plugin" ? (
+          {kind === "smtp" ? (
             <div className="space-y-3 pt-1">
               <div className="flex items-start gap-2 rounded-lg border border-zinc-200/80 bg-zinc-50/70 px-3 py-2 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
                 <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-400" />
-                <span>
-                  {kind === "smtp"
-                    ? m.channels.wizard.pacing.smtpNoProxyNote
-                    : m.plugins.bridge.bridgeNoProxyNote}
-                </span>
+                <span>{m.channels.wizard.pacing.smtpNoProxyNote}</span>
               </div>
               <Switch
                 id="ch-enabled"
@@ -2900,7 +2901,7 @@ function ChannelAccountModal({
                           ? m.channels.wizard.destModal.namePlaceholderTg
                           : kind === "notion"
                             ? m.channels.wizard.destModal.namePlaceholderNotion
-                            : m.plugins.bridge.pluginDestPlaceholder
+                            : m.plugins.js.pluginDestPlaceholder
                     }
                     className="mt-1"
                   />
@@ -3194,7 +3195,7 @@ function DestinationModal({
     if (channel.kind === "plugin") {
       if (pluginsLoading) return;
       if (!plugin) {
-        setFormError(m.plugins.bridge.errSelectPlugin);
+        setFormError(m.plugins.js.errSelectPlugin);
         return;
       }
       const res = buildValidatedSchemaConfig(
@@ -3287,7 +3288,7 @@ function DestinationModal({
                   ? m.channels.wizard.destModal.namePlaceholderTg
                   : channel.kind === "notion"
                     ? m.channels.wizard.destModal.namePlaceholderNotion
-                    : m.plugins.bridge.pluginDestPlaceholder
+                    : m.plugins.js.pluginDestPlaceholder
             }
             className="mt-1.5"
           />
@@ -3366,7 +3367,7 @@ function DestinationModal({
         {channel.kind === "plugin" && (
           <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
             <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-              {m.plugins.bridge.pluginDestHeading(
+              {m.plugins.js.pluginDestHeading(
                 plugin?.manifest.name ?? m.channels.kindLabels.plugin,
               )}
             </h3>

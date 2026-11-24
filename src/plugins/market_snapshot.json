@@ -1,7 +1,43 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-11-24T19:56:48Z",
+  "generated_at": "2026-11-24T22:58:58Z",
   "plugins": [
+    {
+      "id": "bark",
+      "name": "Bark Push",
+      "version": "0.3.1",
+      "api_version": "1",
+      "kind": "channel",
+      "runtime": "js",
+      "min_core": "0.3.1",
+      "category": "delivery",
+      "icon": "bell",
+      "description": "Push RSS article summaries to iOS/macOS via Bark (official api.day.app or self-hosted server), formatted like Telegram Compact Card.",
+      "description_i18n": {
+        "en": "Push RSS article summaries to iOS/macOS via Bark (official api.day.app or self-hosted server), formatted like Telegram Compact Card.",
+        "zh": "通过 Bark 向 iOS/macOS 推送文章摘要卡片（参考 Telegram 摘要模式排版，支持官方 api.day.app 与自建服务端）。"
+      },
+      "homepage": "https://feedcourier.ellery.me/plugins/js-plugins",
+      "repository": "https://github.com/ElleryHe/FeedCourier-Plugins/tree/main/plugins/channels/bark",
+      "hooks": [],
+      "permissions": [
+        "network"
+      ],
+      "allowed_hosts": [
+        "api.day.app"
+      ],
+      "latest": "0.3.1",
+      "versions": [
+        {
+          "version": "0.3.1",
+          "min_core": "0.3.1",
+          "path": "plugins/channels/bark/0.3.1/plugin.js",
+          "sha256": "9b994cdf8ce0bb996cda27b3a9a0e725cbc887602a133ea483e3af93e5ae9e16",
+          "changelog_path": "plugins/channels/bark/0.3.1/CHANGELOG.md",
+          "changelog": "# 0.3.1\n\n- Initial release of the official **Bark Push** single-file JS channel plugin (`Plugin API v1`).\n- Formats iOS/macOS notifications in FeedCourier's **Telegram Compact Card (摘要模式)** style: concise headline, clean summary with duplicate-title suppression, compact editorial footer (`— Source · Author · YYYY-MM-DD HH:MM`), tap-to-open article URL, and optional HTTPS feed favicon.\n- Supports official `https://api.day.app` as well as self-hosted Bark servers with optional HTTP Basic Auth, interruption levels (`active`, `timeSensitive`, `passive`, `critical`), custom notification group, and custom sound."
+        }
+      ]
+    },
     {
       "id": "link-rewrite",
       "name": "Link Rewrite (YOURLS)",
@@ -13,6 +49,10 @@
       "category": "links",
       "icon": "link",
       "description": "Rewrite outgoing article links using one or more self-hosted YOURLS short-link providers at delivery time, with SQLite caching, domain exclusions, and optional strict retry mode.",
+      "description_i18n": {
+        "en": "Rewrite outgoing article links using one or more self-hosted YOURLS short-link providers at delivery time, with SQLite caching, domain exclusions, and optional strict retry mode.",
+        "zh": "在推送渲染阶段通过一个或多个自建 YOURLS 短链服务重写文章链接，内置 SQLite 缓存、域名排除规则与可选严格重试模式。"
+      },
       "homepage": "https://feedcourier.ellery.me/plugins/link-rewrite",
       "repository": "https://github.com/ElleryHe/FeedCourier",
       "hooks": [
@@ -20,7 +60,10 @@
       ],
       "permissions": [
         "network"
-      ]
+      ],
+      "allowed_hosts": [],
+      "latest": "0.3.1",
+      "versions": []
     },
     {
       "id": "ntfy",
@@ -28,18 +71,34 @@
       "version": "0.3.1",
       "api_version": "1",
       "kind": "channel",
-      "runtime": "bridge",
+      "runtime": "js",
       "min_core": "0.3.1",
       "category": "delivery",
       "icon": "bell",
-      "description": "Reference HTTP Bridge channel plugin delivering RSS articles as push notifications to ntfy.sh or self-hosted ntfy servers with topic, priority, tags, and bearer token auth.",
-      "homepage": "https://feedcourier.ellery.me/plugins/bridge-channels",
-      "repository": "https://github.com/ElleryHe/FeedCourier-Plugins/tree/main/channels/ntfy",
-      "image": "ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest",
-      "compose_snippet": "services:\n  feedcourier-ntfy:\n    image: ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest\n    environment:\n      BRIDGE_SECRET: \"replace-with-strong-secret\"\n      PORT: \"8787\"\n    restart: unless-stopped",
+      "description": "Deliver RSS articles as push notifications to ntfy.sh or self-hosted ntfy servers with topic, priority, tags, click URL, and optional bearer token auth.",
+      "description_i18n": {
+        "en": "Deliver RSS articles as push notifications to ntfy.sh or self-hosted ntfy servers with topic, priority, tags, click URL, and optional bearer token auth.",
+        "zh": "将 RSS 文章推送到 ntfy.sh 或自建 ntfy 服务器，支持自定义主题、优先级、标签、点击跳转链接与可选 Bearer Token 认证。"
+      },
+      "homepage": "https://feedcourier.ellery.me/plugins/js-plugins",
+      "repository": "https://github.com/ElleryHe/FeedCourier-Plugins/tree/main/plugins/channels/ntfy",
       "hooks": [],
       "permissions": [
         "network"
+      ],
+      "allowed_hosts": [
+        "ntfy.sh"
+      ],
+      "latest": "0.3.1",
+      "versions": [
+        {
+          "version": "0.3.1",
+          "min_core": "0.3.1",
+          "path": "plugins/channels/ntfy/0.3.1/plugin.js",
+          "sha256": "1e59d211b57a8fec4c1cf2d59d40b41226485d5d0785c23bef58414f76685ba5",
+          "changelog_path": "plugins/channels/ntfy/0.3.1/CHANGELOG.md",
+          "changelog": "# 0.3.1\n\n- Migrated `ntfy` from the legacy out-of-process HTTP Bridge sidecar to a single-file ES Module (`plugin.js`, Plugin API v1) running directly inside FeedCourier's sandboxed JS runtime.\n- Preserved all hardening rules: strict `server_url` normalization (rejects embedded credentials, strips query/fragment and trailing slashes), RFC 2047 UTF-8 Base64 `Title` encoding for non-ASCII titles, code-point-safe `<= 4096` UTF-8 byte truncation, and `429` (`Retry-After`) / `5xx` / `4xx` retry mapping."
+        }
       ]
     }
   ]

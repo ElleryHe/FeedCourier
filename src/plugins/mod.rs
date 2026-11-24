@@ -1,10 +1,10 @@
-//! FeedCourier Plugin Framework (Plugin Protocol v1) — Built-in Rust Plugins, Out-of-Process
-//! HTTP Bridge Plugins (`processor` + `channel` + `on_delivered`), and Marketplace Index Client.
+//! FeedCourier Plugin Framework (Plugin Protocol v1) — Built-in Rust Plugins, In-Process
+//! Pure-Rust JS Sandbox Plugins (`boa_engine`), and Marketplace Index Client.
 
-pub mod bridge;
+pub mod js_runtime;
 pub mod link_rewrite;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -12,15 +12,18 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::channels::RouteOptions;
-use crate::crypto::MasterKey;
+use crate::crypto::{MasterKey, constant_time_eq, sha256_hex};
 use crate::db::Database;
 use crate::db::models::{Channel, ChannelDestination, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
 use crate::net::{OutboundRequest, ProtectedHttpClient};
 
-use self::bridge::{BridgeClient, BridgeProcessorPlugin};
+use self::js_runtime::{
+    JS_MAX_SCRIPT_BYTES, JsPluginRuntime, JsProcessorPlugin, compile_js_plugin_sync,
+};
 use self::link_rewrite::LinkRewritePlugin;
 
 /// Current stable plugin protocol version (`api_version`).
@@ -65,20 +68,20 @@ impl PluginKind {
     }
 }
 
-/// Execution runtime for a plugin (`builtin` compiled into Rust binary vs out-of-process `bridge`).
+/// Execution runtime for a plugin (`builtin` compiled into Rust binary vs in-process `js` sandbox).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginRuntime {
     #[default]
     Builtin,
-    Bridge,
+    Js,
 }
 
 impl PluginRuntime {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Builtin => "builtin",
-            Self::Bridge => "bridge",
+            Self::Js => "js",
         }
     }
 }
@@ -123,8 +126,12 @@ pub struct PluginManifest {
     pub icon: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
     #[serde(default)]
     pub homepage: String,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     #[serde(default)]
     pub hooks: Vec<HookKind>,
     #[serde(default)]
@@ -181,7 +188,7 @@ pub fn check_plugin_compatibility(
     (true, None)
 }
 
-fn parse_semver_triple(raw: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_semver_triple(raw: &str) -> Option<(u64, u64, u64)> {
     let clean = raw
         .trim()
         .trim_start_matches('v')
@@ -259,7 +266,7 @@ pub enum PluginResult {
     },
 }
 
-/// Plugin trait implemented by both compiled-in Rust plugins and HTTP bridge processor plugins.
+/// Plugin trait implemented by both compiled-in Rust plugins and in-process JS processor plugins.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -304,12 +311,11 @@ pub struct PluginRetry {
     pub retry_after_secs: Option<u64>,
 }
 
-/// Cached runtime metadata for a registered HTTP bridge plugin (`processor` or `channel`).
+/// Cached runtime metadata for an installed JS plugin (`processor` or `channel`).
 #[derive(Clone)]
-pub struct BridgePluginEntry {
-    pub manifest: PluginManifest,
-    pub client: BridgeClient,
-    pub bridge_url: String,
+pub struct JsPluginEntry {
+    pub source: String,
+    pub runtime: Arc<JsPluginRuntime>,
     pub enabled: bool,
     pub compatible: bool,
     pub compatibility_reason: Option<String>,
@@ -318,11 +324,11 @@ pub struct BridgePluginEntry {
 struct RegistryCache {
     loaded_from_db: bool,
     enabled_by_id: HashMap<String, bool>,
-    bridges: HashMap<String, BridgePluginEntry>,
-    bridge_processors: HashMap<String, Arc<dyn Plugin>>,
+    js_plugins: HashMap<String, JsPluginEntry>,
+    js_processors: HashMap<String, Arc<dyn Plugin>>,
 }
 
-/// Registry holding built-in Rust plugins plus in-memory cached bridge plugins & enabled flags.
+/// Registry holding built-in Rust plugins plus in-memory cached JS plugins & enabled flags.
 #[derive(Clone)]
 pub struct PluginRegistry {
     builtins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -337,14 +343,14 @@ impl fmt::Debug for PluginRegistry {
             .iter()
             .map(|p| p.manifest().id.as_str())
             .collect();
-        let bridge_ids: Vec<String> = self
+        let js_ids: Vec<String> = self
             .cache
             .read()
-            .map(|g| g.bridges.keys().cloned().collect())
+            .map(|g| g.js_plugins.keys().cloned().collect())
             .unwrap_or_default();
         f.debug_struct("PluginRegistry")
             .field("builtins", &builtin_ids)
-            .field("bridges", &bridge_ids)
+            .field("js_plugins", &js_ids)
             .finish()
     }
 }
@@ -356,7 +362,7 @@ impl Default for PluginRegistry {
 }
 
 impl PluginRegistry {
-    /// Construct a registry containing all built-in plugins (bridge plugins are loaded via `reload_from_db`).
+    /// Construct a registry containing all built-in plugins (JS plugins are loaded via `reload_from_db`).
     pub fn with_builtins() -> Self {
         let builtins: Vec<Arc<dyn Plugin>> = vec![Arc::new(LinkRewritePlugin::new())];
         let mut builtins_by_id = HashMap::with_capacity(builtins.len());
@@ -369,8 +375,8 @@ impl PluginRegistry {
             cache: Arc::new(RwLock::new(RegistryCache {
                 loaded_from_db: false,
                 enabled_by_id: HashMap::new(),
-                bridges: HashMap::new(),
-                bridge_processors: HashMap::new(),
+                js_plugins: HashMap::new(),
+                js_processors: HashMap::new(),
             })),
         }
     }
@@ -384,7 +390,7 @@ impl PluginRegistry {
         self.builtins_by_id.contains_key(id.trim())
     }
 
-    /// Look up any processor plugin (built-in or bridge) implementing [`Plugin`].
+    /// Look up any processor plugin (built-in or JS) implementing [`Plugin`].
     pub fn get(&self, id: &str) -> Option<Arc<dyn Plugin>> {
         let trimmed = id.trim();
         if let Some(p) = self.builtins_by_id.get(trimmed) {
@@ -393,38 +399,39 @@ impl PluginRegistry {
         self.cache
             .read()
             .ok()
-            .and_then(|g| g.bridge_processors.get(trimmed).cloned())
+            .and_then(|g| g.js_processors.get(trimmed).cloned())
     }
 
-    /// Look up a registered HTTP bridge plugin entry (`processor` or `channel`).
-    pub fn get_bridge(&self, id: &str) -> Option<BridgePluginEntry> {
+    /// Look up an installed JS plugin entry (`processor` or `channel`).
+    pub fn get_js(&self, id: &str) -> Option<JsPluginEntry> {
         self.cache
             .read()
             .ok()
-            .and_then(|g| g.bridges.get(id.trim()).cloned())
+            .and_then(|g| g.js_plugins.get(id.trim()).cloned())
     }
 
-    /// Return all registered bridge plugins sorted by ID.
-    pub fn list_bridges(&self) -> Vec<BridgePluginEntry> {
-        let mut list: Vec<BridgePluginEntry> = self
+    /// Return all installed JS plugins sorted by ID.
+    pub fn list_js(&self) -> Vec<JsPluginEntry> {
+        let mut list: Vec<JsPluginEntry> = self
             .cache
             .read()
-            .map(|g| g.bridges.values().cloned().collect())
+            .map(|g| g.js_plugins.values().cloned().collect())
             .unwrap_or_default();
-        list.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
+        list.sort_by(|a, b| a.runtime.manifest.id.cmp(&b.runtime.manifest.id));
         list
     }
 
-    /// Return the manifest for any installed plugin (built-in or bridge).
+    /// Return the manifest for any installed plugin (built-in or JS).
     pub fn get_manifest(&self, id: &str) -> Option<PluginManifest> {
         let trimmed = id.trim();
         if let Some(p) = self.builtins_by_id.get(trimmed) {
             return Some(p.manifest().clone());
         }
-        self.cache
-            .read()
-            .ok()
-            .and_then(|g| g.bridges.get(trimmed).map(|b| b.manifest.clone()))
+        self.cache.read().ok().and_then(|g| {
+            g.js_plugins
+                .get(trimmed)
+                .map(|p| p.runtime.manifest.clone())
+        })
     }
 
     /// Ensure every built-in plugin has a row in SQLite `plugins` (idempotent; preserves `enabled`).
@@ -436,81 +443,85 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Reload all plugin enabled states and registered HTTP bridge plugins from SQLite into memory.
-    /// Called at startup and immediately after any plugin create/update/refresh/delete mutation.
-    pub async fn reload_from_db(&self, db: &Database, master_key: &MasterKey) -> AppResult<()> {
+    /// Reload all plugin enabled states and installed JS plugins from SQLite into memory.
+    /// Called at startup and immediately after any plugin install/upload/update/delete mutation.
+    pub async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
         let rows = db.list_plugins().await?;
         let mut enabled_by_id = HashMap::with_capacity(rows.len());
-        let mut bridges = HashMap::new();
-        let mut bridge_processors: HashMap<String, Arc<dyn Plugin>> = HashMap::new();
+        let mut js_plugins = HashMap::new();
+        let mut js_processors: HashMap<String, Arc<dyn Plugin>> = HashMap::new();
 
         for row in rows {
             enabled_by_id.insert(row.id.clone(), row.enabled);
-            if row.source == "bridge" {
-                let Some(bridge_url) = row.bridge_url.clone() else {
+            if matches!(row.source.as_str(), "market" | "custom") {
+                let Some(script_js) = row.script_js.clone() else {
+                    tracing::warn!(
+                        plugin_id = %row.id,
+                        "persisted JS plugin row is missing script_js; skipping"
+                    );
                     continue;
                 };
-                let Some(enc_secret) = row.encrypted_bridge_secret.as_deref() else {
-                    continue;
-                };
-                let Some(manifest_json) = row.manifest_json.as_deref() else {
-                    continue;
-                };
-                let secret: String = match master_key.decrypt_json(enc_secret) {
-                    Ok(s) => s,
-                    Err(err) => {
+                let script_for_compile = script_js.clone();
+                let compiled = match tokio::task::spawn_blocking(move || {
+                    compile_js_plugin_sync(&script_for_compile)
+                })
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(err)) => {
                         tracing::warn!(
                             plugin_id = %row.id,
                             error = %err,
-                            "failed to decrypt bridge secret; skipping bridge plugin"
+                            "failed to compile persisted JS plugin; skipping"
+                        );
+                        continue;
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(
+                            plugin_id = %row.id,
+                            error = %join_err,
+                            "persisted JS plugin compiler task panicked; skipping"
                         );
                         continue;
                     }
                 };
-                let mut manifest: PluginManifest = match serde_json::from_str(manifest_json) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        tracing::warn!(
-                            plugin_id = %row.id,
-                            error = %err,
-                            "failed to parse persisted bridge manifest_json; skipping bridge plugin"
-                        );
-                        continue;
-                    }
-                };
-                manifest.runtime = PluginRuntime::Bridge;
-                let (compatible, compatibility_reason) =
-                    check_plugin_compatibility(&manifest.api_version, manifest.min_core.as_deref());
+
+                // Allow persisted manifest_json (if manually adjusted in tests) to surface
+                // min_core / api_version compatibility checks consistently.
+                let mut runtime = JsPluginRuntime::from_compiled(script_js, compiled);
+                if let Some(manifest_json) = row.manifest_json.as_deref()
+                    && let Ok(persisted_manifest) =
+                        serde_json::from_str::<PluginManifest>(manifest_json)
+                {
+                    runtime.manifest.api_version = persisted_manifest.api_version;
+                    runtime.manifest.min_core = persisted_manifest.min_core;
+                }
+                runtime.manifest.runtime = PluginRuntime::Js;
+
+                let (compatible, compatibility_reason) = check_plugin_compatibility(
+                    &runtime.manifest.api_version,
+                    runtime.manifest.min_core.as_deref(),
+                );
                 if !compatible {
                     tracing::warn!(
                         plugin_id = %row.id,
                         reason = compatibility_reason.as_deref().unwrap_or("incompatible"),
-                        "persisted bridge plugin is incompatible with current core; disabling runtime execution"
+                        "persisted JS plugin is incompatible with current core; disabling runtime execution"
                     );
                 }
                 let effective_enabled = row.enabled && compatible;
                 enabled_by_id.insert(row.id.clone(), effective_enabled);
-                let client = match BridgeClient::new(bridge_url.clone(), secret, row.id.clone()) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        tracing::warn!(
-                            plugin_id = %row.id,
-                            error = %err,
-                            "invalid persisted bridge_url; skipping bridge plugin"
-                        );
-                        continue;
-                    }
-                };
-                if manifest.kind == PluginKind::Processor {
-                    let proc_plugin = BridgeProcessorPlugin::new(manifest.clone(), client.clone());
-                    bridge_processors.insert(row.id.clone(), Arc::new(proc_plugin));
+
+                let runtime_arc = Arc::new(runtime);
+                if runtime_arc.manifest.kind == PluginKind::Processor {
+                    let proc_plugin = JsProcessorPlugin::new(Arc::clone(&runtime_arc));
+                    js_processors.insert(row.id.clone(), Arc::new(proc_plugin));
                 }
-                bridges.insert(
+                js_plugins.insert(
                     row.id.clone(),
-                    BridgePluginEntry {
-                        manifest,
-                        client,
-                        bridge_url,
+                    JsPluginEntry {
+                        source: row.source,
+                        runtime: runtime_arc,
                         enabled: effective_enabled,
                         compatible,
                         compatibility_reason,
@@ -522,8 +533,8 @@ impl PluginRegistry {
         if let Ok(mut guard) = self.cache.write() {
             guard.loaded_from_db = true;
             guard.enabled_by_id = enabled_by_id;
-            guard.bridges = bridges;
-            guard.bridge_processors = bridge_processors;
+            guard.js_plugins = js_plugins;
+            guard.js_processors = js_processors;
         }
         Ok(())
     }
@@ -563,7 +574,7 @@ impl PluginRegistry {
         }
         let mut seen_order = HashSet::with_capacity(route_options.plugin_order.len());
         for pid in &route_options.plugin_order {
-            bridge::validate_plugin_id(pid)?;
+            js_runtime::validate_plugin_id(pid)?;
             if !seen_order.insert(pid.as_str()) {
                 return Err(AppError::Validation(format!(
                     "duplicate plugin id '{pid}' in route options.plugin_order"
@@ -583,7 +594,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Compute the ordered list of enabled bridge plugins subscribed to `HookKind::OnDelivered`
+    /// Compute the ordered list of enabled JS plugins subscribed to `HookKind::OnDelivered`
     /// for a completed delivery task (route-configured processor plugins + optional channel plugin).
     pub fn on_delivered_subscriber_ids(
         &self,
@@ -600,20 +611,20 @@ impl PluginRegistry {
             if !is_route_plugin_enabled(opt) {
                 continue;
             }
-            if let Some(bridge) = guard.bridges.get(pid)
-                && bridge.enabled
-                && bridge.compatible
-                && bridge.manifest.hooks.contains(&HookKind::OnDelivered)
+            if let Some(js) = guard.js_plugins.get(pid)
+                && js.enabled
+                && js.compatible
+                && js.runtime.manifest.hooks.contains(&HookKind::OnDelivered)
                 && seen.insert(pid.clone())
             {
                 out.push(pid.clone());
             }
         }
         if let Some(ch_pid) = channel_plugin_id
-            && let Some(bridge) = guard.bridges.get(ch_pid)
-            && bridge.enabled
-            && bridge.compatible
-            && bridge.manifest.hooks.contains(&HookKind::OnDelivered)
+            && let Some(js) = guard.js_plugins.get(ch_pid)
+            && js.enabled
+            && js.compatible
+            && js.runtime.manifest.hooks.contains(&HookKind::OnDelivered)
             && seen.insert(ch_pid.to_string())
         {
             out.push(ch_pid.to_string());
@@ -799,16 +810,31 @@ const fn default_schema_version() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketPluginVersionEntry {
+    pub version: String,
+    #[serde(default)]
+    pub min_core: Option<String>,
+    pub path: String,
+    pub sha256: String,
+    #[serde(default)]
+    pub changelog_path: Option<String>,
+    #[serde(default)]
+    pub changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPluginEntry {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub latest: Option<String>,
     #[serde(default = "default_api_version")]
     pub api_version: String,
     /// `"builtin"`, `"processor"`, `"channel"`, or `"external"` / `"coming_soon"`.
     #[serde(default = "default_market_kind")]
     pub kind: String,
-    /// `"builtin"` or `"bridge"`.
+    /// `"builtin"` or `"js"`.
     #[serde(default)]
     pub runtime: Option<String>,
     #[serde(default)]
@@ -820,17 +846,19 @@ pub struct MarketPluginEntry {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub description_i18n: BTreeMap<String, String>,
+    #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
-    pub image: Option<String>,
-    #[serde(default)]
-    pub compose_snippet: Option<String>,
+    pub allowed_hosts: Vec<String>,
     #[serde(default)]
     pub hooks: Vec<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub versions: Vec<MarketPluginVersionEntry>,
 }
 
 fn default_api_version() -> String {
@@ -980,6 +1008,77 @@ impl MarketIndexCache {
         }
         (snapshot, "snapshot")
     }
+
+    /// Download a versioned `plugin.js` script relative to `index_url` and strictly verify its
+    /// SHA-256 fingerprint before allowing compilation or installation.
+    pub async fn fetch_plugin_script(
+        &self,
+        http: &ProtectedHttpClient,
+        relative_path: &str,
+        expected_sha256: &str,
+    ) -> AppResult<String> {
+        let rel = relative_path.trim();
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.contains("..")
+            || rel.contains("://")
+            || rel.contains('\\')
+            || !rel.ends_with(".js")
+        {
+            return Err(AppError::Validation(format!(
+                "invalid marketplace plugin script path '{rel}'"
+            )));
+        }
+        let expected_norm = expected_sha256.trim().to_ascii_lowercase();
+        if expected_norm.len() != 64 || !expected_norm.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::Validation(format!(
+                "invalid marketplace plugin sha256 '{expected_sha256}'"
+            )));
+        }
+
+        let base = Url::parse(&self.index_url).map_err(|err| {
+            AppError::Config(format!(
+                "invalid plugin marketplace index URL '{}': {err}",
+                self.index_url
+            ))
+        })?;
+        let script_url = base.join(rel).map_err(|err| {
+            AppError::Validation(format!(
+                "failed to resolve marketplace plugin script URL for '{rel}': {err}"
+            ))
+        })?;
+
+        let use_proxy = http.settings().outbound_proxy_url.is_some();
+        let req = OutboundRequest::new(script_url.as_str())
+            .use_proxy(use_proxy)
+            .timeout(Duration::from_secs(15))
+            .max_bytes(JS_MAX_SCRIPT_BYTES);
+
+        let resp = http.get_bytes(req).await.map_err(|err| {
+            AppError::Upstream(format!(
+                "failed to download plugin script from '{script_url}': {err}"
+            ))
+        })?;
+        if !resp.status.is_success() {
+            return Err(AppError::Upstream(format!(
+                "marketplace returned HTTP {} downloading '{rel}'",
+                resp.status
+            )));
+        }
+
+        let actual_sha256 = sha256_hex(&resp.bytes);
+        if !constant_time_eq(actual_sha256.as_bytes(), expected_norm.as_bytes()) {
+            return Err(AppError::Validation(format!(
+                "downloaded plugin script '{rel}' failed SHA-256 verification (expected {expected_norm}, got {actual_sha256})"
+            )));
+        }
+
+        String::from_utf8(resp.bytes.to_vec()).map_err(|err| {
+            AppError::Validation(format!(
+                "downloaded plugin script '{rel}' is not valid UTF-8: {err}"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1077,7 +1176,9 @@ mod tests {
             category: "content".to_string(),
             icon: "wand".to_string(),
             description: "test".to_string(),
+            description_i18n: BTreeMap::new(),
             homepage: "https://example.com".to_string(),
+            allowed_hosts: vec![],
             hooks: vec![HookKind::OnRender],
             permissions: vec![],
             instance_schema: serde_json::json!({}),
@@ -1107,8 +1208,8 @@ mod tests {
                     ("p-nonstrict".to_string(), true),
                     ("p-strict".to_string(), true),
                 ]),
-                bridges: HashMap::new(),
-                bridge_processors: HashMap::new(),
+                js_plugins: HashMap::new(),
+                js_processors: HashMap::new(),
             })),
         };
 

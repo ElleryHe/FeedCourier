@@ -242,17 +242,17 @@ pub struct NotionDestinationConfig {
     pub column_mapping: NotionColumnMapping,
 }
 
-/// Decrypted account-level configuration for a bridge channel plugin (`ChannelKind::Plugin`).
+/// Decrypted account-level configuration for a channel plugin (`ChannelKind::Plugin`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginChannelConfig {
-    /// Registered channel plugin ID (`plugins.id` where `kind = 'channel'`).
+    /// Installed channel plugin ID (`plugins.id` where `kind = 'channel'`).
     pub plugin_id: String,
     /// Schema-validated account configuration object encrypted at rest.
     #[serde(default)]
     pub config: serde_json::Value,
 }
 
-/// Decrypted destination-level configuration for a bridge channel plugin (`ChannelKind::Plugin`).
+/// Decrypted destination-level configuration for a channel plugin (`ChannelKind::Plugin`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginDestinationConfig {
     /// Schema-validated destination target object encrypted at rest.
@@ -472,7 +472,7 @@ impl ChannelConfig {
             Self::Plugin(cfg) => serde_json::json!({
                 "kind": "plugin",
                 "plugin_id": cfg.plugin_id,
-                "config": crate::plugins::bridge::redact_config_generic(&cfg.config),
+                "config": crate::plugins::js_runtime::redact_config_generic(&cfg.config),
             }),
         }
     }
@@ -586,7 +586,7 @@ impl DestinationConfig {
             }),
             Self::Plugin(cfg) => serde_json::json!({
                 "kind": "plugin",
-                "config": crate::plugins::bridge::redact_config_generic(&cfg.config),
+                "config": crate::plugins::js_runtime::redact_config_generic(&cfg.config),
             }),
         }
     }
@@ -835,7 +835,7 @@ pub enum DeliveryCheckpoint {
         #[serde(default)]
         page_id: Option<String>,
     },
-    /// Opaque bridge channel plugin checkpoint state (capped at 16 KiB).
+    /// Opaque channel plugin checkpoint state (capped at 16 KiB).
     Plugin {
         #[serde(default)]
         state: serde_json::Value,

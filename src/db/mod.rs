@@ -35,7 +35,7 @@ pub struct Database {
     /// `0003_plugins_and_smtp_compliance.sql` on an existing v0.2.x database.
     pre_v3_backup_path: Option<PathBuf>,
     /// Path to a pre-v0.3.1 DDL backup captured via `VACUUM INTO` before applying
-    /// `0004_plugin_bridges.sql` on an existing v0.3.0 database.
+    /// `0004_js_plugins.sql` on an existing v0.3.0 database.
     pre_v4_backup_path: Option<PathBuf>,
 }
 
@@ -296,7 +296,7 @@ impl Database {
                 None
             };
 
-        // Snapshot a genuine pre-v0.3.1 database BEFORE applying `0004_plugin_bridges.sql`.
+        // Snapshot a genuine pre-v0.3.1 database BEFORE applying `0004_js_plugins.sql`.
         let pre_v4_backup_path = if pre_v2_backup_path.is_none()
             && pre_v3_backup_path.is_none()
             && needs_pre_v4_ddl_backup(&write_pool).await?

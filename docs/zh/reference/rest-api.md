@@ -176,31 +176,32 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
 | `GET` | `/api/v1/channels` | 获取全部授信通道账号列表（`ChannelDto[]`，敏感密码/Token 自动脱敏为 `has_password` / `bot_token_hint` / `secret_hint`，对于 `plugin` 通道则按插件 Schema 自动脱敏为 `has_<field>` / `<field>_hint`，并内嵌 `destinations: ChannelDestinationDto[]`，每个目的地包含 `enabled` 与 `auto_paused: bool`，SMTP 目的地另附带 `smtp_summary` 收件人验证计数，详见[安全与防注入机制](/zh/reference/security)）。 |
-| `POST` | `/api/v1/channels` | 返回 **`201 Created`**。创建新通道账号（`smtp` / `telegram` / `notion` / `plugin`，SMTP 支持可选 `sender_identity` 且使用原生 TCP/TLS 直连，不适用 HTTP/SOCKS 代理；`name` 可省略以自动获取，可选传入 `initial_destination` 一并创建首个目的地）；Telegram 账号创建时自动执行 `probe_capabilities` 探测（`api_base_url` 强制走 SSRF 校验，命中禁止目标时返回 `403 ssrf_blocked`）；`kind = "plugin"` 时自动向对应通道桥接插件发起签名 `POST /validate`（`scope: "account"`）校验。 |
-| `PATCH` | `/api/v1/channels/{id}` | 更新账号凭据、`sender_identity`、代理（HTTP 类通道）、共享步进间隔或配额（**密钥保留语义**：当 `password` / `bot_token` / `integration_secret` 或 `plugin` 通道 Schema 中的密钥字段省略或留空时，后端自动保留原加密密钥不变；对于 SMTP 账号，显式传入 `"password": null` 可清空可选的 SMTP 密码；将 `hourly_quota` 或 `daily_quota` 显式传 `null` 可清空配额限制）。 |
+| `POST` | `/api/v1/channels` | 返回 **`201 Created`**。创建新通道账号（`smtp` / `telegram` / `notion` / `plugin`，SMTP 支持可选 `sender_identity` 且使用原生 TCP/TLS 直连，不适用 HTTP/SOCKS 代理；`name` 可省略以自动获取，可选传入 `initial_destination` 一并创建首个目的地）；Telegram 账号创建时自动执行 `probe_capabilities` 探测（`api_base_url` 强制走 SSRF 校验，命中禁止目标时返回 `403 ssrf_blocked`）；`kind = "plugin"` 时通过沙箱 JS 插件的 `validate` 函数（`scope: "account"`）校验账号配置，且支持 `use_proxy` 开关（针对公网 `allowed_hosts` 走全局代理，自建内网地址受 `SSRF_ALLOWLIST` 约束直连）。 |
+| `PATCH` | `/api/v1/channels/{id}` | 更新账号凭据、`sender_identity`、代理（Telegram / Notion / 插件通道）、共享步进间隔或配额（**密钥保留语义**：当 `password` / `bot_token` / `integration_secret` 或 `plugin` 通道 Schema 中的密钥字段省略或留空时，后端自动保留原加密密钥不变；对于 SMTP 账号，显式传入 `"password": null` 可清空可选的 SMTP 密码；将 `hourly_quota` 或 `daily_quota` 显式传 `null` 可清空配额限制）。 |
 | `DELETE` | `/api/v1/channels/{id}` | 在单事务内原子删除通道账号。若其下目的地仍被任意路由引用且未传 `?cascade=true`，返回 **`409 Conflict`** 及 `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`（与 `DELETE /api/v1/destinations/{id}` 对齐）；显式传入 **`?cascade=true`** 才会连同所有目的地、关联路由与任务一并删除。 |
-| `POST` | `/api/v1/channels/{id}/test` | 未传 `destination_id` 时，校验账号级凭据（SMTP 校验连通性与认证并**仅向自身 `from_address`** 发送自检邮件；Telegram 执行 `getMe` + `sendRichMessage` 探测；Notion 调用 `GET /v1/users/me`；`plugin` 通道向桥接服务发起签名 `POST /test` 且 `scope: "account"`）；传入 `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` 时执行目的地级测试（规则同 `POST /api/v1/destinations/{id}/test`）。 |
+| `POST` | `/api/v1/channels/{id}/test` | 未传 `destination_id` 时，校验账号级凭据（SMTP 校验连通性与认证并**仅向自身 `from_address`** 发送自检邮件；Telegram 执行 `getMe` + `sendRichMessage` 探测；Notion 调用 `GET /v1/users/me`；`plugin` 通道执行沙箱 JS 插件的 `test` 函数且 `scope: "account"`）；传入 `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` 时执行目的地级测试（规则同 `POST /api/v1/destinations/{id}/test`）。 |
 | `GET` | `/api/v1/channels/{id}/destinations` | 列出通道账号 `{id}` 下的全部目的地（`ChannelDestinationDto[]`，含 `auto_paused: bool`，`plugin` 目的地自动按 Schema 脱敏密钥字段，SMTP 目的地附带 `smtp_summary`）。 |
-| `POST` | `/api/v1/channels/{id}/destinations` | 返回 **`201 Created`**。在通道账号 `{id}` 下新增目的地（`CreateDestinationRequest`；省略 `name` 时自动取 Telegram `getChat`、打码后的 SMTP 首个非空收件人如 `a***e@example.com`、Notion 数据库标题或 `plugin` 目的地主标识字段）；`plugin` 通道会自动向桥接服务发起签名 `POST /validate`（`scope: "destination"`）校验。 |
+| `POST` | `/api/v1/channels/{id}/destinations` | 返回 **`201 Created`**。在通道账号 `{id}` 下新增目的地（`CreateDestinationRequest`；省略 `name` 时自动取 Telegram `getChat`、打码后的 SMTP 首个非空收件人如 `a***e@example.com`、Notion 数据库标题或 `plugin` 目的地主标识字段）；`plugin` 通道会自动执行 JS 插件 `validate` 函数（`scope: "destination"`）校验。 |
 | `PATCH` | `/api/v1/destinations/{id}` | 局部更新目的地备注名、目标配置（`DestinationPatch`）或启用状态（`enabled`；手动修改 `enabled` 时自动清零 `auto_paused = false`；`plugin` 目的地中的密钥字段在省略或传空串时保持不变）。修改 SMTP `to_addresses` 时自动同步 `smtp_recipients`（新地址初始为 `unverified`，已移除地址同步删除，保留地址维持原状态）。 |
 | `DELETE` | `/api/v1/destinations/{id}` | 在单事务内原子删除指定目的地。若仍有路由引用该目的地且未传 `?cascade=true`，返回 **`409 Conflict`** 及 `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`；显式传入 **`?cascade=true`** 才会连同关联路由与任务一起删除。 |
-| `POST` | `/api/v1/destinations/{id}/test` | 向指定目的地发送实时连通性测试邮件/消息/页面，或对 `plugin` 目的地发起签名 `POST /test`（`scope: "destination"`）。可选请求体 `{ "locale"?: "en" \| "zh-CN" }` 指定测试消息语言。针对 SMTP 目的地，严格**仅向 `verified` 收件人**按单 `To:` 隔离信封附带 RFC 8058 合规头逐人发送，0 位已验证收件人时返回明确错误。 |
+| `POST` | `/api/v1/destinations/{id}/test` | 向指定目的地发送实时连通性测试邮件/消息/页面，或对 `plugin` 目的地执行沙箱 JS 插件 `test`（`scope: "destination"`）。可选请求体 `{ "locale"?: "en" \| "zh-CN" }` 指定测试消息语言。针对 SMTP 目的地，严格**仅向 `verified` 收件人**按单 `To:` 隔离信封附带 RFC 8058 合规头逐人发送，0 位已验证收件人时返回明确错误。 |
 | `POST` | `/api/v1/channels/notion/init-db` | 在授权父页面下创建包含 8 个标准属性列（含可选 `Short URL`）的 Notion 数据库（`Notion-Version: 2026-03-11`，`initial_data_source.properties`）。 |
 | `POST` | `/api/v1/channels/notion/inspect-schema` | 检查已有 Notion 数据源属性列匹配情况，并在 `patch_missing: true` 时自动补齐缺失列。 |
 
 ### 插件通道配置结构（`kind = "plugin"`）
 
-创建或更新 HTTP Bridge 通道账号（`ChannelKind::Plugin`）时，在账号侧指定 `plugin_id` 并在 `config` 中传入由插件 Schema 定义的配置对象；目的地侧同样嵌套在 `config` 内（自动归属父账号的 `plugin_id`）：
+创建或更新 JS 插件通道账号（`ChannelKind::Plugin`）时，在账号侧指定 `plugin_id`、按需设置 `use_proxy`（用于公网 `allowed_hosts`），并在 `config` 中传入由插件 Schema 定义的配置对象；目的地侧同样嵌套在 `config` 内（自动归属父账号的 `plugin_id`）：
 
 ```json
 {
-  "name": "自建 ntfy",
+  "name": "ntfy 推送",
   "kind": "plugin",
+  "use_proxy": false,
   "config": {
     "kind": "plugin",
     "plugin_id": "ntfy",
     "config": {
-      "server_url": "https://ntfy.example.com",
+      "server_url": "https://ntfy.sh",
       "access_token": "tk_..."
     }
   },
@@ -217,7 +218,7 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 }
 ```
 
-插件 Manifest 的 `account_schema` / `destination_schema` 中标注为敏感凭据的字段（如 `"format": "password"` 或密钥/令牌字段）落盘时采用 ChaCha20-Poly1305 加密，读取接口（`GET`）中自动脱敏为 `has_<field>: true|false` 与 `<field>_hint: "tk_••••"`，不返回明文。
+插件 Manifest 的 `account_schema` / `destination_schema` 中标注为敏感凭据的字段（如 `"format": "password"` 或 `"x-secret": true`）落盘时采用 ChaCha20-Poly1305 加密，读取接口（`GET`）中自动脱敏为 `has_<field>: true|false` 与 `<field>_hint: "tk_••••"`，不返回明文。
 
 ### SMTP 收件人合规管理（`/api/v1/destinations/{id}/recipients*`）
 
@@ -235,18 +236,19 @@ FeedCourier 的内嵌 React 19 管理面板通过挂载于 `/api/v1/*` 的 JSON 
 
 | 方法 | 路径 | 说明 |
 | :---: | :--- | :--- |
-| `GET` | `/api/v1/plugins` | 获取已安装插件列表（`PluginDto[]`），含 `source` / `runtime`（`builtin` \| `bridge`）、`kind`（`processor` \| `channel`）、`bridge_url`、`compatible` / `compatibility_reason`、`manifest`（内嵌 `instance_schema`、`route_option_schema`、`account_schema`、`destination_schema`、`capabilities`）、`enabled`、`installed_version`、`settings`、`instance_count` 及脱敏后的 `instances: PluginInstanceDto[]`。 |
-| `POST` | `/api/v1/plugins/bridges` | 注册进程外 HTTP Bridge 插件（请求体 `{ "bridge_url", "bridge_secret", "enabled"?: true, "dry_run"?: false }`）。后端会先发起 HMAC-SHA256 签名的 `GET /manifest` 探活并校验 Protocol v1 兼容性：`dry_run: true` 时仅返回 **`200 OK`** 预览（`BridgeManifestPreviewResponse`）不落盘；否则加密存储 `bridge_secret`、持久化插件并重载内存注册表，返回 **`201 Created`**（`PluginDto`；若 `id` 已存在则返回 **`409 Conflict`**）。 |
-| `PATCH` | `/api/v1/plugins/{id}` | 请求体 `{ "enabled"?: bool, "settings"?: object, "bridge_url"?: string, "bridge_secret"?: string }`。全局启用/禁用插件或更新插件级配置（禁用时保留路由配置）；对桥接插件还支持原地修改 `bridge_url` 与轮换 `bridge_secret`，落盘前强制对新地址/新密钥发起实时签名 `GET /manifest` 探测并校验 `id`、`kind` 与 Protocol v1 兼容性。 |
-| `POST` | `/api/v1/plugins/{id}/refresh-manifest` | 重新向桥接插件拉取签名 `GET /manifest` 以更新版本、Schema 与能力信息；严格禁止变更插件 `kind`（`processor` ↔ `channel`），并自动同步更新所有关联 `kind = 'plugin'` 通道的 `capabilities_json`。 |
-| `DELETE` | `/api/v1/plugins/{id}` | 删除已注册的 HTTP Bridge 插件。内置插件拒绝删除并返回 **`400 Bad Request`**；若仍被任意 `kind = 'plugin'` 通道账号或路由（`options.plugins` / `options.plugin_order`）引用且未传 `?cascade=true`，返回 **`409 Conflict`** 并列出 `referencing_channels: [{ "id", "name" }]` 与 `referencing_routes: [{ "id", "name" }]`；显式传入 **`?cascade=true`** 将原子删除该插件及其关联通道账号（含目的地、路由与任务）并从其余路由中剥离处理器引用。 |
+| `GET` | `/api/v1/plugins` | 获取已安装插件列表（`PluginDto[]`），含 `source`（`builtin` \| `market` \| `custom`）、`runtime`（`builtin` \| `js`）、`kind`（`processor` \| `channel`）、`script_sha256`、`allowed_hosts`、`compatible` / `compatibility_reason`、`manifest`（内嵌 `description_i18n`、`allowed_hosts`、`instance_schema`、`route_option_schema`、`account_schema`、`destination_schema`、`capabilities`）、`enabled`、`installed_version`、`settings`、`instance_count` 及脱敏后的 `instances: PluginInstanceDto[]`。 |
+| `POST` | `/api/v1/plugins/install` | 从插件市场一键安装或更新沙箱 JS 插件（请求体 `{ "plugin_id", "version"?, "enabled"?: true, "dry_run"?: false }`）。后端通过 `ProtectedHttpClient` 拉取对应版本的 `plugin.js`、强制校验注册表记录的 SHA-256 摘要，并在 `boa_engine` 中编译提取 `meta` 与校验 Protocol v1 / `min_core` 兼容性：`dry_run: true` 时返回 **`200 OK`**（`JsPluginPreviewResponse`，含 `script_sha256`、`allowed_hosts`、`already_installed` 与 `changelog`）不落盘；否则持久化脚本、同步关联通道能力并返回 **`201 Created`**（原位更新返回 **`200 OK`**）及 `PluginDto`。 |
+| `POST` | `/api/v1/plugins/upload` | 导入自定义单文件 JS 插件（请求体 `{ "script_js", "enabled"?: true, "dry_run"?: false, "allow_overwrite"?: false }`）。在 `boa_engine` 沙箱中编译校验 `script_js` 并提取 `meta`、`allowed_hosts` 与 `script_sha256`：`dry_run: true` 时返回 **`200 OK`**（`JsPluginPreviewResponse`）；否则以 `source: "custom"` 持久化并返回 **`201 Created`** / **`200 OK`**（`PluginDto`；若目标 ID 已安装且未传 `allow_overwrite: true` 返回 **`409 Conflict`**，若与内置插件 ID 冲突返回 **`400 Bad Request`**）。 |
+| `GET` | `/api/v1/plugins/{id}/source` | 查看已安装 JS 插件的持久化源码（`PluginSourceResponse`：`{ "id", "source", "version", "script_sha256", "script_js" }`）；对内置 Rust 插件返回 **`400 Bad Request`**。 |
+| `PATCH` | `/api/v1/plugins/{id}` | 请求体 `{ "enabled"?: bool, "settings"?: object }`。全局启用/禁用插件或更新插件级配置（禁用时保留路由配置与通道账号）。 |
+| `DELETE` | `/api/v1/plugins/{id}` | 卸载已安装的 JS 插件。内置插件拒绝卸载并返回 **`400 Bad Request`**；若仍被任意 `kind = 'plugin'` 通道账号或路由（`options.plugins` / `options.plugin_order`）引用且未传 `?cascade=true`，返回 **`409 Conflict`** 并列出 `referencing_channels: [{ "id", "name" }]` 与 `referencing_routes: [{ "id", "name" }]`；显式传入 **`?cascade=true`** 将原子卸载该插件及其关联通道账号（含目的地、路由与任务）并从其余路由中剥离处理器引用。 |
 | `GET` | `/api/v1/plugins/{id}/instances` | 列出插件 `{id}` 下已配置的服务商实例（敏感凭据脱敏为 `has_signature`、`signature_hint`、`has_password` 或按 Schema 生成的 `has_<field>` / `<field>_hint`，并附带 `cache_entries` 缓存条数）。 |
 | `POST` | `/api/v1/plugins/{id}/instances` | 返回 **`201 Created`**。校验、加密（ChaCha20-Poly1305）并保存新服务商实例（`CreatePluginInstanceRequest`：`{ "name", "config", "enabled"?: true }`）。 |
 | `PATCH` | `/api/v1/plugins/{id}/instances/{iid}` | 密钥保留式局部更新服务商实例（敏感字段省略或传 `""` 时保留原密钥）。 |
 | `DELETE` | `/api/v1/plugins/{id}/instances/{iid}` | 删除服务商实例；若仍被路由 `options.plugins` 引用，返回 **`409 Conflict`** 并列出 `referencing_routes: [{ "id", "name" }]`。 |
-| `POST` | `/api/v1/plugins/{id}/instances/{iid}/test` | 执行连通性测试（`link-rewrite` 经由 `ProtectedHttpClient` 实际缩短 `https://feedcourier.ellery.me/`；桥接处理器调用签名 `POST /test` 且 `scope: "instance"`）。返回 `{ "ok": true, "message": "..." }`。 |
+| `POST` | `/api/v1/plugins/{id}/instances/{iid}/test` | 执行连通性测试（`link-rewrite` 经由 `ProtectedHttpClient` 实际缩短 `https://feedcourier.ellery.me/`；JS 处理器执行插件的 `test` 函数且 `scope: "instance"`）。返回 `{ "ok": true, "message": "..." }`。 |
 | `DELETE` | `/api/v1/plugins/{id}/instances/{iid}/cache` | 清空服务商 `{iid}` 在 `plugin_link_cache` 中的全部短链缓存，返回 `{ "cleared_entries": N }`。 |
-| `GET` | `/api/v1/plugins/market` | 后端通过防 SSRF 客户端拉取插件市场索引（6 小时内存缓存；回退编译内置快照时负缓存 TTL 缩短为 60 秒，拉取瞬时失败时不覆盖已有有效远端缓存；传 `?refresh=true` 强制刷新），返回 `{ "source": "remote" \| "snapshot", "index_url", "generated_at", "plugins": MarketPluginItemDto[] }` 并标注 `kind`、`installed` 与 `enabled`（`homepage`/`repository` 严格限制为 `http://` 或 `https://` URL）。 |
+| `GET` | `/api/v1/plugins/market` | 后端通过防 SSRF 客户端拉取插件市场索引（6 小时内存缓存；回退编译内置快照时负缓存 TTL 缩短为 60 秒，拉取瞬时失败时不覆盖已有有效远端缓存；传 `?refresh=true` 强制刷新），返回 `{ "source": "remote" \| "snapshot", "index_url", "generated_at", "plugins": MarketPluginItemDto[] }` 并标注 `runtime`、`allowed_hosts`、`versions`、`latest`、`description_i18n`、`installed`、`installed_version`、`update_available` 与 `enabled`（`homepage`/`repository` 严格限制为 `http://` 或 `https://` URL）。 |
 
 ### 创建通道账号请求结构（`POST /api/v1/channels`）
 

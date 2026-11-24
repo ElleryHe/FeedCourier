@@ -1,24 +1,24 @@
 -- no-transaction
--- FeedCourier v0.3.1: Out-of-process HTTP Bridge Plugins, Channel Plugins (`channels.kind = 'plugin'`),
+-- FeedCourier v0.3.1: In-process JS Plugins (`boa_engine`), Channel Plugins (`channels.kind = 'plugin'`),
 -- and persistent at-least-once `on_delivered` plugin event outbox.
 
 PRAGMA foreign_keys = OFF;
 
 BEGIN IMMEDIATE;
 
--- 1. Extend `plugins` table with bridge registration & manifest metadata.
+-- 1. Extend `plugins` table with JS plugin source, kind, script persistence, SHA-256, and compiled manifest.
 ALTER TABLE plugins
-    ADD COLUMN source TEXT NOT NULL DEFAULT 'builtin' CHECK (source IN ('builtin', 'bridge'));
+    ADD COLUMN source TEXT NOT NULL DEFAULT 'builtin' CHECK (source IN ('builtin', 'market', 'custom'));
 ALTER TABLE plugins
     ADD COLUMN kind TEXT NOT NULL DEFAULT 'processor' CHECK (kind IN ('processor', 'channel'));
 ALTER TABLE plugins
-    ADD COLUMN bridge_url TEXT;
+    ADD COLUMN script_js TEXT;
 ALTER TABLE plugins
-    ADD COLUMN encrypted_bridge_secret BLOB;
+    ADD COLUMN script_sha256 TEXT;
 ALTER TABLE plugins
     ADD COLUMN manifest_json TEXT;
 ALTER TABLE plugins
-    ADD COLUMN manifest_fetched_at INTEGER;
+    ADD COLUMN installed_at INTEGER;
 
 -- 2. Rebuild `channels` table so `kind` accepts 'plugin' alongside 'smtp', 'telegram', 'notion'.
 CREATE TABLE channels_v4 (
