@@ -7,13 +7,16 @@ export interface MarketPlugin {
   name: string;
   version: string;
   api_version: string;
-  kind: "builtin" | "external" | "coming_soon" | string;
+  kind: "builtin" | "processor" | "channel" | "external" | "coming_soon" | string;
+  runtime?: "builtin" | "bridge" | string;
   min_core?: string;
   category: string;
   icon: string;
   description: string;
   homepage?: string;
   repository?: string;
+  image?: string;
+  compose_snippet?: string;
   hooks: string[];
   permissions: string[];
 }
@@ -61,7 +64,7 @@ export default {
         signal: AbortSignal.timeout(4000),
         headers: {
           Accept: "application/json",
-          "User-Agent": "FeedCourier-Docs-Builder/0.3.0",
+          "User-Agent": "FeedCourier-Docs-Builder/0.3.1",
         },
       });
       if (response.ok) {

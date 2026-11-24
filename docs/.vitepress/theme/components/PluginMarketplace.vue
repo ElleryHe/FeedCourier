@@ -13,15 +13,22 @@ const props = withDefaults(
 
 const isZh = computed(() => props.locale === "zh");
 
-function kindLabel(kind: string): string {
-  if (kind === "builtin") return isZh.value ? "内置" : "Built-in";
-  if (kind === "coming_soon") return isZh.value ? "即将支持" : "Coming Soon";
+function kindLabel(plugin: MarketPlugin): string {
+  if (plugin.kind === "builtin") return isZh.value ? "内置" : "Built-in";
+  if (plugin.runtime === "bridge" && plugin.kind === "channel") {
+    return isZh.value ? "桥接 · 通道" : "Bridge · Channel";
+  }
+  if (plugin.runtime === "bridge") {
+    return isZh.value ? "桥接 · 处理" : "Bridge · Processor";
+  }
+  if (plugin.kind === "coming_soon") return isZh.value ? "即将支持" : "Coming Soon";
   return isZh.value ? "第三方" : "External";
 }
 
-function kindClass(kind: string): string {
-  if (kind === "builtin") return "fc-badge-builtin";
-  if (kind === "coming_soon") return "fc-badge-soon";
+function kindClass(plugin: MarketPlugin): string {
+  if (plugin.kind === "builtin") return "fc-badge-builtin";
+  if (plugin.runtime === "bridge") return "fc-badge-builtin";
+  if (plugin.kind === "coming_soon") return "fc-badge-soon";
   return "fc-badge-external";
 }
 
@@ -81,8 +88,8 @@ function isExternalUrl(url?: string): boolean {
             <h3 class="fc-plugin-title">{{ plugin.name }}</h3>
             <code class="fc-plugin-id">{{ plugin.id }}</code>
           </div>
-          <span class="fc-badge" :class="kindClass(plugin.kind)">
-            {{ kindLabel(plugin.kind) }}
+          <span class="fc-badge" :class="kindClass(plugin)">
+            {{ kindLabel(plugin) }}
           </span>
         </div>
 

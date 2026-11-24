@@ -39,6 +39,7 @@ const enUserGuideSidebar: DefaultTheme.SidebarItem[] = [
     text: "Plugins",
     items: [
       { text: "Overview & Marketplace", link: "/plugins/" },
+      { text: "Bridge Channel Plugins", link: "/plugins/bridge-channels" },
       { text: "Link Rewrite (YOURLS)", link: "/plugins/link-rewrite" },
       { text: "Plugin Development", link: "/plugins/development" },
     ],
@@ -95,6 +96,7 @@ const zhUserGuideSidebar: DefaultTheme.SidebarItem[] = [
     text: "插件",
     items: [
       { text: "插件概览与市场", link: "/zh/plugins/" },
+      { text: "桥接通道插件", link: "/zh/plugins/bridge-channels" },
       { text: "链接替换 (YOURLS)", link: "/zh/plugins/link-rewrite" },
       { text: "插件开发手册", link: "/zh/plugins/development" },
     ],

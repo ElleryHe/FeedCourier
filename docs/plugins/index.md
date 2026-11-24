@@ -4,30 +4,28 @@ description: "FeedCourier Plugin Framework overview and live Plugin Marketplace 
 
 # Plugins & Marketplace
 
-Starting in **`v0.3.0`**, FeedCourier introduces a **Protocol v1 (`api_version: "1"`) Plugin Framework** that lets you extend the delivery pipeline per route without mutating stored feed entries.
+FeedCourier provides a **Protocol v1 (`api_version: "1"`) Plugin Framework** supporting both **built-in Rust plugins** (`v0.3.0+`) and **out-of-process HTTP Bridge plugins** (`v0.3.1+`) for custom delivery channels (`kind: "channel"`), delivery-time processors (`kind: "processor"`, `on_render`), and persistent post-delivery callbacks (`on_delivered`).
 
 ```mermaid
 flowchart LR
-    Entry[("Stored Entry\n(Immutable canonical_url & HTML)")] --> Hook["on_render Hook Chain\n(Per-Route Enabled Plugins)"]
-    Hook --> Overrides["RenderOverrides\n(Rewritten HTML / primary_link / warnings)"]
-    Overrides --> Channels["Channel Renderers\n(SMTP / Telegram / Notion)"]
-    Entry -.-> Preserve["Preserved Original URL\n(Telegram Link Preview & Notion Link)"]
-    Preserve -.-> Channels
+    Entry[("Stored Entry\n(Immutable canonical_url & HTML)")] --> Hook["on_render Hook Chain\n(RouteOptions.plugin_order)"]
+    Hook --> Overrides["RenderOverrides\n(Sanitized HTML / primary_link / warnings)"]
+    Overrides --> Channels["Channel Adapters\n(SMTP / Telegram / Notion / Plugin Bridge)"]
+    Channels --> Delivered["Persistent plugin_events\n(on_delivered At-Least-Once)"]
 ```
 
 ---
 
 ## Plugin Architecture Overview
 
-- **Delivery-Time, Non-Destructive Execution (`on_render`)**: Plugins execute inside the outbox worker right before the channel adapter renders a delivery (and during stateless Debug Push previews, without writing to cache). Stored `entries` remain unmodified so multi-route fanout, Telegram link previews, and Notion `Link` archival stay intact.
-- **Per-Route Configuration (`RouteOptions.plugins`)**: Enable a plugin globally under **Plugins** in the WebUI, add one or more encrypted provider instances (for example, separate YOURLS servers), and bind a provider per route in the route editor's collapsible **Plugins** section (or via REST API / MCP `configure_route`).
-- **Safe Lifecycle & Referential Integrity**:
-  - Disabling a plugin globally skips its hooks at delivery time while preserving all route configurations.
-  - Deleting a provider instance still referenced by one or more routes returns **`409 Conflict`** listing the referencing routes.
-  - If a provider instance is disabled (not deleted), the plugin degrades gracefully and attaches a warning to the task's diagnostic log (rendered in amber in the Outbox view).
-- **Two-Phase Runtime Roadmap**:
-  - **Phase 1 (`v0.3.0`)**: First-party plugins (beginning with [Link Rewrite (YOURLS)](/plugins/link-rewrite)) implement the Rust `Plugin` trait and compile directly into the single binary while using the stable Protocol v1 manifest, SQLite schema (`plugins`, `plugin_instances`, `plugin_link_cache`), and hook lifecycle.
-  - **Phase 2 (Planned)**: Sandboxed WASM/Extism runtime for third-party plugins reusing the exact Protocol v1 contracts.
+- **Two Runtime Models Sharing Protocol v1**:
+  - **Built-in (`runtime: "builtin"`)**: First-party Rust plugins compiled directly into the single FeedCourier binary (such as [Link Rewrite (YOURLS)](/plugins/link-rewrite)).
+  - **HTTP Bridge (`runtime: "bridge"`, `v0.3.1+`)**: Operator-registered sidecar HTTP services authenticated via HMAC-SHA256 (`±300s` replay window). Bridges can implement custom **delivery channels** (`POST /deliver`), **render processors** (`POST /hooks/on_render`, with `ammonia` HTML re-sanitization), or **post-delivery subscribers** (`POST /hooks/on_delivered`).
+- **Per-Route Configuration & Execution Ordering (`RouteOptions.plugins` & `plugin_order`)**: Enable processor plugins globally, configure per-route options, and control execution sequence with up/down ordering arrows in the route editor. Each plugin runs under an isolated 15s wall-clock timeout; non-strict failures record warnings without blocking delivery.
+- **Persistent `on_delivered` Events (`plugin_events`)**: Subscriptions to `on_delivered` are enqueued inside the same SQLite transaction that commits task delivery and dispatched asynchronously with an idempotency key and exponential backoff (up to 5 attempts).
+- **Safe Lifecycle & Compatibility Checks**:
+  - Marketplace and bridge manifests are checked against `api_version` and `min_core` before installation.
+  - Deleting an in-use bridge plugin or provider instance returns **`409 Conflict`** listing referencing channels and routes (`?cascade=true` supported for bridge plugins).
 
 ---
 
@@ -44,11 +42,12 @@ When you open **Plugins → Marketplace** in the WebUI (`GET /api/v1/plugins/mar
 - FeedCourier fetches `https://raw.githubusercontent.com/ElleryHe/FeedCourier-Plugins/main/index.json` through the SSRF-protected HTTP client (up to `1 MiB`, `8s` timeout) and caches the result in memory for **6 hours**.
 - Set [`PLUGIN_INDEX_URL`](/guide/configuration#environment-variables-reference) to point to a private mirror or self-hosted registry.
 - In air-gapped networks where the remote URL is unreachable, FeedCourier automatically falls back to its built-in snapshot (`source: "snapshot"`).
-- Built-in (`kind: "builtin"`) plugins can be activated in one click; external (`kind: "external"`) and planned (`kind: "coming_soon"`) listings link to their documentation and source repositories.
+- Built-in (`kind: "builtin"`) plugins can be activated in one click; HTTP Bridge (`runtime: "bridge"`) listings display their container image and Docker Compose snippet and open the **Register Bridge** flow; incompatible entries display their required core version (`min_core`).
 
 ---
 
 ## Next Steps
 
+- **[Bridge Channel Plugins](/plugins/bridge-channels)**: Deploy and register out-of-process HTTP Bridge delivery channels (including the reference `ntfy` plugin).
 - **[Link Rewrite (YOURLS)](/plugins/link-rewrite)**: Set up self-hosted YOURLS short-link rewriting, authentication modes, `SSRF_ALLOWLIST`, caching, and channel-specific behavior.
-- **[Plugin Development](/plugins/development)**: Protocol v1 (`api_version: "1"`) manifest schema, hook lifecycle, submitting listings to [`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins), and the Phase 2 WASM sandbox roadmap.
+- **[Plugin Development](/plugins/development)**: Protocol v1 (`api_version: "1"`) manifest & HTTP Bridge wire specification, HMAC-SHA256 signing, `channel-template`, and submitting to [`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins).

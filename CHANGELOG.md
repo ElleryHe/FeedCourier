@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-25
+
+### Added
+
+- **HTTP Bridge Plugins — Custom Delivery Channels, Processors & `on_delivered` (`migrations/0004_plugin_bridges.sql`, `src/plugins/bridge.rs`, `ElleryHe/FeedCourier-Plugins`)**:
+  - Extended Plugin Protocol v1 (`api_version: "1"`) to support out-of-process HTTP Bridge sidecars (`runtime: "bridge"`) for both custom delivery channels (`kind: "channel"`, `ChannelKind::Plugin`) and delivery-time processors (`kind: "processor"`, `/hooks/on_render`), authenticated via HMAC-SHA256 (`X-FeedCourier-Timestamp`, `X-FeedCourier-Signature`, `±300s` replay window).
+  - Enforced strict per-bridge network isolation: FeedCourier contacts only the exact registered `(scheme, host, port)` directly (no global proxy, `redirect::Policy::none()`, `1 MiB` response cap, `30s` `/deliver` timeout, `10s` default timeout) without relaxing `SSRF_ALLOWLIST` for feeds or external requests. HTML returned by bridge `/hooks/on_render` is always re-sanitized through `ammonia`, and `/deliver` checkpoint payloads are capped at `16 KiB`.
+  - Added persistent, at-least-once `on_delivered` event dispatch (`plugin_events` table committed atomically inside the task delivery transaction, dispatched by a dedicated background loop with `X-FeedCourier-Idempotency-Key` and exponential backoff up to 5 attempts).
+  - Added bridge management endpoints (`POST /api/v1/plugins/bridges` with `dry_run` manifest preview, `POST /api/v1/plugins/{id}/refresh-manifest`, `DELETE /api/v1/plugins/{id}` with `409 Conflict` + `?cascade=true` reference guard) and full `ChannelKind::Plugin` support across channel/destination APIs and WebUI schema-driven forms.
+  - Published `schema/bridge-protocol.schema.json`, a zero-dependency Node.js 24 starter kit (`channels/channel-template/`), and the reference **`ntfy`** push channel plugin (`channels/ntfy/`, `registry/ntfy.json`) in `ElleryHe/FeedCourier-Plugins` with automated `node --test` CI checks.
+- **Unified Redacting Structured Logging & Isolated Log Storage (`src/logging/`, `src/config.rs`)**:
+  - Added a unified single-pass redacting `tracing` layer driving both `stdout` (`LOG_FORMAT=text|json`) and bounded non-blocking async log storage (isolated `<DATA_DIR>/logs.db` SQLite WAL database by default with 7-day / 100k-row retention, or optional ClickHouse HTTP `JSONEachRow` backend via `LOG_STORE=clickhouse` & `LOG_CLICKHOUSE_*`).
+  - Automatically masks email addresses, sensitive field values (`token`/`password`/`secret`/`signature`/`api_key`/`authorization`/`cookie`), URL query strings/userinfo, Telegram bot tokens, and chat IDs across stdout and stored logs, with structured `feed_id` / `task_id` / `route_id` / `channel_id` / `destination_id` / `plugin_id` instrumentation across the full pipeline.
+
+### Changed
+
+- **Outbox Restart & Graceful Shutdown Hardening (`src/db/repo.rs`, `src/scheduler/mod.rs`, `src/main.rs`)**:
+  - Automatically reclaims any orphaned `delivering` outbox leases immediately on startup (`Database::reclaim_orphaned_deliveries`) while preserving checkpoints and attempt counts, and checks the shutdown cancellation token between outbox tasks so in-flight deliveries finish cleanly without claiming new work (recommended `stop_grace_period: 30s`).
+- **Plugin Kernel Optimizations (`src/plugins/mod.rs`, `web/src/views/RoutesView.tsx`, `web/src/views/PluginsView.tsx`)**:
+  - Cached plugin enabled states and bridge clients in an in-memory `RwLock` invalidated on every mutation; added route-level processor execution ordering (`RouteOptions.plugin_order` with up/down arrows in the route editor), per-plugin 15s `on_render` timeouts with non-strict error isolation, and `min_core`/`api_version` marketplace compatibility checks.
+- **WebUI Outbox Table & MCP Settings Redesign (`web/src/views/TasksView.tsx`, `web/src/views/SettingsView.tsx`)**:
+  - Rebuilt the Outbox queue table with `table-fixed` + `<colgroup>` (zero horizontal overflow at `≥ lg`, merged Status & Timing column, 2-line clamped Diagnostics with full hover tooltip, icon action buttons, and vertical card layout on `< lg` viewports).
+  - Compacted the System Settings MCP panel with a copyable Endpoint pill, single-row token issuance bar with segmented scope toggle and expandable public tool chips, compact token rows, and a tabbed client configuration reveal modal (Claude Desktop / Cursor / Generic JSON).
+
 ## [0.3.0] - 2026-11-23
 
 ### Added

@@ -1,5 +1,5 @@
 /**
- * Canonical REST API Contract (`/api/v1`) for FeedCourier v0.3.0.
+ * Canonical REST API Contract (`/api/v1`) for FeedCourier v0.3.1.
  *
  * Aligned 1-to-1 with `src/channels/mod.rs`, `src/api/dto.rs`, `src/plugins/mod.rs`,
  * and `src/db/models.rs`:
@@ -49,7 +49,7 @@ export interface ActionAckResponse {
 
 export const DEFAULT_REPO_URL = "https://github.com/ElleryHe/FeedCourier";
 export const DEFAULT_LICENSE = "AGPL-3.0";
-export const DEFAULT_VERSION = "0.3.0";
+export const DEFAULT_VERSION = "0.3.1";
 
 /** `GET /api/v1/auth/status` */
 export interface AuthStatusResponse {
@@ -57,7 +57,7 @@ export interface AuthStatusResponse {
   setup_required: boolean;
   /** True when the current HttpOnly session cookie is valid. */
   authenticated: boolean;
-  /** Build version (e.g. `"0.3.0"`). */
+  /** Build version (e.g. `"0.3.1"`). */
   version: string;
   /** Source repository URL (AGPLv3 Section 13 compliance). */
   repo_url: string;
