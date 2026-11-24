@@ -1673,6 +1673,21 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Immediately expire leases on orphaned `delivering` tasks left behind by an unclean shutdown.
+    ///
+    /// Safe because FeedCourier operates on a single-writer local SQLite instance: at startup no
+    /// other worker holds those leases. Preserves `checkpoint_json` and `attempt_count` intact so
+    /// the outbox worker reconciles and resumes immediately instead of waiting for `DEFAULT_TASK_LEASE_SECS`.
+    pub async fn reclaim_orphaned_deliveries(&self, now: i64) -> AppResult<u64> {
+        let res = sqlx::query(
+            "UPDATE delivery_tasks SET lease_until = ?1 WHERE status = 'delivering' AND (lease_until IS NULL OR lease_until > ?1)",
+        )
+        .bind(now)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Persist raw `checkpoint_json` mid-flight without changing task status.
     pub async fn save_task_checkpoint(&self, task_id: i64, checkpoint_json: &str) -> AppResult<()> {
         sqlx::query("UPDATE delivery_tasks SET checkpoint_json = ?1 WHERE id = ?2")

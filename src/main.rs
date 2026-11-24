@@ -37,10 +37,25 @@ async fn main() -> AppResult<()> {
     // Backfill existing pre-v0.3.0 SMTP destination recipients as `verified (legacy)` idempotently.
     db.backfill_legacy_smtp_recipients(&master_key).await?;
 
+    // Immediately expire any orphaned `delivering` leases left by an unclean previous shutdown
+    // before spawning the outbox loop so pending deliveries resume right away with checkpoints intact.
+    let reclaimed = db
+        .reclaim_orphaned_deliveries(feedcourier::db::models::now_unix())
+        .await?;
+    if reclaimed > 0 {
+        tracing::info!(
+            reclaimed_tasks = reclaimed,
+            "reclaimed orphaned delivering outbox tasks on startup"
+        );
+    }
+
     let runtime =
         DeliveryDispatcher::from_db_settings(config.clone(), db.clone(), master_key.clone())
             .await?;
     let scheduler_handle = runtime.spawn();
+    if reclaimed > 0 {
+        runtime.outbox_notify().notify_one();
+    }
 
     let mcp_cancel = scheduler_handle.cancel_token().child_token();
     let mcp_state = McpState::new(db.clone(), runtime.ingest().clone())

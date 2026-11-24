@@ -143,6 +143,25 @@ docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
 
 ---
 
+## 版本升级与优雅停机 {#upgrading-and-graceful-shutdown}
+
+发件箱的全部待投递任务、断点进度（包括 SMTP 逐人已发记录、Telegram 媒体分批偏移与 Notion 页面/异步任务 ID）、文章去重指纹及配额账本均持久化保存在 `DATA_DIR`（`/data`）的 SQLite 数据库中。只要保留持久化卷，升级容器镜像或二进制不会丢失进度。
+
+- **优雅停机（`SIGTERM` / `SIGINT`）**：收到停机信号后，FeedCourier 会先排空 HTTP 连接，同时在两个投递任务之间立即停止领取新任务，等待当前在途任务发送完成后再干净关闭 SQLite。
+- **异常中断自动恢复**：若进程在投递中途被强制终止，下次启动时会立即回收遗留的 `delivering` 任务并完整保留断点进度，无需等待租约自然到期。
+- **Docker Compose 建议**：推荐配置 `stop_grace_period: 30s`（Docker 默认仅 10 秒），避免较慢的 SMTP、Telegram 媒体上传或 Notion 请求在完成前被强杀：
+
+```yaml
+services:
+  feedcourier:
+    image: elleryhe/feedcourier:latest
+    stop_grace_period: 30s
+    volumes:
+      - ./data:/data
+```
+
+---
+
 ## 自动与手动清理正文缓存（GC）
 
 - **后台定时清理**：每间隔 1 小时自动运行一次：

@@ -3392,3 +3392,238 @@ async fn qa_round2_in_flight_route_sync_deferral_chain_tz_wakeup_and_update_prob
         "routes with explicit timezone override must not be disturbed by system timezone changes"
     );
 }
+
+#[tokio::test]
+async fn v031_outbox_reclaim_orphaned_deliveries_and_cancellable_drain() {
+    use feedcourier::channels::DeliveryCheckpoint;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request as WiremockRequest, Respond, ResponseTemplate};
+
+    let h = TestHarness::new().await;
+    h.dispatcher
+        .reload_network_settings(NetSettings {
+            outbound_proxy_url: None,
+            ssrf_allowlist: vec!["127.0.0.1/32".to_string()],
+        })
+        .unwrap();
+    let tg_mock = MockServer::start().await;
+
+    let cancel = CancellationToken::new();
+    let cancel_for_mock = cancel.clone();
+    let tg_hits = Arc::new(AtomicUsize::new(0));
+    let tg_hits_for_mock = Arc::clone(&tg_hits);
+
+    struct CancelAfterFirst(CancellationToken, Arc<AtomicUsize>);
+    impl Respond for CancelAfterFirst {
+        fn respond(&self, _req: &WiremockRequest) -> ResponseTemplate {
+            let n = self.1.fetch_add(1, Ordering::SeqCst) + 1;
+            // Simulate SIGTERM arriving while task #1 is mid-flight: task #1 finishes cleanly,
+            // and the drain loop must stop before claiming task #2.
+            if n == 1 {
+                self.0.cancel();
+            }
+            ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "message_id": 1000 + n }
+            }))
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/botTOK_RECLAIM/sendMessage"))
+        .respond_with(CancelAfterFirst(cancel_for_mock, tg_hits_for_mock))
+        .mount(&tg_mock)
+        .await;
+
+    let ch =
+        h.db.create_channel(&NewChannel {
+            name: "Reclaim TG".to_string(),
+            kind: ChannelKind::Telegram,
+            encrypted_config: h
+                .master_key
+                .encrypt_json(&ChannelConfig::Telegram(TelegramChannelConfig {
+                    bot_token: "TOK_RECLAIM".to_string(),
+                    api_base_url: Some(tg_mock.uri()),
+                }))
+                .unwrap(),
+            credential_group_key: "tg:reclaim".to_string(),
+            capabilities_json: json!({ "supports_rich_message": false }).to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let dest =
+        h.db.create_destination(&NewDestination {
+            channel_id: ch.id,
+            name: "Reclaim Chat".to_string(),
+            encrypted_config: h
+                .master_key
+                .encrypt_json(&DestinationConfig::Telegram(TelegramDestinationConfig {
+                    chat_id: "-100123".to_string(),
+                    message_thread_id: None,
+                }))
+                .unwrap(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let feed =
+        h.db.create_feed(&NewFeed::new("https://reclaim.example/rss"))
+            .await
+            .unwrap();
+    let route =
+        h.db.create_route(&NewRoute {
+            name: "Reclaim Route".to_string(),
+            feed_ids: vec![feed.id],
+            match_tags: vec![],
+            channel_id: ch.id,
+            destination_id: dest.id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions {
+                telegram_mode: TelegramDeliveryMode::CompactCard,
+                ..RouteOptions::default()
+            },
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+    let now = now_unix();
+    let mut entries = Vec::new();
+    for i in 0..4 {
+        let e = match h
+            .db
+            .insert_entry_if_new(&NewEntry {
+                feed_id: feed.id,
+                fingerprint_sha256: sha256_hex(format!("reclaim-fp-{i}").as_bytes()),
+                published_at: Some(now - 100 + i),
+                discovered_at: now - 100 + i,
+                title: Some(format!("Article #{i}")),
+                canonical_url: Some(format!("https://reclaim.example/posts/{i}")),
+                author: None,
+                content_html: Some(format!("<p>Body #{i}</p>")),
+                first_sentence: Some(format!("Body #{i}")),
+                summary_text: Some(format!("Body #{i}")),
+                media: vec![],
+            })
+            .await
+            .unwrap()
+        {
+            feedcourier::db::models::EntryInsertOutcome::Inserted(e) => *e,
+            _ => unreachable!(),
+        };
+        entries.push(e);
+    }
+
+    // Part 1: Simulate an unclean shutdown leaving an active `delivering` task with 120s lease
+    // and an in-progress checkpoint.
+    let orphan =
+        h.db.enqueue_delivery_task(route.id, ch.id, dest.id, entries[0].id, now - 10)
+            .await
+            .unwrap()
+            .unwrap();
+    let claimed =
+        h.db.claim_next_delivery_task(now, 120)
+            .await
+            .unwrap()
+            .expect("claim orphan");
+    assert_eq!(claimed.id, orphan.id);
+    assert_eq!(claimed.status, DeliveryTaskStatus::Delivering);
+    let saved_cp = DeliveryCheckpoint::Telegram {
+        sent_message_ids: vec![77],
+        next_batch_offset: 1,
+        degraded_to_compact: false,
+    };
+    h.db.save_task_checkpoint_typed(orphan.id, &saved_cp)
+        .await
+        .unwrap();
+
+    // Before startup reclaim, task cannot be claimed while its 120s lease is still in the future.
+    assert!(
+        h.db.claim_next_delivery_task(now, 120)
+            .await
+            .unwrap()
+            .is_none(),
+        "delivering task with future lease must not be claimed before startup reclaim"
+    );
+
+    // Startup reclaim immediately expires the orphaned lease while preserving checkpoint & attempts.
+    let reclaimed_count = h.db.reclaim_orphaned_deliveries(now).await.unwrap();
+    assert_eq!(reclaimed_count, 1);
+    let reclaimed =
+        h.db.claim_next_delivery_task(now, 120)
+            .await
+            .unwrap()
+            .expect("reclaimed orphan must be immediately claimable");
+    assert_eq!(reclaimed.id, orphan.id);
+    assert_eq!(reclaimed.checkpoint().unwrap(), Some(saved_cp));
+    assert_eq!(
+        reclaimed.attempt_count, 2,
+        "attempt_count must preserve prior attempts and increment on re-claim"
+    );
+
+    // Mark orphan delivered so Part 2 tests clean cancellation on 3 fresh queued tasks.
+    h.db.mark_task_delivered(orphan.id, now, Some(200), None, None)
+        .await
+        .unwrap();
+
+    // Part 2: Enqueue 3 due tasks; cancel mid-flight during task #1 -> drain stops at 1.
+    let mut queued_ids = Vec::new();
+    for entry in &entries[1..4] {
+        let t =
+            h.db.enqueue_delivery_task(route.id, ch.id, dest.id, entry.id, now - 5)
+                .await
+                .unwrap()
+                .unwrap();
+        queued_ids.push(t.id);
+    }
+
+    let processed = h
+        .dispatcher
+        .drain_due_outbox_tasks_cancellable(10, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(
+        processed, 1,
+        "drain must finish the in-flight task and stop before claiming the next after cancellation"
+    );
+    assert_eq!(tg_hits.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        h.db.get_delivery_task(queued_ids[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryTaskStatus::Delivered
+    );
+    assert_eq!(
+        h.db.get_delivery_task(queued_ids[1])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryTaskStatus::Queued,
+        "task #2 must remain queued after cancellation"
+    );
+    assert_eq!(
+        h.db.get_delivery_task(queued_ids[2])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryTaskStatus::Queued,
+        "task #3 must remain queued after cancellation"
+    );
+}

@@ -1418,8 +1418,30 @@ impl DeliveryDispatcher {
 
     /// Drain up to `max_tasks` currently due outbox tasks sequentially.
     pub async fn drain_due_outbox_tasks(&self, max_tasks: usize) -> AppResult<usize> {
+        self.drain_due_outbox_tasks_inner(max_tasks, None).await
+    }
+
+    /// Drain up to `max_tasks` currently due outbox tasks sequentially, checking `cancel` before
+    /// claiming each task so graceful shutdown finishes the current delivery without starting another.
+    pub async fn drain_due_outbox_tasks_cancellable(
+        &self,
+        max_tasks: usize,
+        cancel: &CancellationToken,
+    ) -> AppResult<usize> {
+        self.drain_due_outbox_tasks_inner(max_tasks, Some(cancel))
+            .await
+    }
+
+    async fn drain_due_outbox_tasks_inner(
+        &self,
+        max_tasks: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<usize> {
         let mut processed = 0usize;
         while processed < max_tasks {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
             if !self.process_next_outbox_task().await? {
                 break;
             }
@@ -1525,10 +1547,12 @@ impl DeliveryDispatcher {
                         break;
                     }
                     while !token.is_cancelled() {
-                        let drain_fut = AssertUnwindSafe(
-                            dispatcher.drain_due_outbox_tasks(DEFAULT_OUTBOX_DRAIN_LIMIT),
-                        )
-                        .catch_unwind();
+                        let drain_fut =
+                            AssertUnwindSafe(dispatcher.drain_due_outbox_tasks_cancellable(
+                                DEFAULT_OUTBOX_DRAIN_LIMIT,
+                                &token,
+                            ))
+                            .catch_unwind();
                         match drain_fut.await {
                             Ok(Ok(n)) if n == DEFAULT_OUTBOX_DRAIN_LIMIT => {
                                 tokio::task::yield_now().await;

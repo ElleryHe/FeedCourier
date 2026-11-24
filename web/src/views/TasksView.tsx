@@ -541,12 +541,21 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
           description={m.tasks.emptyDesc}
         />
       ) : (
-        <Card className="overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
+        <>
+          {/* Desktop fixed-layout table (>= lg, zero horizontal scroll) */}
+          <Card className="hidden overflow-hidden lg:block">
+            <table className="w-full table-fixed text-left text-xs">
+              <colgroup>
+                <col className="w-9" />
+                <col className="w-[26%]" />
+                <col className="w-[19%]" />
+                <col className="w-[19%]" />
+                <col />
+                <col className="w-[72px]" />
+              </colgroup>
               <thead className="border-b border-zinc-200 bg-zinc-50/80 text-[11px] text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-950/60">
                 <tr>
-                  <th className="w-8 px-3 py-2.5">
+                  <th className="px-2.5 py-2.5">
                     <span className="sr-only">{m.tasks.colSelect}</span>
                   </th>
                   <th className="px-3 py-2.5 font-medium">
@@ -556,15 +565,12 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                     {m.tasks.colRouteChannel}
                   </th>
                   <th className="px-3 py-2.5 font-medium">
-                    {m.tasks.colStatusLease}
+                    {m.tasks.colStatusTiming}
                   </th>
                   <th className="px-3 py-2.5 font-medium">
-                    {m.tasks.colAttemptsCode}
+                    {m.tasks.colDiagnostics}
                   </th>
-                  <th className="px-3 py-2.5 font-medium">
-                    {m.tasks.colTiming}
-                  </th>
-                  <th className="px-3 py-2.5 text-right font-medium">
+                  <th className="px-2.5 py-2.5 text-right font-medium">
                     {m.tasks.colActions}
                   </th>
                 </tr>
@@ -582,31 +588,34 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                   return (
                     <tr
                       key={task.id}
-                      className="hover:bg-zinc-50/70 dark:hover:bg-zinc-950/40"
+                      className="align-top hover:bg-zinc-50/70 dark:hover:bg-zinc-950/40"
                     >
-                      <td className="px-3 py-3">
+                      <td className="px-2.5 py-3">
                         {canRetry && (
                           <input
                             type="checkbox"
                             checked={selectedIds.includes(task.id)}
                             onChange={() => toggleSelect(task.id)}
                             aria-label={m.tasks.selectTaskAria(task.id)}
-                            className="accent-zinc-900 dark:accent-emerald-500"
+                            className="mt-0.5 accent-zinc-900 dark:accent-emerald-500"
                           />
                         )}
                       </td>
 
-                      <td className="max-w-xs px-3 py-3">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-mono text-[10px] text-zinc-400">
+                      <td className="min-w-0 px-3 py-3">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className="shrink-0 font-mono text-[10px] text-zinc-400">
                             #{task.id}
                           </span>
                           {task.entry_title ? (
-                            <span className="truncate font-medium text-zinc-900 dark:text-zinc-100">
+                            <span
+                              className="min-w-0 flex-1 truncate font-medium text-zinc-900 dark:text-zinc-100"
+                              title={task.entry_title}
+                            >
                               {task.entry_title}
                             </span>
                           ) : (
-                            <span className="italic text-zinc-400">
+                            <span className="min-w-0 flex-1 truncate italic text-zinc-400">
                               {m.tasks.payloadPurged(task.entry_id)}
                             </span>
                           )}
@@ -615,40 +624,49 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                               href={task.entry_url}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                              className="shrink-0 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
                             >
-                              <ExternalLink className="h-3 w-3 shrink-0" />
+                              <ExternalLink className="h-3 w-3" />
                             </a>
                           )}
                         </div>
                         {task.feed_title && (
-                          <div className="mt-0.5 truncate text-[11px] text-zinc-500">
+                          <div
+                            className="mt-0.5 truncate text-[11px] text-zinc-500"
+                            title={task.feed_title}
+                          >
                             {task.feed_title}
                           </div>
                         )}
                       </td>
 
-                      <td className="px-3 py-3">
-                        <div className="font-medium text-zinc-800 dark:text-zinc-200">
+                      <td className="min-w-0 px-3 py-3">
+                        <div
+                          className="truncate font-medium text-zinc-800 dark:text-zinc-200"
+                          title={task.route_name}
+                        >
                           {task.route_name}
                         </div>
-                        <div className="mt-0.5 flex flex-wrap items-center gap-1 text-[11px] text-zinc-500">
+                        <div
+                          className="mt-0.5 truncate text-[11px] text-zinc-500"
+                          title={`${task.channel_name}${task.destination_name ? ` / ${task.destination_name}` : ""} (${task.channel_kind.toUpperCase()})`}
+                        >
                           <span>→ {task.channel_name}</span>
                           {task.destination_name && (
                             <>
-                              <span className="text-zinc-400">/</span>
+                              <span className="mx-1 text-zinc-400">/</span>
                               <span className="font-medium text-zinc-700 dark:text-zinc-300">
                                 {task.destination_name}
                               </span>
                             </>
                           )}
-                          <span className="font-mono text-[10px] uppercase text-zinc-400">
+                          <span className="ml-1 font-mono text-[10px] uppercase text-zinc-400">
                             ({task.channel_kind})
                           </span>
                         </div>
                       </td>
 
-                      <td className="px-3 py-3">
+                      <td className="min-w-0 px-3 py-3">
                         <div className="flex flex-wrap items-center gap-1">
                           <Badge variant={badge.variant}>
                             {isPartialWarning && (
@@ -673,18 +691,20 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                           task.status === "deferred") &&
                           isFuture(task.next_attempt_at) && (
                             <div
-                              className="mt-1 inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-400"
+                              className="mt-1 inline-flex max-w-full items-center gap-1 truncate text-[10px] text-amber-700 dark:text-amber-400"
                               title={formatDateTime(task.next_attempt_at)}
                             >
-                              <Clock className="h-3 w-3" />
-                              {m.tasks.scheduledPrefix(
-                                formatRelativeTime(task.next_attempt_at),
-                              )}
+                              <Clock className="h-3 w-3 shrink-0" />
+                              <span className="truncate">
+                                {m.tasks.scheduledPrefix(
+                                  formatRelativeTime(task.next_attempt_at),
+                                )}
+                              </span>
                             </div>
                           )}
                         {task.lease_until && task.status === "delivering" && (
                           <div
-                            className="mt-1 font-mono text-[10px] text-sky-600 dark:text-sky-400"
+                            className="mt-1 truncate font-mono text-[10px] text-sky-600 dark:text-sky-400"
                             title={formatDateTime(task.lease_until)}
                           >
                             {m.tasks.leasePrefix(
@@ -692,9 +712,43 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             )}
                           </div>
                         )}
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-zinc-500">
+                          <span
+                            className="truncate"
+                            title={formatDateTime(task.created_at)}
+                          >
+                            {m.tasks.createdPrefix(
+                              formatRelativeTime(task.created_at),
+                            )}
+                          </span>
+                          {task.completed_at ? (
+                            <span
+                              className="truncate"
+                              title={formatDateTime(task.completed_at)}
+                            >
+                              {m.tasks.donePrefix(
+                                formatRelativeTime(task.completed_at),
+                              )}
+                            </span>
+                          ) : task.next_attempt_at &&
+                            !(
+                              (task.status === "queued" ||
+                                task.status === "deferred") &&
+                              isFuture(task.next_attempt_at)
+                            ) ? (
+                            <span
+                              className="truncate"
+                              title={formatDateTime(task.next_attempt_at)}
+                            >
+                              {m.tasks.nextPrefix(
+                                formatRelativeTime(task.next_attempt_at),
+                              )}
+                            </span>
+                          ) : null}
+                        </div>
                       </td>
 
-                      <td className="px-3 py-3">
+                      <td className="min-w-0 px-3 py-3">
                         <div className="flex flex-wrap items-center gap-1.5 font-mono">
                           <Badge
                             variant={attemptCountVariant(task.attempt_count)}
@@ -715,9 +769,9 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                           )}
                         </div>
                         {task.diagnostic_log && (
-                          <div
+                          <p
                             className={cn(
-                              "mt-1 max-w-[200px] truncate font-sans text-[11px]",
+                              "mt-1 line-clamp-2 break-words font-sans text-[11px] leading-snug",
                               diagnosticRowTextClass(
                                 task.status,
                                 isPartialWarning,
@@ -726,44 +780,24 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             title={task.diagnostic_log}
                           >
                             {task.diagnostic_log}
-                          </div>
+                          </p>
                         )}
                       </td>
 
-                      <td className="px-3 py-3 text-[11px] text-zinc-500">
-                        <div title={formatDateTime(task.created_at)}>
-                          {m.tasks.createdPrefix(
-                            formatRelativeTime(task.created_at),
-                          )}
-                        </div>
-                        {task.completed_at ? (
-                          <div title={formatDateTime(task.completed_at)}>
-                            {m.tasks.donePrefix(
-                              formatRelativeTime(task.completed_at),
-                            )}
-                          </div>
-                        ) : task.next_attempt_at ? (
-                          <div title={formatDateTime(task.next_attempt_at)}>
-                            {m.tasks.nextPrefix(
-                              formatRelativeTime(task.next_attempt_at),
-                            )}
-                          </div>
-                        ) : null}
-                      </td>
-
-                      <td className="px-3 py-3 text-right">
-                        <div className="inline-flex items-center gap-1">
+                      <td className="px-2.5 py-3 text-right">
+                        <div className="inline-flex items-center justify-end gap-0.5">
                           {canRetry && (
                             <Button
-                              variant="outline"
-                              size="sm"
+                              variant="ghost"
+                              size="icon"
                               onClick={() =>
                                 retryMutation.mutate({ task_ids: [task.id] })
                               }
-                              loading={retryMutation.isPending}
+                              disabled={retryMutation.isPending}
+                              title={m.common.retry}
+                              aria-label={m.common.retry}
                             >
-                              <RotateCcw className="h-3 w-3" />
-                              {m.common.retry}
+                              <RotateCcw className="h-3.5 w-3.5" />
                             </Button>
                           )}
                           <Button
@@ -782,8 +816,210 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                 })}
               </tbody>
             </table>
+          </Card>
+
+          {/* Compact vertical cards for smaller viewports (< lg) */}
+          <div className="space-y-2.5 lg:hidden">
+            {tasks.map((task) => {
+              const badge = statusBadge(task, m);
+              const isPartialWarning = Boolean(badge.warning);
+              const cpSummary = summarizeCheckpoint(task.checkpoint, m);
+              const canRetry =
+                task.status === "dead_letter" ||
+                task.status === "retrying" ||
+                task.status === "deferred";
+
+              return (
+                <Card key={task.id} className="p-3.5 text-xs">
+                  <div className="flex items-start gap-2.5">
+                    {canRetry && (
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.includes(task.id)}
+                        onChange={() => toggleSelect(task.id)}
+                        aria-label={m.tasks.selectTaskAria(task.id)}
+                        className="mt-1 shrink-0 accent-zinc-900 dark:accent-emerald-500"
+                      />
+                    )}
+                    <div className="min-w-0 flex-1 space-y-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="shrink-0 font-mono text-[10px] text-zinc-400">
+                              #{task.id}
+                            </span>
+                            {task.entry_title ? (
+                              <span
+                                className="min-w-0 flex-1 truncate font-medium text-zinc-900 dark:text-zinc-100"
+                                title={task.entry_title}
+                              >
+                                {task.entry_title}
+                              </span>
+                            ) : (
+                              <span className="min-w-0 flex-1 truncate italic text-zinc-400">
+                                {m.tasks.payloadPurged(task.entry_id)}
+                              </span>
+                            )}
+                            {task.entry_url && (
+                              <a
+                                href={task.entry_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="shrink-0 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                              >
+                                <ExternalLink className="h-3 w-3" />
+                              </a>
+                            )}
+                          </div>
+                          {task.feed_title && (
+                            <div className="mt-0.5 truncate text-[11px] text-zinc-500">
+                              {task.feed_title}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex shrink-0 items-center gap-0.5">
+                          {canRetry && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() =>
+                                retryMutation.mutate({ task_ids: [task.id] })
+                              }
+                              disabled={retryMutation.isPending}
+                              title={m.common.retry}
+                              aria-label={m.common.retry}
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => setInspectingTask(task)}
+                            title={m.tasks.inspectTitle}
+                            aria-label={m.tasks.inspectTitle}
+                          >
+                            <FileSearch className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-zinc-500">
+                        <span className="font-medium text-zinc-800 dark:text-zinc-200">
+                          {task.route_name}
+                        </span>
+                        <span>→ {task.channel_name}</span>
+                        {task.destination_name && (
+                          <>
+                            <span className="text-zinc-400">/</span>
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                              {task.destination_name}
+                            </span>
+                          </>
+                        )}
+                        <span className="font-mono text-[10px] uppercase text-zinc-400">
+                          ({task.channel_kind})
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Badge variant={badge.variant}>
+                          {isPartialWarning && (
+                            <AlertTriangle className="h-3 w-3 shrink-0" />
+                          )}
+                          {badge.label}
+                        </Badge>
+                        {cpSummary && (
+                          <Badge variant="mono">{cpSummary}</Badge>
+                        )}
+                        <Badge
+                          variant={attemptCountVariant(task.attempt_count)}
+                          className="font-mono text-[11px]"
+                        >
+                          {task.attempt_count}x
+                        </Badge>
+                        {task.last_status_code !== null && (
+                          <Badge
+                            variant={statusCodeVariant(
+                              task.last_status_code,
+                              task.status,
+                            )}
+                            className="font-mono text-[11px]"
+                          >
+                            {task.last_status_code}
+                          </Badge>
+                        )}
+                        {queuePaused &&
+                          (task.status === "queued" ||
+                            task.status === "retrying" ||
+                            task.status === "deferred") && (
+                            <Badge variant="warning">
+                              <Pause className="h-3 w-3" />
+                              {m.tasks.queue.heldBadge}
+                            </Badge>
+                          )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-500">
+                        {(task.status === "queued" ||
+                          task.status === "deferred") &&
+                          isFuture(task.next_attempt_at) && (
+                            <span
+                              className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400"
+                              title={formatDateTime(task.next_attempt_at)}
+                            >
+                              <Clock className="h-3 w-3" />
+                              {m.tasks.scheduledPrefix(
+                                formatRelativeTime(task.next_attempt_at),
+                              )}
+                            </span>
+                          )}
+                        {task.lease_until && task.status === "delivering" && (
+                          <span
+                            className="font-mono text-sky-600 dark:text-sky-400"
+                            title={formatDateTime(task.lease_until)}
+                          >
+                            {m.tasks.leasePrefix(
+                              formatRelativeTime(task.lease_until),
+                            )}
+                          </span>
+                        )}
+                        <span title={formatDateTime(task.created_at)}>
+                          {m.tasks.createdPrefix(
+                            formatRelativeTime(task.created_at),
+                          )}
+                        </span>
+                        {task.completed_at && (
+                          <span title={formatDateTime(task.completed_at)}>
+                            {m.tasks.donePrefix(
+                              formatRelativeTime(task.completed_at),
+                            )}
+                          </span>
+                        )}
+                      </div>
+
+                      {task.diagnostic_log && (
+                        <p
+                          className={cn(
+                            "line-clamp-2 break-words text-[11px] leading-snug",
+                            diagnosticRowTextClass(
+                              task.status,
+                              isPartialWarning,
+                            ),
+                          )}
+                          title={task.diagnostic_log}
+                        >
+                          {task.diagnostic_log}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </Card>
+              );
+            })}
           </div>
-        </Card>
+        </>
       )}
 
       {/* Task Diagnostic & Checkpoint Inspector Modal */}

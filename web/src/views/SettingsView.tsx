@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Bot,
   Check,
+  ChevronDown,
   Copy,
   Clock,
   Globe,
@@ -29,7 +30,6 @@ import {
   CardHeader,
   CardTitle,
   ConfirmDialog,
-  EmptyState,
   FieldError,
   FieldHint,
   Input,
@@ -178,11 +178,36 @@ export function SettingsView() {
 
   const [tokenName, setTokenName] = useState("");
   const [tokenScope, setTokenScope] = useState<McpTokenScope>("readonly");
+  const [showToolsList, setShowToolsList] = useState(false);
   const [tokenFormError, setTokenFormError] = useState<string | null>(null);
   const [createdTokenModal, setCreatedTokenModal] =
     useState<CreateMcpTokenResponse | null>(null);
+  const [clientConfigTab, setClientConfigTab] = useState<
+    "claude" | "cursor" | "generic"
+  >("claude");
   const [revokingToken, setRevokingToken] = useState<McpTokenDto | null>(null);
-  const [copiedField, setCopiedField] = useState<"token" | "json" | null>(null);
+  const [copiedField, setCopiedField] = useState<
+    "endpoint" | "token" | "json" | null
+  >(null);
+
+  const PUBLIC_READONLY_TOOLS = [
+    "list_feeds_status",
+    "inspect_failed_deliveries",
+    "preview_feed_latest",
+    "list_plugins",
+  ] as const;
+  const PUBLIC_ADMIN_EXTRA_TOOLS = [
+    "manage_feed",
+    "configure_route",
+    "reset_and_poll_feed",
+    "retry_dead_tasks",
+    "manage_outbox_queue",
+    "test_push_feed_entry",
+  ] as const;
+  const visibleScopeTools =
+    tokenScope === "admin"
+      ? [...PUBLIC_READONLY_TOOLS, ...PUBLIC_ADMIN_EXTRA_TOOLS]
+      : [...PUBLIC_READONLY_TOOLS];
 
   const createTokenMutation = useMutation({
     mutationFn: () =>
@@ -192,6 +217,7 @@ export function SettingsView() {
       }),
     onSuccess: (res) => {
       setTokenName("");
+      setClientConfigTab("claude");
       setCreatedTokenModal(res);
       toast.success(m.settings.toastTokenIssued);
       void queryClient.invalidateQueries({ queryKey: ["mcp-tokens"] });
@@ -223,14 +249,19 @@ export function SettingsView() {
     createTokenMutation.mutate();
   };
 
-  const handleCopy = async (kind: "token" | "json", value: string) => {
+  const handleCopy = async (
+    kind: "endpoint" | "token" | "json",
+    value: string,
+  ) => {
     const ok = await copyToClipboard(value);
     if (ok) {
       setCopiedField(kind);
       toast.success(
-        kind === "token"
-          ? m.settings.toastTokenCopied
-          : m.settings.toastJsonCopied,
+        kind === "endpoint"
+          ? m.settings.toastEndpointCopied
+          : kind === "token"
+            ? m.settings.toastTokenCopied
+            : m.settings.toastJsonCopied,
       );
       window.setTimeout(() => setCopiedField(null), 2000);
     }
@@ -241,22 +272,65 @@ export function SettingsView() {
       ? `${window.location.origin}/mcp`
       : "http://127.0.0.1:8080/mcp";
 
-  const buildFallbackClientJson = (plaintextToken: string): string =>
-    JSON.stringify(
-      {
-        mcpServers: {
-          feedcourier: {
-            type: "streamable-http",
-            url: mcpEndpointUrl,
-            headers: {
-              Authorization: `Bearer ${plaintextToken}`,
+  const buildClientConfigSnippet = (
+    tab: "claude" | "cursor" | "generic",
+    modal: CreateMcpTokenResponse,
+  ): string => {
+    if (tab === "claude") {
+      return JSON.stringify(
+        {
+          mcpServers: {
+            feedcourier: {
+              command: "npx",
+              args: [
+                "-y",
+                "mcp-remote",
+                mcpEndpointUrl,
+                "--header",
+                `Authorization: Bearer ${modal.plaintext_token}`,
+              ],
             },
           },
         },
-      },
-      null,
-      2,
+        null,
+        2,
+      );
+    }
+    if (tab === "cursor") {
+      return JSON.stringify(
+        {
+          mcpServers: {
+            feedcourier: {
+              url: mcpEndpointUrl,
+              headers: {
+                Authorization: `Bearer ${modal.plaintext_token}`,
+              },
+            },
+          },
+        },
+        null,
+        2,
+      );
+    }
+    return (
+      modal.client_config_json ||
+      JSON.stringify(
+        {
+          mcpServers: {
+            feedcourier: {
+              type: "streamable-http",
+              url: mcpEndpointUrl,
+              headers: {
+                Authorization: `Bearer ${modal.plaintext_token}`,
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )
     );
+  };
 
   return (
     <div className="space-y-6">
@@ -469,195 +543,194 @@ export function SettingsView() {
       {/* Section 2: MCP Server & Bearer Tokens */}
       <Card>
         <CardHeader>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <Bot className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-              <CardTitle>{m.settings.mcpTitle}</CardTitle>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-center gap-2">
+                <Bot className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                <CardTitle>{m.settings.mcpTitle}</CardTitle>
+              </div>
+              <CardDescription>{m.settings.mcpDesc}</CardDescription>
             </div>
-            <Badge variant="mono">{mcpEndpointUrl}</Badge>
+            <button
+              type="button"
+              onClick={() => void handleCopy("endpoint", mcpEndpointUrl)}
+              title={m.settings.copyEndpoint}
+              className="inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1 font-mono text-[11px] text-zinc-700 transition-colors hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-600 dark:hover:bg-zinc-800"
+            >
+              <span className="truncate">{mcpEndpointUrl}</span>
+              {copiedField === "endpoint" ? (
+                <Check className="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+              ) : (
+                <Copy className="h-3 w-3 shrink-0 text-zinc-400" />
+              )}
+            </button>
           </div>
-          <CardDescription>{m.settings.mcpDesc}</CardDescription>
         </CardHeader>
 
-        <CardContent className="space-y-5">
-          {/* Issue Token Form */}
+        <CardContent className="space-y-4">
+          {/* Compact Single-Row Issue Token Form */}
           <form
             onSubmit={handleIssueToken}
-            className="space-y-3.5 rounded-xl border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-800 dark:bg-zinc-950/50"
+            className="space-y-2.5 rounded-xl border border-zinc-200 bg-zinc-50/60 p-3.5 dark:border-zinc-800 dark:bg-zinc-950/40"
           >
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="sm:col-span-1">
-                <Label htmlFor="mcp-token-name">{m.settings.clientLabel}</Label>
-                <Input
-                  id="mcp-token-name"
-                  value={tokenName}
-                  onChange={(e) => {
-                    setTokenName(e.target.value);
-                    setTokenFormError(null);
-                  }}
-                  placeholder={m.settings.clientPlaceholder}
-                  className="mt-1.5"
-                />
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Input
+                id="mcp-token-name"
+                value={tokenName}
+                onChange={(e) => {
+                  setTokenName(e.target.value);
+                  setTokenFormError(null);
+                }}
+                placeholder={m.settings.clientPlaceholder}
+                aria-label={m.settings.clientLabel}
+                className="min-w-0 flex-1"
+              />
+
+              <div
+                role="radiogroup"
+                aria-label={m.settings.scopeLabel}
+                className="inline-flex shrink-0 rounded-lg border border-zinc-200 bg-white p-0.5 dark:border-zinc-800 dark:bg-zinc-900"
+              >
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={tokenScope === "readonly"}
+                  onClick={() => setTokenScope("readonly")}
+                  className={`inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                    tokenScope === "readonly"
+                      ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                      : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  {m.settings.scopeReadonlyShort}
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={tokenScope === "admin"}
+                  onClick={() => setTokenScope("admin")}
+                  className={`inline-flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                    tokenScope === "admin"
+                      ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                      : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <KeyRound className="h-3.5 w-3.5" />
+                  {m.settings.scopeAdminShort}
+                </button>
               </div>
 
-              <div className="sm:col-span-2">
-                <Label>{m.settings.scopeLabel}</Label>
-                <div className="mt-1.5 grid gap-2 sm:grid-cols-2">
-                  <button
-                    type="button"
-                    onClick={() => setTokenScope("readonly")}
-                    className={`cursor-pointer rounded-lg border p-2.5 text-left transition-colors ${
-                      tokenScope === "readonly"
-                        ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
-                        : "border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold">
-                        {m.settings.scopeReadonlyTitle}
-                      </span>
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                    </div>
-                    <p
-                      className={`mt-1 font-mono text-[11px] ${
-                        tokenScope === "readonly"
-                          ? "text-zinc-300 dark:text-zinc-600"
-                          : "text-zinc-500"
-                      }`}
-                    >
-                      list_feeds_status, inspect_failed_deliveries, preview_feed_latest
-                    </p>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setTokenScope("admin")}
-                    className={`cursor-pointer rounded-lg border p-2.5 text-left transition-colors ${
-                      tokenScope === "admin"
-                        ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
-                        : "border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold">
-                        {m.settings.scopeAdminTitle}
-                      </span>
-                      <KeyRound className="h-3.5 w-3.5" />
-                    </div>
-                    <p
-                      className={`mt-1 font-mono text-[11px] ${
-                        tokenScope === "admin"
-                          ? "text-zinc-300 dark:text-zinc-600"
-                          : "text-zinc-500"
-                      }`}
-                    >
-                      + manage_feed, configure_route, reset_and_poll_feed, retry_dead_tasks, manage_outbox_queue, test_push_feed_entry
-                    </p>
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <FieldError message={tokenFormError} />
-
-            <div className="flex justify-end">
               <Button
                 type="submit"
                 size="sm"
                 loading={createTokenMutation.isPending}
+                className="shrink-0"
               >
                 <Plus className="h-3.5 w-3.5" />
                 {m.settings.issueToken}
               </Button>
             </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+              <span>
+                {tokenScope === "admin"
+                  ? m.settings.scopeAdminHint
+                  : m.settings.scopeReadonlyHint}
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowToolsList((prev) => !prev)}
+                className="inline-flex shrink-0 cursor-pointer items-center gap-1 font-medium text-zinc-700 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100"
+              >
+                {showToolsList
+                  ? m.settings.hideTools
+                  : m.settings.viewTools(visibleScopeTools.length)}
+                <ChevronDown
+                  className={`h-3 w-3 transition-transform ${showToolsList ? "rotate-180" : ""}`}
+                />
+              </button>
+            </div>
+
+            {showToolsList && (
+              <div className="flex flex-wrap gap-1.5 border-t border-zinc-200/80 pt-2.5 dark:border-zinc-800/80">
+                {visibleScopeTools.map((tool) => (
+                  <span
+                    key={tool}
+                    className="rounded-md border border-zinc-200 bg-white px-2 py-0.5 font-mono text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                  >
+                    {tool}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            <FieldError message={tokenFormError} />
           </form>
 
-          {/* Issued Tokens Table */}
+          {/* Compact Issued Tokens List */}
           {tokensQuery.isLoading ? (
-            <div className="py-6 text-center text-xs text-zinc-500">
+            <div className="py-4 text-center text-xs text-zinc-500">
               {m.settings.loadingTokens}
             </div>
           ) : (tokensQuery.data?.length ?? 0) === 0 ? (
-            <EmptyState
-              icon={KeyRound}
-              title={m.settings.emptyTokensTitle}
-              description={m.settings.emptyTokensDesc}
-            />
+            <div className="flex items-center gap-2.5 rounded-lg border border-zinc-200/80 bg-zinc-50/40 px-3.5 py-2.5 text-xs text-zinc-500 dark:border-zinc-800/80 dark:bg-zinc-950/30 dark:text-zinc-400">
+              <KeyRound className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+              <span>{m.settings.emptyTokensInline}</span>
+            </div>
           ) : (
-            <div className="overflow-x-auto rounded-lg border border-zinc-200 dark:border-zinc-800">
-              <table className="w-full text-left text-xs">
-                <thead className="border-b border-zinc-200 bg-zinc-50 text-[11px] text-zinc-500 uppercase dark:border-zinc-800 dark:bg-zinc-950">
-                  <tr>
-                    <th className="px-3.5 py-2.5 font-medium">
-                      {m.settings.colName}
-                    </th>
-                    <th className="px-3.5 py-2.5 font-medium">
-                      {m.settings.colPrefix}
-                    </th>
-                    <th className="px-3.5 py-2.5 font-medium">
-                      {m.settings.colScope}
-                    </th>
-                    <th className="px-3.5 py-2.5 font-medium">
-                      {m.settings.colLastUsed}
-                    </th>
-                    <th className="px-3.5 py-2.5 font-medium">
-                      {m.settings.colCreated}
-                    </th>
-                    <th className="px-3.5 py-2.5 text-right font-medium">
-                      {m.settings.colRevoke}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
-                  {(tokensQuery.data ?? []).map((tok) => (
-                    <tr key={tok.id}>
-                      <td className="px-3.5 py-2.5 font-medium">{tok.name}</td>
-                      <td className="px-3.5 py-2.5 font-mono text-zinc-500">
-                        {tok.token_prefix}••••••
-                      </td>
-                      <td className="px-3.5 py-2.5">
-                        <Badge
-                          variant={tok.scope === "admin" ? "warning" : "info"}
-                        >
-                          {tok.scope}
-                        </Badge>
-                      </td>
-                      <td
-                        className="px-3.5 py-2.5 text-zinc-500"
-                        title={formatDateTime(tok.last_used_at)}
-                      >
-                        {tok.last_used_at
-                          ? formatRelativeTime(tok.last_used_at)
-                          : m.common.never}
-                      </td>
-                      <td
-                        className="px-3.5 py-2.5 text-zinc-500"
-                        title={formatDateTime(tok.created_at)}
-                      >
-                        {formatRelativeTime(tok.created_at)}
-                      </td>
-                      <td className="px-3.5 py-2.5 text-right">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => setRevokingToken(tok)}
-                          className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
-                          title={m.settings.revokeTitle}
-                          aria-label={m.settings.revokeTitle}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="divide-y divide-zinc-100 rounded-lg border border-zinc-200 dark:divide-zinc-800/80 dark:border-zinc-800">
+              {(tokensQuery.data ?? []).map((tok) => (
+                <div
+                  key={tok.id}
+                  className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 text-xs hover:bg-zinc-50/60 dark:hover:bg-zinc-950/40"
+                >
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                      {tok.name}
+                    </span>
+                    <span className="font-mono text-[11px] text-zinc-400">
+                      {tok.token_prefix}••••
+                    </span>
+                    <Badge
+                      variant={tok.scope === "admin" ? "warning" : "info"}
+                    >
+                      {tok.scope}
+                    </Badge>
+                  </div>
+
+                  <div className="flex items-center gap-3 text-[11px] text-zinc-500">
+                    <span title={formatDateTime(tok.created_at)}>
+                      {m.settings.colCreated}: {formatRelativeTime(tok.created_at)}
+                    </span>
+                    <span
+                      title={formatDateTime(tok.last_used_at)}
+                      className="hidden sm:inline"
+                    >
+                      {m.settings.colLastUsed}:{" "}
+                      {tok.last_used_at
+                        ? formatRelativeTime(tok.last_used_at)
+                        : m.common.never}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setRevokingToken(tok)}
+                      className="h-7 w-7 text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                      title={m.settings.revokeTitle}
+                      aria-label={m.settings.revokeTitle}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* One-Time Plaintext Token & Client JSON Reveal Modal */}
+      {/* One-Time Plaintext Token & Multi-Client Config Reveal Modal */}
       {createdTokenModal && (
         <Modal
           open={createdTokenModal !== null}
@@ -700,19 +773,40 @@ export function SettingsView() {
               />
             </div>
 
-            <div>
-              <div className="flex items-center justify-between">
-                <Label>{m.settings.clientJsonLabel}</Label>
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-800 dark:bg-zinc-900">
+                  {(
+                    [
+                      { id: "claude", label: m.settings.clientTabClaude },
+                      { id: "cursor", label: m.settings.clientTabCursor },
+                      { id: "generic", label: m.settings.clientTabGeneric },
+                    ] as const
+                  ).map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setClientConfigTab(tab.id)}
+                      className={`cursor-pointer rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                        clientConfigTab === tab.id
+                          ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                          : "text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() =>
                     void handleCopy(
                       "json",
-                      createdTokenModal.client_config_json ||
-                        buildFallbackClientJson(
-                          createdTokenModal.plaintext_token,
-                        ),
+                      buildClientConfigSnippet(
+                        clientConfigTab,
+                        createdTokenModal,
+                      ),
                     )
                   }
                 >
@@ -724,9 +818,15 @@ export function SettingsView() {
                   {m.settings.copyJson}
                 </Button>
               </div>
-              <pre className="mt-1 overflow-x-auto rounded-lg bg-zinc-900 p-3.5 font-mono text-xs text-zinc-100">
-                {createdTokenModal.client_config_json ||
-                  buildFallbackClientJson(createdTokenModal.plaintext_token)}
+              <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                {clientConfigTab === "claude"
+                  ? m.settings.clientTabClaudeHint
+                  : clientConfigTab === "cursor"
+                    ? m.settings.clientTabCursorHint
+                    : m.settings.clientTabGenericHint}
+              </p>
+              <pre className="overflow-x-auto rounded-lg bg-zinc-900 p-3.5 font-mono text-xs text-zinc-100">
+                {buildClientConfigSnippet(clientConfigTab, createdTokenModal)}
               </pre>
             </div>
           </div>
