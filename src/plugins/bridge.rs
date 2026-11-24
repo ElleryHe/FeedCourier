@@ -13,6 +13,7 @@
 //!   downstream channel renderers.
 //! - Bridge checkpoint payloads are capped at 16 KiB.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,6 +52,13 @@ pub const HEADER_TIMESTAMP: &str = "X-FeedCourier-Timestamp";
 pub const HEADER_SIGNATURE: &str = "X-FeedCourier-Signature";
 pub const HEADER_PLUGIN_ID: &str = "X-FeedCourier-Plugin-Id";
 pub const HEADER_IDEMPOTENCY_KEY: &str = "X-FeedCourier-Idempotency-Key";
+
+static DEBUG_NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_debug_nonce() -> String {
+    let seq = DEBUG_NONCE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}:{seq}", chrono::Utc::now().timestamp_millis())
+}
 
 /// Compute `v1=<hex(HMAC-SHA256(secret, "{timestamp}.{body}"))>`.
 pub fn sign_bridge_request(secret: &str, timestamp: i64, body: &[u8]) -> String {
@@ -447,6 +455,14 @@ fn is_schema_secret_prop(key: &str, prop_schema: Option<&Value>) -> bool {
 
 /// Validate a config JSON object against a declarative JSON Schema (`type: object`, `required`, `properties`).
 pub fn validate_config_against_schema(schema: &Value, cfg: &Value) -> AppResult<Value> {
+    validate_config_against_schema_inner(schema, cfg, true)
+}
+
+fn validate_config_against_schema_inner(
+    schema: &Value,
+    cfg: &Value,
+    apply_defaults: bool,
+) -> AppResult<Value> {
     let obj = cfg
         .as_object()
         .ok_or_else(|| AppError::Validation("configuration must be a JSON object".to_string()))?;
@@ -465,7 +481,7 @@ pub fn validate_config_against_schema(schema: &Value, cfg: &Value) -> AppResult<
             let is_req = required.iter().any(|r| r == key);
             match obj.get(key) {
                 None | Some(Value::Null) => {
-                    if let Some(default_val) = prop.get("default") {
+                    if apply_defaults && let Some(default_val) = prop.get("default") {
                         normalized.insert(key.clone(), default_val.clone());
                     } else if is_req {
                         return Err(AppError::Validation(format!(
@@ -600,7 +616,7 @@ pub fn merge_config_against_schema(
         }
     }
 
-    validate_config_against_schema(schema, &Value::Object(merged))
+    validate_config_against_schema_inner(schema, &Value::Object(merged), false)
 }
 
 /// Redact secret fields in a config object using an explicit JSON schema.
@@ -694,10 +710,28 @@ impl Plugin for BridgeProcessorPlugin {
                 self.manifest.id
             ))
         })?;
+        if let Some(enabled_val) = obj.get("enabled")
+            && !enabled_val.is_null()
+            && !enabled_val.is_boolean()
+        {
+            return Err(AppError::Validation(format!(
+                "plugin '{}' route option 'enabled' must be a boolean",
+                self.manifest.id
+            )));
+        }
+        if let Some(strict_val) = obj.get("strict_mode")
+            && !strict_val.is_null()
+            && !strict_val.is_boolean()
+        {
+            return Err(AppError::Validation(format!(
+                "plugin '{}' route option 'strict_mode' must be a boolean",
+                self.manifest.id
+            )));
+        }
         if let Some(pid_val) = obj.get("provider_id")
             && !pid_val.is_null()
         {
-            let pid = pid_val.as_i64().ok_or_else(|| {
+            let pid = pid_val.as_i64().filter(|&v| v > 0).ok_or_else(|| {
                 AppError::Validation("provider_id must be a positive integer".to_string())
             })?;
             let inst = db.get_plugin_instance(pid).await?.ok_or_else(|| {
@@ -713,6 +747,9 @@ impl Plugin for BridgeProcessorPlugin {
                 )));
             }
         }
+        if obj.get("enabled").and_then(Value::as_bool) != Some(false) {
+            validate_config_against_schema(&self.manifest.route_option_schema, option)?;
+        }
         Ok(())
     }
 
@@ -722,6 +759,25 @@ impl Plugin for BridgeProcessorPlugin {
         self.client
             .test_remote(&json!({ "scope": "instance", "config": normalized }))
             .await
+    }
+
+    async fn effective_strict_mode(&self, ctx: &RenderContext<'_>) -> bool {
+        let Some(route_opt) = ctx.plugin_route_config else {
+            return false;
+        };
+        if route_opt.get("strict_mode").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+        if let Some(pid) = route_opt.get("provider_id").and_then(Value::as_i64)
+            && let Ok(Some(inst)) = ctx.db.get_plugin_instance(pid).await
+            && inst.plugin_id == self.manifest.id
+            && inst.enabled
+            && let Ok(decrypted) = ctx.master_key.decrypt_json::<Value>(&inst.encrypted_config)
+            && decrypted.get("strict_mode").and_then(Value::as_bool) == Some(true)
+        {
+            return true;
+        }
+        false
     }
 
     async fn on_render(
@@ -777,13 +833,21 @@ impl Plugin for BridgeProcessorPlugin {
             .primary_link
             .as_deref()
             .or(ctx.entry.canonical_url.as_deref());
-        let idempotency_key = sha256_hex(
+        let idempotency_input = if !ctx.write_cache {
+            format!(
+                "on_render-debug:{}:{}:{}:{}",
+                self.manifest.id,
+                ctx.route.id,
+                ctx.entry.fingerprint_sha256,
+                next_debug_nonce()
+            )
+        } else {
             format!(
                 "on_render:{}:{}:{}",
                 self.manifest.id, ctx.route.id, ctx.entry.fingerprint_sha256
             )
-            .as_bytes(),
-        );
+        };
+        let idempotency_key = sha256_hex(idempotency_input.as_bytes());
 
         let payload = json!({
             "idempotency_key": idempotency_key,
@@ -977,6 +1041,31 @@ impl ChannelSender for BridgeChannelSender {
                 ),
             });
         };
+        if bridge.manifest.kind != PluginKind::Channel {
+            return Ok(DeliveryOutcome::PermanentFailure {
+                status_code: None,
+                checkpoint: ctx.checkpoint.clone(),
+                diagnostic: format!(
+                    "Plugin '{}' has kind '{}' instead of 'channel'",
+                    acct_cfg.plugin_id,
+                    bridge.manifest.kind.as_str()
+                ),
+            });
+        }
+        if !bridge.compatible {
+            return Ok(DeliveryOutcome::Deferred {
+                next_window_at: now_unix().saturating_add(300),
+                checkpoint: ctx.checkpoint.clone(),
+                diagnostic: format!(
+                    "Channel plugin '{}' is incompatible with current core: {}",
+                    acct_cfg.plugin_id,
+                    bridge
+                        .compatibility_reason
+                        .as_deref()
+                        .unwrap_or("version mismatch")
+                ),
+            });
+        }
         if !bridge.enabled {
             return Ok(DeliveryOutcome::Deferred {
                 next_window_at: now_unix().saturating_add(300),
@@ -997,13 +1086,21 @@ impl ChannelSender for BridgeChannelSender {
             .or_else(|| ctx.entry.first_sentence.clone())
             .unwrap_or_default();
 
-        let idempotency_key = sha256_hex(
+        let idempotency_input = if ctx.task.id == 0 {
+            format!(
+                "deliver-debug:{}:{}:{}:{}",
+                acct_cfg.plugin_id,
+                ctx.destination.id,
+                ctx.entry.fingerprint_sha256,
+                next_debug_nonce()
+            )
+        } else {
             format!(
                 "deliver:{}:{}:{}:{}",
                 acct_cfg.plugin_id, ctx.destination.id, ctx.task.id, ctx.entry.fingerprint_sha256
             )
-            .as_bytes(),
-        );
+        };
+        let idempotency_key = sha256_hex(idempotency_input.as_bytes());
         let cp_value = match &ctx.checkpoint {
             Some(DeliveryCheckpoint::Plugin { state }) => state.clone(),
             _ => Value::Null,

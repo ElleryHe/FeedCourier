@@ -1111,6 +1111,8 @@ export interface BridgeManifestPreviewResponse {
 export interface UpdatePluginRequest {
   enabled?: boolean;
   settings?: Record<string, unknown>;
+  bridge_url?: string;
+  bridge_secret?: string;
 }
 
 export interface CreatePluginInstanceRequest {

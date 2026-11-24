@@ -101,12 +101,14 @@ function extractConfiguredRoutePlugins(
   const entries: Array<[string, Record<string, unknown>]> = [];
   for (const [pluginId, raw] of Object.entries(pluginsMap)) {
     if (!isPlainObject(raw)) continue;
-    const hasActiveVal = Object.values(raw).some(
-      (v) => v !== null && v !== undefined && v !== "",
-    );
-    if (hasActiveVal) {
-      entries.push([pluginId, raw]);
+    if (raw.enabled === false) continue;
+    if (pluginId === "link-rewrite") {
+      const hasActiveVal = Object.values(raw).some(
+        (v) => v !== null && v !== undefined && v !== "",
+      );
+      if (!hasActiveVal) continue;
     }
+    entries.push([pluginId, raw]);
   }
   return entries;
 }
@@ -116,14 +118,22 @@ function cleanPluginOptionsForSubmit(
 ): Record<string, Record<string, unknown>> {
   const out: Record<string, Record<string, unknown>> = {};
   for (const [pluginId, obj] of Object.entries(draft)) {
+    if (obj.enabled === false) continue;
     const cleaned: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
       if (v === null || v === undefined || v === "") continue;
       cleaned[k] = v;
     }
-    if (Object.keys(cleaned).length > 0) {
-      out[pluginId] = cleaned;
+    if (pluginId === "link-rewrite") {
+      if (
+        cleaned.provider_id === undefined ||
+        cleaned.provider_id === null ||
+        cleaned.provider_id === ""
+      ) {
+        continue;
+      }
     }
+    out[pluginId] = cleaned;
   }
   return out;
 }
@@ -814,14 +824,28 @@ function RouteEditorModal({
     }
     return initial;
   });
-  const [pluginOrder, setPluginOrder] = useState<string[]>(
-    () => route?.options.plugin_order ?? [],
-  );
+  const [pluginOrder, setPluginOrder] = useState<string[]>(() => {
+    const configured = extractConfiguredRoutePlugins(
+      route?.options.plugins,
+    ).map(([pid]) => pid);
+    const saved = (route?.options.plugin_order ?? []).filter((id) =>
+      configured.includes(id),
+    );
+    for (const id of configured) {
+      if (!saved.includes(id)) saved.push(id);
+    }
+    return saved;
+  });
   const [pluginsSectionOpen, setPluginsSectionOpen] = useState<boolean>(
     () => extractConfiguredRoutePlugins(route?.options.plugins).length > 0,
   );
   const [enabled, setEnabled] = useState<boolean>(route?.enabled ?? true);
   const [formError, setFormError] = useState<string | null>(null);
+
+  const cleanedPluginOptions = useMemo(
+    () => cleanPluginOptionsForSubmit(pluginOptions),
+    [pluginOptions],
+  );
 
   const visiblePlugins = useMemo(() => {
     const filtered = plugins.filter(
@@ -842,25 +866,52 @@ function RouteEditorModal({
     });
   }, [plugins, pluginOptions, initialPluginIds, pluginOrder]);
 
+  const enabledPluginIds = useMemo(
+    () =>
+      visiblePlugins
+        .map((p) => p.id)
+        .filter((id) => cleanedPluginOptions[id] !== undefined),
+    [visiblePlugins, cleanedPluginOptions],
+  );
+
   const movePlugin = (pluginId: string, direction: -1 | 1) => {
-    const ids = visiblePlugins.map((p) => p.id);
-    const idx = ids.indexOf(pluginId);
+    const idx = enabledPluginIds.indexOf(pluginId);
     const target = idx + direction;
-    if (idx < 0 || target < 0 || target >= ids.length) return;
-    const next = [...ids];
+    if (idx < 0 || target < 0 || target >= enabledPluginIds.length) return;
+    const next = [...enabledPluginIds];
     [next[idx], next[target]] = [next[target], next[idx]];
     setPluginOrder(next);
   };
-  const activePluginCount = useMemo(
-    () => Object.keys(cleanPluginOptionsForSubmit(pluginOptions)).length,
-    [pluginOptions],
-  );
+  const activePluginCount = enabledPluginIds.length;
+
+  const toggleRoutePlugin = (pluginId: string, enabledOnRoute: boolean) => {
+    if (enabledOnRoute) {
+      setPluginOptions((prev) => {
+        const current = { ...(prev[pluginId] ?? {}) };
+        if (current.enabled === false) {
+          delete current.enabled;
+        }
+        return { ...prev, [pluginId]: current };
+      });
+      setPluginOrder((prev) =>
+        prev.includes(pluginId) ? prev : [...prev, pluginId],
+      );
+    } else {
+      setPluginOptions((prev) => {
+        const next = { ...prev };
+        delete next[pluginId];
+        return next;
+      });
+      setPluginOrder((prev) => prev.filter((id) => id !== pluginId));
+    }
+  };
 
   const updatePluginField = (
     pluginId: string,
     propKey: string,
     value: unknown,
   ) => {
+    let removedLinkRewrite = false;
     setPluginOptions((prev) => {
       const nextPluginObj = { ...(prev[pluginId] ?? {}) };
       if (value === null || value === undefined || value === "") {
@@ -869,13 +920,26 @@ function RouteEditorModal({
         nextPluginObj[propKey] = value;
       }
       const next = { ...prev };
-      if (Object.keys(nextPluginObj).length === 0) {
+      if (
+        pluginId === "link-rewrite" &&
+        Object.keys(nextPluginObj).length === 0
+      ) {
         delete next[pluginId];
+        removedLinkRewrite = true;
       } else {
         next[pluginId] = nextPluginObj;
       }
       return next;
     });
+    if (pluginId === "link-rewrite") {
+      if (removedLinkRewrite || value === null || value === undefined || value === "") {
+        setPluginOrder((prev) => prev.filter((id) => id !== pluginId));
+      } else {
+        setPluginOrder((prev) =>
+          prev.includes(pluginId) ? prev : [...prev, pluginId],
+        );
+      }
+    }
   };
 
   const selectedChannel = destinationsById.get(effectiveDestinationId)?.channel;
@@ -1542,7 +1606,7 @@ function RouteEditorModal({
 
           {pluginsSectionOpen && (
             <div className="space-y-3 border-t border-zinc-100 p-4 dark:border-zinc-800">
-              {visiblePlugins.length > 1 && (
+              {enabledPluginIds.length > 1 && (
                 <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
                   {m.routes.editor.pluginOrderHint}
                 </p>
@@ -1552,13 +1616,17 @@ function RouteEditorModal({
                   {m.routes.editor.pluginsNoneEnabled}
                 </p>
               ) : (
-                visiblePlugins.map((plugin, pluginIdx) => {
+                visiblePlugins.map((plugin) => {
                   const properties =
                     plugin.manifest.route_option_schema?.properties ?? {};
                   const propEntries = Object.entries(properties) as Array<
                     [string, PluginRouteOptionPropertySchema]
                   >;
                   const currentCfg = pluginOptions[plugin.id] ?? {};
+                  const isDynamicProcessor = plugin.id !== "link-rewrite";
+                  const isEnabledOnRoute =
+                    cleanedPluginOptions[plugin.id] !== undefined;
+                  const enabledIdx = enabledPluginIds.indexOf(plugin.id);
 
                   return (
                     <div
@@ -1580,204 +1648,242 @@ function RouteEditorModal({
                             </Badge>
                           )}
                         </div>
-                        {visiblePlugins.length > 1 && (
-                          <div className="flex items-center gap-1">
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              disabled={pluginIdx === 0}
-                              onClick={() => movePlugin(plugin.id, -1)}
-                              title={m.routes.editor.pluginMoveUp}
-                              aria-label={m.routes.editor.pluginMoveUp}
-                              className="h-6 w-6"
-                            >
-                              <ArrowUp className="h-3.5 w-3.5" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              disabled={pluginIdx === visiblePlugins.length - 1}
-                              onClick={() => movePlugin(plugin.id, 1)}
-                              title={m.routes.editor.pluginMoveDown}
-                              aria-label={m.routes.editor.pluginMoveDown}
-                              className="h-6 w-6"
-                            >
-                              <ArrowDown className="h-3.5 w-3.5" />
-                            </Button>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="grid gap-2.5 sm:grid-cols-2">
-                        {propEntries.map(([propKey, schema]) => {
-                          const fieldVal = currentCfg[propKey];
-                          const fieldId = `route-plugin-${plugin.id}-${propKey}`;
-
-                          if (
-                            schema.type === "select" &&
-                            schema.source === "plugin_instances"
-                          ) {
-                            const selectedId =
-                              typeof fieldVal === "number" ? fieldVal : null;
-                            const missingSelected =
-                              selectedId !== null &&
-                              !plugin.instances.some(
-                                (i) => i.id === selectedId,
-                              );
-
-                            return (
-                              <div key={propKey} className="sm:col-span-2">
-                                <Label htmlFor={fieldId}>
-                                  {schema.title || propKey}
-                                </Label>
-                                <Select
-                                  id={fieldId}
-                                  value={
-                                    selectedId !== null
-                                      ? String(selectedId)
-                                      : ""
-                                  }
-                                  onChange={(e) => {
-                                    const raw = e.target.value;
-                                    updatePluginField(
-                                      plugin.id,
-                                      propKey,
-                                      raw ? Number(raw) : null,
-                                    );
-                                  }}
-                                  className="mt-1 h-8 text-xs"
-                                >
-                                  {schema.nullable !== false && (
-                                    <option value="">
-                                      {m.common.disabled}
-                                    </option>
-                                  )}
-                                  {missingSelected && selectedId !== null && (
-                                    <option value={String(selectedId)}>
-                                      {m.routes.editor.pluginsMissingProvider(
-                                        selectedId,
-                                      )}
-                                    </option>
-                                  )}
-                                  {plugin.instances.map((inst) => (
-                                    <option key={inst.id} value={inst.id}>
-                                      {inst.name}
-                                      {!inst.enabled
-                                        ? ` (${m.common.disabled})`
-                                        : ""}
-                                    </option>
-                                  ))}
-                                </Select>
-                                {plugin.instances.length === 0 && (
-                                  <FieldHint>
-                                    {m.routes.editor.pluginsNoProviders}
-                                  </FieldHint>
-                                )}
-                              </div>
-                            );
-                          }
-
-                          if (
-                            schema.type === "select" &&
-                            Array.isArray(schema.enum)
-                          ) {
-                            return (
-                              <div key={propKey}>
-                                <Label htmlFor={fieldId}>
-                                  {schema.title || propKey}
-                                </Label>
-                                <Select
-                                  id={fieldId}
-                                  value={
-                                    typeof fieldVal === "string" ? fieldVal : ""
-                                  }
-                                  onChange={(e) =>
-                                    updatePluginField(
-                                      plugin.id,
-                                      propKey,
-                                      e.target.value || null,
-                                    )
-                                  }
-                                  className="mt-1 h-8 text-xs"
-                                >
-                                  {schema.nullable !== false && (
-                                    <option value="">
-                                      {m.common.disabled}
-                                    </option>
-                                  )}
-                                  {schema.enum.map((opt) => (
-                                    <option key={opt} value={opt}>
-                                      {opt}
-                                    </option>
-                                  ))}
-                                </Select>
-                              </div>
-                            );
-                          }
-
-                          if (schema.type === "boolean") {
-                            return (
-                              <div key={propKey} className="sm:col-span-2">
-                                <Switch
-                                  id={fieldId}
-                                  checked={
-                                    typeof fieldVal === "boolean"
-                                      ? fieldVal
-                                      : Boolean(schema.default)
-                                  }
-                                  onCheckedChange={(checked) =>
-                                    updatePluginField(
-                                      plugin.id,
-                                      propKey,
-                                      checked,
-                                    )
-                                  }
-                                  label={schema.title || propKey}
-                                  description={schema.description}
-                                />
-                              </div>
-                            );
-                          }
-
-                          return (
-                            <div key={propKey}>
-                              <Label htmlFor={fieldId}>
-                                {schema.title || propKey}
-                              </Label>
-                              <Input
-                                id={fieldId}
-                                type={
-                                  schema.type === "number" ? "number" : "text"
+                        <div className="flex items-center gap-2">
+                          {isEnabledOnRoute && enabledPluginIds.length > 1 && (
+                            <div className="flex items-center gap-1">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={enabledIdx <= 0}
+                                onClick={() => movePlugin(plugin.id, -1)}
+                                title={m.routes.editor.pluginMoveUp}
+                                aria-label={m.routes.editor.pluginMoveUp}
+                                className="h-6 w-6"
+                              >
+                                <ArrowUp className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={
+                                  enabledIdx < 0 ||
+                                  enabledIdx === enabledPluginIds.length - 1
                                 }
-                                value={
-                                  fieldVal !== undefined && fieldVal !== null
-                                    ? String(fieldVal)
-                                    : ""
-                                }
-                                onChange={(e) => {
-                                  const raw = e.target.value;
-                                  if (!raw) {
-                                    updatePluginField(plugin.id, propKey, null);
-                                  } else if (schema.type === "number") {
-                                    const num = Number(raw);
-                                    if (!Number.isNaN(num)) {
-                                      updatePluginField(
-                                        plugin.id,
-                                        propKey,
-                                        num,
-                                      );
-                                    }
-                                  } else {
-                                    updatePluginField(plugin.id, propKey, raw);
-                                  }
-                                }}
-                                placeholder={schema.placeholder}
-                                className="mt-1 h-8 text-xs"
-                              />
+                                onClick={() => movePlugin(plugin.id, 1)}
+                                title={m.routes.editor.pluginMoveDown}
+                                aria-label={m.routes.editor.pluginMoveDown}
+                                className="h-6 w-6"
+                              >
+                                <ArrowDown className="h-3.5 w-3.5" />
+                              </Button>
                             </div>
-                          );
-                        })}
+                          )}
+                          {isDynamicProcessor && (
+                            <Switch
+                              id={`route-plugin-enable-${plugin.id}`}
+                              checked={isEnabledOnRoute}
+                              onCheckedChange={(checked) =>
+                                toggleRoutePlugin(plugin.id, checked)
+                              }
+                              label={m.routes.editor.pluginEnableOnRoute}
+                            />
+                          )}
+                        </div>
                       </div>
+
+                      {(!isDynamicProcessor || isEnabledOnRoute) &&
+                        (propEntries.length === 0 ? (
+                          <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                            {m.routes.editor.pluginNoRouteOptionsHint}
+                          </p>
+                        ) : (
+                          <div className="grid gap-2.5 sm:grid-cols-2">
+                            {propEntries.map(([propKey, schema]) => {
+                              const fieldVal = currentCfg[propKey];
+                              const fieldId = `route-plugin-${plugin.id}-${propKey}`;
+
+                              if (
+                                schema.type === "select" &&
+                                schema.source === "plugin_instances"
+                              ) {
+                                const selectedId =
+                                  typeof fieldVal === "number"
+                                    ? fieldVal
+                                    : null;
+                                const missingSelected =
+                                  selectedId !== null &&
+                                  !plugin.instances.some(
+                                    (i) => i.id === selectedId,
+                                  );
+
+                                return (
+                                  <div key={propKey} className="sm:col-span-2">
+                                    <Label htmlFor={fieldId}>
+                                      {schema.title || propKey}
+                                    </Label>
+                                    <Select
+                                      id={fieldId}
+                                      value={
+                                        selectedId !== null
+                                          ? String(selectedId)
+                                          : ""
+                                      }
+                                      onChange={(e) => {
+                                        const raw = e.target.value;
+                                        updatePluginField(
+                                          plugin.id,
+                                          propKey,
+                                          raw ? Number(raw) : null,
+                                        );
+                                      }}
+                                      className="mt-1 h-8 text-xs"
+                                    >
+                                      {schema.nullable !== false && (
+                                        <option value="">
+                                          {m.common.disabled}
+                                        </option>
+                                      )}
+                                      {missingSelected &&
+                                        selectedId !== null && (
+                                          <option value={String(selectedId)}>
+                                            {m.routes.editor.pluginsMissingProvider(
+                                              selectedId,
+                                            )}
+                                          </option>
+                                        )}
+                                      {plugin.instances.map((inst) => (
+                                        <option key={inst.id} value={inst.id}>
+                                          {inst.name}
+                                          {!inst.enabled
+                                            ? ` (${m.common.disabled})`
+                                            : ""}
+                                        </option>
+                                      ))}
+                                    </Select>
+                                    {plugin.instances.length === 0 && (
+                                      <FieldHint>
+                                        {m.routes.editor.pluginsNoProviders}
+                                      </FieldHint>
+                                    )}
+                                  </div>
+                                );
+                              }
+
+                              if (
+                                schema.type === "select" &&
+                                Array.isArray(schema.enum)
+                              ) {
+                                return (
+                                  <div key={propKey}>
+                                    <Label htmlFor={fieldId}>
+                                      {schema.title || propKey}
+                                    </Label>
+                                    <Select
+                                      id={fieldId}
+                                      value={
+                                        typeof fieldVal === "string"
+                                          ? fieldVal
+                                          : ""
+                                      }
+                                      onChange={(e) =>
+                                        updatePluginField(
+                                          plugin.id,
+                                          propKey,
+                                          e.target.value || null,
+                                        )
+                                      }
+                                      className="mt-1 h-8 text-xs"
+                                    >
+                                      {schema.nullable !== false && (
+                                        <option value="">
+                                          {m.common.disabled}
+                                        </option>
+                                      )}
+                                      {schema.enum.map((opt) => (
+                                        <option key={opt} value={opt}>
+                                          {opt}
+                                        </option>
+                                      ))}
+                                    </Select>
+                                  </div>
+                                );
+                              }
+
+                              if (schema.type === "boolean") {
+                                return (
+                                  <div key={propKey} className="sm:col-span-2">
+                                    <Switch
+                                      id={fieldId}
+                                      checked={
+                                        typeof fieldVal === "boolean"
+                                          ? fieldVal
+                                          : Boolean(schema.default)
+                                      }
+                                      onCheckedChange={(checked) =>
+                                        updatePluginField(
+                                          plugin.id,
+                                          propKey,
+                                          checked,
+                                        )
+                                      }
+                                      label={schema.title || propKey}
+                                      description={schema.description}
+                                    />
+                                  </div>
+                                );
+                              }
+
+                              return (
+                                <div key={propKey}>
+                                  <Label htmlFor={fieldId}>
+                                    {schema.title || propKey}
+                                  </Label>
+                                  <Input
+                                    id={fieldId}
+                                    type={
+                                      schema.type === "number"
+                                        ? "number"
+                                        : "text"
+                                    }
+                                    value={
+                                      fieldVal !== undefined &&
+                                      fieldVal !== null
+                                        ? String(fieldVal)
+                                        : ""
+                                    }
+                                    onChange={(e) => {
+                                      const raw = e.target.value;
+                                      if (!raw) {
+                                        updatePluginField(
+                                          plugin.id,
+                                          propKey,
+                                          null,
+                                        );
+                                      } else if (schema.type === "number") {
+                                        const num = Number(raw);
+                                        if (!Number.isNaN(num)) {
+                                          updatePluginField(
+                                            plugin.id,
+                                            propKey,
+                                            num,
+                                          );
+                                        }
+                                      } else {
+                                        updatePluginField(
+                                          plugin.id,
+                                          propKey,
+                                          raw,
+                                        );
+                                      }
+                                    }}
+                                    placeholder={schema.placeholder}
+                                    className="mt-1 h-8 text-xs"
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ))}
                     </div>
                   );
                 })

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -120,6 +120,11 @@ pub trait LogStoreBackend: Send + Sync {
     async fn close(&self) {}
 }
 
+enum LogWorkerCmd {
+    Flush(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
 struct LogStoreInner {
     backend_name: &'static str,
     backend: Option<Arc<dyn LogStoreBackend>>,
@@ -127,7 +132,7 @@ struct LogStoreInner {
     healthy: Arc<AtomicBool>,
     last_error: Arc<RwLock<Option<String>>>,
     tx: Option<mpsc::Sender<LogRecord>>,
-    flush_notify: Arc<Notify>,
+    cmd_tx: Option<mpsc::UnboundedSender<LogWorkerCmd>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -158,7 +163,7 @@ impl LogStoreHandle {
                 healthy: Arc::new(AtomicBool::new(true)),
                 last_error: Arc::new(RwLock::new(None)),
                 tx: None,
-                flush_notify: Arc::new(Notify::new()),
+                cmd_tx: None,
                 worker: Mutex::new(None),
             }),
         }
@@ -171,19 +176,19 @@ impl LogStoreHandle {
         initial_error: Option<String>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(LOG_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let dropped = Arc::new(AtomicU64::new(0));
         let healthy = Arc::new(AtomicBool::new(initial_healthy));
         let last_error = Arc::new(RwLock::new(initial_error));
-        let flush_notify = Arc::new(Notify::new());
         let backend_name = backend.backend_name();
 
         let worker_handle = spawn_batch_writer(
             Arc::clone(&backend),
             rx,
+            cmd_rx,
             Arc::clone(&dropped),
             Arc::clone(&healthy),
             Arc::clone(&last_error),
-            Arc::clone(&flush_notify),
         );
 
         Self {
@@ -194,7 +199,7 @@ impl LogStoreHandle {
                 healthy,
                 last_error,
                 tx: Some(tx),
-                flush_notify,
+                cmd_tx: Some(cmd_tx),
                 worker: Mutex::new(Some(worker_handle)),
             }),
         }
@@ -231,10 +236,14 @@ impl LogStoreHandle {
         }
     }
 
-    /// Request an immediate flush of buffered records and yield briefly.
+    /// Drain all currently buffered log records to the backend before returning.
     pub async fn flush_now(&self) {
-        self.inner.flush_notify.notify_one();
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        if let Some(ref cmd_tx) = self.inner.cmd_tx {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if cmd_tx.send(LogWorkerCmd::Flush(ack_tx)).is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
+            }
+        }
     }
 
     /// Retrieve current backend health, drop counter, and earliest timestamp.
@@ -315,14 +324,22 @@ impl LogStoreHandle {
         backend.prune().await
     }
 
-    /// Flush remaining buffered logs and close backend connections cleanly.
+    /// Flush all remaining buffered logs, stop the background writer gracefully, and close backend connections.
     pub async fn shutdown(&self) {
-        self.inner.flush_notify.notify_one();
-        // Give the background writer a moment to flush any remaining in-flight records.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(ref cmd_tx) = self.inner.cmd_tx {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if cmd_tx.send(LogWorkerCmd::Shutdown(ack_tx)).is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
+            }
+        }
         if let Some(handle) = self.inner.worker.lock().ok().and_then(|mut g| g.take()) {
-            handle.abort();
-            let _ = handle.await;
+            let abort_handle = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .is_err()
+            {
+                abort_handle.abort();
+            }
         }
         if let Some(ref backend) = self.inner.backend {
             backend.close().await;
@@ -362,7 +379,7 @@ pub async fn init_logging(config: &AppConfig) -> LogStoreHandle {
                             healthy: Arc::new(AtomicBool::new(false)),
                             last_error: Arc::new(RwLock::new(Some(msg))),
                             tx: None,
-                            flush_notify: Arc::new(Notify::new()),
+                            cmd_tx: None,
                             worker: Mutex::new(None),
                         }),
                     }
@@ -403,7 +420,7 @@ pub async fn init_logging(config: &AppConfig) -> LogStoreHandle {
                             healthy: Arc::new(AtomicBool::new(false)),
                             last_error: Arc::new(RwLock::new(Some(msg))),
                             tx: None,
-                            flush_notify: Arc::new(Notify::new()),
+                            cmd_tx: None,
                             worker: Mutex::new(None),
                         }),
                     }
@@ -431,10 +448,10 @@ pub async fn init_logging(config: &AppConfig) -> LogStoreHandle {
 fn spawn_batch_writer(
     backend: Arc<dyn LogStoreBackend>,
     mut rx: mpsc::Receiver<LogRecord>,
+    mut cmd_rx: mpsc::UnboundedReceiver<LogWorkerCmd>,
     dropped: Arc<AtomicU64>,
     healthy: Arc<AtomicBool>,
     last_error: Arc<RwLock<Option<String>>>,
-    flush_notify: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf: Vec<LogRecord> = Vec::with_capacity(LOG_BATCH_SIZE);
@@ -444,6 +461,24 @@ fn spawn_batch_writer(
 
         loop {
             tokio::select! {
+                biased;
+                maybe_cmd = cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(LogWorkerCmd::Flush(ack)) => {
+                            drain_all(&mut rx, &mut buf, &backend, &dropped, &healthy, &last_error, &mut last_warn_at).await;
+                            let _ = ack.send(());
+                        }
+                        Some(LogWorkerCmd::Shutdown(ack)) => {
+                            drain_all(&mut rx, &mut buf, &backend, &dropped, &healthy, &last_error, &mut last_warn_at).await;
+                            let _ = ack.send(());
+                            break;
+                        }
+                        None => {
+                            drain_all(&mut rx, &mut buf, &backend, &dropped, &healthy, &last_error, &mut last_warn_at).await;
+                            break;
+                        }
+                    }
+                }
                 maybe_rec = rx.recv() => {
                     match maybe_rec {
                         Some(rec) => {
@@ -466,17 +501,6 @@ fn spawn_batch_writer(
                         }
                     }
                 }
-                _ = flush_notify.notified() => {
-                    while buf.len() < LOG_BATCH_SIZE {
-                        match rx.try_recv() {
-                            Ok(next) => buf.push(next),
-                            Err(_) => break,
-                        }
-                    }
-                    if !buf.is_empty() {
-                        flush_batch(&backend, &mut buf, &dropped, &healthy, &last_error, &mut last_warn_at).await;
-                    }
-                }
                 _ = tick.tick() => {
                     if !buf.is_empty() {
                         flush_batch(&backend, &mut buf, &dropped, &healthy, &last_error, &mut last_warn_at).await;
@@ -485,6 +509,29 @@ fn spawn_batch_writer(
             }
         }
     })
+}
+
+async fn drain_all(
+    rx: &mut mpsc::Receiver<LogRecord>,
+    buf: &mut Vec<LogRecord>,
+    backend: &Arc<dyn LogStoreBackend>,
+    dropped: &Arc<AtomicU64>,
+    healthy: &Arc<AtomicBool>,
+    last_error: &Arc<RwLock<Option<String>>>,
+    last_warn_at: &mut Option<Instant>,
+) {
+    loop {
+        while buf.len() < LOG_BATCH_SIZE {
+            match rx.try_recv() {
+                Ok(next) => buf.push(next),
+                Err(_) => break,
+            }
+        }
+        if buf.is_empty() {
+            break;
+        }
+        flush_batch(backend, buf, dropped, healthy, last_error, last_warn_at).await;
+    }
 }
 
 async fn flush_batch(
@@ -551,5 +598,81 @@ pub fn parse_level_num(raw: &str) -> Option<i32> {
         "warn" | "warning" => Some(40),
         "error" => Some(50),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn flush_now_and_shutdown_drain_more_than_one_batch_without_loss() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("logs.db");
+        let store = Arc::new(SqliteLogStore::open(&db_path, 7, 10_000).await.unwrap());
+        let handle = LogStoreHandle::from_backend(
+            Arc::clone(&store) as Arc<dyn LogStoreBackend>,
+            true,
+            None,
+        );
+
+        let make_rec = |i: i64| LogRecord {
+            ts_ms: 1_700_000_000_000 + i,
+            level: "INFO".to_string(),
+            level_num: 30,
+            target: "feedcourier::test".to_string(),
+            message: format!("msg-{i}"),
+            fields_json: "{}".to_string(),
+            feed_id: None,
+            task_id: None,
+            route_id: None,
+            channel_id: None,
+            destination_id: None,
+            plugin_id: None,
+        };
+
+        // Push 1,250 records (> 2 * LOG_BATCH_SIZE = 1000) and verify flush_now drains all of them.
+        for i in 0..1_250 {
+            assert!(handle.push_record(make_rec(i)));
+        }
+        handle.flush_now().await;
+        assert_eq!(handle.dropped_count(), 0);
+
+        let first_batch = store
+            .query(&LogQuery {
+                limit: Some(MAX_LOG_QUERY_LIMIT),
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_batch.len(), MAX_LOG_QUERY_LIMIT);
+        assert_eq!(first_batch[0].message, "msg-1249");
+
+        // Push 600 more records and call shutdown(); every single record must reach SQLite before close.
+        for i in 1_250..1_850 {
+            assert!(handle.push_record(make_rec(i)));
+        }
+        handle.shutdown().await;
+
+        let reopened = SqliteLogStore::open(&db_path, 7, 10_000).await.unwrap();
+        let newest = reopened
+            .query(&LogQuery {
+                limit: Some(5),
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(newest[0].message, "msg-1849");
+        let oldest = reopened
+            .query(&LogQuery {
+                limit: Some(5),
+                ascending: true,
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(oldest[0].message, "msg-0");
+        reopened.close().await;
     }
 }

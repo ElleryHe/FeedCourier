@@ -159,18 +159,49 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 
 | Method & Path | Description |
 | :--- | :--- |
-| `GET /api/v1/channels` | List all channel accounts (`ChannelDto[]`) with secrets redacted (`has_password`, `bot_token_hint`, `secret_hint`) and nested `destinations: ChannelDestinationDto[]` (each destination includes `enabled` and `auto_paused: bool`; SMTP destinations also include `smtp_summary` recipient counts; see [Security & Isolation](/reference/security)). |
-| `POST /api/v1/channels` | Returns **`201 Created`**. Create and encrypt a new `smtp`, `telegram`, or `notion` **Channel Account** (`CreateChannelRequest`, including optional SMTP `sender_identity`, optional `name` auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me`, and optional `initial_destination`). Automatically probes Telegram Bot API capabilities on creation (Telegram `api_base_url` enforces SSRF validation and returns `403 ssrf_blocked` on disallowed targets). SMTP accounts use direct TCP/TLS connections (outbound HTTP/SOCKS proxies do not apply). |
-| `PATCH /api/v1/channels/{id}` | Secret-preserving partial update for account credentials, `sender_identity`, proxy (HTTP-based channels), pacing, quotas, or enabled flag (`UpdateChannelRequest`). Omitting `password` / `bot_token` / `integration_secret` preserves the existing encrypted credential intact; passing `"password": null` on an SMTP account explicitly clears an optional SMTP password. |
+| `GET /api/v1/channels` | List all channel accounts (`ChannelDto[]`) with secrets redacted (`has_password`, `bot_token_hint`, `secret_hint`, or schema-driven `has_<field>` / `<field>_hint` for `plugin` channels) and nested `destinations: ChannelDestinationDto[]` (each destination includes `enabled` and `auto_paused: bool`; SMTP destinations also include `smtp_summary` recipient counts; see [Security & Isolation](/reference/security)). |
+| `POST /api/v1/channels` | Returns **`201 Created`**. Create and encrypt a new `smtp`, `telegram`, `notion`, or `plugin` **Channel Account** (`CreateChannelRequest`, including optional SMTP `sender_identity`, optional `name` auto-derived from Telegram `getMe`, SMTP `from_address`, Notion `/v1/users/me`, or channel plugin manifest name, and optional `initial_destination`). Automatically probes Telegram Bot API capabilities on creation (Telegram `api_base_url` enforces SSRF validation and returns `403 ssrf_blocked` on disallowed targets). For `kind: "plugin"`, validates account config via signed bridge `POST /validate` (`scope: "account"`). SMTP accounts use direct TCP/TLS connections (outbound HTTP/SOCKS proxies do not apply). |
+| `PATCH /api/v1/channels/{id}` | Secret-preserving partial update for account credentials, `sender_identity`, proxy (HTTP-based channels), pacing, quotas, or enabled flag (`UpdateChannelRequest`). Omitting `password` / `bot_token` / `integration_secret` (or schema-marked secret fields on `plugin` channels) preserves the existing encrypted credential intact; passing `"password": null` on an SMTP account explicitly clears an optional SMTP password. |
 | `DELETE /api/v1/channels/{id}` | Atomically delete a channel account. If any routes still reference destinations under this account and `?cascade=true` is not set, returns **`409 Conflict`** with `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }` (matching `DELETE /api/v1/destinations/{id}`). Passing **`?cascade=true`** deletes the account together with its destinations, referencing routes, and tasks in a single transaction. |
-| `POST /api/v1/channels/{id}/test` | When `destination_id` is omitted, verifies account-level credentials (for SMTP, verifies connectivity/auth and sends a self-test email **only to `from_address`**; for Telegram, runs `getMe` + `sendRichMessage` probe; for Notion, calls `GET /v1/users/me`). Passing `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` runs a destination test (same compliance rules as `POST /api/v1/destinations/{id}/test`). |
-| `GET /api/v1/channels/{id}/destinations` | List all destinations belonging to channel account `{id}` (`ChannelDestinationDto[]`, including `auto_paused: bool`, and `smtp_summary` on SMTP destinations). |
-| `POST /api/v1/channels/{id}/destinations` | Returns **`201 Created`**. Create and encrypt a new destination under channel account `{id}` (`CreateDestinationRequest`; optional `name` is auto-derived from Telegram `getChat`, masked SMTP first non-empty recipient such as `a***e@example.com`, or Notion database title). |
-| `PATCH /api/v1/destinations/{id}` | Partially update a destination's label, target config (`DestinationPatch`), or `enabled` state (manually toggling `enabled` clears `auto_paused = false`). Modifying SMTP `to_addresses` syncs `smtp_recipients` (new addresses start `unverified`, removed addresses are deleted, retained addresses preserve status). |
+| `POST /api/v1/channels/{id}/test` | When `destination_id` is omitted, verifies account-level credentials (for SMTP, verifies connectivity/auth and sends a self-test email **only to `from_address`**; for Telegram, runs `getMe` + `sendRichMessage` probe; for Notion, calls `GET /v1/users/me`; for `plugin`, calls signed bridge `POST /test` with `scope: "account"`). Passing `{ "destination_id": 5, "locale"?: "en" \| "zh-CN" }` runs a destination test (same compliance rules as `POST /api/v1/destinations/{id}/test`). |
+| `GET /api/v1/channels/{id}/destinations` | List all destinations belonging to channel account `{id}` (`ChannelDestinationDto[]`, including `auto_paused: bool`, schema-redacted secret fields on `plugin` destinations, and `smtp_summary` on SMTP destinations). |
+| `POST /api/v1/channels/{id}/destinations` | Returns **`201 Created`**. Create and encrypt a new destination under channel account `{id}` (`CreateDestinationRequest`; optional `name` is auto-derived from Telegram `getChat`, masked SMTP first non-empty recipient such as `a***e@example.com`, Notion database title, or primary `plugin` destination field). For `plugin` accounts, validates destination config via signed bridge `POST /validate` (`scope: "destination"`). |
+| `PATCH /api/v1/destinations/{id}` | Partially update a destination's label, target config (`DestinationPatch`), or `enabled` state (manually toggling `enabled` clears `auto_paused = false`; secret fields on `plugin` destinations are preserved when omitted or empty). Modifying SMTP `to_addresses` syncs `smtp_recipients` (new addresses start `unverified`, removed addresses are deleted, retained addresses preserve status). |
 | `DELETE /api/v1/destinations/{id}` | Atomically delete a destination. If any routes still reference this destination and `?cascade=true` is not set, returns **`409 Conflict`** with `{ "error", "code": "conflict", "message", "referencing_routes": [{ "id", "name" }] }`. Passing **`?cascade=true`** deletes the destination together with its referencing routes and tasks. |
-| `POST /api/v1/destinations/{id}/test` | Send an interactive test email, Telegram message, or Notion verification page to destination `{id}` (`TestChannelResponse`). Optional body `{ "locale"?: "en" \| "zh-CN" }` selects the test message language. For SMTP destinations, strictly delivers **only to `verified` recipients** via isolated single-`To:` envelopes with RFC 8058 compliance headers, returning an error when `0` verified recipients exist. |
+| `POST /api/v1/destinations/{id}/test` | Send an interactive test email, Telegram message, Notion verification page, or signed bridge `POST /test` (`scope: "destination"`) to destination `{id}` (`TestChannelResponse`). Optional body `{ "locale"?: "en" \| "zh-CN" }` selects the test message language. For SMTP destinations, strictly delivers **only to `verified` recipients** via isolated single-`To:` envelopes with RFC 8058 compliance headers, returning an error when `0` verified recipients exist. |
 | `POST /api/v1/channels/notion/init-db` | Provision a new 8-column Notion database under a parent page (`Notion-Version: 2026-03-11`, `initial_data_source.properties`, including optional `Short URL`). |
 | `POST /api/v1/channels/notion/inspect-schema` | Inspect an existing Notion `data_source_id` (or database URL) and optionally auto-patch missing standard columns (`patch_missing: true`). |
+
+### Plugin Channel Config Shape (`kind = "plugin"`)
+
+When creating or updating an HTTP Bridge channel account (`ChannelKind::Plugin`), bind `plugin_id` on the account and pass schema-defined fields inside `config`:
+
+```json
+{
+  "name": "Self-hosted ntfy",
+  "kind": "plugin",
+  "config": {
+    "kind": "plugin",
+    "plugin_id": "ntfy",
+    "config": {
+      "server_url": "https://ntfy.example.com",
+      "access_token": "tk_..."
+    }
+  },
+  "initial_destination": {
+    "name": "Release Alerts",
+    "config": {
+      "kind": "plugin",
+      "config": {
+        "topic": "feedcourier-alerts",
+        "priority": "high"
+      }
+    }
+  }
+}
+```
+
+Secret fields declared in the bridge manifest's `account_schema` / `destination_schema` (such as `"format": "password"` or token/secret keys) are encrypted at rest with ChaCha20-Poly1305 and automatically redacted on `GET` responses as `has_<field>: true|false` and `<field>_hint: "tk_••••"` (omitting plaintext).
 
 ### SMTP Per-Recipient Compliance (`/api/v1/destinations/{id}/recipients*`)
 
@@ -188,13 +219,16 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 
 | Method & Path | Description |
 | :--- | :--- |
-| `GET /api/v1/plugins` | List installed plugins (`PluginDto[]`), including `manifest` (with `instance_schema` and `route_option_schema`), `enabled`, `installed_version`, `settings`, `instance_count`, and redacted `instances: PluginInstanceDto[]`. |
-| `PATCH /api/v1/plugins/{id}` | Body `{ "enabled"?: bool, "settings"?: object }`. Globally enable/disable a plugin or update plugin-level settings (disabling preserves route configs). |
-| `GET /api/v1/plugins/{id}/instances` | List configured provider instances (`PluginInstanceDto[]`) for plugin `{id}` with secret fields redacted (`has_signature`, `signature_hint`, `has_password`) and `cache_entries` count. |
+| `GET /api/v1/plugins` | List installed plugins (`PluginDto[]`), including `source` / `runtime` (`builtin` \| `bridge`), `kind` (`processor` \| `channel`), `bridge_url`, `compatible` / `compatibility_reason`, `manifest` (with `instance_schema`, `route_option_schema`, `account_schema`, `destination_schema`, `capabilities`), `enabled`, `installed_version`, `settings`, `instance_count`, and redacted `instances: PluginInstanceDto[]`. |
+| `POST /api/v1/plugins/bridges` | Register an out-of-process HTTP Bridge Plugin (`{ "bridge_url", "bridge_secret", "enabled"?: true, "dry_run"?: false }`). Probes signed `GET /manifest` (HMAC-SHA256) and validates Protocol v1 compatibility. With `dry_run: true`, returns **`200 OK`** (`BridgeManifestPreviewResponse`) without persisting; otherwise encrypts `bridge_secret`, persists the plugin, reloads the in-memory registry, and returns **`201 Created`** (`PluginDto`; returns **`409 Conflict`** if the manifest `id` is already installed). |
+| `PATCH /api/v1/plugins/{id}` | Body `{ "enabled"?: bool, "settings"?: object, "bridge_url"?: string, "bridge_secret"?: string }`. Globally enable/disable a plugin or update plugin-level settings (disabling preserves route configs). For bridge plugins, also supports in-place `bridge_url` updates and `bridge_secret` rotation, performing a mandatory live signed `GET /manifest` probe and enforcing manifest `id`, `kind`, and Protocol v1 compatibility checks before persisting. |
+| `POST /api/v1/plugins/{id}/refresh-manifest` | Re-fetch a registered bridge plugin's signed `GET /manifest` to update version, schemas, and capabilities. Strictly forbids `kind` mutation (`processor` ↔ `channel`) and syncs `capabilities_json` on all referencing `kind = 'plugin'` channels. |
+| `DELETE /api/v1/plugins/{id}` | Delete a registered HTTP Bridge Plugin. Refuses built-in plugins with **`400 Bad Request`**. If still referenced by any `kind = 'plugin'` channels or routes (`options.plugins` / `options.plugin_order`) and `?cascade=true` is not set, returns **`409 Conflict`** with `{ "error", "code": "conflict", "message", "referencing_channels": [{ "id", "name" }], "referencing_routes": [{ "id", "name" }] }`. Passing **`?cascade=true`** deletes the plugin together with referencing channel accounts (and their destinations/routes/tasks) and strips processor references from remaining routes. |
+| `GET /api/v1/plugins/{id}/instances` | List configured provider instances (`PluginInstanceDto[]`) for plugin `{id}` with secret fields redacted (`has_signature`, `signature_hint`, `has_password`, or schema-driven `has_<field>` / `<field>_hint`) and `cache_entries` count. |
 | `POST /api/v1/plugins/{id}/instances` | Returns **`201 Created`**. Validate, encrypt (`ChaCha20-Poly1305`), and store a new provider instance (`CreatePluginInstanceRequest`: `{ "name", "config", "enabled"?: true }`). |
-| `PATCH /api/v1/plugins/{id}/instances/{iid}` | Secret-preserving partial update of a provider instance (`UpdatePluginInstanceRequest`; omitting or sending `""` for `signature`/`password` preserves the stored secret). |
+| `PATCH /api/v1/plugins/{id}/instances/{iid}` | Secret-preserving partial update of a provider instance (`UpdatePluginInstanceRequest`; omitting or sending `""` for secret fields preserves the stored secret). |
 | `DELETE /api/v1/plugins/{id}/instances/{iid}` | Delete a provider instance. If referenced by any route (`routes.options_json`), returns **`409 Conflict`** with `referencing_routes: [{ "id", "name" }]`. |
-| `POST /api/v1/plugins/{id}/instances/{iid}/test` | Execute a live connectivity test (for `link-rewrite`, shortens `https://feedcourier.ellery.me/` via `ProtectedHttpClient`). Returns `{ "ok": true, "message": "..." }`. |
+| `POST /api/v1/plugins/{id}/instances/{iid}/test` | Execute a live connectivity test (for `link-rewrite`, shortens `https://feedcourier.ellery.me/` via `ProtectedHttpClient`; for bridge processors, calls signed `POST /test` with `scope: "instance"`). Returns `{ "ok": true, "message": "..." }`. |
 | `DELETE /api/v1/plugins/{id}/instances/{iid}/cache` | Clear all `plugin_link_cache` rows for provider `{iid}`. Returns `{ "cleared_entries": N }`. |
 | `GET /api/v1/plugins/market` | Fetch the plugin marketplace index via `ProtectedHttpClient` (6h in-memory cache; 60s negative-cache TTL on compiled snapshot fallback; preserves valid remote cache on transient refresh errors; pass `?refresh=true` to bypass cache). Returns `{ "source": "remote" \| "snapshot", "index_url", "generated_at", "plugins": MarketPluginItemDto[] }` annotated with `kind`, `installed`, and `enabled`, with `homepage`/`repository` restricted strictly to `http://` or `https://` URLs. |
 
@@ -226,8 +260,11 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
   "timezone": "America/New_York",
   "active_windows": [{ "start": "22:00", "end": "06:00" }],
   "active_weekdays": [1, 2, 3, 4, 5],
+  "plugin_order": ["link-rewrite", "ai-summary"],
   "plugins": {
-    "link-rewrite": { "provider_id": 1 }
+    "link-rewrite": { "provider_id": 1 },
+    "ai-summary": {},
+    "optional-tagger": { "enabled": false }
   }
 }
 ```
@@ -240,7 +277,8 @@ Delivers a single feed entry to a trusted destination for testing. It is **state
 | `timezone` | Optional per-route IANA timezone override (e.g., `"Asia/Shanghai"`, `"America/New_York"`; omit or pass `""` to inherit `settings.timezone`). Governs `active_windows` / `active_weekdays`, SMTP email article timestamps, and Telegram rich-message `<footer>` timestamps (`YYYY-MM-DD HH:MM (UTC±HH:MM)`). |
 | `active_windows` | Daily delivery windows (`HH:MM`) in the **route timezone** (inheriting system timezone), evaluated with DST-safe boundaries. `end` earlier than `start` wraps midnight; only `00:00`–`00:00` (or an empty list `[]`) means all day—any other `start == end` window returns **`400 Bad Request`**. |
 | `active_weekdays` | `1` (Monday) – `7` (Sunday); empty means every day. For a window wrapping midnight, the weekday of the day the window starts is used. |
-| `plugins` | Optional map of per-plugin route configuration keyed by plugin ID (e.g., `{"link-rewrite": {"provider_id": 1}}`). Validated on route create/update against installed plugins and provider instances. |
+| `plugin_order` | Optional ordered array of enabled processor plugin IDs controlling the `on_render` pipeline execution sequence (maximum **64** entries). Plugins present in `plugins` but omitted from `plugin_order` execute afterwards in ascending ID order. |
+| `plugins` | Optional map of per-plugin route configuration keyed by plugin ID (e.g., `{"link-rewrite": {"provider_id": 1}}`). Supports `{}` for zero-argument processor plugins and `"enabled": false` to explicitly disable a plugin on this route. Validated on route create/update against installed processor plugins and provider instances. |
 
 Tasks outside the window or weekdays are **still queued**: their status stays `queued` / `deferred` and `next_attempt_at` is set to the next window start.
 

@@ -385,6 +385,32 @@ impl Plugin for LinkRewritePlugin {
         ))
     }
 
+    async fn effective_strict_mode(&self, ctx: &RenderContext<'_>) -> bool {
+        let Some(raw_opt) = ctx.plugin_route_config else {
+            return false;
+        };
+        if raw_opt.get("strict_mode").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+        let Ok(route_opt) = serde_json::from_value::<LinkRewriteRouteOption>(raw_opt.clone())
+        else {
+            return false;
+        };
+        let Some(provider_id) = route_opt.provider_id else {
+            return false;
+        };
+        if let Ok(Some(instance)) = ctx.db.get_plugin_instance(provider_id).await
+            && instance.plugin_id == LINK_REWRITE_PLUGIN_ID
+            && instance.enabled
+            && let Ok(provider_cfg) = ctx
+                .master_key
+                .decrypt_json::<YourlsProviderConfig>(&instance.encrypted_config)
+        {
+            return provider_cfg.strict_mode;
+        }
+        false
+    }
+
     async fn on_render(
         &self,
         ctx: &RenderContext<'_>,

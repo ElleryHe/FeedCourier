@@ -267,28 +267,68 @@ export function SettingsView() {
     }
   };
 
+  const configuredPublicUrl = settingsQuery.data?.public_url
+    ?.trim()
+    .replace(/\/+$/, "");
   const mcpEndpointUrl =
-    typeof window !== "undefined"
-      ? `${window.location.origin}/mcp`
-      : "http://127.0.0.1:8080/mcp";
+    configuredPublicUrl && configuredPublicUrl.length > 0
+      ? `${configuredPublicUrl}/mcp`
+      : typeof window !== "undefined"
+        ? `${window.location.origin}/mcp`
+        : "http://127.0.0.1:8080/mcp";
+
+  const resolveAuthoritativeMcpUrl = (
+    clientConfigJson: string | undefined,
+  ): string => {
+    if (clientConfigJson) {
+      try {
+        const parsed = JSON.parse(clientConfigJson) as {
+          mcpServers?: { feedcourier?: { url?: unknown } };
+        };
+        const url = parsed?.mcpServers?.feedcourier?.url;
+        if (typeof url === "string" && url.trim().length > 0) {
+          return url.trim();
+        }
+      } catch {
+        // Fall back to resolved endpoint URL when snippet JSON is unparseable
+      }
+    }
+    return mcpEndpointUrl;
+  };
+
+  const needsMcpRemoteAllowHttp = (endpointUrl: string): boolean => {
+    try {
+      const parsed = new URL(endpointUrl);
+      if (parsed.protocol !== "http:") return false;
+      const host = parsed.hostname.toLowerCase();
+      return (
+        host !== "localhost" &&
+        host !== "127.0.0.1" &&
+        host !== "::1" &&
+        host !== "[::1]"
+      );
+    } catch {
+      return false;
+    }
+  };
 
   const buildClientConfigSnippet = (
     tab: "claude" | "cursor" | "generic",
     modal: CreateMcpTokenResponse,
   ): string => {
+    const endpointUrl = resolveAuthoritativeMcpUrl(modal.client_config_json);
     if (tab === "claude") {
+      const args = ["-y", "mcp-remote", endpointUrl];
+      if (needsMcpRemoteAllowHttp(endpointUrl)) {
+        args.push("--allow-http");
+      }
+      args.push("--header", `Authorization: Bearer ${modal.plaintext_token}`);
       return JSON.stringify(
         {
           mcpServers: {
             feedcourier: {
               command: "npx",
-              args: [
-                "-y",
-                "mcp-remote",
-                mcpEndpointUrl,
-                "--header",
-                `Authorization: Bearer ${modal.plaintext_token}`,
-              ],
+              args,
             },
           },
         },
@@ -301,7 +341,7 @@ export function SettingsView() {
         {
           mcpServers: {
             feedcourier: {
-              url: mcpEndpointUrl,
+              url: endpointUrl,
               headers: {
                 Authorization: `Bearer ${modal.plaintext_token}`,
               },
@@ -319,7 +359,7 @@ export function SettingsView() {
           mcpServers: {
             feedcourier: {
               type: "streamable-http",
-              url: mcpEndpointUrl,
+              url: endpointUrl,
               headers: {
                 Authorization: `Bearer ${modal.plaintext_token}`,
               },

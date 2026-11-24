@@ -1001,6 +1001,15 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
                             )}
                           </span>
                         )}
+                        {(task.status === "deferred" ||
+                          task.status === "retrying") &&
+                          task.next_attempt_at && (
+                            <span title={formatDateTime(task.next_attempt_at)}>
+                              {m.tasks.nextPrefix(
+                                formatDateTime(task.next_attempt_at),
+                              )}
+                            </span>
+                          )}
                       </div>
 
                       {task.diagnostic_log && (

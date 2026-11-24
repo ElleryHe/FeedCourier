@@ -416,13 +416,14 @@ impl DeliveryDispatcher {
         self.inner.started_at
     }
 
-    /// Return `(poller_panics, outbox_panics, maintenance_panics)`.
-    pub fn panic_counts(&self) -> (u64, u64, u64) {
+    /// Return `(poller_panics, outbox_panics, maintenance_panics, plugin_events_panics)`.
+    pub fn panic_counts(&self) -> (u64, u64, u64, u64) {
         use std::sync::atomic::Ordering;
         (
             self.inner.poller_panics.load(Ordering::Relaxed),
             self.inner.outbox_panics.load(Ordering::Relaxed),
             self.inner.maintenance_panics.load(Ordering::Relaxed),
+            self.inner.plugin_events_panics.load(Ordering::Relaxed),
         )
     }
 
@@ -1625,6 +1626,21 @@ impl DeliveryDispatcher {
     /// [`MAX_PLUGIN_EVENT_ATTEMPTS`] (`15s, 30s, 60s, 120s`); permanently dropped after max attempts
     /// without affecting the already-delivered task status or channel quotas.
     pub async fn process_due_plugin_events_once(&self, limit: i64) -> AppResult<usize> {
+        self.process_due_plugin_events_cancellable(limit, &CancellationToken::new())
+            .await
+    }
+
+    /// Shutdown-aware variant of [`Self::process_due_plugin_events_once`]: aborts immediately
+    /// when `cancel` is triggered (including mid-HTTP request against an unreachable sidecar),
+    /// leaving unacknowledged `plugin_events` rows intact in SQLite for the next startup.
+    pub async fn process_due_plugin_events_cancellable(
+        &self,
+        limit: i64,
+        cancel: &CancellationToken,
+    ) -> AppResult<usize> {
+        if cancel.is_cancelled() {
+            return Ok(0);
+        }
         let now = now_unix();
         let events = self.inner.db.list_due_plugin_events(now, limit).await?;
         if events.is_empty() {
@@ -1632,8 +1648,11 @@ impl DeliveryDispatcher {
         }
         let mut processed = 0usize;
         for ev in events {
-            processed += 1;
+            if cancel.is_cancelled() {
+                break;
+            }
             let Some(bridge) = self.inner.plugins.get_bridge(&ev.plugin_id) else {
+                processed += 1;
                 warn!(
                     plugin_id = %ev.plugin_id,
                     event_id = ev.id,
@@ -1643,6 +1662,7 @@ impl DeliveryDispatcher {
                 continue;
             };
             if !bridge.enabled {
+                processed += 1;
                 let next_attempts = ev.attempts + 1;
                 if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
                     warn!(
@@ -1662,11 +1682,13 @@ impl DeliveryDispatcher {
             }
             let payload: serde_json::Value =
                 serde_json::from_str(&ev.payload_json).unwrap_or_else(|_| serde_json::json!({}));
-            match bridge
-                .client
-                .send_on_delivered(&ev.idempotency_key, &payload)
-                .await
-            {
+            let send_outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                res = bridge.client.send_on_delivered(&ev.idempotency_key, &payload) => res,
+            };
+            processed += 1;
+            match send_outcome {
                 Ok(()) => {
                     debug!(
                         plugin_id = %ev.plugin_id,
@@ -1864,8 +1886,10 @@ impl DeliveryDispatcher {
                     if token.is_cancelled() {
                         break;
                     }
-                    let ev_fut = AssertUnwindSafe(dispatcher.process_due_plugin_events_once(64))
-                        .catch_unwind();
+                    let ev_fut = AssertUnwindSafe(
+                        dispatcher.process_due_plugin_events_cancellable(64, &token),
+                    )
+                    .catch_unwind();
                     match ev_fut.await {
                         Ok(Ok(_)) => {}
                         Ok(Err(err)) => {

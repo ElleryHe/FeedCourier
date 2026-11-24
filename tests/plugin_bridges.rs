@@ -1094,3 +1094,545 @@ async fn on_delivered_persistent_events_retry_backoff_and_409_cascade_delete() {
     // Sanity: ChannelKind::Plugin parses & formats cleanly
     assert_eq!(ChannelKind::Plugin.as_str(), "plugin");
 }
+
+#[tokio::test]
+async fn bridge_lifecycle_kind_guard_capability_sync_and_in_place_secret_rotation() {
+    let h = BridgeHarness::new().await;
+    let bridge_v1 = MockServer::start().await;
+    let bridge_v2 = MockServer::start().await;
+    let secret_v1 = "rotate-secret-v1";
+    let secret_v2 = "rotate-secret-v2";
+
+    let manifest_v1 = json!({
+        "id": "rot-chan",
+        "name": "Rotatable Channel",
+        "version": "1.0.0",
+        "api_version": "1",
+        "kind": "channel",
+        "hooks": [],
+        "account_schema": { "type": "object", "properties": {} },
+        "destination_schema": { "type": "object", "properties": {} },
+        "capabilities": { "supports_html": false, "max_text_len": 4096 }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with({
+            let m = manifest_v1.clone();
+            move |req: &MockRequest| {
+                assert_valid_bridge_hmac(req, secret_v1);
+                ResponseTemplate::new(200).set_body_json(m.clone())
+            }
+        })
+        .mount(&bridge_v1)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&bridge_v1)
+        .await;
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/bridges",
+            Some(json!({ "bridge_url": bridge_v1.uri(), "bridge_secret": secret_v1, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "rot-chan", "config": {} },
+                "initial_destination": { "config": { "kind": "plugin", "config": {} } },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+
+    // 1. P1-05: refresh-manifest MUST reject cross-kind mutation (channel -> processor).
+    bridge_v1.reset().await;
+    let mut bad_kind = manifest_v1.clone();
+    bad_kind["kind"] = json!("processor");
+    bad_kind["hooks"] = json!(["on_render"]);
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bad_kind))
+        .mount(&bridge_v1)
+        .await;
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/rot-chan/refresh-manifest",
+            None,
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "cross-kind mutation must be rejected: {err}"
+    );
+
+    // 2. P1-05: refresh-manifest synchronizes updated capabilities_json to existing channels.
+    bridge_v1.reset().await;
+    let mut updated_caps = manifest_v1.clone();
+    updated_caps["version"] = json!("1.1.0");
+    updated_caps["capabilities"] = json!({ "supports_html": true, "max_text_len": 8192 });
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(updated_caps))
+        .mount(&bridge_v1)
+        .await;
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/rot-chan/refresh-manifest",
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let ch_row = h.db.get_channel(ch_id).await.unwrap().unwrap();
+    assert!(
+        ch_row.capabilities_json.contains("8192"),
+        "channel capabilities_json must be synced on refresh: {}",
+        ch_row.capabilities_json
+    );
+
+    // 3. P1-05: PATCH /api/v1/plugins/{id} probes new URL + rotated secret before saving;
+    //    if probe fails (401), old connection remains intact.
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with({
+            let m = manifest_v1.clone();
+            move |req: &MockRequest| {
+                let ts: i64 = req
+                    .headers
+                    .get(HEADER_TIMESTAMP)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let sig = req.headers.get(HEADER_SIGNATURE).unwrap().to_str().unwrap();
+                if !verify_bridge_signature(secret_v2, ts, &req.body, sig, now_unix()) {
+                    return ResponseTemplate::new(401)
+                        .set_body_json(json!({ "ok": false, "error": "bad sig" }));
+                }
+                let mut m2 = m.clone();
+                m2["version"] = json!("2.0.0");
+                m2["capabilities"] = json!({ "supports_html": true, "max_text_len": 16384 });
+                ResponseTemplate::new(200).set_body_json(m2)
+            }
+        })
+        .mount(&bridge_v2)
+        .await;
+
+    let (st, _) = h
+        .req(
+            Method::PATCH,
+            "/api/v1/plugins/rot-chan",
+            Some(json!({ "bridge_url": bridge_v2.uri(), "bridge_secret": "wrong-secret" })),
+        )
+        .await;
+    assert!(st.is_client_error() || st.is_server_error());
+    assert_eq!(
+        h.dispatcher
+            .plugins()
+            .get_bridge("rot-chan")
+            .unwrap()
+            .bridge_url,
+        bridge_v1.uri()
+    );
+
+    // Now rotate cleanly with valid secret_v2 -> updates URL, secret, version & capabilities!
+    let (st, patched) = h
+        .req(
+            Method::PATCH,
+            "/api/v1/plugins/rot-chan",
+            Some(json!({ "bridge_url": bridge_v2.uri(), "bridge_secret": secret_v2 })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "rotation failed: {patched}");
+    assert_eq!(patched["bridge_url"], bridge_v2.uri());
+    assert_eq!(patched["installed_version"], "2.0.0");
+    let ch_row = h.db.get_channel(ch_id).await.unwrap().unwrap();
+    assert!(ch_row.capabilities_json.contains("16384"));
+
+    // Subsequent delivery hits bridge_v2 authenticated with secret_v2!
+    let seen_keys = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    Mock::given(method("POST"))
+        .and(path("/deliver"))
+        .respond_with({
+            let seen_keys = Arc::clone(&seen_keys);
+            move |req: &MockRequest| {
+                assert_valid_bridge_hmac(req, secret_v2);
+                if let Some(k) = req.headers.get(HEADER_IDEMPOTENCY_KEY) {
+                    seen_keys
+                        .lock()
+                        .unwrap()
+                        .push(k.to_str().unwrap().to_string());
+                }
+                ResponseTemplate::new(200).set_body_json(json!({ "outcome": "delivered" }))
+            }
+        })
+        .mount(&bridge_v2)
+        .await;
+
+    let (feed_id, entry_id) = h.seed_feed_and_entry("<p>Rotated</p>", "Rotated").await;
+    let route =
+        h.db.create_route(&NewRoute {
+            name: "Rot Route".to_string(),
+            feed_ids: vec![feed_id],
+            match_tags: vec![],
+            channel_id: ch_id,
+            destination_id: dest_id,
+            include_keywords: vec![],
+            exclude_keywords: vec![],
+            include_regex: None,
+            exclude_regex: None,
+            options: RouteOptions::default(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let task =
+        h.db.enqueue_delivery_task(route.id, ch_id, dest_id, entry_id, now_unix())
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(h.dispatcher.process_next_outbox_task().await.unwrap());
+    assert_eq!(
+        h.db.get_delivery_task(task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryTaskStatus::Delivered
+    );
+
+    // P2-06: Two consecutive debug pushes (task.id == 0) for the same entry MUST produce distinct idempotency keys.
+    let entry = h.db.get_entry(entry_id).await.unwrap().unwrap();
+    let feed = h.db.get_feed(feed_id).await.unwrap().unwrap();
+    let dest = h.db.get_destination(dest_id).await.unwrap().unwrap();
+    let ch_cfg: feedcourier::channels::ChannelConfig = h
+        .dispatcher
+        .master_key()
+        .decrypt_json(&ch_row.encrypted_config)
+        .unwrap();
+    let dest_cfg: feedcourier::channels::DestinationConfig = h
+        .dispatcher
+        .master_key()
+        .decrypt_json(&dest.encrypted_config)
+        .unwrap();
+    let sender =
+        feedcourier::plugins::bridge::BridgeChannelSender::new(h.dispatcher.plugins().clone());
+    let mut dummy_task = h.db.get_delivery_task(task.id).await.unwrap().unwrap();
+    dummy_task.id = 0;
+    let dctx = feedcourier::channels::DeliveryContext {
+        task: &dummy_task,
+        entry: &entry,
+        feed: &feed,
+        route: &route,
+        route_options: RouteOptions::default(),
+        channel: &ch_row,
+        channel_config: &ch_cfg,
+        destination: &dest,
+        destination_config: &dest_cfg,
+        timezone: chrono_tz::UTC,
+        checkpoint: None,
+        checkpoint_sink: None,
+        overrides: feedcourier::plugins::RenderOverrides::default(),
+        smtp_delivery: None,
+    };
+    use feedcourier::channels::ChannelSender;
+    assert!(matches!(
+        sender.send(&dctx).await.unwrap(),
+        feedcourier::channels::DeliveryOutcome::Delivered { .. }
+    ));
+    assert!(matches!(
+        sender.send(&dctx).await.unwrap(),
+        feedcourier::channels::DeliveryOutcome::Delivered { .. }
+    ));
+    let keys = seen_keys.lock().unwrap();
+    assert_eq!(keys.len(), 3);
+    assert_ne!(
+        keys[1], keys[2],
+        "consecutive debug pushes (task.id == 0) must use unique idempotency keys"
+    );
+}
+
+#[tokio::test]
+async fn plugin_events_cancellation_aborts_stuck_sidecar_immediately() {
+    let h = BridgeHarness::new().await;
+    let slow_bridge = MockServer::start().await;
+    let secret = "cancel-secret";
+
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "slow-ev",
+            "name": "Slow Events",
+            "version": "1.0.0",
+            "api_version": "1",
+            "kind": "processor",
+            "hooks": ["on_delivered"]
+        })))
+        .mount(&slow_bridge)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hooks/on_delivered"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(json!({ "ok": true })),
+        )
+        .mount(&slow_bridge)
+        .await;
+
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/bridges",
+            Some(json!({ "bridge_url": slow_bridge.uri(), "bridge_secret": secret, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    sqlx::query(
+        "INSERT INTO plugin_events (plugin_id, event, idempotency_key, payload_json, attempts, next_attempt_at) VALUES (?1, 'on_delivered', 'idem-cancel-1', '{}', 0, ?2)",
+    )
+    .bind("slow-ev")
+    .bind(now_unix() - 1)
+    .execute(h.db.write_pool())
+    .await
+    .unwrap();
+
+    // P1-04: Cancel after 100ms while HTTP call would otherwise stall 10s+; must return promptly
+    // and preserve the unacknowledged event row in SQLite.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel_trigger.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let processed = h
+        .dispatcher
+        .process_due_plugin_events_cancellable(64, &cancel)
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "cancellation must abort stuck plugin_events HTTP call promptly (took {elapsed:?})"
+    );
+    assert_eq!(processed, 0);
+    let still_pending =
+        h.db.list_due_plugin_events(now_unix() + 60, 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "unacked event must stay persisted in SQLite"
+    );
+}
+
+#[tokio::test]
+async fn migration_0004_preserves_channels_sqlite_sequence_watermark() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("upgrade_seq.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+
+    // Apply pre-v0.3.1 migrations (0001 -> 0003).
+    sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0002_channel_destinations.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0003_plugins_and_smtp_compliance.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create channel #1 and channel #2, record quota ledger for #2, then delete #2.
+    sqlx::query(
+        "INSERT INTO channels (name, kind, encrypted_config, credential_group_key) VALUES ('Ch1', 'smtp', X'01', 'cg1'), ('Ch2', 'smtp', X'02', 'cg2')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO delivery_quota_ledger (channel_id, credential_group_key, completed_at) VALUES (2, 'cg2', 1700000000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM channels WHERE id = 2")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Apply v0.3.1 migration 0004 (rebuilds `channels` table).
+    sqlx::raw_sql(include_str!("../migrations/0004_plugin_bridges.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // P1-06: Next created channel MUST get id = 3 (never reusing deleted id = 2).
+    let (new_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO channels (name, kind, encrypted_config, credential_group_key) VALUES ('Ch3', 'plugin', X'03', 'cg3') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        new_id, 3,
+        "0004 migration must preserve sqlite_sequence watermark so deleted channel IDs are never reused"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn schema_merge_null_clears_defaulted_field_and_route_validation_checks_order_and_schema() {
+    use feedcourier::plugins::bridge::{
+        merge_config_against_schema, validate_config_against_schema,
+    };
+
+    // P2-05 (1): PATCH null clears optional field with `default` and does NOT refill on PATCH.
+    let schema = json!({
+        "type": "object",
+        "required": ["topic"],
+        "properties": {
+            "topic": { "type": "string" },
+            "priority": { "type": "string", "default": "default" },
+            "access_token": { "type": "string", "format": "password" }
+        }
+    });
+    let created = validate_config_against_schema(
+        &schema,
+        &json!({ "topic": "alerts", "access_token": "secret123" }),
+    )
+    .unwrap();
+    assert_eq!(created["priority"], "default");
+    assert_eq!(created["access_token"], "secret123");
+
+    let cleared = merge_config_against_schema(
+        &schema,
+        &created,
+        &json!({ "priority": null, "access_token": null }),
+    )
+    .unwrap();
+    assert!(
+        cleared.get("priority").is_none(),
+        "explicit null must clear optional field even when schema declares a default: {cleared}"
+    );
+    assert!(
+        cleared.get("access_token").is_none(),
+        "explicit null must clear optional secret: {cleared}"
+    );
+
+    // Subsequent unrelated PATCH must not resurrect cleared optional field.
+    let patched_again =
+        merge_config_against_schema(&schema, &cleared, &json!({ "topic": "news" })).unwrap();
+    assert!(patched_again.get("priority").is_none());
+    assert_eq!(patched_again["topic"], "news");
+
+    // P2-05 (2) & (3): route_option_schema validation, provider_id <= 0 rejection, plugin_order validation.
+    let h = BridgeHarness::new().await;
+    let proc_srv = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/manifest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "strict-proc",
+            "name": "Strict Proc",
+            "version": "1.0.0",
+            "api_version": "1",
+            "kind": "processor",
+            "hooks": ["on_render"],
+            "route_option_schema": {
+                "type": "object",
+                "required": ["tag"],
+                "properties": {
+                    "tag": { "type": "string" }
+                }
+            }
+        })))
+        .mount(&proc_srv)
+        .await;
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/bridges",
+            Some(json!({ "bridge_url": proc_srv.uri(), "bridge_secret": "s1", "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let reg = h.dispatcher.plugins();
+    // Missing required route_option_schema field `tag` -> error
+    let mut bad_opts = RouteOptions::default();
+    bad_opts
+        .plugins
+        .insert("strict-proc".to_string(), json!({}));
+    assert!(reg.validate_route_plugins(&h.db, &bad_opts).await.is_err());
+
+    // provider_id <= 0 -> error
+    let mut bad_pid = RouteOptions::default();
+    bad_pid.plugins.insert(
+        "strict-proc".to_string(),
+        json!({ "tag": "ok", "provider_id": 0 }),
+    );
+    assert!(reg.validate_route_plugins(&h.db, &bad_pid).await.is_err());
+
+    // Unknown plugin_order entry -> error
+    let mut bad_order = RouteOptions::default();
+    bad_order
+        .plugins
+        .insert("strict-proc".to_string(), json!({ "tag": "ok" }));
+    bad_order.plugin_order = vec!["nonexistent-plug".to_string()];
+    assert!(reg.validate_route_plugins(&h.db, &bad_order).await.is_err());
+
+    // Valid route_option_schema + valid plugin_order -> Ok
+    let mut good_opts = RouteOptions::default();
+    good_opts
+        .plugins
+        .insert("strict-proc".to_string(), json!({ "tag": "ok" }));
+    good_opts.plugin_order = vec!["strict-proc".to_string()];
+    assert!(reg.validate_route_plugins(&h.db, &good_opts).await.is_ok());
+
+    // Explicit enabled=false skips required schema validation and skips execution!
+    let mut disabled_opts = RouteOptions::default();
+    disabled_opts
+        .plugins
+        .insert("strict-proc".to_string(), json!({ "enabled": false }));
+    assert!(
+        reg.validate_route_plugins(&h.db, &disabled_opts)
+            .await
+            .is_ok()
+    );
+}

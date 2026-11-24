@@ -1,14 +1,15 @@
 ---
-description: "SQLite WAL database schema reference for FeedCourier covering feeds, entries, channels, channel_destinations, smtp_recipients, plugins, plugin_instances, plugin_link_cache, routes, delivery_tasks, delivery_quota_ledger, sessions, mcp_tokens, and system_settings."
+description: "SQLite WAL database schema reference for FeedCourier covering feedcourier.db (feeds, entries, channels, channel_destinations, smtp_recipients, plugins, plugin_instances, plugin_link_cache, plugin_events, routes, delivery_tasks, delivery_quota_ledger, sessions, mcp_tokens, system_settings) and the isolated operational log store (logs.db / optional ClickHouse)."
 ---
 
 # SQLite Database Schema
 
-FeedCourier stores all persistent state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`. Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql), [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql), and [`migrations/0003_plugins_and_smtp_compliance.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0003_plugins_and_smtp_compliance.sql) and run automatically on startup.
+FeedCourier stores all persistent business state in a single SQLite `WAL` database at `<DATA_DIR>/feedcourier.db`, while structured operational logs live in a separate database (`<DATA_DIR>/logs.db` or optional ClickHouse; see [Section 9](#_9-operational-log-storage-logs-db-optional-clickhouse)). Schema migrations live in [`migrations/0001_init.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0001_init.sql), [`migrations/0002_channel_destinations.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0002_channel_destinations.sql), [`migrations/0003_plugins_and_smtp_compliance.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0003_plugins_and_smtp_compliance.sql), and [`migrations/0004_plugin_bridges.sql`](https://github.com/ElleryHe/FeedCourier/blob/main/migrations/0004_plugin_bridges.sql) and run automatically on startup.
 
 Before applying major DDL migrations against an existing database, `Database::connect` captures a pure pre-DDL online `VACUUM INTO` snapshot without overwriting prior backups (appending a UTC timestamp and collision suffix if the file or companion `-wal`/`-shm` sidecars exist, and cleaning up residual sidecar files afterward):
 - Upgrading `v0.1.x` → `v0.2.0+`: writes `<DATA_DIR>/pre-v0.2.0-backup.db` before `0002_channel_destinations.sql`, followed by `Database::migrate_channels_to_v2`.
 - Upgrading `v0.2.x` → `v0.3.0`: whenever an existing database has migration `0002` applied, `0003` pending, and **any business table (`feeds`, `channels`, or `channel_destinations`) is non-empty**, writes `<DATA_DIR>/pre-v0.3.0-backup.db` before `0003_plugins_and_smtp_compliance.sql` (and cleans up any partial backup file and `-wal`/`-shm` sidecars if `VACUUM INTO` fails), followed by the idempotent startup backfill `Database::backfill_legacy_smtp_recipients`.
+- Upgrading `v0.3.0` → `v0.3.1`: whenever an existing database has migration `0003` applied, `0004` pending, and **`feeds` or `channels` is non-empty**, writes `<DATA_DIR>/pre-v0.3.1-backup.db` via online `VACUUM INTO` before applying `0004_plugin_bridges.sql` (which extends `plugins`, rebuilds `channels` to allow `kind = 'plugin'` while preserving `sqlite_sequence`, and creates the `plugin_events` durable queue).
 
 All timestamps are stored as **UTC Unix epoch seconds (`INTEGER`)**, and relational business foreign keys enforce **`ON DELETE CASCADE`** (while `delivery_quota_ledger` intentionally omits foreign keys so deletions never clear quota usage).
 
@@ -29,6 +30,7 @@ erDiagram
     entries ||--o{ delivery_tasks : "entry_id (ON DELETE CASCADE)"
     plugins ||--o{ plugin_instances : "plugin_id (ON DELETE CASCADE)"
     plugin_instances ||--o{ plugin_link_cache : "instance_id (ON DELETE CASCADE)"
+    plugins ||--o{ plugin_events : "plugin_id (ON DELETE CASCADE)"
 ```
 
 ---
@@ -98,12 +100,12 @@ Stores account-level ChaCha20-Poly1305 encrypted credentials (`ChannelConfig`), 
 
 | Column | Type | Constraints / Default | Description |
 | :--- | :--- | :--- | :--- |
-| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique channel account ID. |
-| `name` | `TEXT` | `NOT NULL` | Display name shown in WebUI and MCP summaries (auto-derived from Telegram `getMe`, SMTP `from_address`, or Notion `/v1/users/me` when omitted). |
-| `kind` | `TEXT` | `NOT NULL` | `'smtp'`, `'telegram'`, or `'notion'`. |
-| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext (`12-byte nonce \|\| ciphertext \|\| 16-byte Poly1305 tag`) of account-level `ChannelConfig` (SMTP server/auth/`from_address`, Telegram `bot_token`/`api_base_url`, or Notion `integration_secret`). |
-| `credential_group_key` | `TEXT` | `NOT NULL` | SHA-256 key grouping accounts sharing the same underlying sender credential (for SMTP, incorporates the SHA-256 digest of the password—never plaintext—so distinct API keys under a shared username such as SendGrid's `apikey` stay isolated). |
-| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Cached capability probe JSON (e.g., Telegram `supports_rich_message`, `bot_api_version`, `bot_username`). |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique channel account ID (`sqlite_sequence` is preserved across the `0004_plugin_bridges.sql` table rebuild so historical IDs are never reused). |
+| `name` | `TEXT` | `NOT NULL` | Display name shown in WebUI and MCP summaries (auto-derived from Telegram `getMe`, SMTP `from_address`, Notion `/v1/users/me`, or bridge channel plugin name when omitted). |
+| `kind` | `TEXT` | `NOT NULL CHECK (kind IN ('smtp', 'telegram', 'notion', 'plugin'))` | Channel kind (`'plugin'` added via table rebuild in `0004_plugin_bridges.sql`). |
+| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext (`12-byte nonce \|\| ciphertext \|\| 16-byte Poly1305 tag`) of account-level `ChannelConfig` (SMTP server/auth/`from_address`, Telegram `bot_token`/`api_base_url`, Notion `integration_secret`, or bridge `PluginChannelConfig { plugin_id, config }`). |
+| `credential_group_key` | `TEXT` | `NOT NULL` | SHA-256 key grouping accounts sharing the same underlying sender credential (for SMTP, incorporates the SHA-256 digest of the password—never plaintext—so distinct API keys under a shared username such as SendGrid's `apikey` stay isolated; for `plugin`, hashes `plugin_id` plus canonical account config JSON). |
+| `capabilities_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Cached capability probe JSON (e.g., Telegram `supports_rich_message`, `bot_api_version`, `bot_username`; or bridge channel `capabilities` synced from `manifest_json`). |
 | `min_interval_secs` | `INTEGER` | `NOT NULL DEFAULT 15` | Minimum pacing delay in seconds between deliveries across all destinations of this account. |
 | `jitter_max_secs` | `INTEGER` | `NOT NULL DEFAULT 10` | Per-delivery random jitter ceiling in seconds (`0 ..= jitter_max_secs`, kept in memory). |
 | `hourly_quota` | `INTEGER` | `NULL` | Optional maximum deliveries per rolling 1-hour window shared across all destinations of this account. |
@@ -128,7 +130,7 @@ Stores one or more concrete delivery targets per parent Channel Account (`migrat
 | `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Unique destination ID (primary target for `routes` and MCP `configure_route` / `test_push_feed_entry`). |
 | `channel_id` | `INTEGER` | `NOT NULL` | Foreign key to `channels(id) ON DELETE CASCADE`. |
 | `name` | `TEXT` | `NOT NULL` | Destination label shown in WebUI and redacted MCP summaries (auto-derived from Telegram `getChat`, masked SMTP first recipient such as `a***e@example.com`, or Notion database title when omitted). |
-| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext of `DestinationConfig` (Telegram `chat_id`/`message_thread_id`, SMTP `to_addresses`/`reply_to`, or Notion `data_source_id`/`column_mapping`). |
+| `encrypted_config` | `BLOB` | `NOT NULL` | ChaCha20-Poly1305 ciphertext of `DestinationConfig` (Telegram `chat_id`/`message_thread_id`, SMTP `to_addresses`/`reply_to`, Notion `data_source_id`/`column_mapping`, or bridge `PluginDestinationConfig { config }`). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when paused independently of sibling destinations. |
 | `auto_paused` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | Added in `0003_plugins_and_smtp_compliance.sql`. Set to `1` alongside `enabled = 0` when all SMTP recipients become `unsubscribed` or `bounced`. When any recipient subsequently completes re-verification while `auto_paused = 1`, FeedCourier atomically restores `enabled = 1, auto_paused = 0` and wakes deferred tasks; manually toggling `enabled` clears `auto_paused = 0` so manually disabled destinations remain paused. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
@@ -155,7 +157,7 @@ Binds feed IDs or tags to a target `destination_id` (alongside its parent `chann
 | `exclude_keywords_json` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON array of case-insensitive excluded keywords. |
 | `include_regex` | `TEXT` | `NULL` | Optional regular expression that must match. |
 | `exclude_regex` | `TEXT` | `NULL` | Optional regular expression that rejects matching entries. |
-| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `timezone` (optional per-route IANA timezone override inheriting `system_settings.timezone`), `active_windows` (`[{start, end}]`, `HH:MM` in the route timezone), `active_weekdays` (`1` = Mon … `7` = Sun), and `plugins` (`{ "<plugin_id>": { ... } }`). |
+| `options_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | JSON `RouteOptions`: `telegram_mode`, `link_preview`, `locale` (route delivery language), `timezone` (optional per-route IANA timezone override inheriting `system_settings.timezone`), `active_windows` (`[{start, end}]`, `HH:MM` in the route timezone), `active_weekdays` (`1` = Mon … `7` = Sun), `plugin_order` (optional ordered array of up to 64 processor plugin IDs), and `plugins` (`{ "<plugin_id>": { ... } }`). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 1` | `1` when active, `0` when disabled. |
 | `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Creation timestamp. |
 | `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Last modification timestamp. |
@@ -239,18 +241,24 @@ Added in `migrations/0002_channel_destinations.sql` to decouple rolling 1-hour /
 
 ---
 
-### 7. `plugins`, `plugin_instances` & `plugin_link_cache` (`0003_plugins_and_smtp_compliance.sql`)
+### 7. `plugins`, `plugin_instances`, `plugin_link_cache` & `plugin_events` (`0003` + `0004_plugin_bridges.sql`)
 
-Added in `v0.3.0` to store plugin enablement, encrypted provider configurations, and persistent short-link caches:
+Added in `v0.3.0` (`0003_plugins_and_smtp_compliance.sql`) and extended in `v0.3.1` (`0004_plugin_bridges.sql`) to support out-of-process HTTP Bridge Plugins, encrypted bridge secrets, cached manifests, and durable at-least-once `on_delivered` webhook queues:
 
 #### `plugins`
 
 | Column | Type | Constraints / Default | Description |
 | :--- | :--- | :--- | :--- |
-| `id` | `TEXT` | `PRIMARY KEY NOT NULL` | Canonical plugin identifier (e.g., `'link-rewrite'`). |
+| `id` | `TEXT` | `PRIMARY KEY NOT NULL` | Canonical plugin identifier (e.g., `'link-rewrite'`, `'ntfy'`). |
 | `enabled` | `INTEGER` | `NOT NULL DEFAULT 0 CHECK (IN (0, 1))` | Global enable toggle (disabling skips hooks while keeping route configs). |
 | `installed_version` | `TEXT` | `NOT NULL` | Installed plugin SemVer version. |
 | `settings_json` | `TEXT` | `NOT NULL DEFAULT '{}'` | Optional plugin-wide JSON settings. |
+| `source` | `TEXT` | `NOT NULL DEFAULT 'builtin' CHECK (source IN ('builtin', 'bridge'))` | Added in `0004_plugin_bridges.sql`. Distinguishes compiled built-in plugins from registered HTTP Bridge sidecars. |
+| `kind` | `TEXT` | `NOT NULL DEFAULT 'processor' CHECK (kind IN ('processor', 'channel'))` | Added in `0004_plugin_bridges.sql`. Plugin role (`'processor'` for `on_render`/`on_delivered` hooks or `'channel'` for custom delivery channels). |
+| `bridge_url` | `TEXT` | `NULL` | Added in `0004_plugin_bridges.sql`. Base HTTP(S) URL of the bridge sidecar (`NULL` for built-in plugins). |
+| `encrypted_bridge_secret` | `BLOB` | `NULL` | Added in `0004_plugin_bridges.sql`. ChaCha20-Poly1305 AEAD ciphertext of the shared HMAC-SHA256 `BRIDGE_SECRET`. |
+| `manifest_json` | `TEXT` | `NULL` | Added in `0004_plugin_bridges.sql`. Cached Protocol v1 manifest JSON fetched via signed `GET /manifest`. |
+| `manifest_fetched_at` | `INTEGER` | `NULL` | Added in `0004_plugin_bridges.sql`. UTC Unix seconds timestamp of the last successful manifest fetch. |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Timestamps. |
 
 #### `plugin_instances`
@@ -279,6 +287,24 @@ Added in `v0.3.0` to store plugin enablement, encrypted provider configurations,
 - **Primary Key:** `(instance_id, long_url_sha256)`
 - **Index:** `idx_plugin_link_cache_last_used ON plugin_link_cache (last_used_at)`
 
+#### `plugin_events` (`0004_plugin_bridges.sql`)
+
+Durable at-least-once event outbox for asynchronous `on_delivered` webhook delivery to registered HTTP Bridge plugins (persisted alongside successful delivery and retried with exponential backoff):
+
+| Column | Type | Constraints / Default | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT NOT NULL` | Unique event queue row ID. |
+| `plugin_id` | `TEXT` | `NOT NULL REFERENCES plugins(id) ON DELETE CASCADE` | Target bridge plugin ID. |
+| `event` | `TEXT` | `NOT NULL` | Lifecycle event identifier (e.g., `'on_delivered'`). |
+| `idempotency_key` | `TEXT` | `NOT NULL` | Deterministic deduplication key sent in `X-FeedCourier-Idempotency-Key`. |
+| `payload_json` | `TEXT` | `NOT NULL` | Serialized JSON event payload (`task_id`, entry/feed/route/channel/destination metadata, `status_code`, `delivered_at`). |
+| `attempts` | `INTEGER` | `NOT NULL DEFAULT 0` | Number of dispatch attempts completed so far. |
+| `next_attempt_at` | `INTEGER` | `NOT NULL` | Earliest UTC Unix seconds timestamp when the worker may dispatch this event. |
+| `created_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Enqueue timestamp. |
+
+- **Unique Constraint:** `UNIQUE (plugin_id, idempotency_key)`
+- **Index:** `idx_plugin_events_due ON plugin_events (next_attempt_at ASC, id ASC)`
+
 ---
 
 ### 8. `smtp_recipients` (`0003_plugins_and_smtp_compliance.sql`)
@@ -306,3 +332,64 @@ Tracks per-recipient double opt-in verification, consent audit, unsubscribe, and
 
 - **Unique Constraint:** `UNIQUE (destination_id, address_hmac)`
 - **Index:** `idx_smtp_recipients_destination_status ON smtp_recipients (destination_id, status)`
+
+---
+
+### 9. Operational Log Storage (`logs.db` & Optional ClickHouse)
+
+Structured runtime logs are stored **separately** from `feedcourier.db` (`LOG_STORE=sqlite|clickhouse|off`, default `sqlite`) so log ingestion and retention pruning never contend with the main business database's write lock.
+
+#### SQLite Operational Log Database (`<DATA_DIR>/logs.db`)
+
+Opened in SQLite `WAL` mode (`synchronous = NORMAL`, `5s` busy timeout) with a single dedicated writer connection and a 4-connection read-only pool:
+
+##### `logs`
+
+| Column | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `INTEGER` | `PRIMARY KEY AUTOINCREMENT` | Monotonic log row ID. |
+| `ts_ms` | `INTEGER` | `NOT NULL` | UTC Unix epoch timestamp in **milliseconds**. |
+| `level` | `TEXT` | `NOT NULL` | Severity label (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`). |
+| `level_num` | `INTEGER` | `NOT NULL` | Numeric severity rank for threshold filtering. |
+| `target` | `TEXT` | `NOT NULL` | Rust `tracing` module target path. |
+| `message` | `TEXT` | `NOT NULL` | Redacted human-readable log message. |
+| `fields_json` | `TEXT` | `NOT NULL` | Redacted JSON object of structured event fields. |
+| `feed_id` | `INTEGER` | `NULL` | Optional correlated feed ID. |
+| `task_id` | `INTEGER` | `NULL` | Optional correlated outbox delivery task ID. |
+| `route_id` | `INTEGER` | `NULL` | Optional correlated route ID. |
+| `channel_id` | `INTEGER` | `NULL` | Optional correlated channel account ID. |
+| `destination_id` | `INTEGER` | `NULL` | Optional correlated channel destination ID. |
+| `plugin_id` | `TEXT` | `NULL` | Optional correlated plugin ID. |
+
+- **Indexes:**
+  - `idx_logs_ts ON logs(ts_ms DESC)`
+  - `idx_logs_level_ts ON logs(level_num, ts_ms DESC)`
+  - `idx_logs_task_id ON logs(task_id, ts_ms ASC) WHERE task_id IS NOT NULL`
+  - `idx_logs_feed_id ON logs(feed_id, ts_ms DESC) WHERE feed_id IS NOT NULL`
+- **Retention Pruning:** Background maintenance deletes rows older than `LOG_RETENTION_DAYS` (default `7` days) and trims oldest rows beyond `LOG_MAX_ROWS` (default `100,000`).
+
+#### Optional ClickHouse Log Backend (`LOG_STORE=clickhouse`)
+
+When `LOG_STORE=clickhouse` is enabled (`LOG_CLICKHOUSE_URL`, default database `feedcourier`, default table `logs`), FeedCourier idempotently provisions a `MergeTree` table via HTTP (`INSERT ... FORMAT JSONEachRow`, redirects disabled):
+
+```sql
+CREATE TABLE IF NOT EXISTS feedcourier.logs (
+    ts DateTime64(3, 'UTC'),
+    ts_ms Int64,
+    level LowCardinality(String),
+    level_num Int32,
+    target String,
+    message String,
+    fields_json String,
+    feed_id Nullable(Int64),
+    task_id Nullable(Int64),
+    route_id Nullable(Int64),
+    channel_id Nullable(Int64),
+    destination_id Nullable(Int64),
+    plugin_id Nullable(String)
+) ENGINE = MergeTree
+ORDER BY (ts_ms, level_num)
+TTL ts + INTERVAL <LOG_RETENTION_DAYS> DAY
+```
+
+Retention in ClickHouse is enforced natively via the table `TTL` (`LOG_MAX_ROWS` applies only to SQLite `logs.db`). Outages never block startup or delivery—failed batches increment a dropped-log counter and emit rate-limited warnings on `stderr`.

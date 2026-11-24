@@ -817,6 +817,8 @@ export const zhCN: Messages = {
       pluginOrderHint: "当路由启用多个处理插件时，可用上下箭头调整执行顺序。",
       pluginMoveUp: "上移",
       pluginMoveDown: "下移",
+      pluginEnableOnRoute: "在此路由启用",
+      pluginNoRouteOptionsHint: "已在此路由启用，该插件无需额外路由参数。",
     },
   },
 
@@ -914,6 +916,8 @@ export const zhCN: Messages = {
       signatureStoredPlaceholder: (hint: string) =>
         `已加密保存（${hint}），留空保持不变`,
       secretPreserveHint: "留空将保留当前已加密存储的密钥。",
+      clearStoredSecretLabel: "清除已存密钥",
+      secretWillClearPlaceholder: "保存后将清除已存密钥",
       usernameLabel: "用户名",
       usernamePlaceholder: "admin",
       passwordLabel: "密码",
@@ -1009,6 +1013,16 @@ export const zhCN: Messages = {
       refreshManifestTitle: "刷新桥接 Manifest",
       toastManifestRefreshed: "Manifest 已刷新",
       toastManifestRefreshFailed: "刷新 Manifest 失败",
+      editConnectionBtn: "编辑连接",
+      editModalTitle: (name: string) => `编辑桥接连接：${name}`,
+      editModalDesc: "更新桥接 sidecar 服务地址或轮换共享 HMAC 签名密钥。",
+      editSecretPlaceholder: "已加密保存 — 留空保持当前密钥不变",
+      editSecretHint:
+        "留空将保留当前已加密存储的 HMAC 密钥；填写新密钥则会执行轮换。",
+      editProbeHint:
+        "保存前会对桥接服务执行实时签名 GET /manifest 探测；若探测失败，原有连接配置不会变更。",
+      editSaveBtn: "验证并保存",
+      toastConnectionUpdated: "桥接连接配置已更新",
       deleteBtn: "删除桥接",
       deleteConfirmTitle: "删除桥接插件",
       deleteConfirmDesc: (name: string) =>

@@ -25,13 +25,13 @@ static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b(?:https?|socks5h?|socks4a?)://[^\s"'<>)\]}]+"#)
+    Regex::new(r#"(?i)\b(?:https?|smtps?|socks5h?|socks4a?)://[^\s"'<>)\]}]+"#)
         .expect("URL_RE must compile")
 });
 
 static KV_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(token|password|passwd|secret|signature|api[_-]?key|authorization|cookie|access_token|bot_token|private_key)\s*([=:])\s*(?:Bearer\s+)?([^\s,;&"'}\]]+)"#,
+        r#"(?i)(["']?)([A-Za-z0-9_-]*(?:token|password|passwd|secret|signature|api[_-]?key|apikey|authorization|cookie|credential|bearer|private[_-]?key)[A-Za-z0-9_-]*)(["']?)(\s*)([=:])(\s*)(?:("(?:\\.|[^"\\])+")|('(?:\\.|[^'\\])+')|((?:Bearer\s+)?[^\s,;&"'}\]]+))"#,
     )
     .expect("KV_SECRET_RE must compile")
 });
@@ -39,6 +39,13 @@ static KV_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Returns `true` when a structured tracing field name indicates secret material.
 pub fn is_sensitive_field_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "token_id" | "token_name" | "token_scope" | "token_prefix" | "token_count" | "tokens_count"
+    ) || lower.starts_with("has_")
+    {
+        return false;
+    }
     [
         "token",
         "password",
@@ -46,12 +53,14 @@ pub fn is_sensitive_field_name(name: &str) -> bool {
         "secret",
         "signature",
         "api_key",
+        "api-key",
         "apikey",
         "authorization",
         "cookie",
         "credential",
         "bearer",
         "private_key",
+        "private-key",
     ]
     .iter()
     .any(|kw| lower.contains(kw))
@@ -119,8 +128,27 @@ pub fn redact_text(raw: &str) -> String {
     // 3. Mask Telegram Bot API `/bot<token>/` path segments.
     let tg_cleaned = TG_BOT_PATH_RE.replace_all(&urls_cleaned, "/bot[redacted]/");
 
-    // 4. Mask inline `key=value` / `key: value` secret patterns (including `Authorization: Bearer …`).
-    let kv_cleaned = KV_SECRET_RE.replace_all(&tg_cleaned, "${1}${2}[redacted]");
+    // 4. Mask inline `key=value`, `key: value`, quoted `key="value"`, and JSON `"key": "value"` secrets.
+    let kv_cleaned = KV_SECRET_RE.replace_all(&tg_cleaned, |caps: &regex::Captures<'_>| {
+        let key = &caps[2];
+        if !is_sensitive_field_name(key) {
+            return caps[0].to_string();
+        }
+        let open_kq = &caps[1];
+        let close_kq = &caps[3];
+        let ws_before = &caps[4];
+        let sep = &caps[5];
+        let ws_after = &caps[6];
+        if caps.get(7).is_some() {
+            format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\"")
+        } else if caps.get(8).is_some() {
+            format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}'[redacted]'")
+        } else if caps.get(9).is_some_and(|m| m.as_str() == "null") && !open_kq.is_empty() {
+            caps[0].to_string()
+        } else {
+            format!("{open_kq}{key}{close_kq}{sep}[redacted]")
+        }
+    });
 
     // 5. Mask any remaining standalone `Bearer <token>` values.
     let bearer_cleaned = BEARER_RE.replace_all(&kv_cleaned, "Bearer [redacted]");
@@ -195,5 +223,98 @@ mod tests {
         assert!(out.contains("a***e@example.com"));
         assert!(out.contains("Authorization:[redacted]"));
         assert!(out.contains("Bearer [redacted]"));
+    }
+
+    #[test]
+    fn redacts_json_quoted_secrets_and_smtp_urls_without_redacting_mcp_audit_fields() {
+        // P1-01: JSON double-quoted, single/double-quoted values, and smtp(s):// userinfo.
+        let json_payload = r#"upstream error: {"access_token":"tk_secret_42","password": "hunter2","bridge_secret":"s3cr3t","token_id":7,"token_name":"cli-admin","token_scope":"admin","has_access_token":true}"#;
+        let out = redact_text(json_payload);
+        assert!(
+            !out.contains("tk_secret_42"),
+            "json access_token leaked: {out}"
+        );
+        assert!(!out.contains("hunter2"), "json password leaked: {out}");
+        assert!(!out.contains("s3cr3t"), "json bridge_secret leaked: {out}");
+        assert!(
+            out.contains(r#""access_token":"[redacted]""#),
+            "unexpected format: {out}"
+        );
+        assert!(
+            out.contains(r#""password": "[redacted]""#),
+            "unexpected format: {out}"
+        );
+        assert!(
+            out.contains(r#""bridge_secret":"[redacted]""#),
+            "unexpected format: {out}"
+        );
+        assert!(
+            out.contains(r#""token_id":7"#),
+            "token_id wrongly redacted: {out}"
+        );
+        assert!(
+            out.contains(r#""token_name":"cli-admin""#),
+            "token_name wrongly redacted: {out}"
+        );
+        assert!(
+            out.contains(r#""token_scope":"admin""#),
+            "token_scope wrongly redacted: {out}"
+        );
+        assert!(
+            out.contains(r#""has_access_token":true"#),
+            "has_access_token wrongly redacted: {out}"
+        );
+
+        let quoted = r#"auth failed password="my \"quoted\" pw" secret='single_sec' smtp://alice:pass1@mail.example.com:587 smtps://bob:pass2@smtp.example.org:465"#;
+        let q_out = redact_text(quoted);
+        assert!(
+            !q_out.contains("quoted"),
+            "double-quoted password leaked: {q_out}"
+        );
+        assert!(
+            !q_out.contains("single_sec"),
+            "single-quoted secret leaked: {q_out}"
+        );
+        assert!(
+            !q_out.contains("pass1"),
+            "smtp url password leaked: {q_out}"
+        );
+        assert!(
+            !q_out.contains("pass2"),
+            "smtps url password leaked: {q_out}"
+        );
+        assert!(
+            q_out.contains(r#"password="[redacted]""#),
+            "unexpected quoted output: {q_out}"
+        );
+        assert!(
+            q_out.contains("secret='[redacted]'"),
+            "unexpected single-quoted output: {q_out}"
+        );
+        assert!(
+            q_out.contains("smtp://mail.example.com:587"),
+            "smtp host missing: {q_out}"
+        );
+        assert!(
+            q_out.contains("smtps://smtp.example.org:465"),
+            "smtps host missing: {q_out}"
+        );
+
+        // P1-02: MCP audit metadata & presence flags must not be redacted by field name.
+        assert!(!is_sensitive_field_name("token_id"));
+        assert!(!is_sensitive_field_name("token_name"));
+        assert!(!is_sensitive_field_name("token_scope"));
+        assert!(!is_sensitive_field_name("token_prefix"));
+        assert!(!is_sensitive_field_name("has_password"));
+        assert!(!is_sensitive_field_name("has_access_token"));
+        assert_eq!(redact_field("token_name", "ops-cli"), "ops-cli");
+        assert_eq!(redact_field("token_scope", "admin"), "admin");
+
+        // Actual secret fields remain sensitive.
+        assert!(is_sensitive_field_name("access_token"));
+        assert!(is_sensitive_field_name("bridge_secret"));
+        assert!(is_sensitive_field_name("cookie"));
+        assert!(is_sensitive_field_name("private_key"));
+        assert!(is_sensitive_field_name("credential"));
     }
 }

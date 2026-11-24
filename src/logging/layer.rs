@@ -10,7 +10,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tracing::field::{Field, Visit};
-use tracing::{Event, Level, Subscriber};
+use tracing::{Event, Level, Subscriber, span};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Filter, Layer};
 
@@ -166,10 +166,78 @@ impl Visit for RedactingVisitor {
     }
 }
 
+#[derive(Debug, Default)]
+struct SpanFields {
+    fields: Map<String, Value>,
+    feed_id: Option<i64>,
+    task_id: Option<i64>,
+    route_id: Option<i64>,
+    channel_id: Option<i64>,
+    destination_id: Option<i64>,
+    plugin_id: Option<String>,
+}
+
 impl<S> Layer<S> for RedactingLayer
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            let mut visitor = RedactingVisitor::new();
+            attrs.record(&mut visitor);
+            span.extensions_mut().insert(SpanFields {
+                fields: visitor.fields,
+                feed_id: visitor.feed_id,
+                task_id: visitor.task_id,
+                route_id: visitor.route_id,
+                channel_id: visitor.channel_id,
+                destination_id: visitor.destination_id,
+                plugin_id: visitor.plugin_id,
+            });
+        }
+    }
+
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            let mut visitor = RedactingVisitor::new();
+            values.record(&mut visitor);
+            let mut exts = span.extensions_mut();
+            if let Some(sf) = exts.get_mut::<SpanFields>() {
+                for (k, v) in visitor.fields {
+                    sf.fields.insert(k, v);
+                }
+                if visitor.feed_id.is_some() {
+                    sf.feed_id = visitor.feed_id;
+                }
+                if visitor.task_id.is_some() {
+                    sf.task_id = visitor.task_id;
+                }
+                if visitor.route_id.is_some() {
+                    sf.route_id = visitor.route_id;
+                }
+                if visitor.channel_id.is_some() {
+                    sf.channel_id = visitor.channel_id;
+                }
+                if visitor.destination_id.is_some() {
+                    sf.destination_id = visitor.destination_id;
+                }
+                if visitor.plugin_id.is_some() {
+                    sf.plugin_id = visitor.plugin_id;
+                }
+            } else {
+                exts.insert(SpanFields {
+                    fields: visitor.fields,
+                    feed_id: visitor.feed_id,
+                    task_id: visitor.task_id,
+                    route_id: visitor.route_id,
+                    channel_id: visitor.channel_id,
+                    destination_id: visitor.destination_id,
+                    plugin_id: visitor.plugin_id,
+                });
+            }
+        }
+    }
+
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let meta = event.metadata();
         let level_num = level_to_num(*meta.level());
@@ -186,6 +254,34 @@ where
         let now = Utc::now();
         let ts_ms = now.timestamp_millis();
         let mut visitor = RedactingVisitor::new();
+        if let Some(scope) = ctx.event_scope(event) {
+            for span in scope.from_root() {
+                let exts = span.extensions();
+                if let Some(sf) = exts.get::<SpanFields>() {
+                    for (k, v) in &sf.fields {
+                        visitor.fields.insert(k.clone(), v.clone());
+                    }
+                    if sf.feed_id.is_some() {
+                        visitor.feed_id = sf.feed_id;
+                    }
+                    if sf.task_id.is_some() {
+                        visitor.task_id = sf.task_id;
+                    }
+                    if sf.route_id.is_some() {
+                        visitor.route_id = sf.route_id;
+                    }
+                    if sf.channel_id.is_some() {
+                        visitor.channel_id = sf.channel_id;
+                    }
+                    if sf.destination_id.is_some() {
+                        visitor.destination_id = sf.destination_id;
+                    }
+                    if sf.plugin_id.is_some() {
+                        visitor.plugin_id = sf.plugin_id.clone();
+                    }
+                }
+            }
+        }
         event.record(&mut visitor);
 
         let level_str = level_label(*meta.level());
@@ -246,6 +342,34 @@ fn level_label(level: Level) -> &'static str {
     }
 }
 
+fn escape_text_line_breaks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_quoted_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn format_text_line(
     ts: &str,
     level: &str,
@@ -253,16 +377,20 @@ fn format_text_line(
     message: &str,
     fields: &Map<String, Value>,
 ) -> String {
-    let mut out = format!("{ts} {level:>5} {target}: {message}");
+    let safe_msg = escape_text_line_breaks(message);
+    let mut out = format!("{ts} {level:>5} {target}: {safe_msg}");
     for (k, v) in fields {
         out.push(' ');
         out.push_str(k);
         out.push('=');
         match v {
             Value::String(s) => {
-                if s.contains(' ') || s.is_empty() {
+                if s.is_empty()
+                    || s.chars()
+                        .any(|c| c.is_whitespace() || matches!(c, '"' | '\\' | '='))
+                {
                     out.push('"');
-                    out.push_str(&s.replace('"', "\\\""));
+                    out.push_str(&escape_quoted_value(s));
                     out.push('"');
                 } else {
                     out.push_str(s);
@@ -290,4 +418,84 @@ fn format_json_line(
         obj.insert("fields".to_string(), Value::Object(fields.clone()));
     }
     serde_json::to_string(&Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn text_formatter_escapes_newlines_tabs_and_quotes() {
+        let mut fields = Map::new();
+        fields.insert(
+            "uri".to_string(),
+            Value::String("/api/v1/health".to_string()),
+        );
+        fields.insert(
+            "detail".to_string(),
+            Value::String("bad\"quote\nFAKE ERROR\tindented".to_string()),
+        );
+        let line = format_text_line(
+            "2026-11-25T00:00:00.000Z",
+            "INFO",
+            "feedcourier::test",
+            "line1\n2026-11-25T00:00:00.000Z ERROR forged",
+            &fields,
+        );
+        assert!(
+            !line.contains('\n'),
+            "text log must stay single-line: {line}"
+        );
+        assert!(!line.contains('\r'));
+        assert!(line.contains(r"line1\n2026-11-25T00:00:00.000Z ERROR forged"));
+        assert!(line.contains("uri=/api/v1/health"));
+        assert!(line.contains(r#"detail="bad\"quote\nFAKE ERROR\tindented""#));
+    }
+
+    #[test]
+    fn redacting_layer_inherits_and_redacts_span_fields() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let layer = RedactingLayer::new(
+            EnvFilter::new("off"),
+            LogFormat::Text,
+            10,
+            Some(tx),
+            dropped,
+        );
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "tower_http::trace",
+                "http_request",
+                method = "POST",
+                uri = "/api/v1/routes",
+                feed_id = 42_i64,
+                bot_token = "123456:SECRET",
+                token_name = "ops-bot"
+            );
+            let _enter = span.enter();
+            tracing::info!(target: "tower_http::trace", status = 200_u64, "finished request");
+        });
+
+        let rec = rx.try_recv().expect("expected captured log record");
+        assert_eq!(rec.feed_id, Some(42));
+        let fields: Map<String, Value> = serde_json::from_str(&rec.fields_json).unwrap();
+        assert_eq!(fields.get("method").and_then(Value::as_str), Some("POST"));
+        assert_eq!(
+            fields.get("uri").and_then(Value::as_str),
+            Some("/api/v1/routes")
+        );
+        assert_eq!(fields.get("status").and_then(Value::as_u64), Some(200));
+        assert_eq!(
+            fields.get("bot_token").and_then(Value::as_str),
+            Some("[redacted]")
+        );
+        assert_eq!(
+            fields.get("token_name").and_then(Value::as_str),
+            Some("ops-bot")
+        );
+    }
 }

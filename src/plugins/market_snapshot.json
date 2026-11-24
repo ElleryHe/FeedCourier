@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-11-24T18:12:56Z",
+  "generated_at": "2026-11-24T19:56:48Z",
   "plugins": [
     {
       "id": "link-rewrite",
@@ -36,7 +36,7 @@
       "homepage": "https://feedcourier.ellery.me/plugins/bridge-channels",
       "repository": "https://github.com/ElleryHe/FeedCourier-Plugins/tree/main/channels/ntfy",
       "image": "ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest",
-      "compose_snippet": "services:\n  feedcourier-ntfy:\n    build: ./channels/ntfy\n    environment:\n      BRIDGE_SECRET: \"replace-with-strong-secret\"\n      PORT: \"8787\"\n    restart: unless-stopped",
+      "compose_snippet": "services:\n  feedcourier-ntfy:\n    image: ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest\n    environment:\n      BRIDGE_SECRET: \"replace-with-strong-secret\"\n      PORT: \"8787\"\n    restart: unless-stopped",
       "hooks": [],
       "permissions": [
         "network"

@@ -94,6 +94,7 @@ impl ClickHouseLogStore {
         retention_days: u32,
     ) -> AppResult<Self> {
         let client = Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
@@ -143,7 +144,7 @@ impl ClickHouseLogStore {
                 destination_id Nullable(Int64), \
                 plugin_id Nullable(String)\
             ) ENGINE = MergeTree \
-            ORDER BY (ts, level_num) \
+            ORDER BY (ts_ms, level_num) \
             TTL ts + INTERVAL {} DAY",
             self.database, self.table, self.retention_days
         );
@@ -269,11 +270,17 @@ impl LogStoreBackend for ClickHouseLogStore {
             params.push(("param_target_prefix".to_string(), prefix.to_string()));
         }
         if let Some(since_ms) = q.since_ms {
-            sql.push_str(" AND ts_ms >= {since_ms:Int64}");
+            sql.push_str(
+                " AND ts_ms >= {since_ms:Int64} \
+                 AND ts >= fromUnixTimestamp64Milli({since_ms:Int64}, 'UTC')",
+            );
             params.push(("param_since_ms".to_string(), since_ms.to_string()));
         }
         if let Some(until_ms) = q.until_ms {
-            sql.push_str(" AND ts_ms <= {until_ms:Int64}");
+            sql.push_str(
+                " AND ts_ms <= {until_ms:Int64} \
+                 AND ts <= fromUnixTimestamp64Milli({until_ms:Int64}, 'UTC')",
+            );
             params.push(("param_until_ms".to_string(), until_ms.to_string()));
         }
         if let Some(needle) = q

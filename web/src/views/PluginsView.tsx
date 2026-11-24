@@ -32,11 +32,19 @@ import type {
   PluginDto,
   PluginInstanceDto,
   RouteReferenceDto,
+  UpdatePluginRequest,
   YourlsAuthMode,
   YourlsProviderConfigView,
 } from "@/api/types";
 import { PluginIcon } from "@/components/plugins/PluginIcon";
-import { parseObjectSchema } from "@/components/plugins/SchemaFormFields";
+import {
+  buildValidatedSchemaConfig,
+  formatSchemaConfigSummary,
+  initSchemaFieldValues,
+  parseObjectSchema,
+  type SchemaFieldValues,
+  SchemaFormFields,
+} from "@/components/plugins/SchemaFormFields";
 import {
   Badge,
   Button,
@@ -69,78 +77,6 @@ function isSafeHttpUrl(raw?: string | null): boolean {
   } catch {
     return false;
   }
-}
-
-interface InstanceSchemaProperty {
-  type?: string;
-  title?: string;
-  description?: string;
-  placeholder?: string;
-  enum?: Array<string | number>;
-  format?: string;
-  default?: unknown;
-  items?: { type?: string };
-}
-
-interface ParsedInstanceSchema {
-  properties: Array<[string, InstanceSchemaProperty]>;
-  required: ReadonlySet<string>;
-}
-
-function isPlainRecord(val: unknown): val is Record<string, unknown> {
-  return typeof val === "object" && val !== null && !Array.isArray(val);
-}
-
-function parseInstanceSchema(
-  raw: Record<string, unknown> | null | undefined,
-): ParsedInstanceSchema {
-  if (!isPlainRecord(raw)) {
-    return { properties: [], required: new Set() };
-  }
-  const required = new Set<string>(
-    Array.isArray(raw.required)
-      ? raw.required.filter((x): x is string => typeof x === "string")
-      : [],
-  );
-  const properties: Array<[string, InstanceSchemaProperty]> = [];
-  if (isPlainRecord(raw.properties)) {
-    for (const [key, propVal] of Object.entries(raw.properties)) {
-      if (!isPlainRecord(propVal)) continue;
-      properties.push([key, propVal as InstanceSchemaProperty]);
-    }
-  }
-  return { properties, required };
-}
-
-function formatGenericConfigEntries(
-  config: Record<string, unknown>,
-): Array<{ key: string; value: string; isSecretHint?: boolean }> {
-  const entries: Array<{ key: string; value: string; isSecretHint?: boolean }> =
-    [];
-  for (const [key, val] of Object.entries(config)) {
-    if (val === null || val === undefined || val === "") continue;
-    if (key.startsWith("has_") && typeof val === "boolean") continue;
-    if (key.endsWith("_hint") && typeof val === "string") {
-      entries.push({
-        key: key.slice(0, -5),
-        value: val,
-        isSecretHint: true,
-      });
-      continue;
-    }
-    if (typeof val === "boolean") {
-      entries.push({ key, value: val ? "true" : "false" });
-    } else if (typeof val === "number") {
-      entries.push({ key, value: String(val) });
-    } else if (typeof val === "string") {
-      entries.push({ key, value: val });
-    } else if (Array.isArray(val)) {
-      if (val.length > 0) {
-        entries.push({ key, value: val.map((v) => String(v)).join(", ") });
-      }
-    }
-  }
-  return entries;
 }
 
 function parseYourlsConfig(
@@ -184,6 +120,7 @@ export function PluginsView() {
   const [marketCategory, setMarketCategory] = useState<string>("all");
   const [enablingMarketId, setEnablingMarketId] = useState<string | null>(null);
   const [bridgeModalOpen, setBridgeModalOpen] = useState(false);
+  const [editingBridge, setEditingBridge] = useState<PluginDto | null>(null);
   const [refreshingManifestId, setRefreshingManifestId] = useState<
     string | null
   >(null);
@@ -353,6 +290,8 @@ export function PluginsView() {
   }, [marketPlugins, marketCategory, marketSearch]);
 
   if (selectedPlugin) {
+    const isBridgePlugin =
+      selectedPlugin.source === "bridge" || selectedPlugin.runtime === "bridge";
     return (
       <>
         <PluginDetailView
@@ -362,18 +301,28 @@ export function PluginsView() {
             togglePluginMutation.mutate({ id: selectedPlugin.id, enabled })
           }
           togglingPlugin={togglePluginMutation.isPending}
+          onEditBridge={
+            isBridgePlugin ? () => setEditingBridge(selectedPlugin) : undefined
+          }
           onRefreshManifest={
-            selectedPlugin.runtime === "bridge"
+            isBridgePlugin
               ? () => refreshManifestMutation.mutate(selectedPlugin.id)
               : undefined
           }
           refreshingManifest={refreshingManifestId === selectedPlugin.id}
           onDeleteBridge={
-            selectedPlugin.runtime === "bridge"
-              ? () => setDeletingBridge(selectedPlugin)
-              : undefined
+            isBridgePlugin ? () => setDeletingBridge(selectedPlugin) : undefined
           }
         />
+
+        {editingBridge && (
+          <EditBridgeConnectionModal
+            key={editingBridge.id}
+            open={editingBridge !== null}
+            plugin={editingBridge}
+            onClose={() => setEditingBridge(null)}
+          />
+        )}
 
         <ConfirmDialog
           open={deletingBridge !== null}
@@ -667,12 +616,21 @@ export function PluginsView() {
                     </div>
 
                     <div
-                      className="flex items-center gap-1.5"
+                      className="flex flex-wrap items-center gap-1.5"
                       onClick={(e) => e.stopPropagation()}
                       onKeyDown={(e) => e.stopPropagation()}
                     >
-                      {plugin.runtime === "bridge" && (
+                      {(plugin.source === "bridge" ||
+                        plugin.runtime === "bridge") && (
                         <>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setEditingBridge(plugin)}
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                            {m.plugins.bridge.editConnectionBtn}
+                          </Button>
                           <Button
                             variant="ghost"
                             size="icon"
@@ -1032,6 +990,15 @@ export function PluginsView() {
         />
       )}
 
+      {editingBridge && (
+        <EditBridgeConnectionModal
+          key={editingBridge.id}
+          open={editingBridge !== null}
+          plugin={editingBridge}
+          onClose={() => setEditingBridge(null)}
+        />
+      )}
+
       <ConfirmDialog
         open={deletingBridge !== null}
         onClose={() => setDeletingBridge(null)}
@@ -1334,6 +1301,129 @@ function RegisterBridgeModal({
 }
 
 // ---------------------------------------------------------------------------
+// Edit HTTP Bridge Connection Modal
+// ---------------------------------------------------------------------------
+
+function EditBridgeConnectionModal({
+  open,
+  onClose,
+  plugin,
+}: {
+  open: boolean;
+  onClose: () => void;
+  plugin: PluginDto;
+}) {
+  const { m } = useI18n();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+
+  const [bridgeUrl, setBridgeUrl] = useState(plugin.bridge_url ?? "");
+  const [bridgeSecret, setBridgeSecret] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const updateMutation = useMutation({
+    mutationFn: () => {
+      const payload: UpdatePluginRequest = {
+        bridge_url: bridgeUrl.trim(),
+        ...(bridgeSecret.trim() ? { bridge_secret: bridgeSecret.trim() } : {}),
+      };
+      return api.plugins.update(plugin.id, payload);
+    },
+    onSuccess: (updated) => {
+      queryClient.setQueryData<PluginDto[]>(["plugins"], (prev) =>
+        prev ? prev.map((p) => (p.id === updated.id ? updated : p)) : [updated],
+      );
+      toast.success(m.plugins.bridge.toastConnectionUpdated);
+      void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+      void queryClient.invalidateQueries({ queryKey: ["channels"] });
+      onClose();
+    },
+    onError: (err) => {
+      setFormError(errorMessage(err));
+    },
+  });
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    setFormError(null);
+    if (!isValidHttpUrl(bridgeUrl.trim())) {
+      setFormError(m.plugins.bridge.errUrlRequired);
+      return;
+    }
+    updateMutation.mutate();
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={m.plugins.bridge.editModalTitle(plugin.manifest.name)}
+      description={m.plugins.bridge.editModalDesc}
+      size="lg"
+      footer={
+        <>
+          <Button
+            variant="outline"
+            onClick={onClose}
+            disabled={updateMutation.isPending}
+          >
+            {m.common.cancel}
+          </Button>
+          <Button onClick={handleSubmit} loading={updateMutation.isPending}>
+            {m.plugins.bridge.editSaveBtn}
+          </Button>
+        </>
+      }
+    >
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <Label htmlFor="edit-bridge-url">{m.plugins.bridge.urlLabel}</Label>
+          <Input
+            id="edit-bridge-url"
+            type="url"
+            value={bridgeUrl}
+            onChange={(e) => {
+              setBridgeUrl(e.target.value);
+              setFormError(null);
+            }}
+            placeholder={m.plugins.bridge.urlPlaceholder}
+            className="mt-1 font-mono text-xs"
+          />
+          <FieldHint>{m.plugins.bridge.urlHint}</FieldHint>
+        </div>
+
+        <div>
+          <Label htmlFor="edit-bridge-secret">
+            {m.plugins.bridge.secretLabel}
+          </Label>
+          <Input
+            id="edit-bridge-secret"
+            type="password"
+            value={bridgeSecret}
+            onChange={(e) => {
+              setBridgeSecret(e.target.value);
+              setFormError(null);
+            }}
+            placeholder={m.plugins.bridge.editSecretPlaceholder}
+            className="mt-1 font-mono text-xs"
+          />
+          <FieldHint>{m.plugins.bridge.editSecretHint}</FieldHint>
+        </div>
+
+        <div className="flex items-start gap-2 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-2.5 text-xs text-zinc-600 dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-400">
+          <Info className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
+          <span className="leading-relaxed">
+            {m.plugins.bridge.editProbeHint}
+          </span>
+        </div>
+
+        <FieldError message={formError} />
+      </form>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Plugin Detail View (Providers Management)
 // ---------------------------------------------------------------------------
 
@@ -1342,6 +1432,7 @@ function PluginDetailView({
   onBack,
   onToggleEnabled,
   togglingPlugin,
+  onEditBridge,
   onRefreshManifest,
   refreshingManifest = false,
   onDeleteBridge,
@@ -1350,6 +1441,7 @@ function PluginDetailView({
   onBack: () => void;
   onToggleEnabled: (enabled: boolean) => void;
   togglingPlugin: boolean;
+  onEditBridge?: () => void;
   onRefreshManifest?: () => void;
   refreshingManifest?: boolean;
   onDeleteBridge?: () => void;
@@ -1507,7 +1599,13 @@ function PluginDetailView({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            {onEditBridge && (
+              <Button variant="outline" size="sm" onClick={onEditBridge}>
+                <Pencil className="h-3.5 w-3.5" />
+                {m.plugins.bridge.editConnectionBtn}
+              </Button>
+            )}
             {onRefreshManifest && (
               <Button
                 variant="outline"
@@ -1843,7 +1941,7 @@ function PluginDetailView({
                 </thead>
                 <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/80">
                   {plugin.instances.map((inst) => {
-                    const summaryEntries = formatGenericConfigEntries(
+                    const summaryEntries = formatSchemaConfigSummary(
                       inst.config,
                     );
                     return (
@@ -2414,209 +2512,15 @@ function SchemaProviderModal({
   const queryClient = useQueryClient();
   const isEdit = instance !== null;
 
-  const parsedSchema = useMemo(
-    () => parseInstanceSchema(plugin.manifest.instance_schema),
-    [plugin.manifest.instance_schema],
-  );
-
   const [name, setName] = useState(instance?.name ?? "");
   const [enabled, setEnabled] = useState(instance?.enabled ?? true);
-  const [fieldValues, setFieldValues] = useState<
-    Record<string, string | boolean>
-  >(() => {
-    const initial: Record<string, string | boolean> = {};
-    for (const [key, prop] of parsedSchema.properties) {
-      const isSecret = prop.format === "password";
-      if (isSecret) {
-        initial[key] = "";
-        continue;
-      }
-      const existingVal =
-        isEdit && instance && key in instance.config
-          ? instance.config[key]
-          : undefined;
-
-      if (existingVal !== undefined && existingVal !== null) {
-        if (prop.type === "boolean") {
-          initial[key] = Boolean(existingVal);
-        } else if (prop.type === "array") {
-          initial[key] = Array.isArray(existingVal)
-            ? existingVal.map((item) => String(item)).join("\n")
-            : String(existingVal);
-        } else {
-          initial[key] = String(existingVal);
-        }
-      } else if (prop.default !== undefined && prop.default !== null) {
-        if (prop.type === "boolean") {
-          initial[key] = Boolean(prop.default);
-        } else if (prop.type === "array" && Array.isArray(prop.default)) {
-          initial[key] = prop.default.map((item) => String(item)).join("\n");
-        } else {
-          initial[key] = String(prop.default);
-        }
-      } else if (
-        parsedSchema.required.has(key) &&
-        Array.isArray(prop.enum) &&
-        prop.enum.length > 0
-      ) {
-        initial[key] = String(prop.enum[0]);
-      } else {
-        initial[key] = prop.type === "boolean" ? false : "";
-      }
-    }
-    return initial;
-  });
+  const [fieldValues, setFieldValues] = useState<SchemaFieldValues>(() =>
+    initSchemaFieldValues(
+      plugin.manifest.instance_schema,
+      isEdit ? instance?.config : undefined,
+    ),
+  );
   const [formError, setFormError] = useState<string | null>(null);
-
-  const hasStoredSecretFor = (key: string): boolean => {
-    if (!isEdit || !instance) return false;
-    return Boolean(
-      instance.config[`has_${key}`] ||
-        (typeof instance.config[`${key}_hint`] === "string" &&
-          instance.config[`${key}_hint`]),
-    );
-  };
-
-  const secretHintFor = (key: string): string | null => {
-    if (!isEdit || !instance) return null;
-    const hint = instance.config[`${key}_hint`];
-    return typeof hint === "string" && hint ? hint : null;
-  };
-
-  const buildValidatedConfig = (): {
-    config: Record<string, unknown> | null;
-    error: string | null;
-  } => {
-    const config: Record<string, unknown> = {};
-
-    for (const [key, prop] of parsedSchema.properties) {
-      const label = prop.title || key;
-      const isRequired = parsedSchema.required.has(key);
-      const isSecret = prop.format === "password";
-      const raw = fieldValues[key];
-
-      if (prop.type === "boolean") {
-        config[key] = Boolean(raw);
-        continue;
-      }
-
-      const strVal = typeof raw === "string" ? raw : "";
-
-      if (prop.type === "array") {
-        const items = strVal
-          .split(/[\n,]+/)
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0);
-        if (isRequired && items.length === 0) {
-          return {
-            config: null,
-            error: m.plugins.providerModal.errFieldRequired(label),
-          };
-        }
-        config[key] = items;
-        continue;
-      }
-
-      if (Array.isArray(prop.enum) && prop.enum.length > 0) {
-        if (!strVal) {
-          if (isRequired) {
-            return {
-              config: null,
-              error: m.plugins.providerModal.errFieldRequired(label),
-            };
-          }
-          if (
-            isEdit &&
-            instance &&
-            instance.config[key] !== undefined &&
-            instance.config[key] !== null
-          ) {
-            config[key] = null;
-          }
-          continue;
-        }
-        const matched = prop.enum.find((opt) => String(opt) === strVal);
-        config[key] = matched !== undefined ? matched : strVal;
-        continue;
-      }
-
-      if (prop.type === "number" || prop.type === "integer") {
-        const trimmed = strVal.trim();
-        if (!trimmed) {
-          if (isRequired) {
-            return {
-              config: null,
-              error: m.plugins.providerModal.errFieldRequired(label),
-            };
-          }
-          if (
-            isEdit &&
-            instance &&
-            instance.config[key] !== undefined &&
-            instance.config[key] !== null
-          ) {
-            config[key] = null;
-          }
-          continue;
-        }
-        const num = Number(trimmed);
-        if (!Number.isFinite(num)) {
-          return {
-            config: null,
-            error: m.plugins.providerModal.errFieldInvalidNumber(label),
-          };
-        }
-        if (prop.type === "integer" && !Number.isInteger(num)) {
-          return {
-            config: null,
-            error: m.plugins.providerModal.errFieldInvalidInteger(label),
-          };
-        }
-        config[key] = num;
-        continue;
-      }
-
-      if (isSecret) {
-        if (strVal.length > 0) {
-          config[key] = strVal;
-        } else if (isRequired && !hasStoredSecretFor(key)) {
-          return {
-            config: null,
-            error: m.plugins.providerModal.errFieldRequired(label),
-          };
-        }
-        continue;
-      }
-
-      const trimmed = strVal.trim();
-      if (!trimmed) {
-        if (isRequired) {
-          return {
-            config: null,
-            error: m.plugins.providerModal.errFieldRequired(label),
-          };
-        }
-        if (
-          isEdit &&
-          instance &&
-          instance.config[key] !== undefined &&
-          instance.config[key] !== null
-        ) {
-          config[key] = null;
-        }
-        continue;
-      }
-      if (prop.format === "uri" && !isSafeHttpUrl(trimmed)) {
-        return {
-          config: null,
-          error: m.plugins.providerModal.errFieldInvalidUrl(label),
-        };
-      }
-      config[key] = trimmed;
-    }
-
-    return { config, error: null };
-  };
 
   const saveMutation = useMutation({
     mutationFn: async (config: Record<string, unknown>) => {
@@ -2656,7 +2560,13 @@ function SchemaProviderModal({
       return;
     }
 
-    const { config, error } = buildValidatedConfig();
+    const { config, error } = buildValidatedSchemaConfig(
+      plugin.manifest.instance_schema,
+      fieldValues,
+      isEdit,
+      instance?.config,
+      m,
+    );
     if (error || !config) {
       setFormError(error);
       return;
@@ -2664,13 +2574,6 @@ function SchemaProviderModal({
 
     saveMutation.mutate(config);
   };
-
-  const booleanProps = parsedSchema.properties.filter(
-    ([, prop]) => prop.type === "boolean",
-  );
-  const nonBooleanProps = parsedSchema.properties.filter(
-    ([, prop]) => prop.type !== "boolean",
-  );
 
   return (
     <Modal
@@ -2710,186 +2613,24 @@ function SchemaProviderModal({
           />
         </div>
 
-        {parsedSchema.properties.length === 0 ? (
-          <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            {m.plugins.providerModal.genericNoSchemaHint}
-          </p>
-        ) : (
-          <>
-            {nonBooleanProps.length > 0 && (
-              <div className="space-y-3">
-                {nonBooleanProps.map(([key, prop]) => {
-                  const fieldId = `schema-provider-field-${key}`;
-                  const label = prop.title || key;
-                  const isRequired = parsedSchema.required.has(key);
-                  const isSecret = prop.format === "password";
-                  const storedSecret = hasStoredSecretFor(key);
-                  const hint = secretHintFor(key);
-                  const strVal =
-                    typeof fieldValues[key] === "string"
-                      ? fieldValues[key]
-                      : "";
+        <SchemaFormFields
+          idPrefix="schema-provider-field"
+          schema={plugin.manifest.instance_schema}
+          values={fieldValues}
+          onChange={setFieldValues}
+          isEdit={isEdit}
+          existingConfig={instance?.config}
+        />
 
-                  if (Array.isArray(prop.enum) && prop.enum.length > 0) {
-                    return (
-                      <div key={key}>
-                        <Label htmlFor={fieldId}>
-                          {label}
-                          {isRequired && (
-                            <span className="ml-1 text-rose-500">*</span>
-                          )}
-                        </Label>
-                        <Select
-                          id={fieldId}
-                          value={strVal}
-                          onChange={(e) =>
-                            setFieldValues((prev) => ({
-                              ...prev,
-                              [key]: e.target.value,
-                            }))
-                          }
-                          className="mt-1"
-                        >
-                          {(!isRequired || !strVal) && (
-                            <option value="">
-                              {m.plugins.providerModal.genericSelectPlaceholder}
-                            </option>
-                          )}
-                          {prop.enum.map((opt) => (
-                            <option key={String(opt)} value={String(opt)}>
-                              {String(opt)}
-                            </option>
-                          ))}
-                        </Select>
-                        {prop.description && (
-                          <FieldHint>{prop.description}</FieldHint>
-                        )}
-                      </div>
-                    );
-                  }
-
-                  if (prop.type === "array") {
-                    return (
-                      <div key={key}>
-                        <Label htmlFor={fieldId}>
-                          {label}
-                          {isRequired && (
-                            <span className="ml-1 text-rose-500">*</span>
-                          )}
-                        </Label>
-                        <Textarea
-                          id={fieldId}
-                          value={strVal}
-                          onChange={(e) =>
-                            setFieldValues((prev) => ({
-                              ...prev,
-                              [key]: e.target.value,
-                            }))
-                          }
-                          placeholder={prop.placeholder}
-                          className="mt-1 min-h-[72px] font-mono text-xs"
-                        />
-                        <FieldHint>
-                          {prop.description ||
-                            m.plugins.providerModal.genericArrayHint}
-                        </FieldHint>
-                      </div>
-                    );
-                  }
-
-                  const inputType = isSecret
-                    ? "password"
-                    : prop.type === "number" || prop.type === "integer"
-                      ? "number"
-                      : prop.format === "uri"
-                        ? "url"
-                        : "text";
-
-                  const placeholder = isSecret
-                    ? storedSecret
-                      ? hint
-                        ? m.plugins.providerModal.signatureStoredPlaceholder(
-                            hint,
-                          )
-                        : m.plugins.providerModal.genericSecretStoredPlaceholder
-                      : prop.placeholder ||
-                        m.plugins.providerModal.genericSecretPlaceholder
-                    : prop.placeholder;
-
-                  return (
-                    <div key={key}>
-                      <Label htmlFor={fieldId}>
-                        {label}
-                        {isRequired && (
-                          <span className="ml-1 text-rose-500">*</span>
-                        )}
-                      </Label>
-                      <Input
-                        id={fieldId}
-                        type={inputType}
-                        step={prop.type === "integer" ? 1 : "any"}
-                        value={strVal}
-                        onChange={(e) =>
-                          setFieldValues((prev) => ({
-                            ...prev,
-                            [key]: e.target.value,
-                          }))
-                        }
-                        placeholder={placeholder}
-                        className="mt-1 font-mono text-xs"
-                      />
-                      {isSecret && storedSecret ? (
-                        <FieldHint>
-                          {prop.description
-                            ? `${prop.description} ${m.plugins.providerModal.secretPreserveHint}`
-                            : m.plugins.providerModal.secretPreserveHint}
-                        </FieldHint>
-                      ) : (
-                        prop.description && (
-                          <FieldHint>{prop.description}</FieldHint>
-                        )
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-              {booleanProps.map(([key, prop]) => (
-                <Switch
-                  key={key}
-                  id={`schema-provider-bool-${key}`}
-                  checked={Boolean(fieldValues[key])}
-                  onCheckedChange={(checked) =>
-                    setFieldValues((prev) => ({ ...prev, [key]: checked }))
-                  }
-                  label={prop.title || key}
-                  description={prop.description}
-                />
-              ))}
-              <Switch
-                id="schema-provider-enabled"
-                checked={enabled}
-                onCheckedChange={setEnabled}
-                label={m.plugins.providerModal.enabledLabel}
-                description={m.plugins.providerModal.enabledDesc}
-              />
-            </div>
-          </>
-        )}
-
-        {parsedSchema.properties.length === 0 && (
-          <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-            <Switch
-              id="schema-provider-enabled-only"
-              checked={enabled}
-              onCheckedChange={setEnabled}
-              label={m.plugins.providerModal.enabledLabel}
-              description={m.plugins.providerModal.enabledDesc}
-            />
-          </div>
-        )}
+        <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+          <Switch
+            id="schema-provider-enabled"
+            checked={enabled}
+            onCheckedChange={setEnabled}
+            label={m.plugins.providerModal.enabledLabel}
+            description={m.plugins.providerModal.enabledDesc}
+          />
+        </div>
 
         <FieldError message={formError} />
       </form>

@@ -343,7 +343,7 @@ pub async fn debug_push_feed(
     state
         .runtime()
         .plugins()
-        .validate_route_plugins(state.db(), &options.plugins)
+        .validate_route_plugins(state.db(), &options)
         .await?;
     let result = state
         .runtime()
@@ -1601,7 +1601,7 @@ pub async fn create_route(
     state
         .runtime()
         .plugins()
-        .validate_route_plugins(state.db(), &options.plugins)
+        .validate_route_plugins(state.db(), &options)
         .await?;
 
     let created = state
@@ -1682,7 +1682,7 @@ pub async fn update_route(
             state
                 .runtime()
                 .plugins()
-                .validate_route_plugins(state.db(), &opts.plugins)
+                .validate_route_plugins(state.db(), &opts)
                 .await?;
             Some(opts)
         }
@@ -2107,6 +2107,28 @@ pub async fn register_bridge_plugin(
     Ok((StatusCode::CREATED, Json(dto)).into_response())
 }
 
+/// Synchronize `channels.capabilities_json` across all existing `ChannelKind::Plugin` accounts
+/// belonging to `plugin_id` after a manifest refresh or bridge endpoint update.
+async fn sync_plugin_channel_capabilities(
+    state: &AppState,
+    plugin_id: &str,
+    capabilities: &serde_json::Value,
+) -> AppResult<()> {
+    for ch in state.db().list_channels().await? {
+        if ch.kind == ChannelKind::Plugin
+            && let Ok(ChannelConfig::Plugin(p)) =
+                state.master_key().decrypt_json(&ch.encrypted_config)
+            && p.plugin_id == plugin_id
+        {
+            state
+                .db()
+                .update_channel_capabilities(ch.id, capabilities)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// `POST /api/v1/plugins/{id}/refresh-manifest`
 pub async fn refresh_bridge_plugin_manifest(
     State(state): State<AppState>,
@@ -2129,6 +2151,13 @@ pub async fn refresh_bridge_plugin_manifest(
             refreshed.id
         )));
     }
+    if refreshed.kind != bridge.manifest.kind {
+        return Err(AppError::Validation(format!(
+            "Bridge manifest kind changed from '{}' to '{}'; cross-kind mutation is not allowed on an installed plugin",
+            bridge.manifest.kind.as_str(),
+            refreshed.kind.as_str()
+        )));
+    }
     let manifest_json = serde_json::to_string(&refreshed)?;
     let updated = state
         .db()
@@ -2139,6 +2168,9 @@ pub async fn refresh_bridge_plugin_manifest(
             &manifest_json,
         )
         .await?;
+    if refreshed.kind == PluginKind::Channel {
+        sync_plugin_channel_capabilities(&state, &plugin_id, &refreshed.capabilities).await?;
+    }
     registry
         .reload_from_db(state.db(), state.master_key())
         .await?;
@@ -2260,10 +2292,15 @@ pub async fn update_plugin(
     Json(req): Json<UpdatePluginRequest>,
 ) -> AppResult<Json<PluginDto>> {
     let registry = state.runtime().plugins();
-    let manifest = registry
+    let existing_manifest = registry
         .get_manifest(&plugin_id)
         .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
     if registry.is_builtin(&plugin_id) {
+        if req.bridge_url.is_some() || req.bridge_secret.is_some() {
+            return Err(AppError::Validation(
+                "Built-in plugins do not have a bridge_url or bridge_secret".to_string(),
+            ));
+        }
         registry.sync_builtin_rows(state.db()).await?;
     }
 
@@ -2271,14 +2308,103 @@ pub async fn update_plugin(
         .settings
         .map(|v| serde_json::to_string(&v))
         .transpose()?;
-    let updated = state
-        .db()
-        .update_plugin(&plugin_id, req.enabled, settings_str.as_deref())
-        .await?;
+
+    let wants_bridge_update = req.bridge_url.is_some()
+        || req
+            .bridge_secret
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+
+    let (updated, final_manifest) = if wants_bridge_update {
+        let row = state
+            .db()
+            .get_plugin(&plugin_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
+        if row.source != "bridge" {
+            return Err(AppError::Validation(
+                "Only HTTP bridge plugins support updating bridge_url or rotating bridge_secret"
+                    .to_string(),
+            ));
+        }
+        let next_url = match req.bridge_url.as_deref() {
+            Some(raw) => validate_bridge_url(raw)?,
+            None => row.bridge_url.clone().ok_or_else(|| {
+                AppError::Validation("bridge_url is missing on stored plugin".to_string())
+            })?,
+        };
+        let next_secret = match req
+            .bridge_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(new_sec) => new_sec.to_string(),
+            None => {
+                let enc = row.encrypted_bridge_secret.as_deref().ok_or_else(|| {
+                    AppError::Validation("bridge_secret is missing on stored plugin".to_string())
+                })?;
+                state.master_key().decrypt_json::<String>(enc)?
+            }
+        };
+
+        // Mandatory live signed GET /manifest probe before persisting the rotated secret / URL.
+        let probe_client =
+            BridgeClient::new(next_url.clone(), next_secret.clone(), plugin_id.clone())?;
+        let probed = probe_client.fetch_manifest().await?;
+        if probed.id != plugin_id {
+            return Err(AppError::Validation(format!(
+                "Bridge manifest id '{}' does not match registered plugin id '{plugin_id}'",
+                probed.id
+            )));
+        }
+        if probed.kind != existing_manifest.kind {
+            return Err(AppError::Validation(format!(
+                "Bridge manifest kind changed from '{}' to '{}'; cross-kind mutation is not allowed on an installed plugin",
+                existing_manifest.kind.as_str(),
+                probed.kind.as_str()
+            )));
+        }
+
+        let encrypted_secret = state.master_key().encrypt_json(&next_secret)?;
+        let manifest_json = serde_json::to_string(&probed)?;
+        let updated_row = state
+            .db()
+            .update_bridge_plugin_connection(
+                &plugin_id,
+                &next_url,
+                &encrypted_secret,
+                &probed.version,
+                &manifest_json,
+                req.enabled,
+                settings_str.as_deref(),
+            )
+            .await?;
+        if probed.kind == PluginKind::Channel {
+            sync_plugin_channel_capabilities(&state, &plugin_id, &probed.capabilities).await?;
+        }
+        tracing::info!(
+            plugin_id = %plugin_id,
+            version = %probed.version,
+            rotated_secret = req
+                .bridge_secret
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
+            "updated HTTP bridge plugin connection after live manifest probe"
+        );
+        (updated_row, probed)
+    } else {
+        let updated_row = state
+            .db()
+            .update_plugin(&plugin_id, req.enabled, settings_str.as_deref())
+            .await?;
+        (updated_row, existing_manifest)
+    };
+
     registry
         .reload_from_db(state.db(), state.master_key())
         .await?;
-    if req.enabled == Some(true) {
+    if req.enabled == Some(true) || wants_bridge_update {
         state.runtime().notify_outbox();
         state.runtime().notify_plugin_events();
     }
@@ -2286,7 +2412,7 @@ pub async fn update_plugin(
     let bridge_url = updated.bridge_url.clone();
     let source = updated.source.clone();
     Ok(Json(
-        build_plugin_dto_for_manifest(&state, manifest, &source, bridge_url, Some(&updated))
+        build_plugin_dto_for_manifest(&state, final_manifest, &source, bridge_url, Some(&updated))
             .await?,
     ))
 }

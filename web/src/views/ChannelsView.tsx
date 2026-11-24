@@ -24,7 +24,7 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api, getReferencingRoutesConflict } from "@/api/client";
 import {
   type ChannelAccountCreate,
@@ -54,6 +54,7 @@ import {
   buildValidatedSchemaConfig,
   formatSchemaConfigSummary,
   initSchemaFieldValues,
+  type SchemaFieldValues,
   SchemaFormFields,
 } from "@/components/plugins/SchemaFormFields";
 import {
@@ -985,6 +986,7 @@ export function ChannelsView() {
           onClose={() => setAccountModalOpen(false)}
           channel={editingChannel}
           channelPlugins={channelPlugins}
+          pluginsLoading={pluginsQuery.isLoading}
         />
       )}
 
@@ -1000,6 +1002,7 @@ export function ChannelsView() {
               ? pluginsById.get(destModalState.channel.config.plugin_id)
               : undefined
           }
+          pluginsLoading={pluginsQuery.isLoading}
         />
       )}
 
@@ -2044,11 +2047,13 @@ function ChannelAccountModal({
   onClose,
   channel,
   channelPlugins,
+  pluginsLoading,
 }: {
   open: boolean;
   onClose: () => void;
   channel: ChannelDto | null;
   channelPlugins: PluginDto[];
+  pluginsLoading: boolean;
 }) {
   const { m } = useI18n();
   const toast = useToast();
@@ -2068,23 +2073,50 @@ function ChannelAccountModal({
   const selectedPlugin = useMemo(
     () =>
       channelPlugins.find((p) => p.id === selectedPluginId) ??
-      enabledChannelPlugins[0] ??
-      null,
-    [channelPlugins, enabledChannelPlugins, selectedPluginId],
+      (isEdit ? null : (enabledChannelPlugins[0] ?? null)),
+    [channelPlugins, enabledChannelPlugins, isEdit, selectedPluginId],
   );
-  const [pluginAcctValues, setPluginAcctValues] = useState<
-    Record<string, string | boolean>
-  >(() =>
-    initSchemaFieldValues(
-      selectedPlugin?.manifest.account_schema,
-      initialPluginAcct?.config,
-    ),
+  const [pluginAcctValues, setPluginAcctValues] = useState<SchemaFieldValues>(
+    () =>
+      initSchemaFieldValues(
+        selectedPlugin?.manifest.account_schema,
+        initialPluginAcct?.config,
+      ),
   );
-  const [pluginInitDestValues, setPluginInitDestValues] = useState<
-    Record<string, string | boolean>
-  >(() =>
-    initSchemaFieldValues(selectedPlugin?.manifest.destination_schema),
+  const [pluginInitDestValues, setPluginInitDestValues] =
+    useState<SchemaFieldValues>(() =>
+      initSchemaFieldValues(selectedPlugin?.manifest.destination_schema),
+    );
+  const hydratedAcctPluginRef = useRef<string | null>(
+    selectedPlugin ? selectedPlugin.id : null,
   );
+  const hydratedDestPluginRef = useRef<string | null>(
+    selectedPlugin ? selectedPlugin.id : null,
+  );
+
+  useEffect(() => {
+    if (!selectedPlugin) return;
+    if (!selectedPluginId) {
+      setSelectedPluginId(selectedPlugin.id);
+    }
+    if (hydratedAcctPluginRef.current !== selectedPlugin.id) {
+      hydratedAcctPluginRef.current = selectedPlugin.id;
+      setPluginAcctValues(
+        initSchemaFieldValues(
+          selectedPlugin.manifest.account_schema,
+          isEdit && initialPluginAcct?.plugin_id === selectedPlugin.id
+            ? initialPluginAcct.config
+            : undefined,
+        ),
+      );
+    }
+    if (!isEdit && hydratedDestPluginRef.current !== selectedPlugin.id) {
+      hydratedDestPluginRef.current = selectedPlugin.id;
+      setPluginInitDestValues(
+        initSchemaFieldValues(selectedPlugin.manifest.destination_schema),
+      );
+    }
+  }, [selectedPlugin, selectedPluginId, isEdit, initialPluginAcct]);
 
   const [name, setName] = useState(channel?.name ?? "");
   const [minIntervalSecs, setMinIntervalSecs] = useState<number>(
@@ -2172,6 +2204,8 @@ function ChannelAccountModal({
     }
     if (nextKind === "plugin" && plugin) {
       setSelectedPluginId(plugin.id);
+      hydratedAcctPluginRef.current = plugin.id;
+      hydratedDestPluginRef.current = plugin.id;
       setPluginAcctValues(initSchemaFieldValues(plugin.manifest.account_schema));
       setPluginInitDestValues(
         initSchemaFieldValues(plugin.manifest.destination_schema),
@@ -2348,6 +2382,7 @@ function ChannelAccountModal({
     }
 
     if (kind === "plugin") {
+      if (pluginsLoading) return;
       if (!selectedPlugin) {
         setFormError(m.plugins.bridge.errSelectPlugin);
         return;
@@ -2454,7 +2489,11 @@ function ChannelAccountModal({
           <Button variant="outline" onClick={onClose}>
             {m.common.cancel}
           </Button>
-          <Button onClick={handleSubmit} loading={saveMutation.isPending}>
+          <Button
+            onClick={handleSubmit}
+            loading={saveMutation.isPending}
+            disabled={kind === "plugin" && (pluginsLoading || !selectedPlugin)}
+          >
             {isEdit
               ? m.channels.wizard.saveChannel
               : m.channels.wizard.createChannel}
@@ -2717,23 +2756,28 @@ function ChannelAccountModal({
           </div>
         )}
 
-        {kind === "plugin" && selectedPlugin && (
-          <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
-            <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
-              {m.plugins.bridge.pluginAccountHeading(
-                selectedPlugin.manifest.name,
-              )}
-            </h3>
-            <SchemaFormFields
-              idPrefix="ch-plugin-acct"
-              schema={selectedPlugin.manifest.account_schema}
-              values={pluginAcctValues}
-              onChange={setPluginAcctValues}
-              isEdit={isEdit}
-              existingConfig={initialPluginAcct?.config}
-            />
-          </div>
-        )}
+        {kind === "plugin" &&
+          (pluginsLoading && !selectedPlugin ? (
+            <div className="rounded-xl border border-zinc-200 p-4 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+              {m.plugins.loading}
+            </div>
+          ) : selectedPlugin ? (
+            <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+              <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+                {m.plugins.bridge.pluginAccountHeading(
+                  selectedPlugin.manifest.name,
+                )}
+              </h3>
+              <SchemaFormFields
+                idPrefix="ch-plugin-acct"
+                schema={selectedPlugin.manifest.account_schema}
+                values={pluginAcctValues}
+                onChange={setPluginAcctValues}
+                isEdit={isEdit}
+                existingConfig={initialPluginAcct?.config}
+              />
+            </div>
+          ) : null)}
 
         {/* Shared Pacing, Jitter, Quotas & Proxy */}
         <div className="space-y-3.5 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
@@ -2926,14 +2970,19 @@ function ChannelAccountModal({
                   />
                 )}
 
-                {kind === "plugin" && selectedPlugin && (
-                  <SchemaFormFields
-                    idPrefix="ch-init-plugin-dest"
-                    schema={selectedPlugin.manifest.destination_schema}
-                    values={pluginInitDestValues}
-                    onChange={setPluginInitDestValues}
-                  />
-                )}
+                {kind === "plugin" &&
+                  (pluginsLoading && !selectedPlugin ? (
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                      {m.plugins.loading}
+                    </p>
+                  ) : selectedPlugin ? (
+                    <SchemaFormFields
+                      idPrefix="ch-init-plugin-dest"
+                      schema={selectedPlugin.manifest.destination_schema}
+                      values={pluginInitDestValues}
+                      onChange={setPluginInitDestValues}
+                    />
+                  ) : null)}
               </div>
             )}
           </div>
@@ -2955,12 +3004,14 @@ function DestinationModal({
   channel,
   destination,
   plugin,
+  pluginsLoading,
 }: {
   open: boolean;
   onClose: () => void;
   channel: ChannelDto;
   destination: ChannelDestinationDto | null;
   plugin?: PluginDto;
+  pluginsLoading: boolean;
 }) {
   const { m } = useI18n();
   const toast = useToast();
@@ -2973,14 +3024,27 @@ function DestinationModal({
 
   const initialPluginDest =
     destination?.config.kind === "plugin" ? destination.config : undefined;
-  const [pluginDestValues, setPluginDestValues] = useState<
-    Record<string, string | boolean>
-  >(() =>
-    initSchemaFieldValues(
-      plugin?.manifest.destination_schema,
-      initialPluginDest?.config,
-    ),
+  const [pluginDestValues, setPluginDestValues] = useState<SchemaFieldValues>(
+    () =>
+      initSchemaFieldValues(
+        plugin?.manifest.destination_schema,
+        initialPluginDest?.config,
+      ),
   );
+  const hydratedPluginRef = useRef<string | null>(plugin ? plugin.id : null);
+
+  useEffect(() => {
+    if (!plugin) return;
+    if (hydratedPluginRef.current !== plugin.id) {
+      hydratedPluginRef.current = plugin.id;
+      setPluginDestValues(
+        initSchemaFieldValues(
+          plugin.manifest.destination_schema,
+          initialPluginDest?.config,
+        ),
+      );
+    }
+  }, [plugin, initialPluginDest]);
 
   const initialSmtp =
     destination?.config.kind === "smtp" ? destination.config : undefined;
@@ -3128,8 +3192,13 @@ function DestinationModal({
     }
 
     if (channel.kind === "plugin") {
+      if (pluginsLoading) return;
+      if (!plugin) {
+        setFormError(m.plugins.bridge.errSelectPlugin);
+        return;
+      }
       const res = buildValidatedSchemaConfig(
-        plugin?.manifest.destination_schema,
+        plugin.manifest.destination_schema,
         pluginDestValues,
         isEdit,
         initialPluginDest?.config,
@@ -3188,7 +3257,11 @@ function DestinationModal({
           <Button variant="outline" onClick={onClose}>
             {m.common.cancel}
           </Button>
-          <Button onClick={handleSubmit} loading={saveMutation.isPending}>
+          <Button
+            onClick={handleSubmit}
+            loading={saveMutation.isPending}
+            disabled={channel.kind === "plugin" && (pluginsLoading || !plugin)}
+          >
             {isEdit
               ? m.channels.wizard.destModal.saveBtn
               : m.channels.wizard.destModal.createBtn}
@@ -3297,14 +3370,20 @@ function DestinationModal({
                 plugin?.manifest.name ?? m.channels.kindLabels.plugin,
               )}
             </h3>
-            <SchemaFormFields
-              idPrefix="dest-plugin"
-              schema={plugin?.manifest.destination_schema}
-              values={pluginDestValues}
-              onChange={setPluginDestValues}
-              isEdit={isEdit}
-              existingConfig={initialPluginDest?.config}
-            />
+            {pluginsLoading && !plugin ? (
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                {m.plugins.loading}
+              </p>
+            ) : (
+              <SchemaFormFields
+                idPrefix="dest-plugin"
+                schema={plugin?.manifest.destination_schema}
+                values={pluginDestValues}
+                onChange={setPluginDestValues}
+                isEdit={isEdit}
+                existingConfig={initialPluginDest?.config}
+              />
+            )}
           </div>
         )}
 

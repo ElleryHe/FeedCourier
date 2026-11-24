@@ -1384,8 +1384,7 @@ impl McpServer {
                     .runtime()
                     .map(|r| r.plugins().clone())
                     .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
-                if let Err(err) = validate_mcp_route_plugins(&registry, db, &options.plugins).await
-                {
+                if let Err(err) = validate_mcp_route_plugins(&registry, db, &options).await {
                     return Ok(tool_error_from_app(err));
                 }
 
@@ -1534,6 +1533,9 @@ impl McpServer {
                     }
                     if let Some(plugins_map) = params.plugins.clone() {
                         current_opts.plugins = plugins_map;
+                        current_opts.plugin_order.retain(|id| {
+                            current_opts.plugins.get(id).is_some_and(|v| !v.is_null())
+                        });
                     }
                     if let Err(err) = validate_schedule(&mut current_opts) {
                         return Ok(tool_error_from_app(err));
@@ -1543,8 +1545,7 @@ impl McpServer {
                         .runtime()
                         .map(|r| r.plugins().clone())
                         .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
-                    if let Err(err) =
-                        validate_mcp_route_plugins(&registry, db, &current_opts.plugins).await
+                    if let Err(err) = validate_mcp_route_plugins(&registry, db, &current_opts).await
                     {
                         return Ok(tool_error_from_app(err));
                     }
@@ -1921,6 +1922,7 @@ impl McpServer {
             ascending: false,
         };
 
+        self.state.log_store().flush_now().await;
         let result = self.state.log_store().query_logs(&query).await;
         let wrapped_logs: Vec<serde_json::Value> = result
             .logs
@@ -1984,7 +1986,7 @@ impl McpServer {
             self.state.runtime()
         {
             let started = runtime.started_at();
-            let (poller_p, outbox_p, maint_p) = runtime.panic_counts();
+            let (poller_p, outbox_p, maint_p, plugin_events_p) = runtime.panic_counts();
             let cfg = runtime.config();
             let net = runtime.http().settings();
             let db_path = cfg.db_path();
@@ -2011,6 +2013,7 @@ impl McpServer {
                     "poller": poller_p,
                     "outbox": outbox_p,
                     "maintenance": maint_p,
+                    "plugin_events": plugin_events_p,
                 }),
                 summary,
                 sizes,
@@ -2019,7 +2022,12 @@ impl McpServer {
             (
                 None,
                 None,
-                serde_json::json!({ "poller": 0, "outbox": 0, "maintenance": 0 }),
+                serde_json::json!({
+                    "poller": 0,
+                    "outbox": 0,
+                    "maintenance": 0,
+                    "plugin_events": 0,
+                }),
                 serde_json::json!({ "log_store": self.state.log_store().backend_name() }),
                 serde_json::json!({ "logs_db_bytes": self.state.log_store().file_size_bytes() }),
             )
@@ -2078,6 +2086,7 @@ impl McpServer {
                 "by_status": stats.queue_by_status,
                 "oldest_due_wait_secs": stats.oldest_due_wait_secs,
                 "expired_lease_count": stats.expired_lease_count,
+                "pending_plugin_events": stats.pending_plugin_events,
                 "paused": queue_state.paused,
                 "resume_at": queue_state.resume_at,
             },
@@ -2125,6 +2134,7 @@ impl McpServer {
             ));
         };
 
+        self.state.log_store().flush_now().await;
         let log_res = self
             .state
             .log_store()
@@ -2374,10 +2384,10 @@ fn normalize_optional_pattern(pattern: Option<String>) -> Option<String> {
 async fn validate_mcp_route_plugins(
     registry: &crate::plugins::PluginRegistry,
     db: &crate::db::Database,
-    route_plugins: &BTreeMap<String, serde_json::Value>,
+    route_options: &RouteOptions,
 ) -> crate::error::AppResult<()> {
-    registry.validate_route_plugins(db, route_plugins).await?;
-    for (plugin_id, opt_val) in route_plugins {
+    registry.validate_route_plugins(db, route_options).await?;
+    for (plugin_id, opt_val) in &route_options.plugins {
         if opt_val.is_null() {
             continue;
         }

@@ -50,8 +50,28 @@ SELECT
     cooldown_until, enabled, created_at, updated_at
 FROM channels;
 
+-- Snapshot previous `channels` autoincrement watermark so deleted tail channel IDs are never
+-- reused after table rebuild (preserving isolation of `delivery_quota_ledger` and `logs.db`).
+CREATE TEMP TABLE _fc_channels_seq_bak (seq INTEGER);
+INSERT INTO _fc_channels_seq_bak (seq)
+SELECT seq FROM sqlite_sequence WHERE name = 'channels';
+
 DROP TABLE channels;
 ALTER TABLE channels_v4 RENAME TO channels;
+
+DELETE FROM sqlite_sequence WHERE name = 'channels';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'channels', max_seq
+FROM (
+    SELECT MAX(val) AS max_seq
+    FROM (
+        SELECT COALESCE(MAX(seq), 0) AS val FROM _fc_channels_seq_bak
+        UNION ALL
+        SELECT COALESCE(MAX(id), 0) AS val FROM channels
+    )
+)
+WHERE max_seq > 0;
+DROP TABLE _fc_channels_seq_bak;
 
 CREATE INDEX IF NOT EXISTS idx_channels_credential_group
     ON channels (credential_group_key);

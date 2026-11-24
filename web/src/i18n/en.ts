@@ -848,6 +848,9 @@ export const en = {
         "Use arrows to control execution order when multiple processor plugins run on this route.",
       pluginMoveUp: "Move up",
       pluginMoveDown: "Move down",
+      pluginEnableOnRoute: "Enable on this route",
+      pluginNoRouteOptionsHint:
+        "Enabled on this route. This plugin has no extra route-level options.",
     },
   },
 
@@ -950,6 +953,8 @@ export const en = {
       signatureStoredPlaceholder: (hint: string) =>
         `Stored (${hint}) — leave blank to keep`,
       secretPreserveHint: "Leave blank to keep the currently stored secret.",
+      clearStoredSecretLabel: "Clear stored secret",
+      secretWillClearPlaceholder: "Stored secret will be cleared on save",
       usernameLabel: "Username",
       usernamePlaceholder: "admin",
       passwordLabel: "Password",
@@ -1057,6 +1062,17 @@ export const en = {
       refreshManifestTitle: "Refresh bridge manifest",
       toastManifestRefreshed: "Bridge manifest refreshed",
       toastManifestRefreshFailed: "Failed to refresh manifest",
+      editConnectionBtn: "Edit Connection",
+      editModalTitle: (name: string) => `Edit Bridge Connection: ${name}`,
+      editModalDesc:
+        "Update the bridge sidecar endpoint URL or rotate its shared HMAC signing secret.",
+      editSecretPlaceholder: "Stored — leave blank to keep current secret",
+      editSecretHint:
+        "Leave blank to keep the existing encrypted HMAC secret, or enter a new secret to rotate it.",
+      editProbeHint:
+        "Saving performs a live signed GET /manifest probe against the bridge before applying changes. If the probe fails, existing settings remain unchanged.",
+      editSaveBtn: "Verify & Save",
+      toastConnectionUpdated: "Bridge connection updated",
       deleteBtn: "Delete Bridge",
       deleteConfirmTitle: "Delete Bridge Plugin",
       deleteConfirmDesc: (name: string) =>

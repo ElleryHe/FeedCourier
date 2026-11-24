@@ -2997,6 +2997,55 @@ impl Database {
         Ok(row)
     }
 
+    /// Atomically update a registered bridge plugin's endpoint URL, encrypted secret, manifest,
+    /// and optional enabled/settings fields after a live signed manifest probe succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_bridge_plugin_connection(
+        &self,
+        id: &str,
+        bridge_url: &str,
+        encrypted_bridge_secret: &[u8],
+        version: &str,
+        manifest_json: &str,
+        enabled: Option<bool>,
+        settings_json: Option<&str>,
+    ) -> AppResult<PluginRow> {
+        let current = self
+            .get_plugin(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{id}' not found")))?;
+        let next_enabled = enabled.unwrap_or(current.enabled);
+        let next_settings = settings_json.unwrap_or(&current.settings_json);
+        let now = now_unix();
+        let row = sqlx::query_as::<_, PluginRow>(
+            r#"
+            UPDATE plugins
+            SET bridge_url = ?1,
+                encrypted_bridge_secret = ?2,
+                installed_version = ?3,
+                manifest_json = ?4,
+                manifest_fetched_at = ?5,
+                enabled = ?6,
+                settings_json = ?7,
+                updated_at = ?5
+            WHERE id = ?8 AND source = 'bridge'
+            RETURNING *
+            "#,
+        )
+        .bind(bridge_url)
+        .bind(encrypted_bridge_secret)
+        .bind(version)
+        .bind(manifest_json)
+        .bind(now)
+        .bind(next_enabled)
+        .bind(next_settings)
+        .bind(id)
+        .fetch_optional(&self.write_pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{id}' not found")))?;
+        Ok(row)
+    }
+
     /// Atomically delete a registered bridge plugin (`source = 'bridge'`), optionally cascading
     /// deletion of referencing channel accounts and stripping route plugin bindings.
     pub async fn delete_bridge_plugin(
@@ -4028,6 +4077,10 @@ impl Database {
         .fetch_one(&self.read_pool)
         .await?;
 
+        let pending_plugin_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_events")
+            .fetch_one(&self.read_pool)
+            .await?;
+
         let mut feeds_by_health = std::collections::BTreeMap::new();
         let health_rows: Vec<(String, i64)> =
             sqlx::query_as("SELECT health_status, COUNT(*) FROM feeds GROUP BY health_status")
@@ -4119,6 +4172,7 @@ impl Database {
             queue_by_status,
             oldest_due_wait_secs,
             expired_lease_count,
+            pending_plugin_events,
             feeds_by_health,
             top_failing_feeds,
             top_failing_destinations,
@@ -4203,6 +4257,7 @@ pub struct DebugRuntimeDbStats {
     pub queue_by_status: std::collections::BTreeMap<String, i64>,
     pub oldest_due_wait_secs: Option<i64>,
     pub expired_lease_count: i64,
+    pub pending_plugin_events: i64,
     pub feeds_by_health: std::collections::BTreeMap<String, i64>,
     pub top_failing_feeds: Vec<DebugFailingFeed>,
     pub top_failing_destinations: Vec<DebugFailingDestination>,

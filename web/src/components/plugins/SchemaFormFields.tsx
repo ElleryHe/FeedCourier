@@ -41,21 +41,57 @@ function isSafeHttpUrl(raw: string): boolean {
   }
 }
 
+export type SchemaFieldValue = string | boolean | null;
+export type SchemaFieldValues = Record<string, SchemaFieldValue>;
+
+const NON_SECRET_METADATA_KEYS = new Set([
+  "token_id",
+  "token_name",
+  "token_scope",
+  "token_prefix",
+  "token_count",
+  "tokens_count",
+]);
+
+const SENSITIVE_FIELD_KEYWORDS = [
+  "token",
+  "password",
+  "passwd",
+  "secret",
+  "signature",
+  "api_key",
+  "apikey",
+  "authorization",
+  "cookie",
+  "credential",
+  "bearer",
+  "private_key",
+] as const;
+
 export function isSchemaSecretProperty(
   key: string,
   prop?: SchemaPropertyDef,
 ): boolean {
-  if (prop?.format === "password" || prop?.["x-secret"] === true) {
+  if (prop?.["x-secret"] === true || prop?.format === "password") {
     return true;
   }
   const lower = key.toLowerCase();
-  return (
-    lower.includes("secret") ||
-    lower.includes("token") ||
-    lower.includes("password") ||
-    lower.includes("signature") ||
-    lower.includes("api_key") ||
-    lower.includes("apikey")
+  if (NON_SECRET_METADATA_KEYS.has(lower) || lower.startsWith("has_")) {
+    return false;
+  }
+  return SENSITIVE_FIELD_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+function hasStoredSecretFor(
+  key: string,
+  isEdit: boolean,
+  existingConfig?: Record<string, unknown>,
+): boolean {
+  if (!isEdit || !existingConfig) return false;
+  const hint = existingConfig[`${key}_hint`];
+  return Boolean(
+    existingConfig[`has_${key}`] === true ||
+      (typeof hint === "string" && hint.length > 0),
   );
 }
 
@@ -83,9 +119,9 @@ export function parseObjectSchema(
 export function initSchemaFieldValues(
   schema: Record<string, unknown> | null | undefined,
   existingConfig?: Record<string, unknown>,
-): Record<string, string | boolean> {
+): SchemaFieldValues {
   const parsed = parseObjectSchema(schema);
-  const initial: Record<string, string | boolean> = {};
+  const initial: SchemaFieldValues = {};
   for (const [key, prop] of parsed.properties) {
     const existing = existingConfig?.[key];
     if (prop.type === "boolean") {
@@ -108,6 +144,12 @@ export function initSchemaFieldValues(
       initial[key] = String(existing);
     } else if (prop.default !== undefined && prop.default !== null) {
       initial[key] = String(prop.default);
+    } else if (
+      parsed.required.has(key) &&
+      Array.isArray(prop.enum) &&
+      prop.enum.length > 0
+    ) {
+      initial[key] = String(prop.enum[0]);
     } else {
       initial[key] = "";
     }
@@ -117,16 +159,13 @@ export function initSchemaFieldValues(
 
 export function buildValidatedSchemaConfig(
   schema: Record<string, unknown> | null | undefined,
-  values: Record<string, string | boolean>,
+  values: SchemaFieldValues,
   isEdit: boolean,
   existingConfig: Record<string, unknown> | undefined,
   m: Messages,
 ): { config: Record<string, unknown> | null; error: string | null } {
   const parsed = parseObjectSchema(schema);
   const config: Record<string, unknown> = {};
-
-  const hasStoredSecret = (key: string): boolean =>
-    Boolean(isEdit && existingConfig && existingConfig[`has_${key}`] === true);
 
   for (const [key, prop] of parsed.properties) {
     const label = prop.title || key;
@@ -143,7 +182,7 @@ export function buildValidatedSchemaConfig(
 
     if (prop.type === "array") {
       const items = strVal
-        .split(/[\n,]/)
+        .split(/[\n,]+/)
         .map((s) => s.trim())
         .filter(Boolean);
       if (isRequired && items.length === 0) {
@@ -155,6 +194,29 @@ export function buildValidatedSchemaConfig(
       if (items.length > 0 || isEdit) {
         config[key] = items;
       }
+      continue;
+    }
+
+    if (Array.isArray(prop.enum) && prop.enum.length > 0) {
+      if (!strVal) {
+        if (isRequired) {
+          return {
+            config: null,
+            error: m.plugins.providerModal.errFieldRequired(label),
+          };
+        }
+        if (
+          isEdit &&
+          existingConfig &&
+          existingConfig[key] !== undefined &&
+          existingConfig[key] !== null
+        ) {
+          config[key] = null;
+        }
+        continue;
+      }
+      const matched = prop.enum.find((opt) => String(opt) === strVal);
+      config[key] = matched !== undefined ? matched : strVal;
       continue;
     }
 
@@ -195,9 +257,11 @@ export function buildValidatedSchemaConfig(
     }
 
     if (isSecret) {
-      if (strVal.length > 0) {
+      if (isEdit && !isRequired && rawVal === null) {
+        config[key] = null;
+      } else if (strVal.length > 0) {
         config[key] = strVal;
-      } else if (isRequired && !hasStoredSecret(key)) {
+      } else if (isRequired && !hasStoredSecretFor(key, isEdit, existingConfig)) {
         return {
           config: null,
           error: m.plugins.providerModal.errFieldRequired(label),
@@ -275,8 +339,8 @@ export function SchemaFormFields({
 }: {
   idPrefix: string;
   schema: Record<string, unknown> | null | undefined;
-  values: Record<string, string | boolean>;
-  onChange: (next: Record<string, string | boolean>) => void;
+  values: SchemaFieldValues;
+  onChange: (next: SchemaFieldValues) => void;
   isEdit?: boolean;
   existingConfig?: Record<string, unknown>;
 }) {
@@ -304,11 +368,12 @@ export function SchemaFormFields({
         const label = prop.title || key;
         const isRequired = parsed.required.has(key);
         const isSecret = isSchemaSecretProperty(key, prop);
-        const storedSecret = Boolean(
-          isEdit && existingConfig && existingConfig[`has_${key}`] === true,
-        );
+        const storedSecret = hasStoredSecretFor(key, isEdit, existingConfig);
+        const isClearedSecret =
+          isSecret && isEdit && !isRequired && values[key] === null;
         const hintRaw = existingConfig?.[`${key}_hint`];
-        const hint = typeof hintRaw === "string" ? hintRaw : null;
+        const hint =
+          typeof hintRaw === "string" && hintRaw.length > 0 ? hintRaw : null;
         const strVal = typeof values[key] === "string" ? values[key] : "";
 
         if (Array.isArray(prop.enum) && prop.enum.length > 0) {
@@ -370,12 +435,14 @@ export function SchemaFormFields({
               : "text";
 
         const placeholder = isSecret
-          ? storedSecret
-            ? hint
-              ? m.plugins.providerModal.signatureStoredPlaceholder(hint)
-              : m.plugins.providerModal.genericSecretStoredPlaceholder
-            : prop.placeholder ||
-              m.plugins.providerModal.genericSecretPlaceholder
+          ? isClearedSecret
+            ? m.plugins.providerModal.secretWillClearPlaceholder
+            : storedSecret
+              ? hint
+                ? m.plugins.providerModal.signatureStoredPlaceholder(hint)
+                : m.plugins.providerModal.genericSecretStoredPlaceholder
+              : prop.placeholder ||
+                m.plugins.providerModal.genericSecretPlaceholder
           : prop.placeholder;
 
         return (
@@ -389,11 +456,28 @@ export function SchemaFormFields({
               type={inputType}
               step={prop.type === "integer" ? 1 : "any"}
               value={strVal}
+              disabled={isClearedSecret}
               onChange={(e) => onChange({ ...values, [key]: e.target.value })}
               placeholder={placeholder}
               className="mt-1 font-mono text-xs"
             />
-            {isSecret && storedSecret ? (
+            {isSecret && isEdit && !isRequired && storedSecret && (
+              <label className="mt-1.5 inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                <input
+                  type="checkbox"
+                  checked={isClearedSecret}
+                  onChange={(e) =>
+                    onChange({
+                      ...values,
+                      [key]: e.target.checked ? null : "",
+                    })
+                  }
+                  className="h-3.5 w-3.5 rounded border-zinc-300 accent-zinc-900 dark:border-zinc-700 dark:accent-zinc-100"
+                />
+                <span>{m.plugins.providerModal.clearStoredSecretLabel}</span>
+              </label>
+            )}
+            {isSecret && storedSecret && !isClearedSecret ? (
               <FieldHint>
                 {prop.description
                   ? `${prop.description} ${m.plugins.providerModal.secretPreserveHint}`

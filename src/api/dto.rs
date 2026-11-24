@@ -1292,6 +1292,10 @@ pub struct UpdatePluginRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub settings: Option<Value>,
+    #[serde(default)]
+    pub bridge_url: Option<String>,
+    #[serde(default)]
+    pub bridge_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
