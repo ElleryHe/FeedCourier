@@ -1,10 +1,13 @@
 import {
+  Bell,
   Code2,
   Filter,
   Globe,
   Link2,
   type LucideIcon,
   Puzzle,
+  Radio,
+  Send,
   Shield,
   Sparkles,
   Webhook,
@@ -20,6 +23,9 @@ const PLUGIN_ICON_MAP: Record<string, LucideIcon> = {
   filter: Filter,
   code: Code2,
   webhook: Webhook,
+  bell: Bell,
+  send: Send,
+  radio: Radio,
   puzzle: Puzzle,
 };
 

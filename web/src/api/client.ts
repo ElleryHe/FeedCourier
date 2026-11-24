@@ -7,8 +7,10 @@ import type {
   AuthLoginResponse,
   AuthPasswordRequest,
   AuthStatusResponse,
+  BridgeManifestPreviewResponse,
   ChannelDestinationDto,
   ChannelDto,
+  ChannelReferenceDto,
   ClearFeedCacheRequest,
   ClearFeedCacheResponse,
   ClearPluginCacheResponse,
@@ -42,6 +44,7 @@ import type {
   QueueStateDto,
   RecoveryCodesResponse,
   RegenerateRecoveryCodesRequest,
+  RegisterBridgePluginRequest,
   RetryTasksRequest,
   RetryTasksResponse,
   RouteDto,
@@ -75,6 +78,7 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
   readonly referencing_routes?: RouteReferenceDto[];
+  readonly referencing_channels?: ChannelReferenceDto[];
   readonly retry_after_secs?: number;
 
   constructor(
@@ -83,12 +87,14 @@ export class ApiError extends Error {
     code?: string,
     referencingRoutes?: RouteReferenceDto[],
     retryAfterSecs?: number,
+    referencingChannels?: ChannelReferenceDto[],
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.referencing_routes = referencingRoutes;
+    this.referencing_channels = referencingChannels;
     this.retry_after_secs = retryAfterSecs;
   }
 }
@@ -120,6 +126,21 @@ export function getReferencingRoutesConflict(
     err.referencing_routes.length > 0
   ) {
     return err.referencing_routes;
+  }
+  return null;
+}
+
+/** Extract referencing channels & routes from a 409 Conflict when deleting a bridge plugin. */
+export function getPluginDeleteConflict(err: unknown): {
+  channels: ChannelReferenceDto[];
+  routes: RouteReferenceDto[];
+} | null {
+  if (err instanceof ApiError && err.status === 409) {
+    const channels = err.referencing_channels ?? [];
+    const routes = err.referencing_routes ?? [];
+    if (channels.length > 0 || routes.length > 0) {
+      return { channels, routes };
+    }
   }
   return null;
 }
@@ -159,12 +180,22 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
               typeof r.name === "string",
           )
         : undefined;
+      const referencingChannels = Array.isArray(data.referencing_channels)
+        ? data.referencing_channels.filter(
+            (c): c is ChannelReferenceDto =>
+              typeof c === "object" &&
+              c !== null &&
+              typeof c.id === "number" &&
+              typeof c.name === "string",
+          )
+        : undefined;
       return new ApiError(
         res.status,
         message,
         data.code,
         referencingRoutes,
         retryAfterSecs,
+        referencingChannels,
       );
     } catch {
       // Fall through to text fallback
@@ -514,6 +545,25 @@ export const api = {
   // -------------------------------------------------------------------------
   plugins: {
     list: () => request<PluginDto[]>("/plugins", { method: "GET" }),
+    previewBridge: (payload: Omit<RegisterBridgePluginRequest, "dry_run">) =>
+      request<BridgeManifestPreviewResponse>("/plugins/bridges", {
+        method: "POST",
+        body: { ...payload, dry_run: true },
+      }),
+    registerBridge: (payload: Omit<RegisterBridgePluginRequest, "dry_run">) =>
+      request<PluginDto>("/plugins/bridges", {
+        method: "POST",
+        body: { ...payload, dry_run: false },
+      }),
+    refreshManifest: (id: string) =>
+      request<PluginDto>(`/plugins/${encodeURIComponent(id)}/refresh-manifest`, {
+        method: "POST",
+      }),
+    deleteBridge: (id: string, cascade = false) =>
+      request<ActionAckResponse | undefined>(
+        `/plugins/${encodeURIComponent(id)}${cascade ? "?cascade=true" : ""}`,
+        { method: "DELETE" },
+      ),
     update: (id: string, payload: UpdatePluginRequest) =>
       request<PluginDto>(`/plugins/${encodeURIComponent(id)}`, {
         method: "PATCH",

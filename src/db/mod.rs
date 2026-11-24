@@ -34,6 +34,9 @@ pub struct Database {
     /// Path to a true pre-v0.3.0 DDL backup captured via `VACUUM INTO` before applying
     /// `0003_plugins_and_smtp_compliance.sql` on an existing v0.2.x database.
     pre_v3_backup_path: Option<PathBuf>,
+    /// Path to a pre-v0.3.1 DDL backup captured via `VACUUM INTO` before applying
+    /// `0004_plugin_bridges.sql` on an existing v0.3.0 database.
+    pre_v4_backup_path: Option<PathBuf>,
 }
 
 /// Return `true` only when `candidate` AND its SQLite WAL/SHM sidecar paths (`-wal`, `-shm`)
@@ -183,6 +186,39 @@ async fn needs_pre_v3_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
     Ok(feed_count > 0 || channel_count > 0)
 }
 
+async fn needs_pre_v4_ddl_backup(write_pool: &SqlitePool) -> AppResult<bool> {
+    let (has_migrations_table,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(write_pool)
+    .await?;
+    if has_migrations_table == 0 {
+        return Ok(false);
+    }
+
+    let (has_v3,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 3")
+            .fetch_one(write_pool)
+            .await?;
+    let (has_v4,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 4")
+            .fetch_one(write_pool)
+            .await?;
+    if has_v3 == 0 || has_v4 > 0 {
+        return Ok(false);
+    }
+
+    let (channel_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM channels")
+        .fetch_one(write_pool)
+        .await
+        .unwrap_or((0,));
+    let (feed_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM feeds")
+        .fetch_one(write_pool)
+        .await
+        .unwrap_or((0,));
+    Ok(channel_count > 0 || feed_count > 0)
+}
+
 async fn vacuum_into_backup_cleanly(write_pool: &SqlitePool, backup_path: &Path) -> AppResult<()> {
     let backup_str = backup_path.to_str().ok_or_else(|| {
         crate::error::AppError::Validation("backup path must be valid UTF-8".to_string())
@@ -260,6 +296,22 @@ impl Database {
                 None
             };
 
+        // Snapshot a genuine pre-v0.3.1 database BEFORE applying `0004_plugin_bridges.sql`.
+        let pre_v4_backup_path = if pre_v2_backup_path.is_none()
+            && pre_v3_backup_path.is_none()
+            && needs_pre_v4_ddl_backup(&write_pool).await?
+        {
+            let backup_path = choose_pre_ddl_backup_path(db_path, "pre-v0.3.1-backup");
+            vacuum_into_backup_cleanly(&write_pool, &backup_path).await?;
+            tracing::info!(
+                backup_path = %backup_path.display(),
+                "captured pre-v0.3.1 SQLite backup prior to applying 0004 schema migration"
+            );
+            Some(backup_path)
+        } else {
+            None
+        };
+
         MIGRATOR.run(&write_pool).await?;
 
         // 2. Open the concurrent read pool with `PRAGMA query_only = ON` so WAL `-shm` read-marks
@@ -279,6 +331,7 @@ impl Database {
             write_pool,
             pre_v2_backup_path,
             pre_v3_backup_path,
+            pre_v4_backup_path,
         })
     }
 
@@ -295,6 +348,11 @@ impl Database {
     /// Path to the pre-DDL v0.2.x backup created during [`Database::connect`], if any.
     pub fn pre_v3_backup_path(&self) -> Option<&Path> {
         self.pre_v3_backup_path.as_deref()
+    }
+
+    /// Path to the pre-DDL v0.3.0 backup created during [`Database::connect`], if any.
+    pub fn pre_v4_backup_path(&self) -> Option<&Path> {
+        self.pre_v4_backup_path.as_deref()
     }
 
     /// Concurrent read-only pool (`PRAGMA query_only = ON`).

@@ -1,21 +1,46 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-11-23T00:00:00Z",
+  "generated_at": "2026-11-24T18:12:56Z",
   "plugins": [
     {
       "id": "link-rewrite",
       "name": "Link Rewrite (YOURLS)",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "api_version": "1",
       "kind": "builtin",
+      "runtime": "builtin",
       "min_core": "0.3.0",
       "category": "links",
       "icon": "link",
       "description": "Rewrite outgoing article links using one or more self-hosted YOURLS short-link providers at delivery time, with SQLite caching, domain exclusions, and optional strict retry mode.",
       "homepage": "https://feedcourier.ellery.me/plugins/link-rewrite",
       "repository": "https://github.com/ElleryHe/FeedCourier",
-      "hooks": ["on_render"],
-      "permissions": ["network"]
+      "hooks": [
+        "on_render"
+      ],
+      "permissions": [
+        "network"
+      ]
+    },
+    {
+      "id": "ntfy",
+      "name": "ntfy Push",
+      "version": "0.3.1",
+      "api_version": "1",
+      "kind": "channel",
+      "runtime": "bridge",
+      "min_core": "0.3.1",
+      "category": "delivery",
+      "icon": "bell",
+      "description": "Reference HTTP Bridge channel plugin delivering RSS articles as push notifications to ntfy.sh or self-hosted ntfy servers with topic, priority, tags, and bearer token auth.",
+      "homepage": "https://feedcourier.ellery.me/plugins/bridge-channels",
+      "repository": "https://github.com/ElleryHe/FeedCourier-Plugins/tree/main/channels/ntfy",
+      "image": "ghcr.io/elleryhe/feedcourier-plugin-ntfy:latest",
+      "compose_snippet": "services:\n  feedcourier-ntfy:\n    build: ./channels/ntfy\n    environment:\n      BRIDGE_SECRET: \"replace-with-strong-secret\"\n      PORT: \"8787\"\n    restart: unless-stopped",
+      "hooks": [],
+      "permissions": [
+        "network"
+      ]
     }
   ]
 }

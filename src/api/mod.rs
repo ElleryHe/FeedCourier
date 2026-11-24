@@ -202,8 +202,19 @@ pub fn build_api_only_router(state: AppState) -> Router {
         )
         // Plugins & Marketplace
         .route("/api/v1/plugins", get(handlers::list_plugins))
+        .route(
+            "/api/v1/plugins/bridges",
+            post(handlers::register_bridge_plugin),
+        )
         .route("/api/v1/plugins/market", get(handlers::get_plugin_market))
-        .route("/api/v1/plugins/{id}", patch(handlers::update_plugin))
+        .route(
+            "/api/v1/plugins/{id}",
+            patch(handlers::update_plugin).delete(handlers::delete_bridge_plugin),
+        )
+        .route(
+            "/api/v1/plugins/{id}/refresh-manifest",
+            post(handlers::refresh_bridge_plugin_manifest),
+        )
         .route(
             "/api/v1/plugins/{id}/instances",
             get(handlers::list_plugin_instances).post(handlers::create_plugin_instance),

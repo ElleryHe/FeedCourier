@@ -340,6 +340,8 @@ pub struct McpPluginSummary {
     pub name: String,
     pub version: String,
     pub api_version: String,
+    pub kind: crate::plugins::PluginKind,
+    pub runtime: crate::plugins::PluginRuntime,
     pub enabled: bool,
     pub hooks: Vec<crate::plugins::HookKind>,
     pub instances: Vec<McpPluginInstanceSummary>,
@@ -732,7 +734,11 @@ impl McpServer {
         }
 
         let db = self.state.db();
-        let registry = crate::plugins::PluginRegistry::with_builtins();
+        let registry = self
+            .state
+            .runtime()
+            .map(|r| r.plugins().clone())
+            .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
 
         let rows = match db.list_plugins().await {
             Ok(r) => r,
@@ -756,7 +762,7 @@ impl McpServer {
                 });
         }
 
-        let plugins: Vec<McpPluginSummary> = registry
+        let mut plugins: Vec<McpPluginSummary> = registry
             .list()
             .iter()
             .map(|p| {
@@ -767,12 +773,30 @@ impl McpServer {
                     name: m.name.clone(),
                     version: m.version.clone(),
                     api_version: m.api_version.clone(),
+                    kind: m.kind,
+                    runtime: m.runtime,
                     enabled,
                     hooks: m.hooks.clone(),
                     instances: inst_by_plugin.remove(&m.id).unwrap_or_default(),
                 }
             })
             .collect();
+
+        for bridge in registry.list_bridges() {
+            let m = &bridge.manifest;
+            let enabled = row_by_id.get(&m.id).map_or(bridge.enabled, |r| r.enabled);
+            plugins.push(McpPluginSummary {
+                id: m.id.clone(),
+                name: m.name.clone(),
+                version: m.version.clone(),
+                api_version: m.api_version.clone(),
+                kind: m.kind,
+                runtime: m.runtime,
+                enabled,
+                hooks: m.hooks.clone(),
+                instances: inst_by_plugin.remove(&m.id).unwrap_or_default(),
+            });
+        }
 
         tool_ok(&serde_json::json!({ "plugins": plugins }))
     }
@@ -1350,11 +1374,18 @@ impl McpServer {
                         .collect(),
                     active_weekdays: params.active_weekdays.clone().unwrap_or_default(),
                     plugins: params.plugins.clone().unwrap_or_default(),
+                    plugin_order: Vec::new(),
                 };
                 if let Err(err) = validate_schedule(&mut options) {
                     return Ok(tool_error_from_app(err));
                 }
-                if let Err(err) = validate_mcp_route_plugins(db, &options.plugins).await {
+                let registry = self
+                    .state
+                    .runtime()
+                    .map(|r| r.plugins().clone())
+                    .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
+                if let Err(err) = validate_mcp_route_plugins(&registry, db, &options.plugins).await
+                {
                     return Ok(tool_error_from_app(err));
                 }
 
@@ -1507,7 +1538,14 @@ impl McpServer {
                     if let Err(err) = validate_schedule(&mut current_opts) {
                         return Ok(tool_error_from_app(err));
                     }
-                    if let Err(err) = validate_mcp_route_plugins(db, &current_opts.plugins).await {
+                    let registry = self
+                        .state
+                        .runtime()
+                        .map(|r| r.plugins().clone())
+                        .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
+                    if let Err(err) =
+                        validate_mcp_route_plugins(&registry, db, &current_opts.plugins).await
+                    {
                         return Ok(tool_error_from_app(err));
                     }
                     Some(current_opts)
@@ -2334,10 +2372,10 @@ fn normalize_optional_pattern(pattern: Option<String>) -> Option<String> {
 }
 
 async fn validate_mcp_route_plugins(
+    registry: &crate::plugins::PluginRegistry,
     db: &crate::db::Database,
     route_plugins: &BTreeMap<String, serde_json::Value>,
 ) -> crate::error::AppResult<()> {
-    let registry = crate::plugins::PluginRegistry::with_builtins();
     registry.validate_route_plugins(db, route_plugins).await?;
     for (plugin_id, opt_val) in route_plugins {
         if opt_val.is_null() {

@@ -24,12 +24,19 @@ export interface RouteReferenceDto {
   name: string;
 }
 
+/** Channel reference returned inside 409 Conflict responses when deleting a referenced bridge plugin. */
+export interface ChannelReferenceDto {
+  id: number;
+  name: string;
+}
+
 /** Standard JSON error body returned by Axum `AppError` on non-2xx responses. */
 export interface ApiErrorBody {
   error: string;
   code?: string;
   message?: string;
   referencing_routes?: RouteReferenceDto[];
+  referencing_channels?: ChannelReferenceDto[];
 }
 
 export interface ActionAckResponse {
@@ -148,7 +155,7 @@ export interface RegenerateRecoveryCodesRequest {
 
 export type FeedHealthStatus = "active" | "backoff" | "circuit_open" | "paused";
 
-export type ChannelKind = "smtp" | "telegram" | "notion";
+export type ChannelKind = "smtp" | "telegram" | "notion" | "plugin";
 
 export type TaskStatus =
   | "queued"
@@ -425,6 +432,11 @@ export type ChannelAccountView =
       kind: "notion";
       /** Masked hint from `mask_secret(&cfg.integration_secret)`, e.g. `"ntn_••••abcd"`. */
       secret_hint: string;
+    }
+  | {
+      kind: "plugin";
+      plugin_id: string;
+      config: Record<string, unknown>;
     };
 
 /**
@@ -450,6 +462,11 @@ export type ChannelAccountCreate =
   | {
       kind: "notion";
       integration_secret: string;
+    }
+  | {
+      kind: "plugin";
+      plugin_id: string;
+      config: Record<string, unknown>;
     };
 
 /**
@@ -480,6 +497,10 @@ export type ChannelAccountPatch =
       kind: "notion";
       /** Omit or pass `null` to keep existing Notion integration secret. */
       integration_secret?: string | null;
+    }
+  | {
+      kind: "plugin";
+      config?: Record<string, unknown>;
     };
 
 /**
@@ -503,6 +524,10 @@ export type DestinationConfigView =
       database_id: string | null;
       parent_page_id: string | null;
       column_mapping: NotionColumnMapping;
+    }
+  | {
+      kind: "plugin";
+      config: Record<string, unknown>;
     };
 
 /**
@@ -527,6 +552,10 @@ export type DestinationConfigCreate =
       database_id?: string | null;
       parent_page_id?: string | null;
       column_mapping: NotionColumnMapping;
+    }
+  | {
+      kind: "plugin";
+      config: Record<string, unknown>;
     };
 
 /** Partial destination patch (`PATCH /api/v1/destinations/:id`). */
@@ -547,6 +576,10 @@ export type DestinationPatch =
       database_id?: string | null;
       parent_page_id?: string | null;
       column_mapping?: NotionColumnMapping;
+    }
+  | {
+      kind: "plugin";
+      config?: Record<string, unknown>;
     };
 
 export type SmtpRecipientStatus =
@@ -797,6 +830,8 @@ export interface RouteOptions {
   active_weekdays?: number[];
   /** Per-plugin route options keyed by plugin ID (e.g. `{"link-rewrite": {"provider_id": 3}}`). */
   plugins?: Record<string, Record<string, unknown> | null>;
+  /** Explicit execution order for `on_render` processor plugins on this route. */
+  plugin_order?: string[];
 }
 
 export interface ActiveWindow {
@@ -878,6 +913,10 @@ export type DeliveryCheckpoint =
       create_initiated: boolean;
       async_task_id: string | null;
       page_id: string | null;
+    }
+  | {
+      kind: "plugin";
+      state: unknown;
     };
 
 /** Enriched outbox task DTO (mirrors `crate::db::models::DeliveryTaskDetail`). */
@@ -971,6 +1010,10 @@ export type HookKind = "on_render" | "on_ingest" | "on_delivered";
 
 export type PluginPermission = "network";
 
+export type PluginKind = "processor" | "channel";
+
+export type PluginRuntime = "builtin" | "bridge";
+
 export interface PluginRouteOptionPropertySchema {
   type: "select" | "boolean" | "string" | "number" | string;
   title?: string;
@@ -992,6 +1035,9 @@ export interface PluginManifest {
   name: string;
   version: string;
   api_version: string;
+  kind: PluginKind;
+  runtime: PluginRuntime;
+  min_core?: string | null;
   category: string;
   icon: string;
   description: string;
@@ -1000,6 +1046,9 @@ export interface PluginManifest {
   permissions: PluginPermission[];
   instance_schema: Record<string, unknown>;
   route_option_schema: PluginRouteOptionSchema;
+  account_schema?: Record<string, unknown>;
+  destination_schema?: Record<string, unknown>;
+  capabilities?: Record<string, unknown>;
 }
 
 export type YourlsAuthMode = "signature" | "timed_signature" | "password";
@@ -1030,6 +1079,12 @@ export interface PluginInstanceDto {
 
 export interface PluginDto {
   id: string;
+  source: "builtin" | "bridge" | string;
+  kind: PluginKind;
+  runtime: PluginRuntime;
+  bridge_url?: string | null;
+  compatible: boolean;
+  compatibility_reason?: string | null;
   manifest: PluginManifest;
   enabled: boolean;
   installed_version: string;
@@ -1037,6 +1092,20 @@ export interface PluginDto {
   instance_count: number;
   instances: PluginInstanceDto[];
   updated_at: string;
+}
+
+export interface RegisterBridgePluginRequest {
+  bridge_url: string;
+  bridge_secret: string;
+  enabled?: boolean;
+  dry_run?: boolean;
+}
+
+export interface BridgeManifestPreviewResponse {
+  bridge_url: string;
+  manifest: PluginManifest;
+  compatible: boolean;
+  compatibility_reason?: string | null;
 }
 
 export interface UpdatePluginRequest {
@@ -1070,15 +1139,20 @@ export interface MarketPluginItemDto {
   name: string;
   version: string;
   api_version: string;
-  kind: "builtin" | "external" | "coming_soon" | string;
+  kind: "builtin" | "processor" | "channel" | "external" | "coming_soon" | string;
+  runtime?: "builtin" | "bridge" | string | null;
   min_core: string | null;
   category: string;
   icon: string;
   description: string;
   homepage: string | null;
   repository: string | null;
+  image?: string | null;
+  compose_snippet?: string | null;
   hooks: string[];
   permissions: string[];
+  compatible: boolean;
+  compatibility_reason?: string | null;
   installed: boolean;
   enabled: boolean;
 }

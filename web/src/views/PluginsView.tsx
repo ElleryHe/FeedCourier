@@ -20,8 +20,14 @@ import {
   Trash2,
 } from "lucide-react";
 import { type FormEvent, useMemo, useState } from "react";
-import { api, getReferencingRoutesConflict } from "@/api/client";
+import {
+  api,
+  getPluginDeleteConflict,
+  getReferencingRoutesConflict,
+} from "@/api/client";
 import type {
+  BridgeManifestPreviewResponse,
+  ChannelReferenceDto,
   MarketPluginItemDto,
   PluginDto,
   PluginInstanceDto,
@@ -30,6 +36,7 @@ import type {
   YourlsProviderConfigView,
 } from "@/api/types";
 import { PluginIcon } from "@/components/plugins/PluginIcon";
+import { parseObjectSchema } from "@/components/plugins/SchemaFormFields";
 import {
   Badge,
   Button,
@@ -176,6 +183,16 @@ export function PluginsView() {
   const [marketSearch, setMarketSearch] = useState("");
   const [marketCategory, setMarketCategory] = useState<string>("all");
   const [enablingMarketId, setEnablingMarketId] = useState<string | null>(null);
+  const [bridgeModalOpen, setBridgeModalOpen] = useState(false);
+  const [refreshingManifestId, setRefreshingManifestId] = useState<
+    string | null
+  >(null);
+  const [deletingBridge, setDeletingBridge] = useState<PluginDto | null>(null);
+  const [bridgeDeleteConflict, setBridgeDeleteConflict] = useState<{
+    plugin: PluginDto;
+    channels: ChannelReferenceDto[];
+    routes: RouteReferenceDto[];
+  } | null>(null);
 
   const pluginsQuery = useQuery({
     queryKey: ["plugins"],
@@ -251,6 +268,59 @@ export function PluginsView() {
     onSettled: () => setEnablingMarketId(null),
   });
 
+  const refreshManifestMutation = useMutation({
+    mutationFn: (id: string) => {
+      setRefreshingManifestId(id);
+      return api.plugins.refreshManifest(id);
+    },
+    onSuccess: (updated) => {
+      queryClient.setQueryData<PluginDto[]>(["plugins"], (prev) =>
+        prev ? prev.map((p) => (p.id === updated.id ? updated : p)) : [updated],
+      );
+      toast.success(m.plugins.bridge.toastManifestRefreshed);
+      void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+    },
+    onError: (err) => {
+      toast.error(
+        m.plugins.bridge.toastManifestRefreshFailed,
+        errorMessage(err),
+      );
+    },
+    onSettled: () => setRefreshingManifestId(null),
+  });
+
+  const deleteBridgeMutation = useMutation({
+    mutationFn: ({ plugin, cascade }: { plugin: PluginDto; cascade: boolean }) =>
+      api.plugins.deleteBridge(plugin.id, cascade),
+    onSuccess: (_res, { plugin }) => {
+      toast.success(m.plugins.bridge.toastDeleted);
+      setDeletingBridge(null);
+      setBridgeDeleteConflict(null);
+      if (selectedPluginId === plugin.id) {
+        setSelectedPluginId(null);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+      void queryClient.invalidateQueries({ queryKey: ["plugins-market"] });
+      void queryClient.invalidateQueries({ queryKey: ["channels"] });
+      void queryClient.invalidateQueries({ queryKey: ["routes"] });
+    },
+    onError: (err, { plugin, cascade }) => {
+      if (!cascade) {
+        const conflict = getPluginDeleteConflict(err);
+        if (conflict) {
+          setDeletingBridge(null);
+          setBridgeDeleteConflict({
+            plugin,
+            channels: conflict.channels,
+            routes: conflict.routes,
+          });
+          return;
+        }
+      }
+      toast.error(m.plugins.bridge.toastDeleteFailed, errorMessage(err));
+    },
+  });
+
   const plugins = pluginsQuery.data ?? [];
   const selectedPlugin = useMemo(
     () => plugins.find((p) => p.id === selectedPluginId) ?? null,
@@ -284,14 +354,118 @@ export function PluginsView() {
 
   if (selectedPlugin) {
     return (
-      <PluginDetailView
-        plugin={selectedPlugin}
-        onBack={() => setSelectedPluginId(null)}
-        onToggleEnabled={(enabled) =>
-          togglePluginMutation.mutate({ id: selectedPlugin.id, enabled })
-        }
-        togglingPlugin={togglePluginMutation.isPending}
-      />
+      <>
+        <PluginDetailView
+          plugin={selectedPlugin}
+          onBack={() => setSelectedPluginId(null)}
+          onToggleEnabled={(enabled) =>
+            togglePluginMutation.mutate({ id: selectedPlugin.id, enabled })
+          }
+          togglingPlugin={togglePluginMutation.isPending}
+          onRefreshManifest={
+            selectedPlugin.runtime === "bridge"
+              ? () => refreshManifestMutation.mutate(selectedPlugin.id)
+              : undefined
+          }
+          refreshingManifest={refreshingManifestId === selectedPlugin.id}
+          onDeleteBridge={
+            selectedPlugin.runtime === "bridge"
+              ? () => setDeletingBridge(selectedPlugin)
+              : undefined
+          }
+        />
+
+        <ConfirmDialog
+          open={deletingBridge !== null}
+          onClose={() => setDeletingBridge(null)}
+          onConfirm={() => {
+            if (deletingBridge) {
+              deleteBridgeMutation.mutate({
+                plugin: deletingBridge,
+                cascade: false,
+              });
+            }
+          }}
+          title={m.plugins.bridge.deleteConfirmTitle}
+          description={m.plugins.bridge.deleteConfirmDesc(
+            deletingBridge?.manifest.name ?? "",
+          )}
+          confirmLabel={m.plugins.bridge.deleteConfirmBtn}
+          loading={deleteBridgeMutation.isPending}
+        />
+
+        <Modal
+          open={bridgeDeleteConflict !== null}
+          onClose={() => setBridgeDeleteConflict(null)}
+          title={m.plugins.bridge.deleteCascadeTitle}
+          size="sm"
+          footer={
+            <>
+              <Button
+                variant="outline"
+                onClick={() => setBridgeDeleteConflict(null)}
+                disabled={deleteBridgeMutation.isPending}
+              >
+                {m.common.cancel}
+              </Button>
+              <Button
+                variant="destructive"
+                loading={deleteBridgeMutation.isPending}
+                onClick={() => {
+                  if (bridgeDeleteConflict) {
+                    deleteBridgeMutation.mutate({
+                      plugin: bridgeDeleteConflict.plugin,
+                      cascade: true,
+                    });
+                  }
+                }}
+              >
+                {m.plugins.bridge.deleteCascadeBtn}
+              </Button>
+            </>
+          }
+        >
+          {bridgeDeleteConflict && (
+            <div className="space-y-3 text-xs">
+              <p className="text-zinc-600 dark:text-zinc-300">
+                {m.plugins.bridge.deleteCascadeDesc(
+                  bridgeDeleteConflict.plugin.manifest.name,
+                  bridgeDeleteConflict.channels.length,
+                  bridgeDeleteConflict.routes.length,
+                )}
+              </p>
+              {bridgeDeleteConflict.channels.length > 0 && (
+                <div>
+                  <div className="mb-1 text-[11px] font-semibold text-zinc-500 uppercase">
+                    {m.plugins.bridge.conflictChannelsLabel}
+                  </div>
+                  <ul className="space-y-1 rounded-lg border border-zinc-200 bg-zinc-50/70 p-2.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+                    {bridgeDeleteConflict.channels.map((ch) => (
+                      <li key={ch.id} className="font-medium">
+                        #{ch.id} · {ch.name}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {bridgeDeleteConflict.routes.length > 0 && (
+                <div>
+                  <div className="mb-1 text-[11px] font-semibold text-zinc-500 uppercase">
+                    {m.plugins.detail.conflictRoutesLabel}
+                  </div>
+                  <ul className="space-y-1 rounded-lg border border-zinc-200 bg-zinc-50/70 p-2.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+                    {bridgeDeleteConflict.routes.map((rt) => (
+                      <li key={rt.id} className="font-medium">
+                        #{rt.id} · {rt.name}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </Modal>
+      </>
     );
   }
 
@@ -308,8 +482,14 @@ export function PluginsView() {
           </p>
         </div>
 
-        {/* Installed / Marketplace Tabs */}
-        <div className="flex items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={() => setBridgeModalOpen(true)}>
+            <Plus className="h-3.5 w-3.5" />
+            {m.plugins.bridge.addBtn}
+          </Button>
+
+          {/* Installed / Marketplace Tabs */}
+          <div className="flex items-center gap-1 rounded-lg border border-zinc-200 bg-white p-1 dark:border-zinc-800 dark:bg-zinc-900">
           <button
             type="button"
             onClick={() => setActiveTab("installed")}
@@ -334,6 +514,7 @@ export function PluginsView() {
             <Store className="h-3.5 w-3.5" />
             {m.plugins.tabs.marketplace}
           </button>
+        </div>
         </div>
       </div>
 
@@ -402,17 +583,41 @@ export function PluginsView() {
                             )}
                           </div>
                           <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                            <Badge variant="outline">
-                              {plugin.manifest.category}
-                            </Badge>
-                            <Badge
-                              variant={
-                                plugin.instance_count > 0 ? "info" : "default"
-                              }
-                            >
-                              {m.plugins.providerCount(plugin.instance_count)}
-                            </Badge>
+                            {plugin.runtime === "bridge" ? (
+                              <Badge
+                                variant={
+                                  plugin.kind === "channel" ? "info" : "warning"
+                                }
+                              >
+                                {plugin.kind === "channel"
+                                  ? m.plugins.market.kindBridgeChannel
+                                  : m.plugins.market.kindBridgeProcessor}
+                              </Badge>
+                            ) : (
+                              <Badge variant="success">
+                                {m.plugins.market.kindBuiltin}
+                              </Badge>
+                            )}
+                            {plugin.manifest.category && (
+                              <Badge variant="outline">
+                                {plugin.manifest.category}
+                              </Badge>
+                            )}
+                            {plugin.kind === "processor" && (
+                              <Badge
+                                variant={
+                                  plugin.instance_count > 0 ? "info" : "default"
+                                }
+                              >
+                                {m.plugins.providerCount(plugin.instance_count)}
+                              </Badge>
+                            )}
                           </div>
+                          {plugin.bridge_url && (
+                            <p className="mt-1 truncate font-mono text-[11px] text-zinc-400">
+                              {plugin.bridge_url}
+                            </p>
+                          )}
                         </div>
                       </div>
 
@@ -461,17 +666,46 @@ export function PluginsView() {
                       ))}
                     </div>
 
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSelectedPluginId(plugin.id);
-                      }}
+                    <div
+                      className="flex items-center gap-1.5"
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => e.stopPropagation()}
                     >
-                      <Settings2 className="h-3.5 w-3.5" />
-                      {m.plugins.configureBtn}
-                    </Button>
+                      {plugin.runtime === "bridge" && (
+                        <>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            loading={refreshingManifestId === plugin.id}
+                            onClick={() =>
+                              refreshManifestMutation.mutate(plugin.id)
+                            }
+                            title={m.plugins.bridge.refreshManifestTitle}
+                            aria-label={m.plugins.bridge.refreshManifestTitle}
+                          >
+                            <RefreshCw className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => setDeletingBridge(plugin)}
+                            title={m.plugins.bridge.deleteBtn}
+                            aria-label={m.plugins.bridge.deleteBtn}
+                            className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </>
+                      )}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setSelectedPluginId(plugin.id)}
+                      >
+                        <Settings2 className="h-3.5 w-3.5" />
+                        {m.plugins.configureBtn}
+                      </Button>
+                    </div>
                   </div>
                 </Card>
               ))}
@@ -589,6 +823,9 @@ export function PluginsView() {
             <div className="grid gap-4 md:grid-cols-2">
               {filteredMarketPlugins.map((item) => {
                 const isBuiltin = item.kind === "builtin";
+                const isBridge = item.runtime === "bridge";
+                const isBridgeChannel = isBridge && item.kind === "channel";
+                const isBridgeProcessor = isBridge && item.kind !== "channel";
                 return (
                   <Card
                     key={item.id}
@@ -610,9 +847,27 @@ export function PluginsView() {
                                 <Badge variant="success">
                                   {m.plugins.market.kindBuiltin}
                                 </Badge>
+                              ) : isBridgeChannel ? (
+                                <Badge variant="info">
+                                  {m.plugins.market.kindBridgeChannel}
+                                </Badge>
+                              ) : isBridgeProcessor ? (
+                                <Badge variant="warning">
+                                  {m.plugins.market.kindBridgeProcessor}
+                                </Badge>
                               ) : (
                                 <Badge variant="warning">
                                   {m.plugins.market.wasmUpcomingBadge}
+                                </Badge>
+                              )}
+                              {!item.compatible && (
+                                <Badge
+                                  variant="danger"
+                                  title={item.compatibility_reason ?? undefined}
+                                >
+                                  <AlertTriangle className="h-3 w-3" />
+                                  {item.compatibility_reason ||
+                                    m.plugins.market.incompatibleBadge}
                                 </Badge>
                               )}
                             </div>
@@ -620,10 +875,12 @@ export function PluginsView() {
                               {item.category && (
                                 <Badge variant="outline">{item.category}</Badge>
                               )}
-                              {item.enabled && (
+                              {item.installed && (
                                 <Badge variant="info">
                                   <CheckCircle2 className="h-3 w-3" />
-                                  {m.plugins.market.enabledBadge}
+                                  {item.enabled
+                                    ? m.plugins.market.enabledBadge
+                                    : m.plugins.market.installedBadge}
                                 </Badge>
                               )}
                             </div>
@@ -658,6 +915,26 @@ export function PluginsView() {
                           ))}
                         </div>
                       )}
+
+                      {(item.image || item.compose_snippet) && (
+                        <details className="rounded-lg border border-zinc-200/80 bg-zinc-50/70 px-3 py-2 text-[11px] dark:border-zinc-800 dark:bg-zinc-950/50">
+                          <summary className="cursor-pointer font-medium text-zinc-600 dark:text-zinc-300">
+                            {m.plugins.market.composeSnippetToggle}
+                          </summary>
+                          <div className="mt-2 space-y-1.5">
+                            {item.image && (
+                              <div className="font-mono text-[10px] text-zinc-500">
+                                {item.image}
+                              </div>
+                            )}
+                            {item.compose_snippet && (
+                              <pre className="overflow-x-auto rounded bg-zinc-900 p-2 font-mono text-[10px] text-zinc-100">
+                                {item.compose_snippet}
+                              </pre>
+                            )}
+                          </div>
+                        </details>
+                      )}
                     </div>
 
                     <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-100 pt-3 dark:border-zinc-800/80">
@@ -690,6 +967,7 @@ export function PluginsView() {
                         <Button
                           size="sm"
                           variant={item.enabled ? "outline" : "primary"}
+                          disabled={!item.compatible}
                           loading={enablingMarketId === item.id}
                           onClick={() => {
                             if (item.enabled) {
@@ -706,6 +984,33 @@ export function PluginsView() {
                             : m.plugins.market.enableAndConfigureBtn}
                         </Button>
                       )}
+                      {isBridge && (
+                        <Button
+                          size="sm"
+                          variant={item.installed ? "outline" : "primary"}
+                          disabled={!item.compatible && !item.installed}
+                          onClick={() => {
+                            if (item.installed) {
+                              setActiveTab("installed");
+                              setSelectedPluginId(item.id);
+                            } else {
+                              setBridgeModalOpen(true);
+                            }
+                          }}
+                        >
+                          {item.installed ? (
+                            <>
+                              <Settings2 className="h-3.5 w-3.5" />
+                              {m.plugins.market.configureBtn}
+                            </>
+                          ) : (
+                            <>
+                              <Plus className="h-3.5 w-3.5" />
+                              {m.plugins.market.registerBridgeBtn}
+                            </>
+                          )}
+                        </Button>
+                      )}
                     </div>
                   </Card>
                 );
@@ -714,7 +1019,317 @@ export function PluginsView() {
           )}
         </div>
       )}
+
+      {bridgeModalOpen && (
+        <RegisterBridgeModal
+          open={bridgeModalOpen}
+          onClose={() => setBridgeModalOpen(false)}
+          onRegistered={(created) => {
+            setBridgeModalOpen(false);
+            setActiveTab("installed");
+            setSelectedPluginId(created.id);
+          }}
+        />
+      )}
+
+      <ConfirmDialog
+        open={deletingBridge !== null}
+        onClose={() => setDeletingBridge(null)}
+        onConfirm={() => {
+          if (deletingBridge) {
+            deleteBridgeMutation.mutate({
+              plugin: deletingBridge,
+              cascade: false,
+            });
+          }
+        }}
+        title={m.plugins.bridge.deleteConfirmTitle}
+        description={m.plugins.bridge.deleteConfirmDesc(
+          deletingBridge?.manifest.name ?? "",
+        )}
+        confirmLabel={m.plugins.bridge.deleteConfirmBtn}
+        loading={deleteBridgeMutation.isPending}
+      />
+
+      <Modal
+        open={bridgeDeleteConflict !== null}
+        onClose={() => setBridgeDeleteConflict(null)}
+        title={m.plugins.bridge.deleteCascadeTitle}
+        size="sm"
+        footer={
+          <>
+            <Button
+              variant="outline"
+              onClick={() => setBridgeDeleteConflict(null)}
+              disabled={deleteBridgeMutation.isPending}
+            >
+              {m.common.cancel}
+            </Button>
+            <Button
+              variant="destructive"
+              loading={deleteBridgeMutation.isPending}
+              onClick={() => {
+                if (bridgeDeleteConflict) {
+                  deleteBridgeMutation.mutate({
+                    plugin: bridgeDeleteConflict.plugin,
+                    cascade: true,
+                  });
+                }
+              }}
+            >
+              {m.plugins.bridge.deleteCascadeBtn}
+            </Button>
+          </>
+        }
+      >
+        {bridgeDeleteConflict && (
+          <div className="space-y-3 text-xs">
+            <p className="text-zinc-600 dark:text-zinc-300">
+              {m.plugins.bridge.deleteCascadeDesc(
+                bridgeDeleteConflict.plugin.manifest.name,
+                bridgeDeleteConflict.channels.length,
+                bridgeDeleteConflict.routes.length,
+              )}
+            </p>
+            {bridgeDeleteConflict.channels.length > 0 && (
+              <div>
+                <div className="mb-1 text-[11px] font-semibold text-zinc-500 uppercase">
+                  {m.plugins.bridge.conflictChannelsLabel}
+                </div>
+                <ul className="space-y-1 rounded-lg border border-zinc-200 bg-zinc-50/70 p-2.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+                  {bridgeDeleteConflict.channels.map((ch) => (
+                    <li key={ch.id} className="font-medium">
+                      #{ch.id} · {ch.name}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {bridgeDeleteConflict.routes.length > 0 && (
+              <div>
+                <div className="mb-1 text-[11px] font-semibold text-zinc-500 uppercase">
+                  {m.plugins.detail.conflictRoutesLabel}
+                </div>
+                <ul className="space-y-1 rounded-lg border border-zinc-200 bg-zinc-50/70 p-2.5 dark:border-zinc-800 dark:bg-zinc-950/60">
+                  {bridgeDeleteConflict.routes.map((rt) => (
+                    <li key={rt.id} className="font-medium">
+                      #{rt.id} · {rt.name}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </Modal>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Register HTTP Bridge Plugin Modal
+// ---------------------------------------------------------------------------
+
+function RegisterBridgeModal({
+  open,
+  onClose,
+  onRegistered,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onRegistered: (plugin: PluginDto) => void;
+}) {
+  const { m } = useI18n();
+  const toast = useToast();
+  const queryClient = useQueryClient();
+
+  const [bridgeUrl, setBridgeUrl] = useState("");
+  const [bridgeSecret, setBridgeSecret] = useState("");
+  const [enabled, setEnabled] = useState(true);
+  const [preview, setPreview] = useState<BridgeManifestPreviewResponse | null>(
+    null,
+  );
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const previewMutation = useMutation({
+    mutationFn: () =>
+      api.plugins.previewBridge({
+        bridge_url: bridgeUrl.trim(),
+        bridge_secret: bridgeSecret.trim(),
+        enabled,
+      }),
+    onSuccess: (res) => {
+      setPreview(res);
+      setFormError(null);
+    },
+    onError: (err) => {
+      setPreview(null);
+      setFormError(errorMessage(err));
+    },
+  });
+
+  const registerMutation = useMutation({
+    mutationFn: () =>
+      api.plugins.registerBridge({
+        bridge_url: bridgeUrl.trim(),
+        bridge_secret: bridgeSecret.trim(),
+        enabled,
+      }),
+    onSuccess: (created) => {
+      toast.success(m.plugins.bridge.toastRegistered);
+      void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+      void queryClient.invalidateQueries({ queryKey: ["plugins-market"] });
+      onRegistered(created);
+    },
+    onError: (err) => {
+      setFormError(errorMessage(err));
+    },
+  });
+
+  const validateInputs = (): boolean => {
+    if (!isValidHttpUrl(bridgeUrl.trim())) {
+      setFormError(m.plugins.bridge.errUrlRequired);
+      return false;
+    }
+    if (!bridgeSecret.trim()) {
+      setFormError(m.plugins.bridge.errSecretRequired);
+      return false;
+    }
+    setFormError(null);
+    return true;
+  };
+
+  const handlePreview = (e: FormEvent) => {
+    e.preventDefault();
+    if (!validateInputs()) return;
+    previewMutation.mutate();
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={m.plugins.bridge.modalTitle}
+      description={m.plugins.bridge.modalDesc}
+      size="lg"
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>
+            {m.common.cancel}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={handlePreview}
+            loading={previewMutation.isPending}
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            {m.plugins.bridge.previewBtn}
+          </Button>
+          <Button
+            disabled={!preview || !preview.compatible}
+            loading={registerMutation.isPending}
+            onClick={() => {
+              if (!validateInputs()) return;
+              registerMutation.mutate();
+            }}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            {m.plugins.bridge.registerBtn}
+          </Button>
+        </>
+      }
+    >
+      <form onSubmit={handlePreview} className="space-y-4">
+        <div>
+          <Label htmlFor="bridge-url">{m.plugins.bridge.urlLabel}</Label>
+          <Input
+            id="bridge-url"
+            type="url"
+            value={bridgeUrl}
+            onChange={(e) => {
+              setBridgeUrl(e.target.value);
+              setPreview(null);
+            }}
+            placeholder={m.plugins.bridge.urlPlaceholder}
+            className="mt-1 font-mono text-xs"
+          />
+          <FieldHint>{m.plugins.bridge.urlHint}</FieldHint>
+        </div>
+
+        <div>
+          <Label htmlFor="bridge-secret">{m.plugins.bridge.secretLabel}</Label>
+          <Input
+            id="bridge-secret"
+            type="password"
+            value={bridgeSecret}
+            onChange={(e) => {
+              setBridgeSecret(e.target.value);
+              setPreview(null);
+            }}
+            placeholder={m.plugins.bridge.secretPlaceholder}
+            className="mt-1 font-mono text-xs"
+          />
+          <FieldHint>{m.plugins.bridge.secretHint}</FieldHint>
+        </div>
+
+        <div className="rounded-lg border border-zinc-200/80 bg-zinc-50/60 p-3 dark:border-zinc-800 dark:bg-zinc-950/60">
+          <Switch
+            id="bridge-enabled"
+            checked={enabled}
+            onCheckedChange={setEnabled}
+            label={m.plugins.bridge.enabledLabel}
+          />
+        </div>
+
+        {preview && (
+          <div className="space-y-2.5 rounded-xl border border-zinc-200 bg-zinc-50/70 p-3.5 text-xs dark:border-zinc-800 dark:bg-zinc-950/60">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
+                {m.plugins.bridge.previewHeading}
+              </span>
+              <Badge
+                variant={
+                  preview.manifest.kind === "channel" ? "info" : "warning"
+                }
+              >
+                {preview.manifest.kind === "channel"
+                  ? m.plugins.market.kindBridgeChannel
+                  : m.plugins.market.kindBridgeProcessor}
+              </Badge>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                {preview.manifest.name}
+              </span>
+              <Badge variant="mono">{preview.manifest.id}</Badge>
+              <Badge variant="mono">v{preview.manifest.version}</Badge>
+              {!preview.compatible && (
+                <Badge variant="danger">
+                  {preview.compatibility_reason ||
+                    m.plugins.market.incompatibleBadge}
+                </Badge>
+              )}
+            </div>
+            {preview.manifest.description && (
+              <p className="text-zinc-500 dark:text-zinc-400">
+                {preview.manifest.description}
+              </p>
+            )}
+            {preview.manifest.hooks.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1">
+                {preview.manifest.hooks.map((h) => (
+                  <Badge key={h} variant="mono" className="text-[10px]">
+                    {h}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <FieldError message={formError} />
+      </form>
+    </Modal>
   );
 }
 
@@ -727,11 +1342,17 @@ function PluginDetailView({
   onBack,
   onToggleEnabled,
   togglingPlugin,
+  onRefreshManifest,
+  refreshingManifest = false,
+  onDeleteBridge,
 }: {
   plugin: PluginDto;
   onBack: () => void;
   onToggleEnabled: (enabled: boolean) => void;
   togglingPlugin: boolean;
+  onRefreshManifest?: () => void;
+  refreshingManifest?: boolean;
+  onDeleteBridge?: () => void;
 }) {
   const { m } = useI18n();
   const toast = useToast();
@@ -887,6 +1508,28 @@ function PluginDetailView({
           </div>
 
           <div className="flex items-center gap-2">
+            {onRefreshManifest && (
+              <Button
+                variant="outline"
+                size="sm"
+                loading={refreshingManifest}
+                onClick={onRefreshManifest}
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                {m.plugins.bridge.refreshManifestTitle}
+              </Button>
+            )}
+            {onDeleteBridge && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onDeleteBridge}
+                className="text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/40"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                {m.plugins.bridge.deleteBtn}
+              </Button>
+            )}
             <Switch
               checked={plugin.enabled}
               disabled={togglingPlugin}
@@ -894,6 +1537,13 @@ function PluginDetailView({
             />
           </div>
         </div>
+
+        {plugin.bridge_url && (
+          <div className="mt-3 flex items-center gap-2 text-xs text-zinc-500">
+            <Globe className="h-3.5 w-3.5 shrink-0" />
+            <span className="font-mono">{plugin.bridge_url}</span>
+          </div>
+        )}
 
         {!plugin.enabled && (
           <div className="mt-3.5 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
@@ -903,7 +1553,65 @@ function PluginDetailView({
         )}
       </Card>
 
-      {/* Provider Instances Section */}
+      {/* Channel Plugin Summary vs Processor Provider Instances */}
+      {plugin.kind === "channel" ? (
+        <Card className="space-y-4 p-4">
+          <div>
+            <h2 className="text-sm font-semibold tracking-tight">
+              {m.plugins.bridge.channelSummaryTitle}
+            </h2>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              {m.plugins.bridge.channelSummaryDesc}
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {(() => {
+              const acctProps = parseObjectSchema(
+                plugin.manifest.account_schema,
+              ).properties;
+              const destProps = parseObjectSchema(
+                plugin.manifest.destination_schema,
+              ).properties;
+              return (
+                <>
+                  <div className="rounded-lg border border-zinc-200/80 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-950/50">
+                    <div className="mb-2 text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
+                      {m.plugins.bridge.accountSchemaFields(acctProps.length)}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {acctProps.length === 0 ? (
+                        <span className="text-xs text-zinc-400">—</span>
+                      ) : (
+                        acctProps.map(([key, prop]) => (
+                          <Badge key={key} variant="mono" className="text-[10px]">
+                            {prop.title || key}
+                          </Badge>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-zinc-200/80 bg-zinc-50/50 p-3 dark:border-zinc-800 dark:bg-zinc-950/50">
+                    <div className="mb-2 text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
+                      {m.plugins.bridge.destSchemaFields(destProps.length)}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {destProps.length === 0 ? (
+                        <span className="text-xs text-zinc-400">—</span>
+                      ) : (
+                        destProps.map(([key, prop]) => (
+                          <Badge key={key} variant="mono" className="text-[10px]">
+                            {prop.title || key}
+                          </Badge>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </Card>
+      ) : (
       <div className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-semibold tracking-tight">
@@ -1252,6 +1960,7 @@ function PluginDetailView({
           </Card>
         )}
       </div>
+      )}
 
       {/* Add / Edit Provider Modal */}
       {providerModalOpen &&

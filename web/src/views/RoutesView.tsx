@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
   CalendarDays,
   ChevronDown,
   ChevronRight,
@@ -299,6 +301,7 @@ export function RoutesView() {
             <option value="telegram">{m.channels.kindLabels.telegram}</option>
             <option value="smtp">{m.channels.kindLabels.smtp}</option>
             <option value="notion">{m.channels.kindLabels.notion}</option>
+            <option value="plugin">{m.channels.kindLabels.plugin}</option>
           </Select>
         </div>
 
@@ -811,22 +814,43 @@ function RouteEditorModal({
     }
     return initial;
   });
+  const [pluginOrder, setPluginOrder] = useState<string[]>(
+    () => route?.options.plugin_order ?? [],
+  );
   const [pluginsSectionOpen, setPluginsSectionOpen] = useState<boolean>(
     () => extractConfiguredRoutePlugins(route?.options.plugins).length > 0,
   );
   const [enabled, setEnabled] = useState<boolean>(route?.enabled ?? true);
   const [formError, setFormError] = useState<string | null>(null);
 
-  const visiblePlugins = useMemo(
-    () =>
-      plugins.filter(
-        (p) =>
-          p.enabled ||
+  const visiblePlugins = useMemo(() => {
+    const filtered = plugins.filter(
+      (p) =>
+        p.kind !== "channel" &&
+        (p.enabled ||
           pluginOptions[p.id] !== undefined ||
-          initialPluginIds.has(p.id),
-      ),
-    [plugins, pluginOptions, initialPluginIds],
-  );
+          initialPluginIds.has(p.id)),
+    );
+    if (pluginOrder.length === 0) return filtered;
+    const rank = new Map<string, number>();
+    pluginOrder.forEach((id, idx) => rank.set(id, idx));
+    return [...filtered].sort((a, b) => {
+      const ra = rank.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+      const rb = rank.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+      if (ra !== rb) return ra - rb;
+      return a.id.localeCompare(b.id);
+    });
+  }, [plugins, pluginOptions, initialPluginIds, pluginOrder]);
+
+  const movePlugin = (pluginId: string, direction: -1 | 1) => {
+    const ids = visiblePlugins.map((p) => p.id);
+    const idx = ids.indexOf(pluginId);
+    const target = idx + direction;
+    if (idx < 0 || target < 0 || target >= ids.length) return;
+    const next = [...ids];
+    [next[idx], next[target]] = [next[target], next[idx]];
+    setPluginOrder(next);
+  };
   const activePluginCount = useMemo(
     () => Object.keys(cleanPluginOptionsForSubmit(pluginOptions)).length,
     [pluginOptions],
@@ -909,6 +933,11 @@ function RouteEditorModal({
         active_windows: activeWindows,
         active_weekdays: [...activeWeekdays].sort((a, b) => a - b),
         plugins: cleanPluginOptionsForSubmit(pluginOptions),
+        plugin_order: visiblePlugins
+          .map((p) => p.id)
+          .filter(
+            (id) => cleanPluginOptionsForSubmit(pluginOptions)[id] !== undefined,
+          ),
       };
 
       if (isEdit && route) {
@@ -1513,12 +1542,17 @@ function RouteEditorModal({
 
           {pluginsSectionOpen && (
             <div className="space-y-3 border-t border-zinc-100 p-4 dark:border-zinc-800">
+              {visiblePlugins.length > 1 && (
+                <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                  {m.routes.editor.pluginOrderHint}
+                </p>
+              )}
               {visiblePlugins.length === 0 ? (
                 <p className="text-xs text-zinc-500 dark:text-zinc-400">
                   {m.routes.editor.pluginsNoneEnabled}
                 </p>
               ) : (
-                visiblePlugins.map((plugin) => {
+                visiblePlugins.map((plugin, pluginIdx) => {
                   const properties =
                     plugin.manifest.route_option_schema?.properties ?? {};
                   const propEntries = Object.entries(properties) as Array<
@@ -1546,6 +1580,32 @@ function RouteEditorModal({
                             </Badge>
                           )}
                         </div>
+                        {visiblePlugins.length > 1 && (
+                          <div className="flex items-center gap-1">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={pluginIdx === 0}
+                              onClick={() => movePlugin(plugin.id, -1)}
+                              title={m.routes.editor.pluginMoveUp}
+                              aria-label={m.routes.editor.pluginMoveUp}
+                              className="h-6 w-6"
+                            >
+                              <ArrowUp className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={pluginIdx === visiblePlugins.length - 1}
+                              onClick={() => movePlugin(plugin.id, 1)}
+                              title={m.routes.editor.pluginMoveDown}
+                              aria-label={m.routes.editor.pluginMoveDown}
+                              className="h-6 w-6"
+                            >
+                              <ArrowDown className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        )}
                       </div>
 
                       <div className="grid gap-2.5 sm:grid-cols-2">

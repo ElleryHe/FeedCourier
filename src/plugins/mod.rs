@@ -1,20 +1,17 @@
-//! Built-in FeedCourier Plugin Framework (Plugin Protocol v1) and Marketplace Index client.
-//!
-//! Phase 1 (v0.3.0): First-party plugins implement [`Plugin`] in Rust and compile directly into
-//! the single binary, while sharing the exact manifest schema (`api_version = "1"`), SQLite tables
-//! (`plugins`, `plugin_instances`, `plugin_link_cache`), and hook lifecycle designed for a future
-//! WASM/Extism third-party sandbox runtime.
+//! FeedCourier Plugin Framework (Plugin Protocol v1) — Built-in Rust Plugins, Out-of-Process
+//! HTTP Bridge Plugins (`processor` + `channel` + `on_delivered`), and Marketplace Index Client.
 
+pub mod bridge;
 pub mod link_rewrite;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::channels::RouteOptions;
 use crate::crypto::MasterKey;
@@ -23,6 +20,7 @@ use crate::db::models::{Channel, ChannelDestination, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
 use crate::net::{OutboundRequest, ProtectedHttpClient};
 
+use self::bridge::{BridgeClient, BridgeProcessorPlugin};
 use self::link_rewrite::LinkRewritePlugin;
 
 /// Current stable plugin protocol version (`api_version`).
@@ -46,10 +44,46 @@ pub const MARKET_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Maximum response size accepted for a remote marketplace `index.json` (`1 MiB`).
 const MAX_MARKET_INDEX_BYTES: usize = 1024 * 1024;
 
+/// Per-plugin execution wall-clock timeout inside `run_on_render`.
+const ON_RENDER_PLUGIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Plugin category distinguishing delivery-time processors from delivery channel adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginKind {
+    #[default]
+    Processor,
+    Channel,
+}
+
+impl PluginKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Processor => "processor",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+/// Execution runtime for a plugin (`builtin` compiled into Rust binary vs out-of-process `bridge`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntime {
+    #[default]
+    Builtin,
+    Bridge,
+}
+
+impl PluginRuntime {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
 /// Supported plugin hook points in Protocol v1.
-///
-/// `OnRender` executes in v0.3.0; `OnIngest` and `OnDelivered` are reserved in the manifest and
-/// protocol schema for upcoming releases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
@@ -65,29 +99,94 @@ pub enum PluginPermission {
     Network,
 }
 
+fn default_empty_object() -> Value {
+    json!({})
+}
+
 /// Static plugin metadata & declarative UI schema matching `schema/manifest.schema.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(default = "default_api_version")]
     pub api_version: String,
+    #[serde(default)]
+    pub kind: PluginKind,
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_core: Option<String>,
+    #[serde(default)]
     pub category: String,
+    #[serde(default)]
     pub icon: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub homepage: String,
+    #[serde(default)]
     pub hooks: Vec<HookKind>,
+    #[serde(default)]
     pub permissions: Vec<PluginPermission>,
-    /// Declarative schema describing per-provider/instance configuration fields.
+    /// Declarative schema describing per-provider/instance configuration fields (processor plugins).
+    #[serde(default = "default_empty_object")]
     pub instance_schema: Value,
     /// Declarative schema describing per-route plugin controls (e.g. provider dropdown).
+    #[serde(default = "default_empty_object")]
     pub route_option_schema: Value,
+    /// Declarative schema describing account-level fields (`kind = "channel"`).
+    #[serde(default = "default_empty_object")]
+    pub account_schema: Value,
+    /// Declarative schema describing destination-level fields (`kind = "channel"`).
+    #[serde(default = "default_empty_object")]
+    pub destination_schema: Value,
+    /// Optional channel capabilities (e.g. `supports_html`, `max_text_len`).
+    #[serde(default = "default_empty_object")]
+    pub capabilities: Value,
+}
+
+/// Check whether a plugin declaring `api_version` and optional `min_core` is compatible with
+/// the running FeedCourier core version (`crate::config::VERSION`).
+pub fn check_plugin_compatibility(
+    api_version: &str,
+    min_core: Option<&str>,
+) -> (bool, Option<String>) {
+    if api_version.trim() != PLUGIN_API_VERSION {
+        return (
+            false,
+            Some(format!(
+                "Incompatible plugin protocol v{} (core supports v{PLUGIN_API_VERSION})",
+                api_version.trim()
+            )),
+        );
+    }
+    if let Some(req) = min_core.map(str::trim).filter(|s| !s.is_empty())
+        && let (Some(core_v), Some(req_v)) = (
+            parse_semver_triple(crate::config::VERSION),
+            parse_semver_triple(req),
+        )
+        && core_v < req_v
+    {
+        return (false, Some(format!("Requires FeedCourier >= {req}")));
+    }
+    (true, None)
+}
+
+fn parse_semver_triple(raw: &str) -> Option<(u64, u64, u64)> {
+    let clean = raw
+        .trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = clean.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    Some((major, minor, patch))
 }
 
 /// Non-destructive per-delivery overrides produced by `on_render` plugins.
-///
-/// The underlying persisted `Entry` is never mutated so multi-route deliveries and archival
-/// properties (`entry.canonical_url` for Telegram previews and Notion `Link` column) remain intact.
 #[derive(Debug, Clone, Default)]
 pub struct RenderOverrides {
     pub content_html: Option<String>,
@@ -140,7 +239,7 @@ pub enum PluginResult {
     },
 }
 
-/// First-party Rust plugin trait (Protocol v1).
+/// Plugin trait implemented by both compiled-in Rust plugins and HTTP bridge processor plugins.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -176,22 +275,45 @@ pub struct PluginRetry {
     pub retry_after_secs: Option<u64>,
 }
 
-/// Registry holding all compiled-in FeedCourier plugins.
+/// Cached runtime metadata for a registered HTTP bridge plugin (`processor` or `channel`).
+#[derive(Clone)]
+pub struct BridgePluginEntry {
+    pub manifest: PluginManifest,
+    pub client: BridgeClient,
+    pub bridge_url: String,
+    pub enabled: bool,
+}
+
+struct RegistryCache {
+    loaded_from_db: bool,
+    enabled_by_id: HashMap<String, bool>,
+    bridges: HashMap<String, BridgePluginEntry>,
+    bridge_processors: HashMap<String, Arc<dyn Plugin>>,
+}
+
+/// Registry holding built-in Rust plugins plus in-memory cached bridge plugins & enabled flags.
 #[derive(Clone)]
 pub struct PluginRegistry {
-    plugins: Vec<Arc<dyn Plugin>>,
-    by_id: HashMap<String, Arc<dyn Plugin>>,
+    builtins: Arc<Vec<Arc<dyn Plugin>>>,
+    builtins_by_id: Arc<HashMap<String, Arc<dyn Plugin>>>,
+    cache: Arc<RwLock<RegistryCache>>,
 }
 
 impl fmt::Debug for PluginRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ids: Vec<&str> = self
-            .plugins
+        let builtin_ids: Vec<&str> = self
+            .builtins
             .iter()
             .map(|p| p.manifest().id.as_str())
             .collect();
+        let bridge_ids: Vec<String> = self
+            .cache
+            .read()
+            .map(|g| g.bridges.keys().cloned().collect())
+            .unwrap_or_default();
         f.debug_struct("PluginRegistry")
-            .field("plugins", &ids)
+            .field("builtins", &builtin_ids)
+            .field("bridges", &bridge_ids)
             .finish()
     }
 }
@@ -203,37 +325,177 @@ impl Default for PluginRegistry {
 }
 
 impl PluginRegistry {
-    /// Construct a registry containing all built-in v0.3.0 plugins.
+    /// Construct a registry containing all built-in plugins (bridge plugins are loaded via `reload_from_db`).
     pub fn with_builtins() -> Self {
         let builtins: Vec<Arc<dyn Plugin>> = vec![Arc::new(LinkRewritePlugin::new())];
-        let mut by_id = HashMap::with_capacity(builtins.len());
+        let mut builtins_by_id = HashMap::with_capacity(builtins.len());
         for p in &builtins {
-            by_id.insert(p.manifest().id.clone(), Arc::clone(p));
+            builtins_by_id.insert(p.manifest().id.clone(), Arc::clone(p));
         }
         Self {
-            plugins: builtins,
-            by_id,
+            builtins: Arc::new(builtins),
+            builtins_by_id: Arc::new(builtins_by_id),
+            cache: Arc::new(RwLock::new(RegistryCache {
+                loaded_from_db: false,
+                enabled_by_id: HashMap::new(),
+                bridges: HashMap::new(),
+                bridge_processors: HashMap::new(),
+            })),
         }
     }
 
+    /// Return built-in Rust plugins only.
     pub fn list(&self) -> &[Arc<dyn Plugin>] {
-        &self.plugins
+        &self.builtins
     }
 
-    pub fn get(&self, id: &str) -> Option<&Arc<dyn Plugin>> {
-        self.by_id.get(id.trim())
+    pub fn is_builtin(&self, id: &str) -> bool {
+        self.builtins_by_id.contains_key(id.trim())
+    }
+
+    /// Look up any processor plugin (built-in or bridge) implementing [`Plugin`].
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Plugin>> {
+        let trimmed = id.trim();
+        if let Some(p) = self.builtins_by_id.get(trimmed) {
+            return Some(Arc::clone(p));
+        }
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.bridge_processors.get(trimmed).cloned())
+    }
+
+    /// Look up a registered HTTP bridge plugin entry (`processor` or `channel`).
+    pub fn get_bridge(&self, id: &str) -> Option<BridgePluginEntry> {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.bridges.get(id.trim()).cloned())
+    }
+
+    /// Return all registered bridge plugins sorted by ID.
+    pub fn list_bridges(&self) -> Vec<BridgePluginEntry> {
+        let mut list: Vec<BridgePluginEntry> = self
+            .cache
+            .read()
+            .map(|g| g.bridges.values().cloned().collect())
+            .unwrap_or_default();
+        list.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
+        list
+    }
+
+    /// Return the manifest for any installed plugin (built-in or bridge).
+    pub fn get_manifest(&self, id: &str) -> Option<PluginManifest> {
+        let trimmed = id.trim();
+        if let Some(p) = self.builtins_by_id.get(trimmed) {
+            return Some(p.manifest().clone());
+        }
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.bridges.get(trimmed).map(|b| b.manifest.clone()))
     }
 
     /// Ensure every built-in plugin has a row in SQLite `plugins` (idempotent; preserves `enabled`).
     pub async fn sync_builtin_rows(&self, db: &Database) -> AppResult<()> {
-        for plugin in &self.plugins {
+        for plugin in self.builtins.iter() {
             let m = plugin.manifest();
             db.ensure_plugin_row(&m.id, &m.version).await?;
         }
         Ok(())
     }
 
-    /// Validate all entries in `route_options.plugins` before creating or updating a route.
+    /// Reload all plugin enabled states and registered HTTP bridge plugins from SQLite into memory.
+    /// Called at startup and immediately after any plugin create/update/refresh/delete mutation.
+    pub async fn reload_from_db(&self, db: &Database, master_key: &MasterKey) -> AppResult<()> {
+        let rows = db.list_plugins().await?;
+        let mut enabled_by_id = HashMap::with_capacity(rows.len());
+        let mut bridges = HashMap::new();
+        let mut bridge_processors: HashMap<String, Arc<dyn Plugin>> = HashMap::new();
+
+        for row in rows {
+            enabled_by_id.insert(row.id.clone(), row.enabled);
+            if row.source == "bridge" {
+                let Some(bridge_url) = row.bridge_url.clone() else {
+                    continue;
+                };
+                let Some(enc_secret) = row.encrypted_bridge_secret.as_deref() else {
+                    continue;
+                };
+                let Some(manifest_json) = row.manifest_json.as_deref() else {
+                    continue;
+                };
+                let secret: String = match master_key.decrypt_json(enc_secret) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %row.id,
+                            error = %err,
+                            "failed to decrypt bridge secret; skipping bridge plugin"
+                        );
+                        continue;
+                    }
+                };
+                let mut manifest: PluginManifest = match serde_json::from_str(manifest_json) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %row.id,
+                            error = %err,
+                            "failed to parse persisted bridge manifest_json; skipping bridge plugin"
+                        );
+                        continue;
+                    }
+                };
+                manifest.runtime = PluginRuntime::Bridge;
+                let client = match BridgeClient::new(bridge_url.clone(), secret, row.id.clone()) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::warn!(
+                            plugin_id = %row.id,
+                            error = %err,
+                            "invalid persisted bridge_url; skipping bridge plugin"
+                        );
+                        continue;
+                    }
+                };
+                if manifest.kind == PluginKind::Processor {
+                    let proc_plugin = BridgeProcessorPlugin::new(manifest.clone(), client.clone());
+                    bridge_processors.insert(row.id.clone(), Arc::new(proc_plugin));
+                }
+                bridges.insert(
+                    row.id.clone(),
+                    BridgePluginEntry {
+                        manifest,
+                        client,
+                        bridge_url,
+                        enabled: row.enabled,
+                    },
+                );
+            }
+        }
+
+        if let Ok(mut guard) = self.cache.write() {
+            guard.loaded_from_db = true;
+            guard.enabled_by_id = enabled_by_id;
+            guard.bridges = bridges;
+            guard.bridge_processors = bridge_processors;
+        }
+        Ok(())
+    }
+
+    /// Check whether a plugin is enabled using the in-memory cache (falling back to DB only if
+    /// `reload_from_db` has not been invoked yet, e.g. in isolated unit tests).
+    async fn is_plugin_enabled(&self, db: &Database, id: &str) -> AppResult<bool> {
+        if let Ok(guard) = self.cache.read()
+            && guard.loaded_from_db
+        {
+            return Ok(guard.enabled_by_id.get(id).copied().unwrap_or(false));
+        }
+        Ok(db.get_plugin(id).await?.is_some_and(|r| r.enabled))
+    }
+
+    /// Validate all entries in `route_options.plugins` and `route_options.plugin_order`.
     pub async fn validate_route_plugins(
         &self,
         db: &Database,
@@ -244,14 +506,54 @@ impl PluginRegistry {
                 continue;
             }
             let plugin = self.get(plugin_id).ok_or_else(|| {
-                AppError::Validation(format!("unknown plugin '{plugin_id}' in route options"))
+                AppError::Validation(format!(
+                    "unknown processor plugin '{plugin_id}' in route options"
+                ))
             })?;
             plugin.validate_route_option(db, opt_val).await?;
         }
         Ok(())
     }
 
-    /// Execute the `on_render` hook chain for every enabled plugin referenced by `route_options`.
+    /// Compute the ordered list of enabled bridge plugins subscribed to `HookKind::OnDelivered`
+    /// for a completed delivery task (route-configured processor plugins + optional channel plugin).
+    pub fn on_delivered_subscriber_ids(
+        &self,
+        route_options: &RouteOptions,
+        channel_plugin_id: Option<&str>,
+    ) -> Vec<String> {
+        let Ok(guard) = self.cache.read() else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+
+        for (pid, opt) in &route_options.plugins {
+            if opt.is_null() {
+                continue;
+            }
+            if let Some(bridge) = guard.bridges.get(pid)
+                && bridge.enabled
+                && bridge.manifest.hooks.contains(&HookKind::OnDelivered)
+                && seen.insert(pid.clone())
+            {
+                out.push(pid.clone());
+            }
+        }
+        if let Some(ch_pid) = channel_plugin_id
+            && let Some(bridge) = guard.bridges.get(ch_pid)
+            && bridge.enabled
+            && bridge.manifest.hooks.contains(&HookKind::OnDelivered)
+            && seen.insert(ch_pid.to_string())
+        {
+            out.push(ch_pid.to_string());
+        }
+        out
+    }
+
+    /// Execute the `on_render` hook chain for every enabled plugin referenced by `route_options`,
+    /// honoring `route_options.plugin_order`, enforcing per-plugin timeouts, and isolating
+    /// non-strict plugin failures into delivery warnings.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_on_render(
         &self,
@@ -271,20 +573,41 @@ impl PluginRegistry {
             return Ok((overrides, None));
         }
 
-        for plugin in &self.plugins {
-            let manifest = plugin.manifest();
-            let Some(route_cfg) = route_options.plugins.get(&manifest.id) else {
+        // Build deterministic execution sequence: explicit `plugin_order` first, then remaining keys.
+        let mut ordered_ids: Vec<&str> = Vec::with_capacity(route_options.plugins.len());
+        let mut seen: HashSet<&str> = HashSet::new();
+        for pid in &route_options.plugin_order {
+            if let Some(opt) = route_options.plugins.get(pid)
+                && !opt.is_null()
+                && seen.insert(pid.as_str())
+            {
+                ordered_ids.push(pid.as_str());
+            }
+        }
+        for (pid, opt) in &route_options.plugins {
+            if !opt.is_null() && seen.insert(pid.as_str()) {
+                ordered_ids.push(pid.as_str());
+            }
+        }
+
+        for plugin_id in ordered_ids {
+            let Some(route_cfg) = route_options.plugins.get(plugin_id) else {
                 continue;
             };
-            if route_cfg.is_null() {
-                continue;
-            }
-            let Some(row) = db.get_plugin(&manifest.id).await? else {
+            let Some(plugin) = self.get(plugin_id) else {
                 continue;
             };
-            if !row.enabled {
+            if !plugin.manifest().hooks.contains(&HookKind::OnRender) {
                 continue;
             }
+            if !self.is_plugin_enabled(db, plugin_id).await? {
+                continue;
+            }
+
+            let strict_mode = route_cfg
+                .get("strict_mode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
 
             let ctx = RenderContext {
                 db,
@@ -300,20 +623,84 @@ impl PluginRegistry {
                 write_cache,
             };
 
-            match plugin.on_render(&ctx, &mut overrides).await? {
-                PluginResult::Continue => {}
-                PluginResult::Retry {
+            let started = Instant::now();
+            let run_res = tokio::time::timeout(
+                ON_RENDER_PLUGIN_TIMEOUT,
+                plugin.on_render(&ctx, &mut overrides),
+            )
+            .await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+
+            match run_res {
+                Ok(Ok(PluginResult::Continue)) => {
+                    tracing::debug!(
+                        plugin_id,
+                        route_id = route.id,
+                        duration_ms,
+                        "on_render plugin completed"
+                    );
+                }
+                Ok(Ok(PluginResult::Retry {
                     diagnostic,
                     retry_after_secs,
-                } => {
+                })) => {
                     return Ok((
                         overrides,
                         Some(PluginRetry {
-                            plugin_id: manifest.id.clone(),
+                            plugin_id: plugin_id.to_string(),
                             diagnostic,
                             retry_after_secs,
                         }),
                     ));
+                }
+                Ok(Err(err)) => {
+                    let msg = format!(
+                        "Plugin '{plugin_id}' failed ({}): kept original",
+                        crate::logging::redact::redact_text(&err.to_string())
+                    );
+                    tracing::warn!(
+                        plugin_id,
+                        route_id = route.id,
+                        duration_ms,
+                        strict_mode,
+                        error = %err,
+                        "on_render plugin returned error"
+                    );
+                    if strict_mode {
+                        return Ok((
+                            overrides,
+                            Some(PluginRetry {
+                                plugin_id: plugin_id.to_string(),
+                                diagnostic: msg,
+                                retry_after_secs: None,
+                            }),
+                        ));
+                    }
+                    overrides.warnings.push(msg);
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "Plugin '{plugin_id}' timed out after {}s; kept original",
+                        ON_RENDER_PLUGIN_TIMEOUT.as_secs()
+                    );
+                    tracing::warn!(
+                        plugin_id,
+                        route_id = route.id,
+                        duration_ms,
+                        strict_mode,
+                        "on_render plugin timed out"
+                    );
+                    if strict_mode {
+                        return Ok((
+                            overrides,
+                            Some(PluginRetry {
+                                plugin_id: plugin_id.to_string(),
+                                diagnostic: msg,
+                                retry_after_secs: None,
+                            }),
+                        ));
+                    }
+                    overrides.warnings.push(msg);
                 }
             }
         }
@@ -347,9 +734,12 @@ pub struct MarketPluginEntry {
     pub version: String,
     #[serde(default = "default_api_version")]
     pub api_version: String,
-    /// `"builtin"` or `"external"` / `"coming_soon"`.
+    /// `"builtin"`, `"processor"`, `"channel"`, or `"external"` / `"coming_soon"`.
     #[serde(default = "default_market_kind")]
     pub kind: String,
+    /// `"builtin"` or `"bridge"`.
+    #[serde(default)]
+    pub runtime: Option<String>,
     #[serde(default)]
     pub min_core: Option<String>,
     #[serde(default)]
@@ -362,6 +752,10 @@ pub struct MarketPluginEntry {
     pub homepage: Option<String>,
     #[serde(default)]
     pub repository: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub compose_snippet: Option<String>,
     #[serde(default)]
     pub hooks: Vec<String>,
     #[serde(default)]
@@ -432,10 +826,6 @@ impl MarketIndexCache {
         &self.index_url
     }
 
-    /// Return the marketplace index, using the 6h cache for remote entries (or 60s negative-cache
-    /// TTL for snapshot fallbacks), fetching remotely via the SSRF-guarded client when stale, and
-    /// gracefully falling back to the compiled snapshot on failure without clobbering an existing
-    /// fresh remote cache entry.
     pub async fn get_index(
         &self,
         http: &ProtectedHttpClient,

@@ -1718,6 +1718,28 @@ impl Database {
         checkpoint: Option<&DeliveryCheckpoint>,
         diagnostic_log: Option<&str>,
     ) -> AppResult<DeliveryTask> {
+        self.mark_task_delivered_with_events(
+            task_id,
+            completed_at,
+            status_code,
+            checkpoint,
+            diagnostic_log,
+            &[],
+        )
+        .await
+    }
+
+    /// Same as [`mark_task_delivered`], additionally enqueuing persistent `plugin_events` rows
+    /// inside the exact same SQLite write transaction for at-least-once `on_delivered` delivery.
+    pub async fn mark_task_delivered_with_events(
+        &self,
+        task_id: i64,
+        completed_at: i64,
+        status_code: Option<i32>,
+        checkpoint: Option<&DeliveryCheckpoint>,
+        diagnostic_log: Option<&str>,
+        plugin_events: &[crate::db::models::NewPluginEvent],
+    ) -> AppResult<DeliveryTask> {
         let checkpoint_json = checkpoint.map(serde_json::to_string).transpose()?;
         let mut tx = self.write_pool.begin().await?;
         let row = sqlx::query_as::<_, DeliveryTask>(
@@ -1758,6 +1780,23 @@ impl Database {
         .bind(row.channel_id)
         .execute(&mut *tx)
         .await?;
+
+        for ev in plugin_events {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO plugin_events (
+                    plugin_id, event, idempotency_key, payload_json, attempts, next_attempt_at, created_at
+                ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)
+                "#,
+            )
+            .bind(&ev.plugin_id)
+            .bind(&ev.event)
+            .bind(&ev.idempotency_key)
+            .bind(&ev.payload_json)
+            .bind(completed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(row)
@@ -2888,6 +2927,159 @@ impl Database {
         .fetch_one(&self.write_pool)
         .await?;
         Ok(row)
+    }
+
+    /// Insert a newly registered HTTP bridge plugin row (`source = 'bridge'`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_bridge_plugin(
+        &self,
+        id: &str,
+        kind: &str,
+        version: &str,
+        bridge_url: &str,
+        encrypted_bridge_secret: &[u8],
+        manifest_json: &str,
+        enabled: bool,
+    ) -> AppResult<PluginRow> {
+        let now = now_unix();
+        let row = sqlx::query_as::<_, PluginRow>(
+            r#"
+            INSERT INTO plugins (
+                id, enabled, installed_version, settings_json, source, kind,
+                bridge_url, encrypted_bridge_secret, manifest_json, manifest_fetched_at,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, '{}', 'bridge', ?4, ?5, ?6, ?7, ?8, ?8, ?8)
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(enabled)
+        .bind(version)
+        .bind(kind)
+        .bind(bridge_url)
+        .bind(encrypted_bridge_secret)
+        .bind(manifest_json)
+        .bind(now)
+        .fetch_one(&self.write_pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Update a registered bridge plugin's refreshed manifest metadata and version.
+    pub async fn refresh_bridge_plugin_manifest(
+        &self,
+        id: &str,
+        kind: &str,
+        version: &str,
+        manifest_json: &str,
+    ) -> AppResult<PluginRow> {
+        let now = now_unix();
+        let row = sqlx::query_as::<_, PluginRow>(
+            r#"
+            UPDATE plugins
+            SET kind = ?1,
+                installed_version = ?2,
+                manifest_json = ?3,
+                manifest_fetched_at = ?4,
+                updated_at = ?4
+            WHERE id = ?5 AND source = 'bridge'
+            RETURNING *
+            "#,
+        )
+        .bind(kind)
+        .bind(version)
+        .bind(manifest_json)
+        .bind(now)
+        .bind(id)
+        .fetch_optional(&self.write_pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("bridge plugin '{id}' not found")))?;
+        Ok(row)
+    }
+
+    /// Atomically delete a registered bridge plugin (`source = 'bridge'`), optionally cascading
+    /// deletion of referencing channel accounts and stripping route plugin bindings.
+    pub async fn delete_bridge_plugin(
+        &self,
+        plugin_id: &str,
+        referencing_channel_ids: &[i64],
+        strip_from_route_ids: &[i64],
+    ) -> AppResult<bool> {
+        let mut tx = self.write_pool.begin().await?;
+        for ch_id in referencing_channel_ids {
+            sqlx::query("DELETE FROM channels WHERE id = ?1")
+                .bind(ch_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for route_id in strip_from_route_ids {
+            if let Some(route) = sqlx::query_as::<_, Route>("SELECT * FROM routes WHERE id = ?1")
+                .bind(route_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                let mut opts = route.options();
+                opts.plugins.remove(plugin_id);
+                opts.plugin_order.retain(|p| p != plugin_id);
+                let opts_json = serde_json::to_string(&opts)?;
+                sqlx::query("UPDATE routes SET options_json = ?1, updated_at = ?2 WHERE id = ?3")
+                    .bind(opts_json)
+                    .bind(now_unix())
+                    .bind(route_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        let res = sqlx::query("DELETE FROM plugins WHERE id = ?1 AND source = 'bridge'")
+            .bind(plugin_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Fetch due persistent `plugin_events` ready for `on_delivered` dispatch.
+    pub async fn list_due_plugin_events(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> AppResult<Vec<crate::db::models::PluginEventRow>> {
+        let rows = sqlx::query_as::<_, crate::db::models::PluginEventRow>(
+            r#"
+            SELECT * FROM plugin_events
+            WHERE next_attempt_at <= ?1
+            ORDER BY next_attempt_at ASC, id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(now)
+        .bind(limit.max(1))
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn delete_plugin_event(&self, event_id: i64) -> AppResult<()> {
+        sqlx::query("DELETE FROM plugin_events WHERE id = ?1")
+            .bind(event_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reschedule_plugin_event(
+        &self,
+        event_id: i64,
+        attempts: i64,
+        next_attempt_at: i64,
+    ) -> AppResult<()> {
+        sqlx::query("UPDATE plugin_events SET attempts = ?1, next_attempt_at = ?2 WHERE id = ?3")
+            .bind(attempts)
+            .bind(next_attempt_at)
+            .bind(event_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn list_plugin_instances(

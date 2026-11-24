@@ -395,6 +395,7 @@ export const en = {
       smtp: "SMTP Email",
       telegram: "Telegram Bot",
       notion: "Notion",
+      plugin: "Plugin Channel",
     },
     pacingLine: (
       minDur: string,
@@ -843,6 +844,10 @@ export const en = {
       pluginWarningPluginDisabled: "Plugin globally disabled",
       pluginWarningProviderMissing: "Selected provider missing",
       pluginWarningProviderDisabled: "Selected provider disabled",
+      pluginOrderHint:
+        "Use arrows to control execution order when multiple processor plugins run on this route.",
+      pluginMoveUp: "Move up",
+      pluginMoveDown: "Move down",
     },
   },
 
@@ -1021,6 +1026,61 @@ export const en = {
       configureBtn: "Configure",
       homepageBtn: "Homepage",
       repositoryBtn: "Repository",
+      kindBridgeProcessor: "Bridge · Processor",
+      kindBridgeChannel: "Bridge · Channel",
+      registerBridgeBtn: "Register Bridge",
+      composeSnippetToggle: "Docker Compose snippet",
+      incompatibleBadge: "Incompatible",
+    },
+    bridge: {
+      addBtn: "Add Bridge Plugin",
+      modalTitle: "Register HTTP Bridge Plugin",
+      modalDesc:
+        "Connect an operator-managed HTTP bridge sidecar (processor or channel plugin). FeedCourier signs every request with HMAC-SHA256 and connects directly to the registered host:port.",
+      urlLabel: "Bridge Base URL",
+      urlPlaceholder: "http://feedcourier-ntfy:8787",
+      urlHint:
+        "Direct http:// or https:// base URL reachable from FeedCourier (e.g. Docker Compose service name). No redirects or proxy are used.",
+      secretLabel: "Shared HMAC Secret",
+      secretPlaceholder: "Enter shared signing secret…",
+      secretHint:
+        "Must match BRIDGE_SECRET configured on your bridge service. Encrypted at rest with ChaCha20-Poly1305.",
+      enabledLabel: "Enable immediately after registration",
+      previewBtn: "Preview Manifest",
+      registerBtn: "Confirm & Register",
+      previewHeading: "Manifest Preview",
+      errUrlRequired: "Enter a valid http:// or https:// bridge URL.",
+      errSecretRequired: "Bridge HMAC secret is required.",
+      toastRegistered: "Bridge plugin registered",
+      toastRegisterFailed: "Failed to register bridge plugin",
+      toastPreviewFailed: "Failed to fetch bridge manifest",
+      refreshManifestTitle: "Refresh bridge manifest",
+      toastManifestRefreshed: "Bridge manifest refreshed",
+      toastManifestRefreshFailed: "Failed to refresh manifest",
+      deleteBtn: "Delete Bridge",
+      deleteConfirmTitle: "Delete Bridge Plugin",
+      deleteConfirmDesc: (name: string) =>
+        `Remove bridge plugin "${name}" and its encrypted signing secret?`,
+      deleteConfirmBtn: "Delete Bridge",
+      deleteCascadeTitle: "Bridge Plugin Is Referenced",
+      deleteCascadeDesc: (name: string, channels: number, routes: number) =>
+        `Bridge plugin "${name}" is used by ${channels} channel(s) and ${routes} route(s). Deleting it with cascade will also remove those channel accounts and strip it from referencing routes.`,
+      deleteCascadeBtn: "Delete Plugin & References",
+      conflictChannelsLabel: "Referencing Channels",
+      toastDeleted: "Bridge plugin deleted",
+      toastDeleteFailed: "Failed to delete bridge plugin",
+      channelSummaryTitle: "Channel Delivery Plugin",
+      channelSummaryDesc:
+        "This plugin provides a custom delivery channel adapter. Configure accounts and destinations for it in the Channels tab.",
+      accountSchemaFields: (count: number) => `Account fields (${count})`,
+      destSchemaFields: (count: number) => `Destination fields (${count})`,
+      bridgeNoProxyNote:
+        "Bridge channel plugins always connect directly to their registered sidecar URL without using the global outbound proxy.",
+      pluginAccountHeading: (name: string) => `${name} Account`,
+      pluginDestHeading: (name: string) => `${name} Destination`,
+      pluginNamePlaceholder: (name: string) => `e.g. ${name} (auto-filled if blank)`,
+      pluginDestPlaceholder: "Auto-derived if blank",
+      errSelectPlugin: "Select an enabled channel plugin.",
     },
   },
 
@@ -1058,6 +1118,7 @@ export const en = {
       notionPage: (id: string) => `Notion page:${id}`,
       notionFcId: "Notion FC-ID check",
       notionDefault: "Notion checkpoint",
+      plugin: "Plugin checkpoint",
     },
     modal: {
       title: (id: number) => `Task #${id} Diagnostics`,

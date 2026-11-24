@@ -49,7 +49,9 @@ const DELIVERED_WARNING_MARKERS = [
   "Link Rewrite partial",
   "hard-bounced",
   "is disabled; kept original",
-  "not found; kept original URLs",
+  "not found; kept original",
+  "failed (",
+  "timed out after",
   "capped at",
 ] as const;
 
@@ -188,6 +190,8 @@ function summarizeCheckpoint(
         return m.tasks.checkpoints.notionFcId;
       }
       return m.tasks.checkpoints.notionDefault;
+    case "plugin":
+      return m.tasks.checkpoints.plugin;
   }
 }
 

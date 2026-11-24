@@ -209,6 +209,9 @@ impl LinkRewritePlugin {
             name: "Link Rewrite (YOURLS)".to_string(),
             version: crate::config::VERSION.to_string(),
             api_version: PLUGIN_API_VERSION.to_string(),
+            kind: super::PluginKind::Processor,
+            runtime: super::PluginRuntime::Builtin,
+            min_core: None,
             category: "links".to_string(),
             icon: "link".to_string(),
             description: "Rewrite outgoing article links using self-hosted YOURLS short-link providers at delivery time with SQLite caching and per-route selection.".to_string(),
@@ -246,6 +249,9 @@ impl LinkRewritePlugin {
                     }
                 }
             }),
+            account_schema: json!({}),
+            destination_schema: json!({}),
+            capabilities: json!({}),
         };
         Self { manifest }
     }

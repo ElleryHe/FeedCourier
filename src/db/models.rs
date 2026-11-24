@@ -739,8 +739,37 @@ pub struct PluginRow {
     pub enabled: bool,
     pub installed_version: String,
     pub settings_json: String,
+    pub source: String,
+    pub kind: String,
+    pub bridge_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub encrypted_bridge_secret: Option<Vec<u8>>,
+    pub manifest_json: Option<String>,
+    pub manifest_fetched_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// Row from `plugin_events` (persistent at-least-once outbox for `on_delivered` hooks).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PluginEventRow {
+    pub id: i64,
+    pub plugin_id: String,
+    pub event: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
+    pub attempts: i64,
+    pub next_attempt_at: i64,
+    pub created_at: i64,
+}
+
+/// Input tuple for atomically enqueuing a `plugin_events` row alongside task completion.
+#[derive(Debug, Clone)]
+pub struct NewPluginEvent {
+    pub plugin_id: String,
+    pub event: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
 }
 
 /// Row from `plugin_instances` (encrypted provider credentials/config).
