@@ -1504,4 +1504,47 @@ async fn mcp_schema_lists_clear_cache_destinations_and_rejects_zero_dest_channel
         extract_tool_payload(&bad_eq_res)["error"],
         "validation_error"
     );
+
+    // 4. Round-3 P2-4 & P2-6:
+    //    - `debug_query_logs` rejects 1-char keyword with `validation_error`.
+    let bad_kw = admin
+        .call_tool("debug_query_logs", json!({ "contains": "x" }))
+        .await;
+    assert_eq!(bad_kw["isError"], true);
+    assert_eq!(extract_tool_payload(&bad_kw)["error"], "validation_error");
+
+    //    - `configure_route` rejects globally disabled plugin even when `provider_id` is omitted,
+    //      while allowing explicitly disabled route plugin options (`enabled: false`).
+    let disabled_plugin_route = admin
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Disabled Plugin Route",
+                "destination_id": harness.trusted_destination_id,
+                "plugins": { "link-rewrite": {} }
+            }),
+        )
+        .await;
+    assert_eq!(disabled_plugin_route["isError"], true);
+    assert_eq!(
+        extract_tool_payload(&disabled_plugin_route)["error"],
+        "validation_error"
+    );
+
+    let opt_disabled_route = admin
+        .call_tool(
+            "configure_route",
+            json!({
+                "action": "create",
+                "name": "Opt-Disabled Plugin Route",
+                "destination_id": harness.trusted_destination_id,
+                "plugins": { "link-rewrite": { "enabled": false } }
+            }),
+        )
+        .await;
+    assert_eq!(
+        opt_disabled_route["isError"], false,
+        "explicit enabled:false route plugin should pass MCP validation: {opt_disabled_route}"
+    );
 }

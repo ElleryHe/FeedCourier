@@ -24,9 +24,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -94,8 +94,37 @@ pub const JS_HOOK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const JS_HOOK_ON_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
 pub const JS_HOOK_DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum concurrent in-process Boa JS sandbox executions across the entire server.
+///
+/// The acquired [`tokio::sync::OwnedSemaphorePermit`] is moved into the `spawn_blocking` closure
+/// so even a runaway pure-CPU loop holds its slot until exit, preventing unbounded blocking-pool
+/// starvation of SMTP, Telegram, or feed ingestion tasks.
+pub const JS_MAX_CONCURRENT_EXECUTIONS: usize = 4;
+
+static JS_EXECUTION_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(JS_MAX_CONCURRENT_EXECUTIONS)));
+
 const SSRF_ERR_PREFIX: &str = "SSRF_BLOCKED: ";
 const PROXY_ERR_PREFIX: &str = "PROXY_UNCONFIGURED: ";
+const JS_CANCELLED_ERR_MSG: &str = "JS plugin execution timed out / cancelled";
+
+/// Returns `true` when `err` represents a JS sandbox wall-clock timeout or cancellation.
+pub fn is_js_timeout_error(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::Upstream(msg)
+            if msg.contains("timed out after ") || msg.contains(JS_CANCELLED_ERR_MSG)
+    )
+}
+
+fn format_timeout_label(timeout: Duration) -> String {
+    let ms = timeout.as_millis();
+    if ms >= 1000 && ms.is_multiple_of(1000) {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{ms}ms")
+    }
+}
 
 static DEBUG_NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -229,28 +258,29 @@ fn host_matches_allowed(host: &str, allowed_hosts: &[String]) -> bool {
 }
 
 /// Extract all exact `(scheme, host, port)` origins from fields declared as `format: "uri"` in
-/// `schema` whose values are present in `cfg` (or fall back to schema `default` when absent).
+/// `schema` whose non-empty values were explicitly provided in `cfg`.
+///
+/// Security invariant: NEVER fall back to plugin-declared schema `default` values here. Default
+/// public hosts (e.g. `https://ntfy.sh`, `https://api.day.app`) must be declared in
+/// `meta.allowed_hosts` and traverse full SSRF protection; private/LAN origin bypass is strictly
+/// reserved for values explicitly persisted by an administrator.
 pub fn extract_uri_origins(schema: &Value, cfg: &Value) -> Vec<AllowedOrigin> {
     let mut out = Vec::new();
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return out;
     };
-    let cfg_obj = cfg.as_object();
+    let Some(cfg_obj) = cfg.as_object() else {
+        return out;
+    };
     for (key, prop) in props {
         if prop.get("format").and_then(Value::as_str) != Some("uri") {
             continue;
         }
         let raw_val = cfg_obj
-            .and_then(|o| o.get(key))
+            .get(key)
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                prop.get("default")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            });
+            .filter(|s| !s.is_empty());
         if let Some(raw_url) = raw_val
             && let Ok(parsed) = Url::parse(raw_url)
             && check_hard_blocked_plugin_url(&parsed).is_ok()
@@ -263,7 +293,9 @@ pub fn extract_uri_origins(schema: &Value, cfg: &Value) -> Vec<AllowedOrigin> {
     out
 }
 
-fn is_schema_secret_prop(key: &str, prop_schema: Option<&Value>) -> bool {
+/// Returns `true` when `prop_schema` marks a field as secret (`format: "password"` or
+/// `x-secret: true`) or `key` matches a known sensitive credential field name.
+pub fn is_schema_secret_prop(key: &str, prop_schema: Option<&Value>) -> bool {
     if let Some(prop) = prop_schema {
         if prop.get("format").and_then(Value::as_str) == Some("password") {
             return true;
@@ -273,6 +305,47 @@ fn is_schema_secret_prop(key: &str, prop_schema: Option<&Value>) -> bool {
         }
     }
     crate::logging::redact::is_sensitive_field_name(key)
+}
+
+/// Verify that a plugin's `validate()` `normalized_config` neither introduces a new
+/// `format: "uri"` value nor mutates the `(scheme, host, port)` origin of any existing
+/// `format: "uri"` field (trailing-slash or path normalization keeping the exact origin is OK).
+fn verify_uri_origins_preserved(schema: &Value, before: &Value, after: &Value) -> AppResult<()> {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let before_obj = before.as_object();
+    let after_obj = after.as_object();
+    for (key, prop) in props {
+        if prop.get("format").and_then(Value::as_str) != Some("uri") {
+            continue;
+        }
+        let extract_origin = |obj: Option<&Map<String, Value>>| -> Option<AllowedOrigin> {
+            let raw = obj?
+                .get(key)?
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let parsed = Url::parse(raw).ok()?;
+            AllowedOrigin::from_url(&parsed)
+        };
+        let before_origin = extract_origin(before_obj);
+        let after_origin = extract_origin(after_obj);
+        match (before_origin, after_origin) {
+            (None, Some(_)) => {
+                return Err(AppError::Validation(format!(
+                    "plugin validate() is not allowed to introduce a new URI value for field '{key}'"
+                )));
+            }
+            (Some(prev), Some(next)) if prev != next => {
+                return Err(AppError::Validation(format!(
+                    "plugin validate() is not allowed to change the origin (scheme/host/port) of URI field '{key}'"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Validate a config JSON object against a declarative JSON Schema (`type: object`, `required`, `properties`).
@@ -303,7 +376,13 @@ fn validate_config_against_schema_inner(
             let is_req = required.iter().any(|r| r == key);
             match obj.get(key) {
                 None | Some(Value::Null) => {
-                    if apply_defaults && let Some(default_val) = prop.get("default") {
+                    // Never auto-inject plugin schema `default` values into `format: "uri"` fields;
+                    // only administrator-submitted URI values may join `admin_uri_origins`.
+                    let is_uri = prop.get("format").and_then(Value::as_str) == Some("uri");
+                    if apply_defaults
+                        && !is_uri
+                        && let Some(default_val) = prop.get("default")
+                    {
                         normalized.insert(key.clone(), default_val.clone());
                     } else if is_req {
                         return Err(AppError::Validation(format!(
@@ -477,19 +556,40 @@ pub struct FcFetchPolicy {
 struct FcHostState {
     fetch: Option<FcFetchPolicy>,
     fetch_calls: Cell<usize>,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
     last_ssrf_error: RefCell<Option<String>>,
     last_proxy_error: RefCell<Option<String>>,
 }
 
 impl FcHostState {
-    fn new(fetch: Option<FcFetchPolicy>) -> Self {
+    fn new(fetch: Option<FcFetchPolicy>, deadline: Instant, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             fetch,
             fetch_calls: Cell::new(0),
+            deadline,
+            cancelled,
             last_ssrf_error: RefCell::new(None),
             last_proxy_error: RefCell::new(None),
         }
     }
+}
+
+/// Check the sandbox cancellation flag and wall-clock deadline at the entry of every `fc.*` host
+/// call, returning the remaining time budget or throwing immediately if expired/cancelled.
+fn check_host_deadline(ctx: &mut Context) -> JsResult<Duration> {
+    let state = ctx
+        .get_data::<FcHostState>()
+        .ok_or_else(|| js_err("fc host state is missing"))?;
+    if state.cancelled.load(Ordering::Acquire) {
+        return Err(js_err(JS_CANCELLED_ERR_MSG));
+    }
+    let remaining = state.deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        state.cancelled.store(true, Ordering::Release);
+        return Err(js_err(JS_CANCELLED_ERR_MSG));
+    }
+    Ok(remaining)
 }
 
 fn js_err(msg: impl Into<String>) -> JsError {
@@ -545,6 +645,7 @@ fn encode_digest(bytes: &[u8], encoding: Option<&str>) -> JsResult<String> {
 }
 
 fn fc_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let req_val = args.get_or_undefined(0);
     let req_json = req_val
         .to_json(ctx)?
@@ -678,20 +779,32 @@ fn fc_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         (policy.clone(), parsed, allow_private)
     };
 
+    let remaining = check_host_deadline(ctx)?;
+    let effective_timeout = Duration::from_millis(timeout_ms).min(remaining);
+    if effective_timeout.is_zero() {
+        return Err(js_err(JS_CANCELLED_ERR_MSG));
+    }
+
     let http_req = PluginHttpRequest {
         method,
         url: parsed_url.into(),
         headers,
         body,
-        timeout: Duration::from_millis(timeout_ms),
+        timeout: effective_timeout,
         max_bytes: JS_MAX_RESPONSE_BYTES,
         allow_private_origin,
         use_proxy: policy.use_proxy,
     };
 
-    let res = policy
-        .rt_handle
-        .block_on(policy.http.send_plugin_http(http_req));
+    let res = policy.rt_handle.block_on(async {
+        tokio::time::timeout(effective_timeout, policy.http.send_plugin_http(http_req))
+            .await
+            .map_err(|_| AppError::Upstream(JS_CANCELLED_ERR_MSG.to_string()))?
+    });
+
+    // Re-check cancellation flag right after returning from HTTP so a cancelled invocation throws
+    // immediately instead of letting JS issue subsequent requests.
+    let _ = check_host_deadline(ctx)?;
 
     match res {
         Ok(resp) => {
@@ -726,6 +839,7 @@ fn fc_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 }
 
 fn fc_sha256(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     let enc = optional_string_arg(args, 1, ctx)?;
     let digest = Sha256::digest(input.as_bytes());
@@ -734,11 +848,13 @@ fn fc_sha256(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
 }
 
 fn fc_md5(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     Ok(JsValue::from(js_string!(md5_hex(input.as_bytes()))))
 }
 
 fn fc_hmac_sha256(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let msg = require_string_arg(args, 0, "message", ctx)?;
     let secret = require_string_arg(args, 1, "secret", ctx)?;
     let enc = optional_string_arg(args, 2, ctx)?;
@@ -750,12 +866,14 @@ fn fc_hmac_sha256(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
 }
 
 fn fc_base64_encode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
     Ok(JsValue::from(js_string!(encoded)))
 }
 
 fn fc_base64_decode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     let trimmed = input.trim();
     let bytes = base64::engine::general_purpose::STANDARD
@@ -770,12 +888,14 @@ fn fc_base64_decode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
 }
 
 fn fc_base64_url_encode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input.as_bytes());
     Ok(JsValue::from(js_string!(encoded)))
 }
 
 fn fc_utf8_byte_length(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     Ok(JsValue::from(input.len() as f64))
 }
@@ -804,6 +924,7 @@ fn fc_truncate_utf8_bytes(
     args: &[JsValue],
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let input = require_string_arg(args, 0, "input", ctx)?;
     let max_val = args.get_or_undefined(1);
     let max_f = max_val.to_number(ctx)?;
@@ -818,15 +939,18 @@ fn fc_truncate_utf8_bytes(
 }
 
 fn fc_html_to_text(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let html = require_string_arg(args, 0, "html", ctx)?;
     Ok(JsValue::from(js_string!(html_to_plain_text(&html))))
 }
 
-fn fc_unix_now(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+fn fc_unix_now(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     Ok(JsValue::from(now_unix() as f64))
 }
 
-fn fc_uuid(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+fn fc_uuid(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = check_host_deadline(ctx)?;
     let mut b = rand::random::<[u8; 16]>();
     b[6] = (b[6] & 0x0f) | 0x40; // RFC 4122 version 4
     b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant 1
@@ -852,7 +976,11 @@ fn fc_uuid(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<J
     Ok(JsValue::from(js_string!(uuid)))
 }
 
-fn build_sandbox_context(fetch: Option<FcFetchPolicy>) -> AppResult<Context> {
+fn build_sandbox_context(
+    fetch: Option<FcFetchPolicy>,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> AppResult<Context> {
     let mut ctx = Context::builder()
         .module_loader(Rc::new(IdleModuleLoader))
         .build()
@@ -865,7 +993,7 @@ fn build_sandbox_context(fetch: Option<FcFetchPolicy>) -> AppResult<Context> {
         limits.set_stack_size_limit(JS_STACK_SIZE_LIMIT);
     }
 
-    ctx.insert_data(FcHostState::new(fetch));
+    ctx.insert_data(FcHostState::new(fetch, deadline, cancelled));
 
     let fc_obj = ObjectInitializer::new(&mut ctx)
         .function(
@@ -1080,6 +1208,18 @@ fn is_callable_export(module: &Module, name: &str, ctx: &mut Context) -> bool {
 /// Synchronously compile a `plugin.js` script in an isolated Boa sandbox (no network access),
 /// validate `export const meta` + exported hook functions, and compute `script_sha256`.
 pub fn compile_js_plugin_sync(script_js: &str) -> AppResult<CompiledJsPlugin> {
+    compile_js_plugin_sync_with_deadline(
+        script_js,
+        Instant::now() + JS_COMPILE_TIMEOUT,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn compile_js_plugin_sync_with_deadline(
+    script_js: &str,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+) -> AppResult<CompiledJsPlugin> {
     if script_js.trim().is_empty() {
         return Err(AppError::Validation(
             "JS plugin source must not be empty".to_string(),
@@ -1093,7 +1233,7 @@ pub fn compile_js_plugin_sync(script_js: &str) -> AppResult<CompiledJsPlugin> {
     }
 
     let script_sha256 = sha256_hex(script_js.as_bytes());
-    let mut ctx = build_sandbox_context(None)?;
+    let mut ctx = build_sandbox_context(None, deadline, cancelled)?;
     let module = evaluate_plugin_module(script_js, &mut ctx)?;
 
     let meta_val = module
@@ -1272,18 +1412,41 @@ pub fn compile_js_plugin_sync(script_js: &str) -> AppResult<CompiledJsPlugin> {
     })
 }
 
-/// Async wrapper running [`compile_js_plugin_sync`] inside `spawn_blocking` with a 5s timeout.
+/// Async wrapper running [`compile_js_plugin_sync`] inside `spawn_blocking` under the global JS
+/// execution semaphore with a 5s deadline and host cancellation flag.
 pub async fn compile_js_plugin(script_js: String) -> AppResult<CompiledJsPlugin> {
-    let handle = tokio::task::spawn_blocking(move || compile_js_plugin_sync(&script_js));
+    let permit = tokio::time::timeout(
+        JS_COMPILE_TIMEOUT,
+        Arc::clone(&JS_EXECUTION_SEMAPHORE).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Validation(format!(
+            "JS plugin compilation timed out waiting for execution slot after {}s",
+            JS_COMPILE_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|_| AppError::Internal(anyhow::anyhow!("JS execution semaphore closed")))?;
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_inner = Arc::clone(&cancelled);
+    let deadline = Instant::now() + JS_COMPILE_TIMEOUT;
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        compile_js_plugin_sync_with_deadline(&script_js, deadline, cancelled_inner)
+    });
     match tokio::time::timeout(JS_COMPILE_TIMEOUT, handle).await {
         Ok(Ok(res)) => res,
         Ok(Err(join_err)) => Err(AppError::Internal(anyhow::anyhow!(
             "JS plugin compiler task panicked: {join_err}"
         ))),
-        Err(_) => Err(AppError::Validation(format!(
-            "JS plugin compilation timed out after {}s",
-            JS_COMPILE_TIMEOUT.as_secs()
-        ))),
+        Err(_) => {
+            cancelled.store(true, Ordering::Release);
+            Err(AppError::Validation(format!(
+                "JS plugin compilation timed out after {}s",
+                JS_COMPILE_TIMEOUT.as_secs()
+            )))
+        }
     }
 }
 
@@ -1327,8 +1490,27 @@ impl JsPluginRuntime {
     ) -> AppResult<Option<Value>> {
         let plugin_id = self.manifest.id.clone();
         let script = Arc::clone(&self.script_js);
+        let timeout_label = format_timeout_label(timeout);
+
+        let permit = tokio::time::timeout(
+            timeout,
+            Arc::clone(&JS_EXECUTION_SEMAPHORE).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Upstream(format!(
+                "JS plugin '{plugin_id}' {export_name}() timed out after {timeout_label} (waiting for JS sandbox slot)"
+            ))
+        })?
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("JS execution semaphore closed")))?;
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = Arc::clone(&cancelled);
+        let deadline = Instant::now() + timeout;
+
         let task = tokio::task::spawn_blocking(move || {
-            let mut ctx = build_sandbox_context(fetch_policy)?;
+            let _permit = permit;
+            let mut ctx = build_sandbox_context(fetch_policy, deadline, cancelled_inner)?;
             let module = evaluate_plugin_module(&script, &mut ctx)?;
             let func_val = module
                 .get_value(js_string!(export_name), &mut ctx)
@@ -1372,11 +1554,13 @@ impl JsPluginRuntime {
                 "JS plugin '{}' {export_name}() task panicked: {join_err}",
                 self.manifest.id
             ))),
-            Err(_) => Err(AppError::Upstream(format!(
-                "JS plugin '{}' {export_name}() timed out after {}s",
-                self.manifest.id,
-                timeout.as_secs()
-            ))),
+            Err(_) => {
+                cancelled.store(true, Ordering::Release);
+                Err(AppError::Upstream(format!(
+                    "JS plugin '{}' {export_name}() timed out after {timeout_label}",
+                    self.manifest.id,
+                )))
+            }
         }
     }
 
@@ -1442,7 +1626,9 @@ impl JsPluginRuntime {
             )));
         }
         if let Some(norm) = res.get("normalized_config").filter(|v| v.is_object()) {
-            return validate_config_against_schema(schema, norm);
+            let next = validate_config_against_schema_inner(schema, norm, false)?;
+            verify_uri_origins_preserved(schema, &validated, &next)?;
+            return Ok(next);
         }
         Ok(validated)
     }
@@ -1538,6 +1724,27 @@ impl JsPluginRuntime {
         admin_uri_origins: Vec<AllowedOrigin>,
         use_proxy: bool,
     ) -> AppResult<()> {
+        self.dispatch_on_delivered_with_timeout(
+            http,
+            idempotency_key,
+            payload,
+            admin_uri_origins,
+            use_proxy,
+            JS_HOOK_DEFAULT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Invoke `onDelivered(ctx)` with an explicit wall-clock timeout.
+    pub async fn dispatch_on_delivered_with_timeout(
+        &self,
+        http: &ProtectedHttpClient,
+        idempotency_key: &str,
+        payload: &Value,
+        admin_uri_origins: Vec<AllowedOrigin>,
+        use_proxy: bool,
+        timeout: Duration,
+    ) -> AppResult<()> {
         if !self.has_on_delivered {
             return Ok(());
         }
@@ -1553,7 +1760,7 @@ impl JsPluginRuntime {
             "payload": payload,
         });
         let _ = self
-            .invoke_export("onDelivered", arg, Some(policy), JS_HOOK_DEFAULT_TIMEOUT)
+            .invoke_export("onDelivered", arg, Some(policy), timeout)
             .await?;
         Ok(())
     }
@@ -1582,11 +1789,12 @@ struct JsOnRenderResponse {
 /// In-process JS processor plugin implementing FeedCourier's [`Plugin`] trait.
 pub struct JsProcessorPlugin {
     runtime: Arc<JsPluginRuntime>,
+    registry: PluginRegistry,
 }
 
 impl JsProcessorPlugin {
-    pub fn new(runtime: Arc<JsPluginRuntime>) -> Self {
-        Self { runtime }
+    pub fn new(runtime: Arc<JsPluginRuntime>, registry: PluginRegistry) -> Self {
+        Self { runtime, registry }
     }
 }
 
@@ -1636,26 +1844,27 @@ impl Plugin for JsProcessorPlugin {
                 self.runtime.manifest.id
             )));
         }
-        if let Some(pid_val) = obj.get("provider_id")
-            && !pid_val.is_null()
-        {
-            let pid = pid_val.as_i64().filter(|&v| v > 0).ok_or_else(|| {
-                AppError::Validation("provider_id must be a positive integer".to_string())
-            })?;
-            let inst = db.get_plugin_instance(pid).await?.ok_or_else(|| {
-                AppError::Validation(format!(
-                    "plugin instance {pid} not found for plugin '{}'",
-                    self.runtime.manifest.id
-                ))
-            })?;
-            if inst.plugin_id != self.runtime.manifest.id {
-                return Err(AppError::Validation(format!(
-                    "plugin instance {pid} does not belong to plugin '{}'",
-                    self.runtime.manifest.id
-                )));
+        let route_enabled = obj.get("enabled").and_then(Value::as_bool) != Some(false);
+        if route_enabled {
+            if let Some(pid_val) = obj.get("provider_id")
+                && !pid_val.is_null()
+            {
+                let pid = pid_val.as_i64().filter(|&v| v > 0).ok_or_else(|| {
+                    AppError::Validation("provider_id must be a positive integer".to_string())
+                })?;
+                let inst = db.get_plugin_instance(pid).await?.ok_or_else(|| {
+                    AppError::Validation(format!(
+                        "plugin instance {pid} not found for plugin '{}'",
+                        self.runtime.manifest.id
+                    ))
+                })?;
+                if inst.plugin_id != self.runtime.manifest.id {
+                    return Err(AppError::Validation(format!(
+                        "plugin instance {pid} does not belong to plugin '{}'",
+                        self.runtime.manifest.id
+                    )));
+                }
             }
-        }
-        if obj.get("enabled").and_then(Value::as_bool) != Some(false) {
             validate_config_against_schema(&self.runtime.manifest.route_option_schema, option)?;
         }
         Ok(())
@@ -1736,17 +1945,38 @@ impl Plugin for JsProcessorPlugin {
                     instance_cfg = decrypted;
                 }
                 Some(inst) if !inst.enabled => {
-                    out.warnings.push(format!(
+                    if !strict_mode
+                        && let Ok(decrypted) =
+                            ctx.master_key.decrypt_json::<Value>(&inst.encrypted_config)
+                        && decrypted.get("strict_mode").and_then(Value::as_bool) == Some(true)
+                    {
+                        strict_mode = true;
+                    }
+                    let msg = format!(
                         "Plugin '{}' provider '{}' is disabled; kept original content",
                         self.runtime.manifest.id, inst.name
-                    ));
+                    );
+                    if strict_mode {
+                        return Ok(PluginResult::Retry {
+                            diagnostic: msg,
+                            retry_after_secs: None,
+                        });
+                    }
+                    out.push_warning(msg);
                     return Ok(PluginResult::Continue);
                 }
                 _ => {
-                    out.warnings.push(format!(
+                    let msg = format!(
                         "Plugin '{}' provider #{pid} not found; kept original content",
                         self.runtime.manifest.id
-                    ));
+                    );
+                    if strict_mode {
+                        return Ok(PluginResult::Retry {
+                            diagnostic: msg,
+                            retry_after_secs: None,
+                        });
+                    }
+                    out.push_warning(msg);
                     return Ok(PluginResult::Continue);
                 }
             }
@@ -1805,22 +2035,43 @@ impl Plugin for JsProcessorPlugin {
             "write_cache": ctx.write_cache,
         });
 
-        let origins = extract_uri_origins(&self.runtime.manifest.instance_schema, &instance_cfg);
+        let mut origins =
+            extract_uri_origins(&self.runtime.manifest.instance_schema, &instance_cfg);
+        for o in extract_uri_origins(&self.runtime.manifest.route_option_schema, &route_opt) {
+            if !origins.contains(&o) {
+                origins.push(o);
+            }
+        }
         let policy = self.runtime.build_fetch_policy(
             ctx.http,
             origins,
             use_proxy,
             JS_MAX_FETCH_CALLS_ON_RENDER,
         );
+        let timeout = self
+            .registry
+            .effective_hook_timeout(JS_HOOK_ON_RENDER_TIMEOUT);
 
         let raw_val = match self
             .runtime
-            .invoke_export("onRender", payload, Some(policy), JS_HOOK_ON_RENDER_TIMEOUT)
+            .invoke_export("onRender", payload, Some(policy), timeout)
             .await
         {
-            Ok(Some(v)) if !v.is_null() => v,
-            Ok(_) => return Ok(PluginResult::Continue),
+            Ok(Some(v)) if !v.is_null() => {
+                self.registry.reset_js_timeout(&self.runtime.manifest.id);
+                v
+            }
+            Ok(_) => {
+                self.registry.reset_js_timeout(&self.runtime.manifest.id);
+                return Ok(PluginResult::Continue);
+            }
             Err(err) => {
+                if is_js_timeout_error(&err) {
+                    let _ = self
+                        .registry
+                        .record_js_timeout(ctx.db, &self.runtime.manifest.id, "onRender")
+                        .await;
+                }
                 let msg = format!(
                     "Plugin '{}' onRender error: {}",
                     self.runtime.manifest.id,
@@ -1832,7 +2083,7 @@ impl Plugin for JsProcessorPlugin {
                         retry_after_secs: None,
                     });
                 }
-                out.warnings.push(msg);
+                out.push_warning(msg);
                 return Ok(PluginResult::Continue);
             }
         };
@@ -1850,7 +2101,7 @@ impl Plugin for JsProcessorPlugin {
                         retry_after_secs: None,
                     });
                 }
-                out.warnings.push(msg);
+                out.push_warning(msg);
                 return Ok(PluginResult::Continue);
             }
         };
@@ -1872,7 +2123,7 @@ impl Plugin for JsProcessorPlugin {
                     retry_after_secs: parsed.retry_after_secs,
                 });
             }
-            out.warnings.push(diag);
+            out.push_warning(diag);
             return Ok(PluginResult::Continue);
         }
 
@@ -1887,7 +2138,7 @@ impl Plugin for JsProcessorPlugin {
             if let Some(safe) = sanitize_http_url(Some(new_link)) {
                 out.primary_link = Some(safe);
             } else {
-                out.warnings.push(format!(
+                out.push_warning(format!(
                     "Plugin '{}' returned non-http(s) primary_link; ignored",
                     self.runtime.manifest.id
                 ));
@@ -1895,7 +2146,7 @@ impl Plugin for JsProcessorPlugin {
         }
 
         for w in parsed.warnings.into_iter().take(5) {
-            out.warnings.push(crate::logging::redact::redact_text(&w));
+            out.push_warning(crate::logging::redact::redact_text(&w));
         }
 
         Ok(PluginResult::Continue)
@@ -1928,11 +2179,22 @@ struct JsDeliverResponse {
 pub struct JsChannelSender {
     registry: PluginRegistry,
     http: ProtectedHttpClient,
+    db: Option<Database>,
 }
 
 impl JsChannelSender {
     pub fn new(registry: PluginRegistry, http: ProtectedHttpClient) -> Self {
-        Self { registry, http }
+        Self {
+            registry,
+            http,
+            db: None,
+        }
+    }
+
+    /// Attach a [`Database`] handle so consecutive execution timeouts trip the persistent circuit breaker.
+    pub fn with_db(mut self, db: Database) -> Self {
+        self.db = Some(db);
+        self
     }
 
     pub async fn send_test_with_locale(
@@ -1958,14 +2220,14 @@ impl JsChannelSender {
                 acct_cfg.plugin_id
             ))
         })?;
-        if entry.runtime.manifest.kind != PluginKind::Channel {
+        if entry.manifest.kind != PluginKind::Channel {
             return Err(AppError::Validation(format!(
                 "Plugin '{}' is a '{}' plugin, not a channel plugin",
                 acct_cfg.plugin_id,
-                entry.runtime.manifest.kind.as_str()
+                entry.manifest.kind.as_str()
             )));
         }
-        if !entry.compatible {
+        if !entry.compatible || entry.runtime.is_none() {
             return Err(AppError::Validation(format!(
                 "Channel plugin '{}' is incompatible with current core: {}",
                 acct_cfg.plugin_id,
@@ -1981,8 +2243,11 @@ impl JsChannelSender {
                 acct_cfg.plugin_id
             )));
         }
-        entry
+        let runtime = entry
             .runtime
+            .as_ref()
+            .expect("compatible plugin has runtime");
+        runtime
             .test_config(
                 &self.http,
                 "destination",
@@ -2024,19 +2289,18 @@ impl ChannelSender for JsChannelSender {
                 ),
             });
         };
-        let runtime = &entry.runtime;
-        if runtime.manifest.kind != PluginKind::Channel {
+        if entry.manifest.kind != PluginKind::Channel {
             return Ok(DeliveryOutcome::PermanentFailure {
                 status_code: None,
                 checkpoint: ctx.checkpoint.clone(),
                 diagnostic: format!(
                     "Plugin '{}' has kind '{}' instead of 'channel'",
                     acct_cfg.plugin_id,
-                    runtime.manifest.kind.as_str()
+                    entry.manifest.kind.as_str()
                 ),
             });
         }
-        if !entry.compatible {
+        if !entry.compatible || entry.runtime.is_none() {
             return Ok(DeliveryOutcome::Deferred {
                 next_window_at: now_unix().saturating_add(300),
                 checkpoint: ctx.checkpoint.clone(),
@@ -2060,6 +2324,10 @@ impl ChannelSender for JsChannelSender {
                 ),
             });
         }
+        let runtime = entry
+            .runtime
+            .as_ref()
+            .expect("compatible channel plugin has runtime");
 
         let effective_html = ctx.effective_content_html();
         let effective_url = ctx.effective_primary_link();
@@ -2154,12 +2422,19 @@ impl ChannelSender for JsChannelSender {
             JS_MAX_FETCH_CALLS_DEFAULT,
         );
 
+        let deliver_timeout = self
+            .registry
+            .effective_hook_timeout(JS_HOOK_DELIVER_TIMEOUT);
         let raw_val = match runtime
-            .invoke_export("deliver", payload, Some(policy), JS_HOOK_DELIVER_TIMEOUT)
+            .invoke_export("deliver", payload, Some(policy), deliver_timeout)
             .await
         {
-            Ok(Some(v)) if !v.is_null() => v,
+            Ok(Some(v)) if !v.is_null() => {
+                self.registry.reset_js_timeout(&acct_cfg.plugin_id);
+                v
+            }
             Ok(_) => {
+                self.registry.reset_js_timeout(&acct_cfg.plugin_id);
                 return Ok(DeliveryOutcome::Retry {
                     retry_after_secs: None,
                     status_code: None,
@@ -2172,6 +2447,7 @@ impl ChannelSender for JsChannelSender {
                 });
             }
             Err(AppError::SsrfBlocked(msg)) => {
+                self.registry.reset_js_timeout(&acct_cfg.plugin_id);
                 return Ok(DeliveryOutcome::PermanentFailure {
                     status_code: None,
                     checkpoint: ctx.checkpoint.clone(),
@@ -2179,6 +2455,7 @@ impl ChannelSender for JsChannelSender {
                 });
             }
             Err(AppError::Validation(msg)) => {
+                self.registry.reset_js_timeout(&acct_cfg.plugin_id);
                 return Ok(DeliveryOutcome::PermanentFailure {
                     status_code: None,
                     checkpoint: ctx.checkpoint.clone(),
@@ -2186,6 +2463,14 @@ impl ChannelSender for JsChannelSender {
                 });
             }
             Err(err) => {
+                if is_js_timeout_error(&err)
+                    && let Some(ref db) = self.db
+                {
+                    let _ = self
+                        .registry
+                        .record_js_timeout(db, &acct_cfg.plugin_id, "deliver")
+                        .await;
+                }
                 return Ok(DeliveryOutcome::Retry {
                     retry_after_secs: None,
                     status_code: None,

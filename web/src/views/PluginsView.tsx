@@ -206,6 +206,8 @@ export function PluginsView() {
       );
       void queryClient.invalidateQueries({ queryKey: ["plugins"] });
       void queryClient.invalidateQueries({ queryKey: ["plugins", "market"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err) => {
       toast.error(m.plugins.detail.toastPluginToggleFailed, errorMessage(err));
@@ -228,6 +230,8 @@ export function PluginsView() {
       toast.success(m.plugins.detail.toastPluginEnabled);
       void queryClient.invalidateQueries({ queryKey: ["plugins"] });
       void queryClient.invalidateQueries({ queryKey: ["plugins", "market"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
       setActiveTab("installed");
       setSelectedPluginId(updated.id);
     },
@@ -251,6 +255,8 @@ export function PluginsView() {
       void queryClient.invalidateQueries({ queryKey: ["plugins", "market"] });
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
       void queryClient.invalidateQueries({ queryKey: ["routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
     },
     onError: (err, { plugin, cascade }) => {
       if (!cascade) {
@@ -613,10 +619,16 @@ export function PluginsView() {
                                     m.plugins.market.incompatibleBadge}
                                 </Badge>
                               )}
-                              {!plugin.enabled && (
-                                <Badge variant="default">
-                                  {m.common.disabled}
+                              {plugin.disabled_reason ? (
+                                <Badge variant="danger">
+                                  {m.plugins.autoDisabledLabel}
                                 </Badge>
+                              ) : (
+                                !plugin.enabled && (
+                                  <Badge variant="default">
+                                    {m.common.disabled}
+                                  </Badge>
+                                )
                               )}
                             </div>
                             <div className="mt-1 flex flex-wrap items-center gap-1.5">
@@ -685,6 +697,20 @@ export function PluginsView() {
                       <p className="text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
                         {localizedDesc}
                       </p>
+
+                      {plugin.disabled_reason && (
+                        <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50/80 px-3 py-2 text-xs text-rose-800 dark:border-rose-900/70 dark:bg-rose-950/40 dark:text-rose-200">
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600 dark:text-rose-400" />
+                          <div className="min-w-0 leading-relaxed">
+                            <span className="font-semibold">
+                              {m.plugins.autoDisabledLabel}:
+                            </span>{" "}
+                            <span className="break-words">
+                              {plugin.disabled_reason}
+                            </span>
+                          </div>
+                        </div>
+                      )}
 
                       {allowedHosts.length > 0 && (
                         <div className="flex flex-wrap items-center gap-1">
@@ -1185,6 +1211,7 @@ function InstallMarketPluginModal({
   const [selectedVersion, setSelectedVersion] =
     useState<string>(defaultVersion);
   const [enabled, setEnabled] = useState(true);
+  const [replaceCustom, setReplaceCustom] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
   const previewQuery = useQuery({
@@ -1207,6 +1234,7 @@ function InstallMarketPluginModal({
         plugin_id: item.id,
         version: selectedVersion || undefined,
         enabled,
+        replace_custom: replaceCustom,
       }),
     onSuccess: (installed) => {
       toast.success(
@@ -1215,6 +1243,9 @@ function InstallMarketPluginModal({
       void queryClient.invalidateQueries({ queryKey: ["plugins"] });
       void queryClient.invalidateQueries({ queryKey: ["plugins", "market"] });
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
+      void queryClient.invalidateQueries({ queryKey: ["routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
       onInstalled(installed);
     },
     onError: (err) => {
@@ -1229,6 +1260,9 @@ function InstallMarketPluginModal({
   const changelog = preview?.changelog || selectedVersionMeta?.changelog || null;
   const allowedHosts = preview?.allowed_hosts ?? item.allowed_hosts ?? [];
   const isUpdate = Boolean(item.installed);
+  const isReplacingCustom = Boolean(
+    preview?.already_installed && preview.installed_source === "custom",
+  );
 
   const copySha256 = async (sha: string) => {
     try {
@@ -1260,7 +1294,12 @@ function InstallMarketPluginModal({
             {m.common.cancel}
           </Button>
           <Button
-            disabled={!preview || !preview.compatible || previewQuery.isFetching}
+            disabled={
+              !preview ||
+              !preview.compatible ||
+              previewQuery.isFetching ||
+              (isReplacingCustom && !replaceCustom)
+            }
             loading={installMutation.isPending}
             onClick={() => {
               setSubmitError(null);
@@ -1417,21 +1456,44 @@ function InstallMarketPluginModal({
               </div>
             </div>
 
-            {preview.already_installed && (
-              <div className="flex items-start gap-2 rounded-lg border border-sky-200 bg-sky-50/70 px-3 py-2.5 text-xs text-sky-900 dark:border-sky-900/60 dark:bg-sky-950/30 dark:text-sky-200">
-                <Info className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
-                <span className="leading-relaxed">
-                  {preview.installed_version &&
-                  preview.installed_version !== preview.manifest.version
-                    ? m.plugins.js.alreadyInstalledUpgradeNotice(
-                        preview.installed_version,
-                        preview.manifest.version,
-                      )
-                    : m.plugins.js.alreadyInstalledSameNotice(
-                        preview.manifest.version,
-                      )}
-                </span>
+            {isReplacingCustom ? (
+              <div className="space-y-2.5 rounded-lg border border-rose-200 bg-rose-50/80 px-3 py-2.5 text-xs text-rose-900 dark:border-rose-900/70 dark:bg-rose-950/40 dark:text-rose-200">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+                  <span className="leading-relaxed">
+                    {m.plugins.js.replaceCustomWarning(
+                      preview.manifest.id,
+                      preview.installed_version,
+                    )}
+                  </span>
+                </div>
+                <label className="inline-flex cursor-pointer items-start gap-2 pl-6 font-medium text-rose-900 dark:text-rose-100">
+                  <input
+                    type="checkbox"
+                    checked={replaceCustom}
+                    onChange={(e) => setReplaceCustom(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-rose-400 accent-rose-600 dark:border-rose-700 dark:accent-rose-500"
+                  />
+                  <span>{m.plugins.js.replaceCustomCheckbox}</span>
+                </label>
               </div>
+            ) : (
+              preview.already_installed && (
+                <div className="flex items-start gap-2 rounded-lg border border-sky-200 bg-sky-50/70 px-3 py-2.5 text-xs text-sky-900 dark:border-sky-900/60 dark:bg-sky-950/30 dark:text-sky-200">
+                  <Info className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
+                  <span className="leading-relaxed">
+                    {preview.installed_version &&
+                    preview.installed_version !== preview.manifest.version
+                      ? m.plugins.js.alreadyInstalledUpgradeNotice(
+                          preview.installed_version,
+                          preview.manifest.version,
+                        )
+                      : m.plugins.js.alreadyInstalledSameNotice(
+                          preview.manifest.version,
+                        )}
+                  </span>
+                </div>
+              )
             )}
 
             {changelog && (
@@ -1525,6 +1587,9 @@ function UploadJsPluginModal({
       void queryClient.invalidateQueries({ queryKey: ["plugins"] });
       void queryClient.invalidateQueries({ queryKey: ["plugins", "market"] });
       void queryClient.invalidateQueries({ queryKey: ["channels"] });
+      void queryClient.invalidateQueries({ queryKey: ["routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      void queryClient.invalidateQueries({ queryKey: ["overview"] });
       onInstalled(installed);
     },
     onError: (err) => {
@@ -2006,6 +2071,17 @@ function PluginDetailView({
           </span>
         </div>
       )}
+      {plugin.disabled_reason && (
+        <div className="flex items-start gap-2.5 rounded-xl border border-rose-200 bg-rose-50/80 px-3.5 py-2.5 text-xs text-rose-800 dark:border-rose-900/70 dark:bg-rose-950/40 dark:text-rose-200">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600 dark:text-rose-400" />
+          <div className="min-w-0 leading-relaxed">
+            <span className="font-semibold">
+              {m.plugins.autoDisabledLabel}:
+            </span>{" "}
+            <span className="break-words">{plugin.disabled_reason}</span>
+          </div>
+        </div>
+      )}
       <Card className="p-4">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="flex min-w-0 items-start gap-3">
@@ -2043,8 +2119,12 @@ function PluginDetailView({
                       m.plugins.market.incompatibleBadge}
                   </Badge>
                 )}
-                {!plugin.enabled && (
-                  <Badge variant="default">{m.common.disabled}</Badge>
+                {plugin.disabled_reason ? (
+                  <Badge variant="danger">{m.plugins.autoDisabledLabel}</Badge>
+                ) : (
+                  !plugin.enabled && (
+                    <Badge variant="default">{m.common.disabled}</Badge>
+                  )
                 )}
               </div>
               <p className="max-w-2xl text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">

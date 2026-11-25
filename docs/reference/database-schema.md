@@ -259,6 +259,7 @@ Added in `v0.3.0` (`0003_plugins_and_smtp_compliance.sql`) and extended in `v0.3
 | `script_sha256` | `TEXT` | `NULL` | Added in `0004_js_plugins.sql`. 64-char lowercase hex SHA-256 checksum of `script_js` (`NULL` for built-in plugins). |
 | `manifest_json` | `TEXT` | `NULL` | Added in `0004_js_plugins.sql`. Compiled Protocol v1 manifest JSON extracted from `export const meta`. |
 | `installed_at` | `INTEGER` | `NULL` | Added in `0004_js_plugins.sql`. UTC Unix seconds timestamp when the JS plugin was installed or last upgraded. |
+| `disabled_reason` | `TEXT` | `NULL` | Added in `0004_js_plugins.sql`. Reason recorded when the automatic 3-consecutive-timeout circuit breaker disables a JS plugin globally (cleared when manually re-enabled). |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | Timestamps. |
 
 #### `plugin_instances`
@@ -392,4 +393,4 @@ ORDER BY (ts_ms, level_num)
 TTL ts + INTERVAL <LOG_RETENTION_DAYS> DAY
 ```
 
-Retention in ClickHouse is enforced natively via the table `TTL` (`LOG_MAX_ROWS` applies only to SQLite `logs.db`). Outages never block startup or delivery—failed batches increment a dropped-log counter and emit rate-limited warnings on `stderr`.
+Retention in ClickHouse is enforced natively via the table `TTL` (`LOG_MAX_ROWS` applies only to SQLite `logs.db`). In `JSONEachRow` inserts, `ts` is serialized as UTC `YYYY-MM-DD HH:MM:SS.fff` strings compatible with `DateTime64(3, 'UTC')` alongside the integer `ts_ms` epoch-millisecond column. Structured keyword searches against either log store validate `2–128` Unicode characters, default to a 24-hour lookback window when no lower bound is given, and enforce a 5-second query timeout. Outages never block startup or delivery—failed batches increment a dropped-log counter and emit rate-limited warnings on `stderr`.

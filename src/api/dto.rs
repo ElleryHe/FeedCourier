@@ -680,7 +680,7 @@ impl ChannelDto {
         destinations: Vec<ChannelDestination>,
         master_key: &MasterKey,
     ) -> AppResult<Self> {
-        Self::from_model_with_schema(channel, destinations, master_key, None)
+        Self::from_model_with_schema(channel, destinations, master_key, None, None)
     }
 
     pub fn from_model_with_schema(
@@ -688,6 +688,7 @@ impl ChannelDto {
         destinations: Vec<ChannelDestination>,
         master_key: &MasterKey,
         plugin_account_schema: Option<&Value>,
+        plugin_destination_schema: Option<&Value>,
     ) -> AppResult<Self> {
         let decrypted: ChannelConfig = master_key.decrypt_json(&channel.encrypted_config)?;
         let redacted_view = match (&decrypted, plugin_account_schema) {
@@ -701,10 +702,12 @@ impl ChannelDto {
         let capabilities = channel.capabilities_value();
         let mut dest_dtos = Vec::with_capacity(destinations.len());
         for d in destinations {
-            dest_dtos.push(ChannelDestinationDto::from_model(
+            dest_dtos.push(ChannelDestinationDto::from_model_with_schema(
                 d,
                 channel.kind,
                 master_key,
+                None,
+                plugin_destination_schema,
             )?);
         }
 
@@ -1098,8 +1101,34 @@ pub struct DeliveryTaskDto {
     pub next_attempt_at: Option<String>,
     pub last_status_code: Option<i32>,
     pub diagnostic_log: Option<String>,
+    /// `true` when `status == Delivered` and one or more non-fatal plugin/recipient warnings were
+    /// recorded in `diagnostic_log` (either with the canonical `[warn] ` prefix or legacy markers).
+    pub has_warnings: bool,
     pub completed_at: Option<String>,
     pub created_at: String,
+}
+
+pub fn diagnostic_has_warning(status: DeliveryTaskStatus, diagnostic_log: Option<&str>) -> bool {
+    if status != DeliveryTaskStatus::Delivered {
+        return false;
+    }
+    let Some(log) = diagnostic_log else {
+        return false;
+    };
+    if log.contains(crate::plugins::DELIVERY_WARNING_PREFIX) {
+        return true;
+    }
+    [
+        "Link Rewrite partial",
+        "hard-bounced",
+        "is disabled; kept original",
+        "not found; kept original",
+        "failed (",
+        "timed out after",
+        "capped at",
+    ]
+    .iter()
+    .any(|marker| log.contains(marker))
 }
 
 impl DeliveryTaskDto {
@@ -1114,6 +1143,7 @@ impl DeliveryTaskDto {
             Some((fid, ftitle)) => (Some(fid), Some(ftitle)),
             None => (None, None),
         };
+        let has_warnings = diagnostic_has_warning(detail.status, detail.diagnostic_log.as_deref());
 
         Self {
             id: detail.id,
@@ -1136,6 +1166,7 @@ impl DeliveryTaskDto {
             next_attempt_at: Some(unix_to_rfc3339(detail.next_attempt_at)),
             last_status_code: detail.last_status_code,
             diagnostic_log: detail.diagnostic_log,
+            has_warnings,
             completed_at: detail.completed_at.map(unix_to_rfc3339),
             created_at: unix_to_rfc3339(detail.created_at),
         }
@@ -1245,6 +1276,8 @@ pub struct PluginDto {
     pub compatible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     pub manifest: PluginManifest,
     pub enabled: bool,
     pub installed_version: String,
@@ -1263,6 +1296,10 @@ pub struct InstallMarketPluginRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub dry_run: bool,
+    /// Must be explicitly `true` to replace an already-installed `source = "custom"` plugin with
+    /// the official marketplace version.
+    #[serde(default)]
+    pub replace_custom: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1289,6 +1326,8 @@ pub struct JsPluginPreviewResponse {
     pub already_installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changelog: Option<String>,
 }

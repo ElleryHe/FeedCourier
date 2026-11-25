@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
@@ -51,7 +52,7 @@ use crate::db::models::{
     SmtpRecipientStatus, UpdateChannel, UpdateDestination, UpdateFeed, UpdateRoute, now_unix,
     unix_to_rfc3339,
 };
-use crate::db::repo::DeleteGuardOutcome;
+use crate::db::repo::{DeleteGuardOutcome, DeleteJsPluginOutcome};
 use crate::error::{AppError, AppResult};
 use crate::ingest::{ContentFilterRules, FeedPreviewResponse};
 use crate::net::NetSettings;
@@ -431,18 +432,18 @@ pub async fn list_channels(State(state): State<AppState>) -> AppResult<Json<Vec<
 
 /// Validate that an installed JS plugin is a compatible, enabled `channel` plugin before
 /// creating, updating, or testing channel accounts or destinations.
-fn ensure_channel_plugin_usable(
-    plugin: &crate::plugins::JsPluginEntry,
+fn ensure_channel_plugin_usable<'a>(
+    plugin: &'a crate::plugins::JsPluginEntry,
     plugin_id: &str,
     disabled_suffix: &str,
-) -> AppResult<()> {
-    if plugin.runtime.manifest.kind != PluginKind::Channel {
+) -> AppResult<&'a Arc<crate::plugins::js_runtime::JsPluginRuntime>> {
+    if plugin.manifest.kind != PluginKind::Channel {
         return Err(AppError::Validation(format!(
             "Plugin '{plugin_id}' is a '{}' plugin, not a channel plugin",
-            plugin.runtime.manifest.kind.as_str()
+            plugin.manifest.kind.as_str()
         )));
     }
-    if !plugin.compatible {
+    if !plugin.compatible || plugin.runtime.is_none() {
         return Err(AppError::Validation(format!(
             "Channel plugin '{plugin_id}' is incompatible with current core: {}",
             plugin
@@ -456,7 +457,42 @@ fn ensure_channel_plugin_usable(
             "Channel plugin '{plugin_id}' is disabled{disabled_suffix}"
         )));
     }
-    Ok(())
+    Ok(plugin
+        .runtime
+        .as_ref()
+        .expect("compatible channel plugin has runtime"))
+}
+
+/// Validate that an installed JS plugin is a compatible, enabled `processor` plugin before
+/// creating, updating, or testing provider instances.
+fn ensure_js_processor_plugin_usable<'a>(
+    plugin: &'a crate::plugins::JsPluginEntry,
+    plugin_id: &str,
+) -> AppResult<&'a Arc<crate::plugins::js_runtime::JsPluginRuntime>> {
+    if plugin.manifest.kind != PluginKind::Processor {
+        return Err(AppError::Validation(format!(
+            "Plugin '{plugin_id}' is a '{}' plugin, not a processor plugin",
+            plugin.manifest.kind.as_str()
+        )));
+    }
+    if !plugin.compatible || plugin.runtime.is_none() {
+        return Err(AppError::Validation(format!(
+            "Processor plugin '{plugin_id}' is incompatible with current core: {}",
+            plugin
+                .compatibility_reason
+                .as_deref()
+                .unwrap_or("version mismatch")
+        )));
+    }
+    if !plugin.enabled {
+        return Err(AppError::Validation(format!(
+            "Processor plugin '{plugin_id}' is disabled; enable it before managing provider instances"
+        )));
+    }
+    Ok(plugin
+        .runtime
+        .as_ref()
+        .expect("compatible processor plugin has runtime"))
 }
 
 /// `POST /api/v1/channels`
@@ -582,19 +618,18 @@ pub async fn create_channel(
                         plugin_cfg.plugin_id
                     ))
                 })?;
-            ensure_channel_plugin_usable(
+            let runtime = ensure_channel_plugin_usable(
                 &js_plugin,
                 &plugin_cfg.plugin_id,
                 "; enable it before creating accounts",
             )?;
-            let normalized = js_plugin
-                .runtime
+            let normalized = runtime
                 .validate_config(state.http(), "account", &plugin_cfg.config, req.use_proxy)
                 .await?;
             plugin_cfg.config = normalized;
             (
-                js_plugin.runtime.manifest.name.clone(),
-                serde_json::to_string(&js_plugin.runtime.manifest.capabilities)?,
+                js_plugin.manifest.name.clone(),
+                serde_json::to_string(&js_plugin.manifest.capabilities)?,
             )
         }
     };
@@ -686,9 +721,7 @@ pub async fn update_channel(
         };
         let (mut merged_cfg, tg_endpoint_changed) = cfg_patch.apply_to_with_schema(
             &current_cfg,
-            plugin_entry
-                .as_ref()
-                .map(|p| &p.runtime.manifest.account_schema),
+            plugin_entry.as_ref().map(|p| &p.manifest.account_schema),
         )?;
         if let ChannelConfig::Plugin(ref mut p_cfg) = merged_cfg {
             let js_plugin = plugin_entry.ok_or_else(|| {
@@ -697,9 +730,8 @@ pub async fn update_channel(
                     p_cfg.plugin_id
                 ))
             })?;
-            ensure_channel_plugin_usable(&js_plugin, &p_cfg.plugin_id, "")?;
-            p_cfg.config = js_plugin
-                .runtime
+            let runtime = ensure_channel_plugin_usable(&js_plugin, &p_cfg.plugin_id, "")?;
+            p_cfg.config = runtime
                 .validate_config(
                     state.http(),
                     "account",
@@ -882,10 +914,9 @@ pub async fn test_channel(
                         plugin_cfg.plugin_id
                     ))
                 })?;
-            ensure_channel_plugin_usable(&js_plugin, &plugin_cfg.plugin_id, "")?;
+            let runtime = ensure_channel_plugin_usable(&js_plugin, &plugin_cfg.plugin_id, "")?;
             let effective_locale = req.locale.unwrap_or_else(|| state.runtime().locale());
-            let message = js_plugin
-                .runtime
+            let message = runtime
                 .test_config(
                     state.http(),
                     "account",
@@ -899,7 +930,7 @@ pub async fn test_channel(
             Ok(Json(TestChannelResponse {
                 ok: true,
                 message,
-                capabilities: Some(js_plugin.runtime.manifest.capabilities.clone()),
+                capabilities: Some(js_plugin.manifest.capabilities.clone()),
             }))
         }
     }
@@ -1003,15 +1034,14 @@ pub async fn update_destination(
             &current_cfg,
             plugin_entry
                 .as_ref()
-                .map(|p| &p.runtime.manifest.destination_schema),
+                .map(|p| &p.manifest.destination_schema),
         )?;
         if let DestinationConfig::Plugin(ref mut p_dest) = merged {
             let js_plugin = plugin_entry.ok_or_else(|| {
                 AppError::Validation("Parent channel plugin is not installed".to_string())
             })?;
-            ensure_channel_plugin_usable(&js_plugin, &js_plugin.runtime.manifest.id, "")?;
-            p_dest.config = js_plugin
-                .runtime
+            let runtime = ensure_channel_plugin_usable(&js_plugin, &js_plugin.manifest.id, "")?;
+            p_dest.config = runtime
                 .validate_config(
                     state.http(),
                     "destination",
@@ -1123,9 +1153,8 @@ async fn create_destination_for_channel(
                     acct_cfg.plugin_id
                 ))
             })?;
-        ensure_channel_plugin_usable(&js_plugin, &acct_cfg.plugin_id, "")?;
-        dest_cfg.config = js_plugin
-            .runtime
+        let runtime = ensure_channel_plugin_usable(&js_plugin, &acct_cfg.plugin_id, "")?;
+        dest_cfg.config = runtime
             .validate_config(
                 state.http(),
                 "destination",
@@ -1193,13 +1222,32 @@ async fn sync_smtp_destination_recipients(
         .await
 }
 
+/// Resolve `(account_schema, destination_schema)` for a JS channel plugin from the in-memory
+/// registry, falling back to persisted SQLite `plugins.manifest_json` when the plugin failed to
+/// load into memory so schema-declared secret fields are STILL properly redacted.
+async fn resolve_plugin_channel_schemas(
+    state: &AppState,
+    plugin_id: &str,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    if let Some(j) = state.runtime().plugins().get_js(plugin_id) {
+        return Some((
+            j.manifest.account_schema.clone(),
+            j.manifest.destination_schema.clone(),
+        ));
+    }
+    let row = state.db().get_plugin(plugin_id).await.ok().flatten()?;
+    let manifest: crate::plugins::PluginManifest =
+        serde_json::from_str(row.manifest_json.as_deref()?).ok()?;
+    Some((manifest.account_schema, manifest.destination_schema))
+}
+
 async fn build_destination_dto(
     state: &AppState,
     dest: ChannelDestination,
     kind: ChannelKind,
 ) -> AppResult<ChannelDestinationDto> {
     let plugin_dest_schema = if kind == ChannelKind::Plugin {
-        state
+        let plugin_id = state
             .db()
             .get_channel(dest.channel_id)
             .await?
@@ -1210,13 +1258,15 @@ async fn build_destination_dto(
                     .ok()
             })
             .and_then(|cfg| match cfg {
-                ChannelConfig::Plugin(p) => state
-                    .runtime()
-                    .plugins()
-                    .get_js(&p.plugin_id)
-                    .map(|j| j.runtime.manifest.destination_schema.clone()),
+                ChannelConfig::Plugin(p) => Some(p.plugin_id),
                 _ => None,
-            })
+            });
+        match plugin_id {
+            Some(pid) => resolve_plugin_channel_schemas(state, &pid)
+                .await
+                .map(|(_, ds)| ds),
+            None => None,
+        }
     } else {
         None
     };
@@ -1240,21 +1290,18 @@ async fn build_channel_dto(
     destinations: Vec<ChannelDestination>,
 ) -> AppResult<ChannelDto> {
     let plugin_schemas = if channel.kind == ChannelKind::Plugin {
-        state
+        let plugin_id = state
             .master_key()
             .decrypt_json::<ChannelConfig>(&channel.encrypted_config)
             .ok()
             .and_then(|cfg| match cfg {
-                ChannelConfig::Plugin(p) => {
-                    state.runtime().plugins().get_js(&p.plugin_id).map(|j| {
-                        (
-                            j.runtime.manifest.account_schema.clone(),
-                            j.runtime.manifest.destination_schema.clone(),
-                        )
-                    })
-                }
+                ChannelConfig::Plugin(p) => Some(p.plugin_id),
                 _ => None,
-            })
+            });
+        match plugin_id {
+            Some(pid) => resolve_plugin_channel_schemas(state, &pid).await,
+            None => None,
+        }
     } else {
         None
     };
@@ -1263,6 +1310,7 @@ async fn build_channel_dto(
         Vec::new(),
         state.master_key(),
         plugin_schemas.as_ref().map(|(a, _)| a),
+        plugin_schemas.as_ref().map(|(_, ds)| ds),
     )?;
     let mut dest_dtos = Vec::with_capacity(destinations.len());
     for d in destinations {
@@ -1343,20 +1391,51 @@ async fn derive_default_destination_name(
             }
         }
         (ChannelConfig::Plugin(acct), DestinationConfig::Plugin(dest)) => {
+            let dest_schema = resolve_plugin_channel_schemas(state, &acct.plugin_id)
+                .await
+                .map(|(_, ds)| ds);
+            let props = dest_schema
+                .as_ref()
+                .and_then(|s| s.get("properties"))
+                .and_then(serde_json::Value::as_object);
+
+            // Strictly consult `destination_schema` so secret fields (`format: "password"`,
+            // `x-secret: true`, or known sensitive field names) are NEVER copied into the
+            // plaintext `channel_destinations.name` column.
+            let is_safe_name_field = |key: &str, allow_enum: bool| -> bool {
+                let Some(props_map) = props else {
+                    return false;
+                };
+                let Some(prop_schema) = props_map.get(key) else {
+                    return false;
+                };
+                if prop_schema.get("type").and_then(serde_json::Value::as_str) != Some("string") {
+                    return false;
+                }
+                if crate::plugins::js_runtime::is_schema_secret_prop(key, Some(prop_schema)) {
+                    return false;
+                }
+                if !allow_enum && prop_schema.get("enum").is_some() {
+                    return false;
+                }
+                true
+            };
+
             let preferred = ["topic", "channel", "room", "target", "name", "webhook_name"];
             if let Some(obj) = dest.config.as_object() {
                 for key in preferred {
-                    if let Some(s) = obj
-                        .get(key)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
+                    if is_safe_name_field(key, true)
+                        && let Some(s) = obj
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                     {
                         return Ok(s.chars().take(64).collect());
                     }
                 }
                 for (k, v) in obj {
-                    if !crate::logging::redact::is_sensitive_field_name(k)
+                    if is_safe_name_field(k, false)
                         && let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty())
                     {
                         return Ok(s.chars().take(64).collect());
@@ -1367,7 +1446,7 @@ async fn derive_default_destination_name(
                 .runtime()
                 .plugins()
                 .get_js(&acct.plugin_id)
-                .map(|j| format!("{} Target", j.runtime.manifest.name))
+                .map(|j| format!("{} Target", j.manifest.name))
                 .unwrap_or_else(|| "Plugin Target".to_string());
             Ok(fallback)
         }
@@ -1983,6 +2062,7 @@ async fn build_plugin_dto_for_manifest(
     source: &str,
     script_sha256: Option<String>,
     row: Option<&crate::db::models::PluginRow>,
+    compatible_override: Option<(bool, Option<String>)>,
 ) -> AppResult<PluginDto> {
     let registry = state.runtime().plugins();
     let mut instances = Vec::new();
@@ -1994,7 +2074,7 @@ async fn build_plugin_dto_for_manifest(
             instances.push(build_plugin_instance_dto(state, plugin.as_ref(), inst).await?);
         }
     }
-    let (enabled, installed_version, settings, updated_at) = match row {
+    let (enabled, installed_version, settings, disabled_reason, updated_at) = match row {
         Some(r) => {
             let settings: serde_json::Value =
                 serde_json::from_str(&r.settings_json).unwrap_or_else(|_| serde_json::json!({}));
@@ -2002,6 +2082,7 @@ async fn build_plugin_dto_for_manifest(
                 r.enabled,
                 r.installed_version.clone(),
                 settings,
+                r.disabled_reason.clone(),
                 unix_to_rfc3339(r.updated_at),
             )
         }
@@ -2009,11 +2090,13 @@ async fn build_plugin_dto_for_manifest(
             false,
             manifest.version.clone(),
             serde_json::json!({}),
+            None,
             unix_to_rfc3339(now_unix()),
         ),
     };
-    let (compatible, compatibility_reason) =
-        check_plugin_compatibility(&manifest.api_version, manifest.min_core.as_deref());
+    let (compatible, compatibility_reason) = compatible_override.unwrap_or_else(|| {
+        check_plugin_compatibility(&manifest.api_version, manifest.min_core.as_deref())
+    });
     let allowed_hosts = manifest.allowed_hosts.clone();
     Ok(PluginDto {
         id: manifest.id.clone(),
@@ -2024,8 +2107,9 @@ async fn build_plugin_dto_for_manifest(
         allowed_hosts,
         compatible,
         compatibility_reason,
+        disabled_reason,
         manifest,
-        enabled,
+        enabled: enabled && compatible,
         installed_version,
         settings,
         instance_count: instances.len(),
@@ -2044,18 +2128,21 @@ pub async fn list_plugins(State(state): State<AppState>) -> AppResult<Json<Vec<P
     for plugin in registry.list() {
         let manifest = plugin.manifest().clone();
         let row = row_by_id.get(&manifest.id);
-        out.push(build_plugin_dto_for_manifest(&state, manifest, "builtin", None, row).await?);
+        out.push(
+            build_plugin_dto_for_manifest(&state, manifest, "builtin", None, row, None).await?,
+        );
     }
     for js_plugin in registry.list_js() {
-        let manifest = js_plugin.runtime.manifest.clone();
+        let manifest = js_plugin.manifest.clone();
         let row = row_by_id.get(&manifest.id);
         out.push(
             build_plugin_dto_for_manifest(
                 &state,
                 manifest,
                 &js_plugin.source,
-                Some(js_plugin.runtime.script_sha256.clone()),
+                js_plugin.script_sha256.clone(),
                 row,
+                Some((js_plugin.compatible, js_plugin.compatibility_reason.clone())),
             )
             .await?,
         );
@@ -2194,13 +2281,24 @@ pub async fn install_market_plugin(
             compatible,
             compatibility_reason,
             already_installed: existing.is_some(),
-            installed_version: existing.map(|r| r.installed_version),
+            installed_version: existing.as_ref().map(|r| r.installed_version.clone()),
+            installed_source: existing.map(|r| r.source),
             changelog: ver_entry.changelog.clone(),
         };
         return Ok((StatusCode::OK, Json(preview)).into_response());
     }
 
     ensure_compiled_plugin_compatible(&compiled.manifest)?;
+
+    if let Some(ref cur) = existing
+        && cur.source == "custom"
+        && !req.replace_custom
+    {
+        return Err(AppError::Conflict(format!(
+            "Custom plugin '{}' (v{}) is currently installed; pass replace_custom=true to replace it with the marketplace version",
+            compiled.manifest.id, cur.installed_version
+        )));
+    }
 
     let was_installed = existing.is_some();
     let manifest_json = serde_json::to_string(&compiled.manifest)?;
@@ -2226,6 +2324,7 @@ pub async fn install_market_plugin(
         .await?;
     }
     registry.reload_from_db(state.db()).await?;
+    registry.reset_js_timeout(&compiled.manifest.id);
     state.runtime().notify_outbox();
     state.runtime().notify_plugin_events();
 
@@ -2244,6 +2343,7 @@ pub async fn install_market_plugin(
         "market",
         Some(compiled.script_sha256),
         Some(&row),
+        None,
     )
     .await?;
     let status = if was_installed {
@@ -2295,7 +2395,8 @@ pub async fn upload_js_plugin(
             compatible,
             compatibility_reason,
             already_installed: existing.is_some(),
-            installed_version: existing.map(|r| r.installed_version),
+            installed_version: existing.as_ref().map(|r| r.installed_version.clone()),
+            installed_source: existing.map(|r| r.source),
             changelog: None,
         };
         return Ok((StatusCode::OK, Json(preview)).into_response());
@@ -2336,6 +2437,7 @@ pub async fn upload_js_plugin(
         .await?;
     }
     registry.reload_from_db(state.db()).await?;
+    registry.reset_js_timeout(&compiled.manifest.id);
     state.runtime().notify_outbox();
     state.runtime().notify_plugin_events();
 
@@ -2354,6 +2456,7 @@ pub async fn upload_js_plugin(
         "custom",
         Some(compiled.script_sha256),
         Some(&row),
+        None,
     )
     .await?;
     let status = if was_installed {
@@ -2398,8 +2501,9 @@ pub async fn get_plugin_source(
 
 /// `DELETE /api/v1/plugins/{id}`
 ///
-/// Refuses deletion of built-in plugins (`400`) and refuses deletion of referenced JS plugins
-/// (`409 Conflict` listing referencing channels/routes) unless `?cascade=true` is passed.
+/// Refuses deletion of built-in plugins (`400`) and atomically refuses deletion of referenced JS
+/// plugins (`409 Conflict` listing referencing channels/routes) inside a single `write_pool`
+/// transaction unless `?cascade=true` is passed.
 pub async fn delete_js_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
@@ -2411,79 +2515,55 @@ pub async fn delete_js_plugin(
             "Built-in plugins cannot be deleted; disable them instead".to_string(),
         ));
     }
-    let Some(row) = state.db().get_plugin(&plugin_id).await? else {
-        return Err(AppError::NotFound(format!(
-            "plugin '{plugin_id}' not found"
-        )));
-    };
-    if !matches!(row.source.as_str(), "market" | "custom") {
-        return Err(AppError::Validation(
-            "Only installed JS plugins can be deleted".to_string(),
-        ));
-    }
-
-    let mut ref_channels: Vec<(i64, String)> = Vec::new();
-    for ch in state.db().list_channels().await? {
-        if ch.kind == ChannelKind::Plugin
-            && let Ok(ChannelConfig::Plugin(p)) =
-                state.master_key().decrypt_json(&ch.encrypted_config)
-            && p.plugin_id == plugin_id
-        {
-            ref_channels.push((ch.id, ch.name));
-        }
-    }
-    let ref_ch_ids: Vec<i64> = ref_channels.iter().map(|(id, _)| *id).collect();
-
-    let mut ref_routes: Vec<(i64, String)> = Vec::new();
-    let mut strip_route_ids: Vec<i64> = Vec::new();
-    for route in state.db().list_routes().await? {
-        let uses_channel = ref_ch_ids.contains(&route.channel_id);
-        let opts = route.options();
-        let uses_processor = opts.plugins.contains_key(&plugin_id)
-            || opts.plugin_order.iter().any(|p| p == &plugin_id);
-        if uses_channel || uses_processor {
-            ref_routes.push((route.id, route.name));
-            if uses_processor && !uses_channel {
-                strip_route_ids.push(route.id);
-            }
-        }
-    }
-
-    if (!ref_channels.is_empty() || !ref_routes.is_empty()) && !query.cascade.unwrap_or(false) {
-        let msg = format!(
-            "Plugin '{plugin_id}' is referenced by {} channel(s) and {} route(s). Pass ?cascade=true to remove it together with those references.",
-            ref_channels.len(),
-            ref_routes.len()
-        );
-        let body = PluginConflictBody {
-            error: msg.clone(),
-            code: "conflict",
-            message: msg,
-            referencing_channels: ref_channels
-                .into_iter()
-                .map(|(id, name)| ChannelReferenceDto { id, name })
-                .collect(),
-            referencing_routes: ref_routes
-                .into_iter()
-                .map(|(id, name)| RouteReferenceDto { id, name })
-                .collect(),
-        };
-        return Ok((StatusCode::CONFLICT, Json(body)).into_response());
-    }
-
-    state
+    let cascade = query.cascade.unwrap_or(false);
+    match state
         .db()
-        .delete_js_plugin(&plugin_id, &ref_ch_ids, &strip_route_ids)
-        .await?;
-    registry.reload_from_db(state.db()).await?;
+        .delete_js_plugin_guarded(&plugin_id, state.master_key(), cascade)
+        .await?
+    {
+        DeleteJsPluginOutcome::NotFound => Err(AppError::NotFound(format!(
+            "plugin '{plugin_id}' not found"
+        ))),
+        DeleteJsPluginOutcome::NotDeletable(msg) => Err(AppError::Validation(msg)),
+        DeleteJsPluginOutcome::Conflict {
+            referencing_channels,
+            referencing_routes,
+        } => {
+            let msg = format!(
+                "Plugin '{plugin_id}' is referenced by {} channel(s) and {} route(s). Pass ?cascade=true to remove it together with those references.",
+                referencing_channels.len(),
+                referencing_routes.len()
+            );
+            let body = PluginConflictBody {
+                error: msg.clone(),
+                code: "conflict",
+                message: msg,
+                referencing_channels: referencing_channels
+                    .into_iter()
+                    .map(|(id, name)| ChannelReferenceDto { id, name })
+                    .collect(),
+                referencing_routes: referencing_routes
+                    .into_iter()
+                    .map(|(id, name)| RouteReferenceDto { id, name })
+                    .collect(),
+            };
+            Ok((StatusCode::CONFLICT, Json(body)).into_response())
+        }
+        DeleteJsPluginOutcome::Deleted => {
+            registry.reload_from_db(state.db()).await?;
+            registry.reset_js_timeout(&plugin_id);
+            state.runtime().notify_outbox();
+            state.runtime().notify_plugin_events();
 
-    tracing::info!(
-        plugin_id = %plugin_id,
-        cascade = query.cascade.unwrap_or(false),
-        "deleted JS plugin"
-    );
+            tracing::info!(
+                plugin_id = %plugin_id,
+                cascade,
+                "deleted JS plugin"
+            );
 
-    Ok((StatusCode::OK, Json(ActionAckResponse::ok())).into_response())
+            Ok((StatusCode::OK, Json(ActionAckResponse::ok())).into_response())
+        }
+    }
 }
 
 /// `PATCH /api/v1/plugins/{id}`
@@ -2512,10 +2592,14 @@ pub async fn update_plugin(
 
     registry.reload_from_db(state.db()).await?;
     if req.enabled == Some(true) {
+        registry.reset_js_timeout(&plugin_id);
         state.runtime().notify_outbox();
         state.runtime().notify_plugin_events();
     }
 
+    let compatible_override = registry
+        .get_js(&plugin_id)
+        .map(|j| (j.compatible, j.compatibility_reason));
     let source = updated.source.clone();
     let script_sha256 = updated.script_sha256.clone();
     Ok(Json(
@@ -2525,6 +2609,7 @@ pub async fn update_plugin(
             &source,
             script_sha256,
             Some(&updated),
+            compatible_override,
         )
         .await?,
     ))
@@ -2555,6 +2640,13 @@ pub async fn create_plugin_instance(
     Json(req): Json<CreatePluginInstanceRequest>,
 ) -> AppResult<(StatusCode, Json<PluginInstanceDto>)> {
     let registry = state.runtime().plugins();
+    let js_runtime = if let Some(js_plugin) = registry.get_js(&plugin_id) {
+        Some(Arc::clone(ensure_js_processor_plugin_usable(
+            &js_plugin, &plugin_id,
+        )?))
+    } else {
+        None
+    };
     let plugin = registry
         .get(&plugin_id)
         .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
@@ -2568,13 +2660,12 @@ pub async fn create_plugin_instance(
     }
 
     let mut validated = plugin.validate_instance_config(&req.config)?;
-    if let Some(js_plugin) = registry.get_js(&plugin_id) {
+    if let Some(runtime) = js_runtime {
         let use_proxy = validated
             .get("use_proxy")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        validated = js_plugin
-            .runtime
+        validated = runtime
             .validate_config(state.http(), "instance", &validated, use_proxy)
             .await?;
     }
@@ -2593,9 +2684,15 @@ pub async fn update_plugin_instance(
     Path((plugin_id, instance_id)): Path<(String, i64)>,
     Json(req): Json<UpdatePluginInstanceRequest>,
 ) -> AppResult<Json<PluginInstanceDto>> {
-    let plugin = state
-        .runtime()
-        .plugins()
+    let registry = state.runtime().plugins();
+    let js_runtime = if let Some(js_plugin) = registry.get_js(&plugin_id) {
+        Some(Arc::clone(ensure_js_processor_plugin_usable(
+            &js_plugin, &plugin_id,
+        )?))
+    } else {
+        None
+    };
+    let plugin = registry
         .get(&plugin_id)
         .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
     let existing = state
@@ -2623,13 +2720,12 @@ pub async fn update_plugin_instance(
             .master_key()
             .decrypt_json(&existing.encrypted_config)?;
         let mut merged = plugin.merge_instance_config(&cur_cfg, cfg_patch)?;
-        if let Some(js_plugin) = state.runtime().plugins().get_js(&plugin_id) {
+        if let Some(runtime) = js_runtime {
             let use_proxy = merged
                 .get("use_proxy")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            merged = js_plugin
-                .runtime
+            merged = runtime
                 .validate_config(state.http(), "instance", &merged, use_proxy)
                 .await?;
         }
@@ -2712,9 +2808,11 @@ pub async fn test_plugin_instance(
     State(state): State<AppState>,
     Path((plugin_id, instance_id)): Path<(String, i64)>,
 ) -> AppResult<Json<TestPluginInstanceResponse>> {
-    let plugin = state
-        .runtime()
-        .plugins()
+    let registry = state.runtime().plugins();
+    if let Some(js_plugin) = registry.get_js(&plugin_id) {
+        let _ = ensure_js_processor_plugin_usable(&js_plugin, &plugin_id)?;
+    }
+    let plugin = registry
         .get(&plugin_id)
         .ok_or_else(|| AppError::NotFound(format!("plugin '{plugin_id}' not found")))?;
     let existing = state

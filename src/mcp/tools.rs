@@ -783,10 +783,12 @@ impl McpServer {
             .collect();
 
         for js_plugin in registry.list_js() {
-            let m = &js_plugin.runtime.manifest;
-            let enabled = row_by_id
-                .get(&m.id)
-                .map_or(js_plugin.enabled, |r| r.enabled);
+            let m = &js_plugin.manifest;
+            let enabled = js_plugin.enabled
+                && js_plugin.compatible
+                && row_by_id
+                    .get(&m.id)
+                    .map_or(js_plugin.enabled, |r| r.enabled);
             plugins.push(McpPluginSummary {
                 id: m.id.clone(),
                 name: m.name.clone(),
@@ -1908,12 +1910,17 @@ impl McpServer {
             Err(msg) => return Ok(tool_error("validation_error", msg)),
         };
 
+        let contains = match crate::logging::validate_log_keyword(params.contains.as_deref()) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+
         let query = crate::logging::LogQuery {
             min_level: params.min_level,
             target_prefix: params.target_prefix,
             since_ms,
             until_ms,
-            contains: params.contains,
+            contains,
             task_id: params.task_id,
             feed_id: params.feed_id,
             route_id: params.route_id,
@@ -1991,11 +1998,15 @@ impl McpServer {
             let (poller_p, outbox_p, maint_p, plugin_events_p) = runtime.panic_counts();
             let cfg = runtime.config();
             let net = runtime.http().settings();
+            let (effective_public_url, _) = db
+                .get_effective_public_url(cfg)
+                .await
+                .unwrap_or_else(|_| (cfg.public_url.clone(), false));
             let db_path = cfg.db_path();
             let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
             let summary = serde_json::json!({
                 "trust_proxy": cfg.trust_proxy,
-                "has_public_url": cfg.public_url.is_some(),
+                "has_public_url": effective_public_url.is_some(),
                 "has_outbound_proxy": net.outbound_proxy_url.is_some(),
                 "ssrf_allowlist_count": net.ssrf_allowlist.len(),
                 "retention_hours": cfg.retention_hours,
@@ -2390,16 +2401,19 @@ async fn validate_mcp_route_plugins(
 ) -> crate::error::AppResult<()> {
     registry.validate_route_plugins(db, route_options).await?;
     for (plugin_id, opt_val) in &route_options.plugins {
-        if opt_val.is_null() {
+        if !crate::plugins::is_route_plugin_enabled(opt_val) {
             continue;
         }
+        let plugin_row = db.get_plugin(plugin_id).await?;
+        let runtime_compat = registry
+            .get_js(plugin_id)
+            .is_none_or(|js| js.compatible && js.runtime.is_some());
+        if !plugin_row.is_some_and(|r| r.enabled) || !runtime_compat {
+            return Err(AppError::Validation(format!(
+                "plugin '{plugin_id}' is not enabled or is incompatible; enable a compatible version in the WebUI before configuring it on a route via MCP"
+            )));
+        }
         if let Some(provider_id) = opt_val.get("provider_id").and_then(|v| v.as_i64()) {
-            let plugin_row = db.get_plugin(plugin_id).await?;
-            if !plugin_row.is_some_and(|r| r.enabled) {
-                return Err(AppError::Validation(format!(
-                    "plugin '{plugin_id}' is not enabled; enable it in the WebUI before assigning a provider via MCP"
-                )));
-            }
             let inst = db.get_plugin_instance(provider_id).await?;
             if !inst.is_some_and(|i| i.enabled) {
                 return Err(AppError::Validation(format!(

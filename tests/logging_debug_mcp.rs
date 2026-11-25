@@ -622,6 +622,14 @@ async fn hidden_debug_mcp_tools_scope_isolation_and_framing() {
     assert!(log_msg.starts_with("<untrusted_feed_content "));
     assert!(log_msg.contains("&lt;/untrusted_feed_content>"));
 
+    // P2-4: `debug_runtime_snapshot` reflects `PUBLIC_URL` stored in SQLite `system_settings` (not only env).
+    h.db.set_setting_typed(
+        feedcourier::db::models::SETTING_PUBLIC_URL,
+        &Some("https://rss.example.com".to_string()),
+    )
+    .await
+    .unwrap();
+
     let (st, _, snap_resp) = h
         .mcp_post(
             &h.admin_token,
@@ -639,6 +647,7 @@ async fn hidden_debug_mcp_tools_scope_isolation_and_framing() {
     assert_eq!(snap["queue"]["by_status"]["queued"], json!(1));
     assert!(snap["queue"]["oldest_due_wait_secs"].as_i64().unwrap() >= 25);
     assert_eq!(snap["log_store"]["backend"], json!("sqlite"));
+    assert_eq!(snap["config"]["has_public_url"], json!(true));
 
     let (st, _, trace_resp) = h
         .mcp_post(

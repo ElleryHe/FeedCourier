@@ -1322,10 +1322,7 @@ function FeedPreviewModal({
   const enabledPluginsWithOptions = useMemo(
     () =>
       (pluginsQuery.data ?? []).filter(
-        (p) =>
-          p.enabled &&
-          p.manifest.route_option_schema?.properties &&
-          Object.keys(p.manifest.route_option_schema.properties).length > 0,
+        (p) => p.kind === "processor" && p.enabled && p.compatible,
       ),
     [pluginsQuery.data],
   );
@@ -1778,6 +1775,37 @@ function FeedPreviewModal({
                         ) as Array<[string, PluginRouteOptionPropertySchema]>;
                         const currentCfg = pushPluginOptions[plugin.id] ?? {};
 
+                        if (propEntries.length === 0) {
+                          const fieldId = `debug-push-plugin-${plugin.id}-enabled`;
+                          const isEnabled = currentCfg.enabled === true;
+                          return [
+                            <div
+                              key={`${plugin.id}.enabled`}
+                              className="flex items-end pb-1"
+                            >
+                              <div className="flex items-center gap-2">
+                                <Switch
+                                  id={fieldId}
+                                  checked={isEnabled}
+                                  onCheckedChange={(checked) =>
+                                    updatePushPluginField(
+                                      plugin.id,
+                                      "enabled",
+                                      checked ? true : null,
+                                    )
+                                  }
+                                />
+                                <label
+                                  htmlFor={fieldId}
+                                  className="cursor-pointer text-xs font-medium"
+                                >
+                                  {plugin.manifest.name}
+                                </label>
+                              </div>
+                            </div>,
+                          ];
+                        }
+
                         return propEntries.map(([propKey, schema]) => {
                           const fieldVal = currentCfg[propKey];
                           const fieldId = `debug-push-plugin-${plugin.id}-${propKey}`;
@@ -1787,8 +1815,9 @@ function FeedPreviewModal({
                               : `${plugin.manifest.name} · ${schema.title || propKey}`;
 
                           if (
-                            schema.type === "select" &&
-                            schema.source === "plugin_instances"
+                            (schema.type === "select" &&
+                              schema.source === "plugin_instances") ||
+                            propKey === "provider_id"
                           ) {
                             const selectedId =
                               typeof fieldVal === "number" ? fieldVal : null;
@@ -1833,8 +1862,8 @@ function FeedPreviewModal({
                           }
 
                           if (
-                            schema.type === "select" &&
-                            Array.isArray(schema.enum)
+                            Array.isArray(schema.enum) &&
+                            schema.enum.length > 0
                           ) {
                             return (
                               <div key={`${plugin.id}.${propKey}`}>
@@ -1842,15 +1871,29 @@ function FeedPreviewModal({
                                 <Select
                                   id={fieldId}
                                   value={
-                                    typeof fieldVal === "string" ? fieldVal : ""
+                                    fieldVal !== undefined && fieldVal !== null
+                                      ? String(fieldVal)
+                                      : ""
                                   }
-                                  onChange={(e) =>
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    if (!raw) {
+                                      updatePushPluginField(
+                                        plugin.id,
+                                        propKey,
+                                        null,
+                                      );
+                                      return;
+                                    }
+                                    const matched = schema.enum?.find(
+                                      (opt) => String(opt) === raw,
+                                    );
                                     updatePushPluginField(
                                       plugin.id,
                                       propKey,
-                                      e.target.value || null,
-                                    )
-                                  }
+                                      matched !== undefined ? matched : raw,
+                                    );
+                                  }}
                                   className="mt-1 h-8 text-xs"
                                 >
                                   {schema.nullable !== false && (
@@ -1859,8 +1902,11 @@ function FeedPreviewModal({
                                     </option>
                                   )}
                                   {schema.enum.map((opt) => (
-                                    <option key={opt} value={opt}>
-                                      {opt}
+                                    <option
+                                      key={String(opt)}
+                                      value={String(opt)}
+                                    >
+                                      {String(opt)}
                                     </option>
                                   ))}
                                 </Select>
@@ -1886,7 +1932,9 @@ function FeedPreviewModal({
                                       updatePushPluginField(
                                         plugin.id,
                                         propKey,
-                                        checked,
+                                        propKey === "enabled" && !checked
+                                          ? null
+                                          : checked,
                                       )
                                     }
                                   />
@@ -1901,18 +1949,24 @@ function FeedPreviewModal({
                             );
                           }
 
+                          const isNumeric =
+                            schema.type === "number" ||
+                            schema.type === "integer";
+
                           return (
                             <div key={`${plugin.id}.${propKey}`}>
                               <Label htmlFor={fieldId}>{fieldLabel}</Label>
                               <Input
                                 id={fieldId}
-                                type={
-                                  schema.type === "number" ? "number" : "text"
-                                }
+                                type={isNumeric ? "number" : "text"}
+                                step={schema.type === "integer" ? 1 : "any"}
                                 value={
-                                  fieldVal !== undefined && fieldVal !== null
-                                    ? String(fieldVal)
-                                    : ""
+                                  Array.isArray(fieldVal)
+                                    ? fieldVal.join(", ")
+                                    : fieldVal !== undefined &&
+                                        fieldVal !== null
+                                      ? String(fieldVal)
+                                      : ""
                                 }
                                 onChange={(e) => {
                                   const raw = e.target.value;
@@ -1922,9 +1976,23 @@ function FeedPreviewModal({
                                       propKey,
                                       null,
                                     );
-                                  } else if (schema.type === "number") {
+                                  } else if (schema.type === "array") {
+                                    const items = raw
+                                      .split(/[\n,]+/)
+                                      .map((s) => s.trim())
+                                      .filter(Boolean);
+                                    updatePushPluginField(
+                                      plugin.id,
+                                      propKey,
+                                      items.length > 0 ? items : null,
+                                    );
+                                  } else if (isNumeric) {
                                     const num = Number(raw);
-                                    if (!Number.isNaN(num)) {
+                                    if (
+                                      Number.isFinite(num) &&
+                                      (schema.type !== "integer" ||
+                                        Number.isInteger(num))
+                                    ) {
                                       updatePushPluginField(
                                         plugin.id,
                                         propKey,

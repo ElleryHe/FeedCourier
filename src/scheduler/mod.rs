@@ -358,7 +358,7 @@ impl DeliveryDispatcher {
         .with_locale(initial_locale);
         let notion_sender = Arc::new(NotionSender::new(net_settings.outbound_proxy_url)?);
         let plugins = PluginRegistry::with_builtins();
-        let plugin_sender = JsChannelSender::new(plugins.clone(), http.clone());
+        let plugin_sender = JsChannelSender::new(plugins.clone(), http.clone()).with_db(db.clone());
         let market_cache = MarketIndexCache::new(config.plugin_index_url.clone());
 
         Ok(Self {
@@ -1192,13 +1192,26 @@ impl DeliveryDispatcher {
             return Ok(true);
         }
 
-        let on_delivered_plugins = self.inner.plugins.on_delivered_subscriber_ids(
-            &route_options,
-            match &channel_config {
-                ChannelConfig::Plugin(p) => Some(p.plugin_id.as_str()),
-                _ => None,
-            },
-        );
+        let on_delivered_plugins: Vec<(String, Option<i64>)> = self
+            .inner
+            .plugins
+            .on_delivered_subscriber_ids(
+                &route_options,
+                match &channel_config {
+                    ChannelConfig::Plugin(p) => Some(p.plugin_id.as_str()),
+                    _ => None,
+                },
+            )
+            .into_iter()
+            .map(|pid| {
+                let provider_id = route_options
+                    .plugins
+                    .get(&pid)
+                    .and_then(|opt| opt.get("provider_id"))
+                    .and_then(serde_json::Value::as_i64);
+                (pid, provider_id)
+            })
+            .collect();
 
         let send_started = std::time::Instant::now();
         let checkpoint_sink = self.inner.db.rich_checkpoint_sink(
@@ -1661,14 +1674,14 @@ impl DeliveryDispatcher {
                 let _ = self.inner.db.delete_plugin_event(ev.id).await;
                 continue;
             };
-            if !js_plugin.enabled {
+            if !js_plugin.enabled || !js_plugin.compatible || js_plugin.runtime.is_none() {
                 processed += 1;
                 let next_attempts = ev.attempts + 1;
                 if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
                     warn!(
                         plugin_id = %ev.plugin_id,
                         event_id = ev.id,
-                        "dropping on_delivered event after max deferrals while plugin disabled"
+                        "dropping on_delivered event after max deferrals while plugin disabled or incompatible"
                     );
                     let _ = self.inner.db.delete_plugin_event(ev.id).await;
                 } else {
@@ -1680,24 +1693,47 @@ impl DeliveryDispatcher {
                 }
                 continue;
             }
+            let runtime = js_plugin
+                .runtime
+                .as_ref()
+                .expect("enabled compatible plugin has runtime");
             let payload: serde_json::Value =
                 serde_json::from_str(&ev.payload_json).unwrap_or_else(|_| serde_json::json!({}));
             let mut admin_origins = Vec::new();
             let mut use_proxy = false;
-            if let Ok(instances) = self.inner.db.list_plugin_instances(&ev.plugin_id).await {
-                for inst in instances.into_iter().filter(|i| i.enabled) {
-                    if let Ok(cfg) = self
-                        .inner
-                        .master_key
-                        .decrypt_json::<serde_json::Value>(&inst.encrypted_config)
-                    {
-                        if cfg.get("use_proxy").and_then(serde_json::Value::as_bool) == Some(true) {
-                            use_proxy = true;
-                        }
-                        admin_origins.extend(extract_uri_origins(
-                            &js_plugin.runtime.manifest.instance_schema,
-                            &cfg,
-                        ));
+
+            // Only load the specific processor `provider_id` recorded on this delivery event
+            // (eliminating cross-instance URI origin / proxy crosstalk).
+            if let Some(pid) = payload
+                .get("provider_id")
+                .and_then(serde_json::Value::as_i64)
+                && let Ok(Some(inst)) = self.inner.db.get_plugin_instance(pid).await
+                && inst.plugin_id == ev.plugin_id
+                && inst.enabled
+                && let Ok(cfg) = self
+                    .inner
+                    .master_key
+                    .decrypt_json::<serde_json::Value>(&inst.encrypted_config)
+            {
+                if cfg.get("use_proxy").and_then(serde_json::Value::as_bool) == Some(true) {
+                    use_proxy = true;
+                }
+                for o in extract_uri_origins(&runtime.manifest.instance_schema, &cfg) {
+                    if !admin_origins.contains(&o) {
+                        admin_origins.push(o);
+                    }
+                }
+            }
+            if let Some(route_id) = payload
+                .get("route")
+                .and_then(|r| r.get("id"))
+                .and_then(serde_json::Value::as_i64)
+                && let Ok(Some(route)) = self.inner.db.get_route(route_id).await
+                && let Some(opt) = route.options().plugins.get(&ev.plugin_id)
+            {
+                for o in extract_uri_origins(&runtime.manifest.route_option_schema, opt) {
+                    if !admin_origins.contains(&o) {
+                        admin_origins.push(o);
                     }
                 }
             }
@@ -1712,25 +1748,47 @@ impl DeliveryDispatcher {
                 && p.plugin_id == ev.plugin_id
             {
                 use_proxy = ch.use_proxy;
-                admin_origins.extend(extract_uri_origins(
-                    &js_plugin.runtime.manifest.account_schema,
-                    &p.config,
-                ));
+                for o in extract_uri_origins(&runtime.manifest.account_schema, &p.config) {
+                    if !admin_origins.contains(&o) {
+                        admin_origins.push(o);
+                    }
+                }
+                if let Some(dest_id) = payload
+                    .get("destination")
+                    .and_then(|d| d.get("id"))
+                    .and_then(serde_json::Value::as_i64)
+                    && let Ok(Some(dest)) = self.inner.db.get_destination(dest_id).await
+                    && dest.channel_id == ch.id
+                    && let Ok(DestinationConfig::Plugin(dp)) =
+                        self.inner.master_key.decrypt_json(&dest.encrypted_config)
+                {
+                    for o in extract_uri_origins(&runtime.manifest.destination_schema, &dp.config) {
+                        if !admin_origins.contains(&o) {
+                            admin_origins.push(o);
+                        }
+                    }
+                }
             }
+            let event_timeout = self
+                .inner
+                .plugins
+                .effective_hook_timeout(crate::plugins::js_runtime::JS_HOOK_DEFAULT_TIMEOUT);
             let send_outcome = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                res = js_plugin.runtime.dispatch_on_delivered(
+                res = runtime.dispatch_on_delivered_with_timeout(
                     &self.inner.http,
                     &ev.idempotency_key,
                     &payload,
                     admin_origins,
                     use_proxy,
+                    event_timeout,
                 ) => res,
             };
             processed += 1;
             match send_outcome {
                 Ok(()) => {
+                    self.inner.plugins.reset_js_timeout(&ev.plugin_id);
                     debug!(
                         plugin_id = %ev.plugin_id,
                         event_id = ev.id,
@@ -1739,6 +1797,13 @@ impl DeliveryDispatcher {
                     self.inner.db.delete_plugin_event(ev.id).await?;
                 }
                 Err(err) => {
+                    if crate::plugins::js_runtime::is_js_timeout_error(&err) {
+                        let _ = self
+                            .inner
+                            .plugins
+                            .record_js_timeout(&self.inner.db, &ev.plugin_id, "onDelivered")
+                            .await;
+                    }
                     let next_attempts = ev.attempts + 1;
                     if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
                         error!(
@@ -2034,7 +2099,7 @@ impl DeliveryDispatcher {
         route: &Route,
         channel: &Channel,
         destination: &ChannelDestination,
-        on_delivered_plugins: &[String],
+        on_delivered_plugins: &[(String, Option<i64>)],
         effective_min_interval: i64,
         effective_jitter_max: i64,
         completed_now: i64,
@@ -2056,12 +2121,12 @@ impl DeliveryDispatcher {
                         .await?;
                 }
                 let mut plugin_events = Vec::with_capacity(on_delivered_plugins.len());
-                for plugin_id in on_delivered_plugins {
-                    let idempotency_key = sha256_hex(
-                        format!("on_delivered:{plugin_id}:{}:{completed_now}", task.id).as_bytes(),
-                    );
+                for (plugin_id, provider_id) in on_delivered_plugins {
+                    let idempotency_key =
+                        sha256_hex(format!("on_delivered:{plugin_id}:{}", task.id).as_bytes());
                     let payload_json = serde_json::to_string(&serde_json::json!({
                         "task_id": task.id,
+                        "provider_id": provider_id,
                         "entry": {
                             "id": entry.id,
                             "title": entry.title,

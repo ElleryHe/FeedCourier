@@ -50,6 +50,13 @@ const MAX_MARKET_INDEX_BYTES: usize = 1024 * 1024;
 /// Per-plugin execution wall-clock timeout inside `run_on_render`.
 const ON_RENDER_PLUGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Fixed warning prefix prepended to all plugin/delivery warnings persisted into `diagnostic_log`
+/// so backend DTOs and WebUI warning badges never rely solely on fragile prose matching.
+pub const DELIVERY_WARNING_PREFIX: &str = "[warn] ";
+
+/// Consecutive JS execution timeouts before the circuit breaker automatically disables a plugin.
+pub const JS_CIRCUIT_BREAKER_TIMEOUT_THRESHOLD: u32 = 3;
+
 /// Plugin category distinguishing delivery-time processors from delivery channel adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +229,20 @@ pub struct RenderOverrides {
 }
 
 impl RenderOverrides {
+    /// Append a delivery warning guaranteed to start with [`DELIVERY_WARNING_PREFIX`].
+    pub fn push_warning(&mut self, msg: impl AsRef<str>) {
+        let trimmed = msg.as_ref().trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.starts_with(DELIVERY_WARNING_PREFIX) {
+            self.warnings.push(trimmed.to_string());
+        } else {
+            self.warnings
+                .push(format!("{DELIVERY_WARNING_PREFIX}{trimmed}"));
+        }
+    }
+
     /// Effective HTML body (`overrides.content_html`, falling back to `entry.content_html`).
     pub fn effective_content_html<'a>(&'a self, entry: &'a Entry) -> Option<&'a str> {
         self.content_html
@@ -312,13 +333,21 @@ pub struct PluginRetry {
 }
 
 /// Cached runtime metadata for an installed JS plugin (`processor` or `channel`).
+///
+/// Even when a persisted JS plugin fails to compile or is incompatible with the running core,
+/// it remains present in [`PluginRegistry`] with `compatible = false` and `runtime = None` so
+/// the WebUI can display it (allowing upgrade or uninstall) and channel tasks degrade to
+/// `Deferred` rather than dead-lettering.
 #[derive(Clone)]
 pub struct JsPluginEntry {
     pub source: String,
-    pub runtime: Arc<JsPluginRuntime>,
+    pub manifest: PluginManifest,
+    pub script_sha256: Option<String>,
+    pub runtime: Option<Arc<JsPluginRuntime>>,
     pub enabled: bool,
     pub compatible: bool,
     pub compatibility_reason: Option<String>,
+    pub disabled_reason: Option<String>,
 }
 
 struct RegistryCache {
@@ -326,6 +355,8 @@ struct RegistryCache {
     enabled_by_id: HashMap<String, bool>,
     js_plugins: HashMap<String, JsPluginEntry>,
     js_processors: HashMap<String, Arc<dyn Plugin>>,
+    consecutive_timeouts: HashMap<String, u32>,
+    hook_timeout_override: Option<Duration>,
 }
 
 /// Registry holding built-in Rust plugins plus in-memory cached JS plugins & enabled flags.
@@ -377,6 +408,8 @@ impl PluginRegistry {
                 enabled_by_id: HashMap::new(),
                 js_plugins: HashMap::new(),
                 js_processors: HashMap::new(),
+                consecutive_timeouts: HashMap::new(),
+                hook_timeout_override: None,
             })),
         }
     }
@@ -417,7 +450,7 @@ impl PluginRegistry {
             .read()
             .map(|g| g.js_plugins.values().cloned().collect())
             .unwrap_or_default();
-        list.sort_by(|a, b| a.runtime.manifest.id.cmp(&b.runtime.manifest.id));
+        list.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
         list
     }
 
@@ -427,11 +460,78 @@ impl PluginRegistry {
         if let Some(p) = self.builtins_by_id.get(trimmed) {
             return Some(p.manifest().clone());
         }
-        self.cache.read().ok().and_then(|g| {
-            g.js_plugins
-                .get(trimmed)
-                .map(|p| p.runtime.manifest.clone())
-        })
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.js_plugins.get(trimmed).map(|p| p.manifest.clone()))
+    }
+
+    /// Override JS hook wall-clock timeouts (intended for deterministic timeout/circuit-breaker tests).
+    pub fn set_hook_timeout_override(&self, timeout: Option<Duration>) {
+        if let Ok(mut guard) = self.cache.write() {
+            guard.hook_timeout_override = timeout;
+        }
+    }
+
+    /// Resolve the effective wall-clock timeout for a JS plugin hook.
+    pub fn effective_hook_timeout(&self, default: Duration) -> Duration {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.hook_timeout_override)
+            .unwrap_or(default)
+    }
+
+    /// Record a JS plugin execution timeout; after [`JS_CIRCUIT_BREAKER_TIMEOUT_THRESHOLD`] (3)
+    /// consecutive timeouts, automatically disables the plugin in SQLite with `disabled_reason`
+    /// and reloads the in-memory registry. Returns `true` if the circuit breaker tripped.
+    pub async fn record_js_timeout(&self, db: &Database, plugin_id: &str, hook: &str) -> bool {
+        let count = {
+            let Ok(mut guard) = self.cache.write() else {
+                return false;
+            };
+            let entry = guard
+                .consecutive_timeouts
+                .entry(plugin_id.to_string())
+                .or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        if count >= JS_CIRCUIT_BREAKER_TIMEOUT_THRESHOLD {
+            let reason = format!(
+                "Auto-disabled by circuit breaker after {count} consecutive execution timeouts (last hook: {hook})"
+            );
+            tracing::error!(
+                plugin_id,
+                hook,
+                consecutive_timeouts = count,
+                "JS plugin circuit breaker tripped; auto-disabling plugin"
+            );
+            if let Err(err) = db.disable_plugin_with_reason(plugin_id, &reason).await {
+                tracing::warn!(
+                    plugin_id,
+                    error = %err,
+                    "failed to persist JS plugin circuit-breaker disable"
+                );
+                return false;
+            }
+            if let Err(err) = self.reload_from_db(db).await {
+                tracing::warn!(
+                    plugin_id,
+                    error = %err,
+                    "failed to reload plugin registry after circuit-breaker disable"
+                );
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Reset consecutive timeout tracking for `plugin_id` after a healthy execution or admin action.
+    pub fn reset_js_timeout(&self, plugin_id: &str) {
+        if let Ok(mut guard) = self.cache.write() {
+            guard.consecutive_timeouts.remove(plugin_id);
+        }
     }
 
     /// Ensure every built-in plugin has a row in SQLite `plugins` (idempotent; preserves `enabled`).
@@ -445,6 +545,10 @@ impl PluginRegistry {
 
     /// Reload all plugin enabled states and installed JS plugins from SQLite into memory.
     /// Called at startup and immediately after any plugin install/upload/update/delete mutation.
+    ///
+    /// Persisted JS plugins that fail to compile or fail `api_version`/`min_core` checks are
+    /// retained as `compatible = false` placeholder entries recovered from `manifest_json` so they
+    /// remain visible, uninstallable, and upgradeable in WebUI while channel tasks defer cleanly.
     pub async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
         let rows = db.list_plugins().await?;
         let mut enabled_by_id = HashMap::with_capacity(rows.len());
@@ -454,39 +558,100 @@ impl PluginRegistry {
         for row in rows {
             enabled_by_id.insert(row.id.clone(), row.enabled);
             if matches!(row.source.as_str(), "market" | "custom") {
+                let fallback_manifest = fallback_manifest_from_row(&row);
                 let Some(script_js) = row.script_js.clone() else {
-                    tracing::warn!(
-                        plugin_id = %row.id,
-                        "persisted JS plugin row is missing script_js; skipping"
+                    let reason = "Missing persisted JS plugin source script".to_string();
+                    tracing::warn!(plugin_id = %row.id, "{reason}; marking plugin incompatible");
+                    enabled_by_id.insert(row.id.clone(), false);
+                    js_plugins.insert(
+                        row.id.clone(),
+                        JsPluginEntry {
+                            source: row.source,
+                            manifest: fallback_manifest,
+                            script_sha256: row.script_sha256,
+                            runtime: None,
+                            enabled: false,
+                            compatible: false,
+                            compatibility_reason: Some(reason),
+                            disabled_reason: row.disabled_reason,
+                        },
                     );
                     continue;
                 };
+
                 let script_for_compile = script_js.clone();
-                let compiled = match tokio::task::spawn_blocking(move || {
+                let compile_res = tokio::task::spawn_blocking(move || {
                     compile_js_plugin_sync(&script_for_compile)
                 })
-                .await
-                {
+                .await;
+
+                let compiled = match compile_res {
                     Ok(Ok(c)) => c,
                     Ok(Err(err)) => {
+                        let (persisted_compat, persisted_reason) = check_plugin_compatibility(
+                            &fallback_manifest.api_version,
+                            fallback_manifest.min_core.as_deref(),
+                        );
+                        let reason = if !persisted_compat {
+                            persisted_reason.unwrap_or_else(|| {
+                                format!(
+                                    "Failed to compile JS plugin: {}",
+                                    crate::logging::redact::redact_text(&err.to_string())
+                                )
+                            })
+                        } else {
+                            format!(
+                                "Failed to compile JS plugin: {}",
+                                crate::logging::redact::redact_text(&err.to_string())
+                            )
+                        };
                         tracing::warn!(
                             plugin_id = %row.id,
                             error = %err,
-                            "failed to compile persisted JS plugin; skipping"
+                            "persisted JS plugin failed compilation; keeping incompatible placeholder"
+                        );
+                        enabled_by_id.insert(row.id.clone(), false);
+                        js_plugins.insert(
+                            row.id.clone(),
+                            JsPluginEntry {
+                                source: row.source,
+                                manifest: fallback_manifest,
+                                script_sha256: row.script_sha256,
+                                runtime: None,
+                                enabled: false,
+                                compatible: false,
+                                compatibility_reason: Some(reason),
+                                disabled_reason: row.disabled_reason,
+                            },
                         );
                         continue;
                     }
                     Err(join_err) => {
+                        let reason = format!("JS plugin compiler task panicked: {join_err}");
                         tracing::warn!(
                             plugin_id = %row.id,
                             error = %join_err,
-                            "persisted JS plugin compiler task panicked; skipping"
+                            "persisted JS plugin compiler task panicked; keeping incompatible placeholder"
+                        );
+                        enabled_by_id.insert(row.id.clone(), false);
+                        js_plugins.insert(
+                            row.id.clone(),
+                            JsPluginEntry {
+                                source: row.source,
+                                manifest: fallback_manifest,
+                                script_sha256: row.script_sha256,
+                                runtime: None,
+                                enabled: false,
+                                compatible: false,
+                                compatibility_reason: Some(reason),
+                                disabled_reason: row.disabled_reason,
+                            },
                         );
                         continue;
                     }
                 };
 
-                // Allow persisted manifest_json (if manually adjusted in tests) to surface
+                // Allow persisted manifest_json (e.g. after downgrade or tests) to surface
                 // min_core / api_version compatibility checks consistently.
                 let mut runtime = JsPluginRuntime::from_compiled(script_js, compiled);
                 if let Some(manifest_json) = row.manifest_json.as_deref()
@@ -512,19 +677,30 @@ impl PluginRegistry {
                 let effective_enabled = row.enabled && compatible;
                 enabled_by_id.insert(row.id.clone(), effective_enabled);
 
-                let runtime_arc = Arc::new(runtime);
-                if runtime_arc.manifest.kind == PluginKind::Processor {
-                    let proc_plugin = JsProcessorPlugin::new(Arc::clone(&runtime_arc));
-                    js_processors.insert(row.id.clone(), Arc::new(proc_plugin));
-                }
+                let manifest = runtime.manifest.clone();
+                let script_sha256 = Some(runtime.script_sha256.clone());
+                let runtime_opt = if compatible {
+                    let runtime_arc = Arc::new(runtime);
+                    if manifest.kind == PluginKind::Processor {
+                        let proc_plugin =
+                            JsProcessorPlugin::new(Arc::clone(&runtime_arc), self.clone());
+                        js_processors.insert(row.id.clone(), Arc::new(proc_plugin));
+                    }
+                    Some(runtime_arc)
+                } else {
+                    None
+                };
                 js_plugins.insert(
                     row.id.clone(),
                     JsPluginEntry {
                         source: row.source,
-                        runtime: runtime_arc,
+                        manifest,
+                        script_sha256,
+                        runtime: runtime_opt,
                         enabled: effective_enabled,
                         compatible,
                         compatibility_reason,
+                        disabled_reason: row.disabled_reason,
                     },
                 );
             }
@@ -560,6 +736,34 @@ impl PluginRegistry {
             if opt_val.is_null() {
                 continue;
             }
+            let route_enabled = is_route_plugin_enabled(opt_val);
+            if let Some(js) = self.get_js(plugin_id) {
+                if js.manifest.kind != PluginKind::Processor {
+                    return Err(AppError::Validation(format!(
+                        "plugin '{plugin_id}' is a '{}' plugin and cannot be attached to a route",
+                        js.manifest.kind.as_str()
+                    )));
+                }
+                if route_enabled {
+                    if !js.compatible || js.runtime.is_none() {
+                        return Err(AppError::Validation(format!(
+                            "plugin '{plugin_id}' is incompatible with current core: {}",
+                            js.compatibility_reason
+                                .as_deref()
+                                .unwrap_or("version mismatch")
+                        )));
+                    }
+                    if !js.enabled {
+                        return Err(AppError::Validation(format!(
+                            "plugin '{plugin_id}' is disabled; enable it before using it in a route"
+                        )));
+                    }
+                }
+                if let Some(plugin) = self.get(plugin_id) {
+                    plugin.validate_route_option(db, opt_val).await?;
+                }
+                continue;
+            }
             let plugin = self.get(plugin_id).ok_or_else(|| {
                 AppError::Validation(format!(
                     "unknown processor plugin '{plugin_id}' in route options"
@@ -580,7 +784,11 @@ impl PluginRegistry {
                     "duplicate plugin id '{pid}' in route options.plugin_order"
                 )));
             }
-            if self.get(pid).is_none() {
+            let known_processor = self.get(pid).is_some()
+                || self
+                    .get_js(pid)
+                    .is_some_and(|j| j.manifest.kind == PluginKind::Processor);
+            if !known_processor {
                 return Err(AppError::Validation(format!(
                     "unknown processor plugin '{pid}' in route options.plugin_order"
                 )));
@@ -614,7 +822,8 @@ impl PluginRegistry {
             if let Some(js) = guard.js_plugins.get(pid)
                 && js.enabled
                 && js.compatible
-                && js.runtime.manifest.hooks.contains(&HookKind::OnDelivered)
+                && js.runtime.is_some()
+                && js.manifest.hooks.contains(&HookKind::OnDelivered)
                 && seen.insert(pid.clone())
             {
                 out.push(pid.clone());
@@ -624,7 +833,8 @@ impl PluginRegistry {
             && let Some(js) = guard.js_plugins.get(ch_pid)
             && js.enabled
             && js.compatible
-            && js.runtime.manifest.hooks.contains(&HookKind::OnDelivered)
+            && js.runtime.is_some()
+            && js.manifest.hooks.contains(&HookKind::OnDelivered)
             && seen.insert(ch_pid.to_string())
         {
             out.push(ch_pid.to_string());
@@ -676,6 +886,45 @@ impl PluginRegistry {
                 continue;
             };
             let Some(plugin) = self.get(plugin_id) else {
+                // If an installed JS processor plugin became incompatible / failed to compile,
+                // honor `strict_mode` (retry) vs graceful warning instead of silently vanishing.
+                if let Some(js) = self.get_js(plugin_id)
+                    && js.manifest.kind == PluginKind::Processor
+                    && !js.compatible
+                {
+                    let reason = js
+                        .compatibility_reason
+                        .as_deref()
+                        .unwrap_or("incompatible with current core");
+                    let msg = format!(
+                        "{DELIVERY_WARNING_PREFIX}Plugin '{plugin_id}' is incompatible ({reason}); kept original"
+                    );
+                    let mut strict_mode = route_cfg
+                        .get("strict_mode")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !strict_mode
+                        && let Some(pid) = route_cfg.get("provider_id").and_then(Value::as_i64)
+                        && let Ok(Some(inst)) = db.get_plugin_instance(pid).await
+                        && inst.plugin_id == plugin_id
+                        && let Ok(decrypted) =
+                            master_key.decrypt_json::<Value>(&inst.encrypted_config)
+                        && decrypted.get("strict_mode").and_then(Value::as_bool) == Some(true)
+                    {
+                        strict_mode = true;
+                    }
+                    if strict_mode {
+                        return Ok((
+                            overrides,
+                            Some(PluginRetry {
+                                plugin_id: plugin_id.to_string(),
+                                diagnostic: msg,
+                                retry_after_secs: None,
+                            }),
+                        ));
+                    }
+                    overrides.push_warning(msg);
+                }
                 continue;
             };
             if !plugin.manifest().hooks.contains(&HookKind::OnRender) {
@@ -701,13 +950,19 @@ impl PluginRegistry {
 
             let strict_mode = plugin.effective_strict_mode(&ctx).await;
             let prev_overrides = overrides.clone();
+            let is_js = plugin.manifest().runtime == PluginRuntime::Js;
+            // For JS plugins, add a small slack over the inner sandbox deadline so `invoke_export`
+            // cancels `FcHostState` and updates the circuit breaker before the outer guard fires.
+            let base_timeout = self.effective_hook_timeout(ON_RENDER_PLUGIN_TIMEOUT);
+            let outer_timeout = if is_js {
+                base_timeout.saturating_add(Duration::from_millis(250))
+            } else {
+                base_timeout
+            };
 
             let started = Instant::now();
-            let run_res = tokio::time::timeout(
-                ON_RENDER_PLUGIN_TIMEOUT,
-                plugin.on_render(&ctx, &mut overrides),
-            )
-            .await;
+            let run_res =
+                tokio::time::timeout(outer_timeout, plugin.on_render(&ctx, &mut overrides)).await;
             let duration_ms = started.elapsed().as_millis() as u64;
 
             match run_res {
@@ -736,7 +991,7 @@ impl PluginRegistry {
                 Ok(Err(err)) => {
                     overrides = prev_overrides;
                     let msg = format!(
-                        "Plugin '{plugin_id}' failed ({}): kept original",
+                        "{DELIVERY_WARNING_PREFIX}Plugin '{plugin_id}' failed ({}): kept original",
                         crate::logging::redact::redact_text(&err.to_string())
                     );
                     tracing::warn!(
@@ -757,13 +1012,16 @@ impl PluginRegistry {
                             }),
                         ));
                     }
-                    overrides.warnings.push(msg);
+                    overrides.push_warning(msg);
                 }
                 Err(_) => {
                     overrides = prev_overrides;
+                    if is_js {
+                        let _ = self.record_js_timeout(db, plugin_id, "onRender").await;
+                    }
                     let msg = format!(
-                        "Plugin '{plugin_id}' timed out after {}s; kept original",
-                        ON_RENDER_PLUGIN_TIMEOUT.as_secs()
+                        "{DELIVERY_WARNING_PREFIX}Plugin '{plugin_id}' timed out after {}s; kept original",
+                        base_timeout.as_secs().max(1)
                     );
                     tracing::warn!(
                         plugin_id,
@@ -782,12 +1040,50 @@ impl PluginRegistry {
                             }),
                         ));
                     }
-                    overrides.warnings.push(msg);
+                    overrides.push_warning(msg);
                 }
             }
         }
 
         Ok((overrides, None))
+    }
+}
+
+/// Recover a fallback [`PluginManifest`] from a persisted SQLite `plugins` row when compilation
+/// fails or `script_js` is absent, ensuring incompatible plugins remain visible in WebUI.
+fn fallback_manifest_from_row(row: &crate::db::models::PluginRow) -> PluginManifest {
+    if let Some(raw_json) = row.manifest_json.as_deref()
+        && let Ok(mut parsed) = serde_json::from_str::<PluginManifest>(raw_json)
+    {
+        parsed.runtime = PluginRuntime::Js;
+        return parsed;
+    }
+    let kind = if row.kind == "channel" {
+        PluginKind::Channel
+    } else {
+        PluginKind::Processor
+    };
+    PluginManifest {
+        id: row.id.clone(),
+        name: row.id.clone(),
+        version: row.installed_version.clone(),
+        api_version: PLUGIN_API_VERSION.to_string(),
+        kind,
+        runtime: PluginRuntime::Js,
+        min_core: None,
+        category: String::new(),
+        icon: String::new(),
+        description: String::new(),
+        description_i18n: BTreeMap::new(),
+        homepage: String::new(),
+        allowed_hosts: Vec::new(),
+        hooks: Vec::new(),
+        permissions: Vec::new(),
+        instance_schema: json!({}),
+        route_option_schema: json!({}),
+        account_schema: json!({}),
+        destination_schema: json!({}),
+        capabilities: json!({}),
     }
 }
 
@@ -1210,6 +1506,8 @@ mod tests {
                 ]),
                 js_plugins: HashMap::new(),
                 js_processors: HashMap::new(),
+                consecutive_timeouts: HashMap::new(),
+                hook_timeout_override: None,
             })),
         };
 

@@ -189,13 +189,15 @@ struct ClientSet {
     /// Direct client for admin-configured `format: "uri"` plugin origins (no proxy, no redirect,
     /// hard-blocks cloud metadata/unspecified IPs at connect time).
     plugin_origin_direct_client: reqwest::Client,
-    /// Optional proxied client for admin-configured `format: "uri"` plugin origins (no redirect).
-    plugin_origin_proxied_client: Option<reqwest::Client>,
+    /// Optional proxied client for admin-configured `format: "uri"` plugin origins (no redirect),
+    /// paired with proxy DNS resolution mode so local-DNS proxies still enforce metadata IP checks.
+    plugin_origin_proxied_client: Option<(reqwest::Client, ProxyDnsMode)>,
 }
 
 struct ProtectedHttpInner {
     policy: Arc<RwLock<SsrfPolicy>>,
     resolver: SsrfDnsResolver,
+    plugin_resolver: PluginMetadataGuardDnsResolver,
     state: RwLock<ClientSet>,
 }
 
@@ -229,12 +231,14 @@ impl ProtectedHttpClient {
             &settings.ssrf_allowlist,
         )?));
         let resolver = SsrfDnsResolver::new(Arc::clone(&policy));
-        let client_set = build_client_set(settings, &resolver)?;
+        let plugin_resolver = PluginMetadataGuardDnsResolver::new();
+        let client_set = build_client_set(settings, &resolver, &plugin_resolver)?;
 
         Ok(Self {
             inner: Arc::new(ProtectedHttpInner {
                 policy,
                 resolver,
+                plugin_resolver,
                 state: RwLock::new(client_set),
             }),
         })
@@ -251,13 +255,16 @@ impl ProtectedHttpClient {
         let policy = Arc::new(RwLock::new(SsrfPolicy::from_allowlist(
             &settings.ssrf_allowlist,
         )?));
-        let resolver = SsrfDnsResolver::with_custom_lookup(Arc::clone(&policy), lookup);
-        let client_set = build_client_set(settings, &resolver)?;
+        let resolver =
+            SsrfDnsResolver::with_custom_lookup(Arc::clone(&policy), Arc::clone(&lookup));
+        let plugin_resolver = PluginMetadataGuardDnsResolver::with_custom_lookup(lookup);
+        let client_set = build_client_set(settings, &resolver, &plugin_resolver)?;
 
         Ok(Self {
             inner: Arc::new(ProtectedHttpInner {
                 policy,
                 resolver,
+                plugin_resolver,
                 state: RwLock::new(client_set),
             }),
         })
@@ -286,7 +293,8 @@ impl ProtectedHttpClient {
     /// Hot-reload [`NetSettings`] (`outbound_proxy_url` and `ssrf_allowlist`) without process restart.
     pub fn update_settings(&self, settings: NetSettings) -> AppResult<()> {
         let new_policy = SsrfPolicy::from_allowlist(&settings.ssrf_allowlist)?;
-        let new_client_set = build_client_set(settings, &self.inner.resolver)?;
+        let new_client_set =
+            build_client_set(settings, &self.inner.resolver, &self.inner.plugin_resolver)?;
 
         {
             let mut policy_guard = self
@@ -668,7 +676,7 @@ impl ProtectedHttpClient {
         let parsed_url = Url::parse(req.url.trim())?;
         check_hard_blocked_plugin_url(&parsed_url)?;
 
-        let (client, ssrf_proxy_dns_mode) = {
+        let (client, proxy_dns_mode) = {
             let guard = self
                 .inner
                 .state
@@ -676,13 +684,14 @@ impl ProtectedHttpClient {
                 .expect("ProtectedHttpClient state RwLock poisoned");
             if req.allow_private_origin {
                 if req.use_proxy {
-                    let proxied = guard.plugin_origin_proxied_client.clone().ok_or_else(|| {
-                        AppError::Validation(
-                            "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
-                                .to_string(),
-                        )
-                    })?;
-                    (proxied, None)
+                    let (proxied, mode) =
+                        guard.plugin_origin_proxied_client.clone().ok_or_else(|| {
+                            AppError::Validation(
+                                "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                                    .to_string(),
+                            )
+                        })?;
+                    (proxied, Some(mode))
                 } else {
                     (guard.plugin_origin_direct_client.clone(), None)
                 }
@@ -700,7 +709,21 @@ impl ProtectedHttpClient {
             }
         };
 
-        if !req.allow_private_origin {
+        if req.allow_private_origin {
+            // For local-DNS proxies (`socks5://`, `socks4://`), pre-resolve locally and reject any
+            // cloud metadata / unspecified / broadcast IP before opening the proxied tunnel.
+            // (Direct connections enforce the same check at connect time via `PluginMetadataGuardDnsResolver`;
+            // remote-DNS proxies such as `http://`/`socks5h://` enforce literal IP & metadata hostname
+            // blocking via `check_hard_blocked_plugin_url` above.)
+            if matches!(proxy_dns_mode, Some(ProxyDnsMode::Local))
+                && let Some(host_str) = parsed_url.host_str()
+            {
+                self.inner
+                    .plugin_resolver
+                    .resolve_and_check_metadata(host_str)
+                    .await?;
+            }
+        } else {
             {
                 let policy = self
                     .inner
@@ -708,10 +731,10 @@ impl ProtectedHttpClient {
                     .read()
                     .expect("SSRF policy RwLock poisoned")
                     .clone();
-                let remote_proxy_dns = matches!(ssrf_proxy_dns_mode, Some(ProxyDnsMode::Remote));
+                let remote_proxy_dns = matches!(proxy_dns_mode, Some(ProxyDnsMode::Remote));
                 policy.validate_url_hop(&parsed_url, remote_proxy_dns)?;
             }
-            if matches!(ssrf_proxy_dns_mode, Some(ProxyDnsMode::Local))
+            if matches!(proxy_dns_mode, Some(ProxyDnsMode::Local))
                 && let Some(host_str) = parsed_url.host_str()
             {
                 self.inner.resolver.resolve_and_validate(host_str).await?;
@@ -792,7 +815,11 @@ fn default_user_agent() -> String {
     format!("{APP_NAME}/{VERSION} (+{REPO_URL})")
 }
 
-fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppResult<ClientSet> {
+fn build_client_set(
+    settings: NetSettings,
+    resolver: &SsrfDnsResolver,
+    plugin_resolver: &PluginMetadataGuardDnsResolver,
+) -> AppResult<ClientSet> {
     let ua = default_user_agent();
 
     let ssrf_direct_client = reqwest::Client::builder()
@@ -816,7 +843,7 @@ fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppRes
     let plugin_origin_direct_client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(Arc::new(PluginMetadataGuardDnsResolver))
+        .dns_resolver(Arc::new(plugin_resolver.clone()))
         .connect_timeout(Duration::from_secs(5))
         .timeout(DEFAULT_REQUEST_TIMEOUT)
         .user_agent(&ua)
@@ -899,7 +926,7 @@ fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppRes
         (
             Some((ssrf_proxied, dns_mode)),
             Some(trusted_proxied),
-            Some(plugin_proxied),
+            Some((plugin_proxied, dns_mode)),
         )
     } else {
         (None, None, None)

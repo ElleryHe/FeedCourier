@@ -45,6 +45,33 @@ pub const DEFAULT_LOG_QUERY_LIMIT: usize = 100;
 /// Hard upper bound on log records returned in a single query.
 pub const MAX_LOG_QUERY_LIMIT: usize = 500;
 
+/// Minimum allowed Unicode character length for a log keyword search (`contains`).
+pub const MIN_LOG_KEYWORD_CHARS: usize = 2;
+
+/// Maximum allowed Unicode character length for a log keyword search (`contains`).
+pub const MAX_LOG_KEYWORD_CHARS: usize = 128;
+
+/// Default lookback window (`24h` in ms) automatically applied when keyword search (`contains`)
+/// is requested without an explicit `since_ms` bound, preventing full-table scans.
+pub const DEFAULT_KEYWORD_SEARCH_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// Maximum execution time allowed for a single SQLite log query (`5s`).
+pub const LOG_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Validate an optional keyword search filter (`2..=128` Unicode characters when non-empty).
+pub fn validate_log_keyword(raw: Option<&str>) -> AppResult<Option<String>> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let len = trimmed.chars().count();
+    if !(MIN_LOG_KEYWORD_CHARS..=MAX_LOG_KEYWORD_CHARS).contains(&len) {
+        return Err(crate::error::AppError::Validation(format!(
+            "log search keyword must be between {MIN_LOG_KEYWORD_CHARS} and {MAX_LOG_KEYWORD_CHARS} characters"
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// Redacted, structured log entry persisted in `logs.db` or ClickHouse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRecord {
@@ -297,15 +324,22 @@ impl LogStoreHandle {
                 }
             }
             Err(err) => {
+                let is_validation = matches!(err, crate::error::AppError::Validation(_));
                 let err_msg = redact::redact_text(&err.to_string());
-                self.inner.healthy.store(false, Ordering::Relaxed);
-                if let Ok(mut guard) = self.inner.last_error.write() {
-                    *guard = Some(err_msg.clone());
+                if !is_validation {
+                    self.inner.healthy.store(false, Ordering::Relaxed);
+                    if let Ok(mut guard) = self.inner.last_error.write() {
+                        *guard = Some(err_msg.clone());
+                    }
                 }
                 LogQueryResult {
                     store: LogStoreStatus {
                         backend: self.inner.backend_name.to_string(),
-                        healthy: false,
+                        healthy: if is_validation {
+                            self.is_healthy()
+                        } else {
+                            false
+                        },
                         dropped: self.dropped_count(),
                         oldest_ts_ms: None,
                         error: Some(err_msg),

@@ -4,16 +4,18 @@
 //! log ingestion and MCP debug queries never contend with `feedcourier.db`'s write lock.
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
-use super::{LogQuery, LogRecord, LogStoreBackend, parse_level_num};
+use super::{
+    DEFAULT_KEYWORD_SEARCH_WINDOW_MS, LOG_QUERY_TIMEOUT, LogQuery, LogRecord, LogStoreBackend,
+    parse_level_num, validate_log_keyword,
+};
 
 #[derive(Debug)]
 pub struct SqliteLogStore {
@@ -33,8 +35,8 @@ impl SqliteLogStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db_url = format!("sqlite://{}", path.to_string_lossy());
-        let write_opts = SqliteConnectOptions::from_str(&db_url)?
+        let write_opts = SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
@@ -76,7 +78,8 @@ impl SqliteLogStore {
             sqlx::query(idx_sql).execute(&write_pool).await?;
         }
 
-        let read_opts = SqliteConnectOptions::from_str(&db_url)?
+        let read_opts = SqliteConnectOptions::new()
+            .filename(path)
             .read_only(true)
             .busy_timeout(Duration::from_secs(5));
         let read_pool = SqlitePoolOptions::new()
@@ -134,6 +137,19 @@ impl LogStoreBackend for SqliteLogStore {
     }
 
     async fn query(&self, q: &LogQuery) -> AppResult<Vec<LogRecord>> {
+        let keyword = validate_log_keyword(q.contains.as_deref())?;
+        // When keyword search is requested without an explicit `since_ms` bound, default to the
+        // last 24 hours so SQLite uses `idx_logs_ts` to bound the scan before evaluating `LIKE`.
+        let effective_since_ms = match (q.since_ms, keyword.is_some()) {
+            (Some(ts), _) => Some(ts),
+            (None, true) => Some(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(DEFAULT_KEYWORD_SEARCH_WINDOW_MS),
+            ),
+            (None, false) => None,
+        };
+
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT ts_ms, level, level_num, target, message, fields_json, \
              feed_id, task_id, route_id, channel_id, destination_id, plugin_id \
@@ -154,7 +170,7 @@ impl LogStoreBackend for SqliteLogStore {
             qb.push_bind(format!("{}%", escape_like(prefix)));
             qb.push(" ESCAPE '\\'");
         }
-        if let Some(since_ms) = q.since_ms {
+        if let Some(since_ms) = effective_since_ms {
             qb.push(" AND ts_ms >= ");
             qb.push_bind(since_ms);
         }
@@ -162,12 +178,7 @@ impl LogStoreBackend for SqliteLogStore {
             qb.push(" AND ts_ms <= ");
             qb.push_bind(until_ms);
         }
-        if let Some(needle) = q
-            .contains
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(ref needle) = keyword {
             let pat = format!("%{}%", escape_like(needle));
             qb.push(" AND (message LIKE ");
             qb.push_bind(pat.clone());
@@ -212,7 +223,14 @@ impl LogStoreBackend for SqliteLogStore {
         }
         qb.push_bind(q.effective_limit() as i64);
 
-        let rows = qb.build().fetch_all(&self.read_pool).await?;
+        let rows = tokio::time::timeout(LOG_QUERY_TIMEOUT, qb.build().fetch_all(&self.read_pool))
+            .await
+            .map_err(|_| {
+                AppError::Upstream(format!(
+                    "SQLite log query timed out after {}s; narrow the time range or filters",
+                    LOG_QUERY_TIMEOUT.as_secs()
+                ))
+            })??;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(LogRecord {
@@ -302,4 +320,90 @@ fn escape_like(raw: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_record(ts_ms: i64, message: &str) -> LogRecord {
+        LogRecord {
+            ts_ms,
+            level: "INFO".to_string(),
+            level_num: 30,
+            target: "feedcourier::test".to_string(),
+            message: message.to_string(),
+            fields_json: "{}".to_string(),
+            feed_id: None,
+            task_id: None,
+            route_id: None,
+            channel_id: None,
+            destination_id: None,
+            plugin_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn opens_relative_and_special_char_paths_and_enforces_keyword_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Path containing `#` and `?` would break `sqlite://...` URI parsing unless `.filename()` is used.
+        let special_path = dir.path().join("logs#1?test.db");
+        let store = SqliteLogStore::open(&special_path, 7, 10_000)
+            .await
+            .expect("SqliteConnectOptions::new().filename() must accept special characters");
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let old_ms = now_ms - (48 * 60 * 60 * 1_000);
+        store
+            .write_batch(&[
+                sample_record(old_ms, "needle-ancient-event"),
+                sample_record(now_ms, "needle-recent-event"),
+            ])
+            .await
+            .unwrap();
+
+        // 1-char keyword is rejected.
+        let short_err = store
+            .query(&LogQuery {
+                contains: Some("a".to_string()),
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(short_err, AppError::Validation(_)));
+
+        // > 128-char keyword is rejected.
+        let long_err = store
+            .query(&LogQuery {
+                contains: Some("x".repeat(129)),
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(long_err, AppError::Validation(_)));
+
+        // Keyword without `since_ms` defaults to last 24h (finds recent, skips 48h-old row).
+        let default_window = store
+            .query(&LogQuery {
+                contains: Some("needle".to_string()),
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(default_window.len(), 1);
+        assert_eq!(default_window[0].message, "needle-recent-event");
+
+        // Explicit `since_ms` still searches older history.
+        let wide_window = store
+            .query(&LogQuery {
+                contains: Some("needle".to_string()),
+                since_ms: Some(old_ms - 1_000),
+                ..LogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(wide_window.len(), 2);
+
+        store.close().await;
+    }
 }

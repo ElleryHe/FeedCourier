@@ -745,6 +745,7 @@ pub struct PluginRow {
     pub script_sha256: Option<String>,
     pub manifest_json: Option<String>,
     pub installed_at: Option<i64>,
+    pub disabled_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

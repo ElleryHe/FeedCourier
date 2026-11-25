@@ -838,6 +838,7 @@ export const zhCN: Messages = {
     backToPlugins: "返回插件列表",
     globallyDisabledNotice:
       "该插件当前处于全局禁用状态。已绑定该插件的路由在重新启用前将保留原始链接和内容。",
+    autoDisabledLabel: "已自动禁用",
     hooksLabel: "钩子",
     permissionsLabel: "权限",
     homepageLink: "项目主页",
@@ -1037,6 +1038,10 @@ export const zhCN: Messages = {
         `当前已安装 v${fromVersion}。确认后将原位更新至 v${toVersion}，已有通道账号与路由规则均会保留。`,
       alreadyInstalledSameNotice: (version: string) =>
         `当前已安装 v${version}，确认后将原位重新安装该版本。`,
+      replaceCustomWarning: (id: string, installedVersion?: string | null) =>
+        `插件「${id}」${installedVersion ? `（v${installedVersion}）` : ""}当前为自定义导入版本。从插件市场安装将永久覆盖现有自定义脚本。`,
+      replaceCustomCheckbox:
+        "我已知晓风险，确认使用插件市场版本覆盖现有自定义插件",
       viewSourceBtn: "查看源码",
       sourceModalTitle: (name: string) => `插件源码：${name}`,
       sourceModalLoading: "正在加载插件源码…",

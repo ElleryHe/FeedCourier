@@ -16,14 +16,17 @@ Administrators can install official push channels such as **ntfy** and **Bark** 
 ## Sandbox & Network Security Boundary
 
 - **Pure-Rust In-Process Sandbox (`boa_engine`)**: Plugins execute per invocation in a fresh sandboxed JS context without access to the local filesystem, environment variables, OS processes, or raw sockets.
-- **Explicit `allowed_hosts` + Admin URI Boundary**: `fc.fetch()` is strictly restricted to:
-  1. Public hostnames explicitly declared in the plugin's `meta.allowed_hosts` (for example, `ntfy.sh` or `api.day.app`), which are displayed as security badges on Marketplace cards and in the installation confirmation modal.
-  2. Hostnames explicitly configured by the administrator in `format: "uri"` account/destination fields (such as a self-hosted `server_url`).
-- **Dual Network Allowlist, Metadata Hard-Block & `use_proxy`**:
-  - Cloud metadata/unspecified targets (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`, `0.0.0.0`, `::`, `metadata.google.internal`) and HTTP `3xx` redirects are **unconditionally blocked** on every `fc.fetch()` call.
-  - Exact `(scheme, host, port)` origins from administrator-configured `format: "uri"` fields (such as a self-hosted LAN/Docker `server_url` for `ntfy` or `Bark`) connect directly without relaxing global `SSRF_ALLOWLIST` for feeds.
-  - Plugin-declared `meta.allowed_hosts` route through FeedCourier's connect-time DNS SSRF guard (`ProtectedHttpClient`).
+- **Explicit `allowed_hosts` + Explicit-Admin `format: "uri"` Policy**: `fc.fetch()` is strictly restricted to:
+  1. Public hostnames explicitly declared in the plugin's `meta.allowed_hosts` (for example, `ntfy.sh` or `api.day.app`), which are displayed as security badges on Marketplace cards and in the installation confirmation modal and traverse standard connect-time DNS SSRF protection (`ProtectedHttpClient`).
+  2. Exact `(scheme, host, port)` origins from **non-empty `format: "uri"` fields explicitly submitted by an administrator** (such as a self-hosted LAN/Docker `server_url` for `ntfy` or `Bark`), which connect directly without relaxing global `SSRF_ALLOWLIST` for feeds. Schema `default` values are **never** automatically trusted or persisted into the private/LAN `admin_uri_origins` allowlist (default public hosts like `ntfy.sh` or `api.day.app` must be listed in `meta.allowed_hosts`). Additionally, a plugin's `validate()` `normalized_config` cannot introduce a new `format: "uri"` field or alter the `(scheme, host, port)` origin of an existing `format: "uri"` field.
+- **Cloud Metadata Hard-Block, Proxy Resolution Boundary & `use_proxy`**:
+  - Cloud metadata literal IPs (`169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, including IPv4-mapped IPv6/NAT64 forms), unspecified addresses (`0.0.0.0`, `::`), metadata hostnames (`metadata.google.internal`, `metadata.goog`, `instance-data`), and HTTP `3xx` redirects are **unconditionally blocked** on every `fc.fetch()` call (direct or proxied).
+  - Direct connections and local-DNS proxies (`socks5://`) also resolve DNS and block metadata IPs before connecting; remote-DNS proxies (`http://`, `https://`, `socks5h://`) enforce hostname and literal-IP checks client-side because DNS resolution occurs on the proxy server.
   - Plugin Channel accounts (`ChannelKind::Plugin`) support the account-level **Use Outbound Proxy** (`use_proxy`) toggle (fail-closed when no global `OUTBOUND_PROXY` is configured).
+- **Concurrency Cap, Timeouts & Automatic Circuit Breaker**:
+  - JS execution is capped globally at **4 simultaneous sandbox invocations**. Each hook enforces a wall-clock deadline and checks cancellation at every `fc.*` host call (preventing post-timeout HTTP calls), with per-request `fc.fetch()` timeouts clamped to the remaining hook budget.
+  - If a JS plugin hits **3 consecutive execution timeouts**, an automatic circuit breaker disables the plugin globally and records the reason in `plugins.disabled_reason`, which is displayed as a red **Auto-disabled** alert banner on the Plugins page until an administrator investigates and re-enables it.
+  - Note: `boa_engine` 0.22 does not provide an external preemption interrupt for pure-CPU nested loops, so a malicious pure-CPU loop can occupy 1 of the 4 sandbox slots until Boa's own per-loop iteration limit completes.
 - **SHA-256 Integrity Verification & Encrypted Credentials**: Marketplace downloads are verified against the SHA-256 checksum recorded in `index.json` before preview or installation. Secret fields declared in `account_schema` / `destination_schema` (`format: "password"` or `x-secret: true`) are encrypted at rest with ChaCha20-Poly1305 (`MasterKey`) and masked in all API responses.
 
 ---
@@ -87,6 +90,6 @@ For private webhooks, internal gateways, or local development without publishing
 ## Lifecycle Operations
 
 - **View Source**: Click **View Source** (`GET /api/v1/plugins/{id}/source`) on any installed JS plugin card or detail page to audit the exact stored `plugin.js` script and its verified SHA-256 digest at any time.
-- **One-Click Updates & Version Switching**: When a newer version appears in the Marketplace index, installed cards show an **Update to vX.Y.Z** button. Upgrading updates the stored script and synced schemas in place while preserving existing channel accounts, destinations, and routes.
-- **Disable / Pause**: Toggling a channel plugin off defers pending outbox tasks cleanly (`status = 'deferred'`) without consuming retry attempts or dead-lettering them.
+- **One-Click Updates, Version Switching & Custom-Overwrite Guard**: When a newer version appears in the Marketplace index, installed cards show an **Update to vX.Y.Z** button. Upgrading updates the stored script and synced schemas in place while preserving existing channel accounts, destinations, and routes. If the plugin ID is currently installed from a **Custom** upload (`source: "custom"`), Marketplace installation returns **`409 Conflict`** unless explicitly confirmed (`replace_custom: true` via the red confirmation warning in the WebUI).
+- **Disable / Pause & Auto-Disable Recovery**: Toggling a channel plugin off defers pending outbox tasks cleanly (`status = 'deferred'`) without consuming retry attempts or dead-lettering them. Plugins tripped by the 3-consecutive-timeout circuit breaker display an **Auto-disabled** alert banner (`disabled_reason`); manually re-enabling the plugin clears `disabled_reason` and resets the timeout counter.
 - **Safe Uninstall**: Uninstalling a plugin still referenced by channels or routes returns **`409 Conflict`** listing all referencing channels and routes, requiring explicit `?cascade=true` confirmation.

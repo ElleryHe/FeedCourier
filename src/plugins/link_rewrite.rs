@@ -439,7 +439,7 @@ impl Plugin for LinkRewritePlugin {
         };
 
         let Some(instance) = ctx.db.get_plugin_instance(provider_id).await? else {
-            out.warnings.push(format!(
+            out.push_warning(format!(
                 "Link Rewrite: provider #{provider_id} not found; kept original URLs"
             ));
             return Ok(PluginResult::Continue);
@@ -448,7 +448,7 @@ impl Plugin for LinkRewritePlugin {
             return Ok(PluginResult::Continue);
         }
         if !instance.enabled {
-            out.warnings.push(format!(
+            out.push_warning(format!(
                 "Link Rewrite: provider '{}' is disabled; kept original URLs",
                 instance.name
             ));
@@ -628,23 +628,6 @@ impl Plugin for LinkRewritePlugin {
             });
         }
 
-        if failed_count > 0 {
-            let ok_count = resolved_map.len();
-            let err_hint = first_error.unwrap_or_else(|| "YOURLS request failed".to_string());
-            out.warnings.push(format!(
-                "Link Rewrite partial ({ok_count}/{} rewritten, {failed_count} kept original: {err_hint})",
-                candidate_urls.len()
-            ));
-        } else if truncated_cap {
-            out.warnings.push(format!(
-                "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} new uncached links; remaining uncached links kept original"
-            ));
-        } else if candidate_cap_hit {
-            out.warnings.push(format!(
-                "Link Rewrite capped at {MAX_CANDIDATE_URLS_PER_ENTRY} unique candidate links per entry; remaining links kept original"
-            ));
-        }
-
         // 5. Apply resolved short links to primary link and HTML `<a href>` attributes.
         if let Some(p_url) = primary_url
             && let Some(short) = resolved_map.get(p_url)
@@ -656,6 +639,23 @@ impl Plugin for LinkRewritePlugin {
             && !resolved_map.is_empty()
         {
             out.content_html = Some(rewrite_anchor_hrefs(html, &resolved_map));
+        }
+
+        if failed_count > 0 {
+            let ok_count = resolved_map.len();
+            let err_hint = first_error.unwrap_or_else(|| "YOURLS request failed".to_string());
+            out.push_warning(format!(
+                "Link Rewrite partial ({ok_count}/{} rewritten, {failed_count} kept original: {err_hint})",
+                candidate_urls.len()
+            ));
+        } else if truncated_cap {
+            out.push_warning(format!(
+                "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} new uncached links; remaining uncached links kept original"
+            ));
+        } else if candidate_cap_hit {
+            out.push_warning(format!(
+                "Link Rewrite capped at {MAX_CANDIDATE_URLS_PER_ENTRY} unique candidate links per entry; remaining links kept original"
+            ));
         }
 
         Ok(PluginResult::Continue)

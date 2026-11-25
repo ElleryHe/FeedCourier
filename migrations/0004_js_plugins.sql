@@ -19,6 +19,8 @@ ALTER TABLE plugins
     ADD COLUMN manifest_json TEXT;
 ALTER TABLE plugins
     ADD COLUMN installed_at INTEGER;
+ALTER TABLE plugins
+    ADD COLUMN disabled_reason TEXT;
 
 -- 2. Rebuild `channels` table so `kind` accepts 'plugin' alongside 'smtp', 'telegram', 'notion'.
 CREATE TABLE channels_v4 (
@@ -91,8 +93,6 @@ CREATE TABLE IF NOT EXISTS plugin_events (
 
 CREATE INDEX IF NOT EXISTS idx_plugin_events_due
     ON plugin_events (next_attempt_at ASC, id ASC);
-
-PRAGMA foreign_key_check;
 
 COMMIT;
 

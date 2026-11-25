@@ -329,6 +329,7 @@ erDiagram
 | `script_sha256` | `TEXT` | `NULL` | 于 `0004_js_plugins.sql` 新增，`script_js` 的 64 位小写十六进制 SHA-256 校验值（内置插件为 `NULL`）。 |
 | `manifest_json` | `TEXT` | `NULL` | 于 `0004_js_plugins.sql` 新增，编译 `export const meta` 提取并缓存的 Protocol v1 清单 JSON。 |
 | `installed_at` | `INTEGER` | `NULL` | 于 `0004_js_plugins.sql` 新增，JS 插件首次安装或最近一次升级的 UTC Unix 秒时间戳。 |
+| `disabled_reason` | `TEXT` | `NULL` | 于 `0004_js_plugins.sql` 新增，记录 JS 插件连续 3 次执行超时触发自动熔断器全局禁用时的原因（管理员手动重新启用后自动清空）。 |
 | `created_at` / `updated_at` | `INTEGER` | `NOT NULL DEFAULT (unixepoch())` | 创建与更新时间戳。 |
 
 ### `plugin_instances`（加密插件服务商实例表）
@@ -462,4 +463,4 @@ ORDER BY (ts_ms, level_num)
 TTL ts + INTERVAL <LOG_RETENTION_DAYS> DAY
 ```
 
-ClickHouse 后端的数据过期完全由表级 `TTL` 自动执行（`LOG_MAX_ROWS` 仅对 SQLite `logs.db` 生效）。远端日志服务异常绝不阻塞启动或主投递流程——写入失败的批次仅递增丢弃计数并在 `stderr` 输出限频告警。
+ClickHouse 后端的数据过期完全由表级 `TTL` 自动执行（`LOG_MAX_ROWS` 仅对 SQLite `logs.db` 生效）；`JSONEachRow` 写入时将 `ts` 序列化为匹配 `DateTime64(3, 'UTC')` 的 UTC `YYYY-MM-DD HH:MM:SS.fff` 字符串，并同时保留整型的毫秒时间戳 `ts_ms`。针对 SQLite 与 ClickHouse 日志库的关键词检索均校验 `2–128` 个字符、未指定起始时间时自动默认检索最近 24 小时，并实施 5 秒查询超时限制。远端日志服务异常绝不阻塞启动或主投递流程——写入失败的批次仅递增丢弃计数并在 `stderr` 输出限频告警。

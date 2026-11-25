@@ -314,6 +314,23 @@ impl Database {
 
         MIGRATOR.run(&write_pool).await?;
 
+        // Verify foreign-key integrity explicitly in Rust (SQLite's `PRAGMA foreign_key_check`
+        // returns violation rows rather than raising an SQL error during migration execution).
+        let fk_violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&write_pool)
+            .await?;
+        if !fk_violations.is_empty() {
+            use sqlx::Row;
+            let first = &fk_violations[0];
+            let table: String = first.try_get(0).unwrap_or_else(|_| "unknown".to_string());
+            let rowid: Option<i64> = first.try_get(1).ok();
+            let parent: String = first.try_get(2).unwrap_or_else(|_| "unknown".to_string());
+            return Err(crate::error::AppError::Config(format!(
+                "SQLite foreign_key_check failed with {} violation(s) (first: table='{table}', rowid={rowid:?}, parent='{parent}')",
+                fk_violations.len()
+            )));
+        }
+
         // 2. Open the concurrent read pool with `PRAGMA query_only = ON` so WAL `-shm` read-marks
         // work natively while SQLite strictly rejects any accidental write query on `read_pool`.
         let read_opts = base_opts

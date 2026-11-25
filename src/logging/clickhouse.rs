@@ -17,7 +17,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-use super::{LogQuery, LogRecord, LogStoreBackend, parse_level_num};
+use super::{
+    DEFAULT_KEYWORD_SEARCH_WINDOW_MS, LogQuery, LogRecord, LogStoreBackend, parse_level_num,
+    validate_log_keyword,
+};
+
+/// Format an epoch-millisecond UTC timestamp as a ClickHouse `DateTime64(3, 'UTC')` string
+/// (`YYYY-MM-DD HH:MM:SS.mmm`) compatible across ClickHouse versions including 26.8+.
+pub fn format_clickhouse_datetime64_utc(ts_ms: i64) -> String {
+    let dt = chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(|| {
+        chrono::DateTime::from_timestamp(0, 0).expect("unix epoch must be valid")
+    });
+    dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
 
 #[derive(Debug)]
 pub struct ClickHouseLogStore {
@@ -33,7 +45,7 @@ pub struct ClickHouseLogStore {
 
 #[derive(Debug, Serialize)]
 struct ClickHouseInsertRow<'a> {
-    ts: i64,
+    ts: String,
     ts_ms: i64,
     level: &'a str,
     level_num: i32,
@@ -189,7 +201,7 @@ impl LogStoreBackend for ClickHouseLogStore {
         let mut payload = String::with_capacity(batch.len() * 256);
         for rec in batch {
             let row = ClickHouseInsertRow {
-                ts: rec.ts_ms,
+                ts: format_clickhouse_datetime64_utc(rec.ts_ms),
                 ts_ms: rec.ts_ms,
                 level: &rec.level,
                 level_num: rec.level_num,
@@ -243,6 +255,17 @@ impl LogStoreBackend for ClickHouseLogStore {
     }
 
     async fn query(&self, q: &LogQuery) -> AppResult<Vec<LogRecord>> {
+        let keyword = validate_log_keyword(q.contains.as_deref())?;
+        let effective_since_ms = match (q.since_ms, keyword.is_some()) {
+            (Some(ts), _) => Some(ts),
+            (None, true) => Some(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(DEFAULT_KEYWORD_SEARCH_WINDOW_MS),
+            ),
+            (None, false) => None,
+        };
+
         if !self.schema_ready.load(Ordering::Acquire) {
             self.ensure_schema().await?;
         }
@@ -269,7 +292,7 @@ impl LogStoreBackend for ClickHouseLogStore {
             sql.push_str(" AND startsWith(target, {target_prefix:String})");
             params.push(("param_target_prefix".to_string(), prefix.to_string()));
         }
-        if let Some(since_ms) = q.since_ms {
+        if let Some(since_ms) = effective_since_ms {
             sql.push_str(
                 " AND ts_ms >= {since_ms:Int64} \
                  AND ts >= fromUnixTimestamp64Milli({since_ms:Int64}, 'UTC')",
@@ -283,17 +306,12 @@ impl LogStoreBackend for ClickHouseLogStore {
             );
             params.push(("param_until_ms".to_string(), until_ms.to_string()));
         }
-        if let Some(needle) = q
-            .contains
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(ref needle) = keyword {
             sql.push_str(
                 " AND (positionCaseInsensitiveUTF8(message, {contains:String}) > 0 \
                  OR positionCaseInsensitiveUTF8(fields_json, {contains:String}) > 0)",
             );
-            params.push(("param_contains".to_string(), needle.to_string()));
+            params.push(("param_contains".to_string(), needle.clone()));
         }
         if let Some(task_id) = q.task_id {
             sql.push_str(" AND task_id = {task_id:Int64}");
@@ -464,5 +482,45 @@ where
             }
         }
         _ => Err(serde::de::Error::custom("expected optional i64 or string")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_clickhouse_datetime64_utc_string_preserving_ts_ms() {
+        // 2026-11-25T14:03:19.456Z = 1795615399456 ms
+        let ts_ms = chrono::DateTime::parse_from_rfc3339("2026-11-25T14:03:19.456Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            format_clickhouse_datetime64_utc(ts_ms),
+            "2026-11-25 14:03:19.456"
+        );
+        assert_eq!(
+            format_clickhouse_datetime64_utc(0),
+            "1970-01-01 00:00:00.000"
+        );
+
+        let row = ClickHouseInsertRow {
+            ts: format_clickhouse_datetime64_utc(ts_ms),
+            ts_ms,
+            level: "INFO",
+            level_num: 30,
+            target: "feedcourier::test",
+            message: "ok",
+            fields_json: "{}",
+            feed_id: None,
+            task_id: None,
+            route_id: None,
+            channel_id: None,
+            destination_id: None,
+            plugin_id: None,
+        };
+        let encoded: serde_json::Value = serde_json::to_value(&row).unwrap();
+        assert_eq!(encoded["ts"], "2026-11-25 14:03:19.456");
+        assert_eq!(encoded["ts_ms"], ts_ms);
     }
 }

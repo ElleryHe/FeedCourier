@@ -1471,6 +1471,7 @@ async fn js_processor_on_render_ammonia_plugin_order_and_on_delivered_queue() {
         )
         .await;
     assert_eq!(st, StatusCode::CREATED, "create instance failed: {inst}");
+    let inst_id = inst["id"].as_i64().unwrap();
 
     let (st, ch) = h
         .req(
@@ -1509,7 +1510,7 @@ async fn js_processor_on_render_ammonia_plugin_order_and_on_delivered_queue() {
                 "destination_id": dest_id,
                 "options": {
                     "plugin_order": ["proc-b", "proc-a"],
-                    "plugins": { "proc-a": {}, "proc-b": {} }
+                    "plugins": { "proc-a": { "provider_id": inst_id }, "proc-b": {} }
                 }
             })),
         )
@@ -1728,5 +1729,1038 @@ async fn migration_0004_preserves_channels_sequence_and_incompatible_plugin_erro
     assert!(
         test_err.to_string().contains("incompatible") && test_err.to_string().contains("99.0.0"),
         "unexpected send_test error: {test_err}"
+    );
+}
+
+// =============================================================================
+// 7. Round-3 QA Regression Suite (P0-2, P0-2b, P0-3, P1-1, P1-2, P1-5, P2-1, P2-3, P2-5)
+// =============================================================================
+
+#[tokio::test]
+async fn round3_schema_default_and_validate_cannot_escalate_uri_origins() {
+    let probe_srv = MockServer::start().await;
+    let probe_hits = Arc::new(Mutex::new(0usize));
+    let hits_clone = Arc::clone(&probe_hits);
+    Mock::given(method("GET"))
+        .and(path("/secret-internal"))
+        .respond_with(move |_req: &MockRequest| {
+            *hits_clone.lock().unwrap() += 1;
+            ResponseTemplate::new(200).set_body_string("LEAKED")
+        })
+        .mount(&probe_srv)
+        .await;
+
+    let h = JsHarness::new().await;
+
+    // P0-2: Plugin tries to smuggle `127.0.0.1` via hidden `default` on a `format: "uri"` field
+    // with `allowed_hosts: []`. Admin submits empty config `{}` — `fc.fetch` MUST be SSRF-blocked.
+    let sneaky_default_js = format!(
+        r#"
+        export const meta = {{
+            id: "sneaky-default",
+            name: "Sneaky Default",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            allowed_hosts: [],
+            account_schema: {{
+                type: "object",
+                properties: {{
+                    probe_url: {{ type: "string", format: "uri", default: "{uri}" }}
+                }}
+            }},
+            destination_schema: {{ type: "object", properties: {{}} }}
+        }};
+        export function deliver() {{
+            const resp = fc.fetch({{ method: "GET", url: "{uri}/secret-internal" }});
+            return {{ outcome: "delivered", diagnostic: resp.body }};
+        }}
+        "#,
+        uri = probe_srv.uri()
+    );
+    let (st, resp) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": sneaky_default_js, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "upload failed: {resp}");
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Sneaky Ch",
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "sneaky-default", "config": {} },
+                "initial_destination": {
+                    "name": "Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "channel create failed: {ch}");
+    // Saved account config must NOT contain the auto-filled `probe_url` default!
+    assert!(
+        ch["config"]["config"].get("probe_url").is_none(),
+        "URI default must never be auto-persisted: {ch}"
+    );
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed_id, entry_id) = h
+        .seed_feed_and_entry("SSRF Check", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Sneaky Route",
+                "feed_ids": [feed_id],
+                "channel_id": ch_id,
+                "destination_id": dest_id
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let task_id =
+        h.db.enqueue_delivery_task(
+            route["id"].as_i64().unwrap(),
+            ch_id,
+            dest_id,
+            entry_id,
+            now_unix(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    h.dispatcher.drain_due_outbox_tasks(10).await.unwrap();
+    let task = h.db.get_delivery_task(task_id).await.unwrap().unwrap();
+    assert_eq!(
+        task.status,
+        DeliveryTaskStatus::DeadLetter,
+        "hidden default URI SSRF must dead-letter: {task:?}"
+    );
+    assert_eq!(
+        *probe_hits.lock().unwrap(),
+        0,
+        "hidden default URI MUST NOT reach internal server"
+    );
+
+    // P0-2b: Plugin `validate()` attempts to inject a new URI field or mutate an existing URI origin.
+    let validate_escalate_js = format!(
+        r#"
+        export const meta = {{
+            id: "validate-escalate",
+            name: "Validate Escalate",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: {{
+                type: "object",
+                properties: {{
+                    server_url: {{ type: "string", format: "uri" }},
+                    extra_url: {{ type: "string", format: "uri" }}
+                }}
+            }},
+            destination_schema: {{ type: "object", properties: {{}} }}
+        }};
+        export function validate(ctx) {{
+            if (ctx.scope === "account") {{
+                if (ctx.config.server_url === "https://ok.example.com/path/") {{
+                    return {{ ok: true, normalized_config: {{ server_url: "https://ok.example.com/path" }} }};
+                }}
+                if (ctx.config.server_url === "https://swap.example.com") {{
+                    return {{ ok: true, normalized_config: {{ server_url: "{uri}" }} }};
+                }}
+                return {{ ok: true, normalized_config: {{ ...ctx.config, extra_url: "{uri}" }} }};
+            }}
+            return {{ ok: true }};
+        }}
+        export function deliver() {{ return {{ outcome: "delivered" }}; }}
+        "#,
+        uri = probe_srv.uri()
+    );
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": validate_escalate_js, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // 1) Introducing a brand-new URI field in `normalized_config` is rejected.
+    let (st, err1) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Inject Test",
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "validate-escalate", "config": {} }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "should reject URI injection: {err1}"
+    );
+
+    // 2) Mutating an existing URI origin `(scheme, host, port)` is rejected.
+    let (st, err2) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Swap Test",
+                "kind": "plugin",
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "validate-escalate",
+                    "config": { "server_url": "https://swap.example.com" }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "should reject URI origin swap: {err2}"
+    );
+
+    // 3) Trailing-slash normalization preserving exact origin succeeds!
+    let (st, ok_ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Trim Slash OK",
+                "kind": "plugin",
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "validate-escalate",
+                    "config": { "server_url": "https://ok.example.com/path/" }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "same-origin normalization must pass: {ok_ch}"
+    );
+    assert_eq!(
+        ok_ch["config"]["config"]["server_url"],
+        "https://ok.example.com/path"
+    );
+}
+
+#[tokio::test]
+async fn round3_bark_default_destination_name_never_leaks_device_key_and_redacts_when_unloaded() {
+    let h = JsHarness::new().await;
+    let bark_js = include_str!("fixtures/plugins/bark_0_3_1.js");
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": bark_js, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let secret_device_key = "BarkSecretKey_9988776655";
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Bark Account",
+                "kind": "plugin",
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "bark",
+                    "config": { "server_url": "https://api.day.app" }
+                },
+                "initial_destination": {
+                    "config": {
+                        "kind": "plugin",
+                        "config": { "device_key": secret_device_key }
+                    }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "bark create failed: {ch}");
+    let dest = &ch["destinations"][0];
+    let dest_name = dest["name"].as_str().unwrap_or("");
+    assert!(
+        !dest_name.contains(secret_device_key),
+        "Bark device_key MUST NOT leak into default destination name: {dest_name}"
+    );
+    assert_eq!(
+        dest_name, "Bark Push Target",
+        "Bark destination without group should fall back to '<Plugin> Target'"
+    );
+    assert!(dest["config"]["config"].get("device_key").is_none());
+    assert_eq!(dest["config"]["config"]["has_device_key"], true);
+
+    // Corrupt persisted `script_js` & reload so runtime fails to load; `GET /api/v1/channels`
+    // must STILL recover `destination_schema` from `manifest_json` and redact `device_key`!
+    sqlx::query("UPDATE plugins SET script_js = 'export const broken = {{{' WHERE id = 'bark'")
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+    h.dispatcher.plugins().reload_from_db(&h.db).await.unwrap();
+
+    let (st, list) = h.req(Method::GET, "/api/v1/channels", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let dumped = list.to_string();
+    assert!(
+        !dumped.contains(secret_device_key),
+        "device_key leaked after plugin failed to load: {dumped}"
+    );
+}
+
+#[tokio::test]
+async fn round3_proxy_plugin_http_blocks_cloud_metadata_literal_and_local_dns() {
+    // 1. Local-DNS SOCKS5 proxy + custom DNS resolving evil hostname to 169.254.169.254.
+    let lookup: feedcourier::net::ssrf::CustomDnsLookup = Arc::new(|host| {
+        Box::pin(async move {
+            if host == "imds-rebind.internal" {
+                Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    169, 254, 169, 254,
+                ))])
+            } else {
+                Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    10, 0, 0, 5,
+                ))])
+            }
+        })
+    });
+    let socks_client = ProtectedHttpClient::with_custom_dns(
+        NetSettings {
+            outbound_proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
+            ssrf_allowlist: vec![],
+        },
+        lookup,
+    )
+    .unwrap();
+
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://169.254.170.2/v2/credentials",
+        "http://100.100.100.200/latest/meta-data/",
+        "http://[::ffff:169.254.169.254]/latest/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://imds-rebind.internal/latest/meta-data/",
+    ] {
+        let err = socks_client
+            .send_plugin_http(feedcourier::net::PluginHttpRequest {
+                method: reqwest::Method::GET,
+                url: url.to_string(),
+                headers: reqwest::header::HeaderMap::new(),
+                body: None,
+                timeout: Duration::from_secs(2),
+                max_bytes: 1024,
+                allow_private_origin: true,
+                use_proxy: true,
+            })
+            .await
+            .expect_err(&format!("proxied metadata URL '{url}' must be blocked"));
+        assert!(
+            matches!(err, feedcourier::error::AppError::SsrfBlocked(_)),
+            "expected SsrfBlocked for '{url}', got: {err:?}"
+        );
+    }
+
+    // 2. Remote-DNS HTTP proxy still unconditionally blocks literal metadata IPs & hostnames.
+    let http_proxy_client = ProtectedHttpClient::new(NetSettings {
+        outbound_proxy_url: Some("http://127.0.0.1:8888".to_string()),
+        ssrf_allowlist: vec![],
+    })
+    .unwrap();
+    let err = http_proxy_client
+        .send_plugin_http(feedcourier::net::PluginHttpRequest {
+            method: reqwest::Method::GET,
+            url: "http://169.254.169.254/latest/meta-data/".to_string(),
+            headers: reqwest::header::HeaderMap::new(),
+            body: None,
+            timeout: Duration::from_secs(2),
+            max_bytes: 1024,
+            allow_private_origin: true,
+            use_proxy: true,
+        })
+        .await
+        .expect_err("HTTP-proxied literal IMDS must be blocked");
+    assert!(matches!(err, feedcourier::error::AppError::SsrfBlocked(_)));
+}
+
+#[tokio::test]
+async fn round3_timeout_cancels_subsequent_fetches_and_trips_circuit_breaker() {
+    let slow_srv = MockServer::start().await;
+    let after_timeout_hits = Arc::new(Mutex::new(0usize));
+    let after_clone = Arc::clone(&after_timeout_hits);
+
+    Mock::given(method("GET"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+        .mount(&slow_srv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/after-timeout"))
+        .respond_with(move |_req: &MockRequest| {
+            *after_clone.lock().unwrap() += 1;
+            ResponseTemplate::new(200).set_body_string("GHOST")
+        })
+        .mount(&slow_srv)
+        .await;
+
+    let h = JsHarness::new().await;
+    h.dispatcher
+        .plugins()
+        .set_hook_timeout_override(Some(Duration::from_millis(250)));
+
+    let slow_chan_js = r#"
+        export const meta = {
+            id: "slow-chan",
+            name: "Slow Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: {
+                type: "object",
+                properties: { base_url: { type: "string", format: "uri" } }
+            },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver(ctx) {
+            try {
+                fc.fetch({ method: "GET", url: ctx.account.base_url + "/slow", timeoutMs: 5000 });
+            } catch (_e) {
+                // Attempt a ghost fetch after the deadline expired; host must reject it immediately!
+                fc.fetch({ method: "GET", url: ctx.account.base_url + "/after-timeout", timeoutMs: 5000 });
+            }
+            return { outcome: "delivered" };
+        }
+    "#;
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": slow_chan_js, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Slow Ch",
+                "kind": "plugin",
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "slow-chan",
+                    "config": { "base_url": slow_srv.uri() }
+                },
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "initial_destination": {
+                    "name": "Slow Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed_id, entry_id) = h
+        .seed_feed_and_entry("Slow Item", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Slow Route",
+                "feed_ids": [feed_id],
+                "channel_id": ch_id,
+                "destination_id": dest_id
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let route_id = route["id"].as_i64().unwrap();
+    let task_id =
+        h.db.enqueue_delivery_task(route_id, ch_id, dest_id, entry_id, now_unix())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+    // Run 3 consecutive timed-out attempts -> circuit breaker trips on the 3rd timeout!
+    for attempt in 1..=3 {
+        sqlx::query(
+            "UPDATE delivery_tasks SET status = 'queued', next_attempt_at = 0 WHERE id = ?1",
+        )
+        .bind(task_id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+        h.dispatcher.drain_due_outbox_tasks(1).await.unwrap();
+        let row = h.db.get_plugin("slow-chan").await.unwrap().unwrap();
+        if attempt < 3 {
+            assert!(row.enabled, "plugin must remain enabled before 3rd timeout");
+        } else {
+            assert!(
+                !row.enabled,
+                "circuit breaker must auto-disable plugin on 3rd timeout"
+            );
+            assert!(
+                row.disabled_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("circuit breaker") && r.contains('3')),
+                "expected circuit breaker disabled_reason, got: {:?}",
+                row.disabled_reason
+            );
+        }
+    }
+
+    // Give any stray background thread a brief moment and confirm ZERO ghost requests fired.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *after_timeout_hits.lock().unwrap(),
+        0,
+        "post-timeout ghost fc.fetch must be cancelled immediately"
+    );
+
+    // `GET /api/v1/plugins` exposes `disabled_reason`, and re-enabling clears it.
+    let (st, plugins) = h.req(Method::GET, "/api/v1/plugins", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let slow_dto = plugins
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "slow-chan")
+        .unwrap();
+    assert_eq!(slow_dto["enabled"], false);
+    assert!(slow_dto["disabled_reason"].as_str().is_some());
+
+    let (st, reenabled) = h
+        .req(
+            Method::PATCH,
+            "/api/v1/plugins/slow-chan",
+            Some(json!({ "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(reenabled["enabled"], true);
+    assert!(reenabled.get("disabled_reason").is_none());
+}
+
+#[tokio::test]
+async fn round3_uncompilable_plugin_stays_visible_and_defers_channel_tasks_and_respects_warnings() {
+    let h = JsHarness::new().await;
+    let chan_js = r#"
+        export const meta = {
+            id: "fragile-chan",
+            name: "Fragile Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: { type: "object", properties: {} },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver() { return { outcome: "delivered" }; }
+    "#;
+    let warn_proc_js = r#"
+        export const meta = {
+            id: "warn-proc",
+            name: "Warn Proc",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "processor",
+            hooks: ["on_render"],
+            route_option_schema: { type: "object", properties: {} }
+        };
+        export function onRender() {
+            return { outcome: "continue", warnings: ["custom notice from plugin"] };
+        }
+    "#;
+    for js in [chan_js, warn_proc_js] {
+        let (st, _) = h
+            .req(
+                Method::POST,
+                "/api/v1/plugins/upload",
+                Some(json!({ "script_js": js, "enabled": true })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED);
+    }
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Fragile Acct",
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "fragile-chan", "config": {} },
+                "initial_destination": {
+                    "name": "Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed_id, entry1_id) = h
+        .seed_feed_and_entry("Warn Entry", None, "<p>Hi</p>", None, None, None)
+        .await;
+    let (st, route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Fragile Route",
+                "feed_ids": [feed_id],
+                "channel_id": ch_id,
+                "destination_id": dest_id,
+                "options": { "plugins": { "warn-proc": {} } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let route_id = route["id"].as_i64().unwrap();
+
+    // P2-5: Delivered task with custom JS plugin warning has `[warn] ` prefix and `has_warnings: true`!
+    let task1_id =
+        h.db.enqueue_delivery_task(route_id, ch_id, dest_id, entry1_id, now_unix())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+    h.dispatcher.drain_due_outbox_tasks(10).await.unwrap();
+    let (st, tasks) = h.req(Method::GET, "/api/v1/tasks", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let t1 = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == task1_id)
+        .unwrap();
+    assert_eq!(t1["status"], "delivered");
+    assert_eq!(t1["has_warnings"], true, "expected has_warnings=true: {t1}");
+    assert!(
+        t1["diagnostic_log"]
+            .as_str()
+            .is_some_and(|d| d.contains("[warn] custom notice from plugin")),
+        "expected [warn] prefix in diagnostic_log: {t1}"
+    );
+
+    // P1-5: Corrupt `fragile-chan` script_js in DB -> reload -> remains visible as `compatible: false`
+    // and new tasks transition to `Deferred` instead of `DeadLetter`!
+    sqlx::query(
+        "UPDATE plugins SET script_js = 'export const syntax error @@@' WHERE id = 'fragile-chan'",
+    )
+    .execute(h.db.write_pool())
+    .await
+    .unwrap();
+    h.dispatcher.plugins().reload_from_db(&h.db).await.unwrap();
+
+    let (st, plugins) = h.req(Method::GET, "/api/v1/plugins", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let fragile_dto = plugins
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "fragile-chan")
+        .expect("uncompilable plugin must stay visible in GET /api/v1/plugins");
+    assert_eq!(fragile_dto["compatible"], false);
+    assert_eq!(fragile_dto["enabled"], false);
+    assert!(
+        fragile_dto["compatibility_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("Failed to compile")),
+        "unexpected compatibility_reason: {fragile_dto}"
+    );
+
+    let (_, entry2_id) = h
+        .seed_feed_and_entry("Defer Entry", None, "<p>Body 2</p>", None, None, None)
+        .await;
+    let task2_id =
+        h.db.enqueue_delivery_task(route_id, ch_id, dest_id, entry2_id, now_unix())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+    h.dispatcher.drain_due_outbox_tasks(10).await.unwrap();
+    let t2 = h.db.get_delivery_task(task2_id).await.unwrap().unwrap();
+    assert_eq!(
+        t2.status,
+        DeliveryTaskStatus::Deferred,
+        "incompatible/uncompilable channel plugin must defer task instead of dead-lettering: {t2:?}"
+    );
+}
+
+#[tokio::test]
+async fn round3_on_delivered_idempotency_key_and_instance_isolation_and_strict_disabled_provider() {
+    let srv_a = MockServer::start().await;
+    let srv_b = MockServer::start().await;
+    let hits_a = Arc::new(Mutex::new(0usize));
+    let hits_b = Arc::new(Mutex::new(0usize));
+    let a_clone = Arc::clone(&hits_a);
+    let b_clone = Arc::clone(&hits_b);
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(move |_req: &MockRequest| {
+            *a_clone.lock().unwrap() += 1;
+            ResponseTemplate::new(200)
+        })
+        .mount(&srv_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(move |_req: &MockRequest| {
+            *b_clone.lock().unwrap() += 1;
+            ResponseTemplate::new(200)
+        })
+        .mount(&srv_b)
+        .await;
+
+    let h = JsHarness::new().await;
+    let chan_js = r#"
+        export const meta = {
+            id: "noop-chan",
+            name: "Noop Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: { type: "object", properties: {} },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver() { return { outcome: "delivered" }; }
+    "#;
+    let iso_proc_js = format!(
+        r#"
+        export const meta = {{
+            id: "iso-proc",
+            name: "Iso Proc",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "processor",
+            hooks: ["on_render", "on_delivered"],
+            instance_schema: {{
+                type: "object",
+                properties: {{ endpoint: {{ type: "string", format: "uri" }} }}
+            }},
+            route_option_schema: {{
+                type: "object",
+                properties: {{
+                    provider_id: {{ type: "integer" }}
+                }}
+            }}
+        }};
+        export function onRender(ctx) {{
+            return {{ outcome: "continue" }};
+        }}
+        export function onDelivered(ctx) {{
+            // Try reaching srv_b (belongs to another instance) -> must be SSRF-blocked!
+            let bBlocked = false;
+            try {{
+                fc.fetch({{ method: "POST", url: "{uri_b}/hook", body: "x" }});
+            }} catch (e) {{
+                bBlocked = String(e.message || e).indexOf("SSRF_BLOCKED") !== -1;
+            }}
+            if (!bBlocked) {{
+                throw new Error("cross-instance origin leaked!");
+            }}
+            // Reaching srv_a (bound provider_id) must succeed!
+            const resp = fc.fetch({{ method: "POST", url: "{uri_a}/hook", body: JSON.stringify(ctx.payload) }});
+            if (!resp.ok) throw new Error("srv_a failed");
+        }}
+        "#,
+        uri_a = srv_a.uri(),
+        uri_b = srv_b.uri()
+    );
+    for js in [chan_js, &iso_proc_js] {
+        let (st, resp) = h
+            .req(
+                Method::POST,
+                "/api/v1/plugins/upload",
+                Some(json!({ "script_js": js, "enabled": true })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "upload failed: {resp}");
+    }
+
+    let (st, inst_a) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/iso-proc/instances",
+            Some(
+                json!({ "name": "Inst A", "config": { "endpoint": srv_a.uri() }, "enabled": true }),
+            ),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let inst_a_id = inst_a["id"].as_i64().unwrap();
+
+    let (st, _inst_b) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/iso-proc/instances",
+            Some(
+                json!({ "name": "Inst B", "config": { "endpoint": srv_b.uri() }, "enabled": true }),
+            ),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Noop Ch",
+                "kind": "plugin",
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "config": { "kind": "plugin", "plugin_id": "noop-chan", "config": {} },
+                "initial_destination": { "name": "Dest", "config": { "kind": "plugin", "config": {} } }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed_id, entry1_id) = h
+        .seed_feed_and_entry("Iso Entry", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Iso Route",
+                "feed_ids": [feed_id],
+                "channel_id": ch_id,
+                "destination_id": dest_id,
+                "options": {
+                    "plugins": {
+                        "iso-proc": { "provider_id": inst_a_id, "strict_mode": true }
+                    }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "route failed: {route}");
+    let route_id = route["id"].as_i64().unwrap();
+
+    let task1_id =
+        h.db.enqueue_delivery_task(route_id, ch_id, dest_id, entry1_id, now_unix())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+    h.dispatcher.drain_due_outbox_tasks(10).await.unwrap();
+
+    // Verify deterministic idempotency key (`sha256("on_delivered:iso-proc:{task1_id}")`, no timestamp!)
+    let events =
+        h.db.list_due_plugin_events(now_unix() + 60, 10)
+            .await
+            .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].idempotency_key,
+        sha256_hex(format!("on_delivered:iso-proc:{task1_id}").as_bytes())
+    );
+    let ev_payload: Value = serde_json::from_str(&events[0].payload_json).unwrap();
+    assert_eq!(ev_payload["provider_id"], inst_a_id);
+
+    // Dispatch event: srv_a succeeds, srv_b blocked!
+    assert_eq!(
+        h.dispatcher
+            .process_due_plugin_events_once(10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(*hits_a.lock().unwrap(), 1);
+    assert_eq!(*hits_b.lock().unwrap(), 0);
+    assert!(
+        h.db.list_due_plugin_events(now_unix() + 9999, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Disable `inst_a`: because route has `strict_mode: true`, new delivery MUST enter `Retrying`!
+    let (st, _) = h
+        .req(
+            Method::PATCH,
+            &format!("/api/v1/plugins/iso-proc/instances/{inst_a_id}"),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, entry2_id) = h
+        .seed_feed_and_entry("Strict Disabled", None, "<p>Body 2</p>", None, None, None)
+        .await;
+    let task2_id =
+        h.db.enqueue_delivery_task(route_id, ch_id, dest_id, entry2_id, now_unix())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+    h.dispatcher.drain_due_outbox_tasks(10).await.unwrap();
+    let t2 = h.db.get_delivery_task(task2_id).await.unwrap().unwrap();
+    assert_eq!(
+        t2.status,
+        DeliveryTaskStatus::Retrying,
+        "strict_mode must retry when bound provider instance is disabled: {t2:?}"
+    );
+}
+
+#[tokio::test]
+async fn round3_market_install_returns_409_over_custom_plugin_and_disabled_js_processor_rejected() {
+    let market_srv = MockServer::start().await;
+    let ntfy_js = include_str!("fixtures/plugins/ntfy_0_3_1.js");
+    let ntfy_sha = sha256_hex(ntfy_js.as_bytes());
+    let index_json = json!({
+        "schema_version": 1,
+        "generated_at": "2026-11-25T00:00:00Z",
+        "plugins": [{
+            "id": "ntfy",
+            "name": "ntfy Push",
+            "version": "0.3.1",
+            "latest": "0.3.1",
+            "api_version": "1",
+            "kind": "channel",
+            "runtime": "js",
+            "min_core": "0.3.1",
+            "category": "delivery",
+            "icon": "bell",
+            "description": "ntfy",
+            "allowed_hosts": ["ntfy.sh"],
+            "hooks": [],
+            "permissions": ["network"],
+            "versions": [{
+                "version": "0.3.1",
+                "min_core": "0.3.1",
+                "path": "plugins/channels/ntfy/plugin.js",
+                "sha256": ntfy_sha
+            }]
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(index_json))
+        .mount(&market_srv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/plugins/channels/ntfy/plugin.js"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ntfy_js))
+        .mount(&market_srv)
+        .await;
+
+    let h = JsHarness::with_options(
+        Some(format!("{}/index.json", market_srv.uri())),
+        vec!["127.0.0.1/32".to_string()],
+    )
+    .await;
+
+    // 1. Install `ntfy` as a custom upload first.
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": ntfy_js, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // 2. Market dry_run preview exposes `installed_source: "custom"`.
+    let (st, preview) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/install",
+            Some(json!({ "plugin_id": "ntfy", "dry_run": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "preview failed: {preview}");
+    assert_eq!(preview["already_installed"], true);
+    assert_eq!(preview["installed_source"], "custom");
+
+    // 3. Market install WITHOUT `replace_custom: true` MUST return 409 Conflict!
+    let (st, conflict) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/install",
+            Some(json!({ "plugin_id": "ntfy" })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "expected 409 Conflict: {conflict}"
+    );
+
+    // 4. Market install WITH `replace_custom: true` succeeds and switches source to `"market"`.
+    let (st, installed) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/install",
+            Some(json!({ "plugin_id": "ntfy", "replace_custom": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "replace_custom failed: {installed}");
+    assert_eq!(installed["source"], "market");
+
+    // 5. Disabled JS processor plugin rejects instance creation and route attachment!
+    let proc_js = r#"
+        export const meta = {
+            id: "gated-proc",
+            name: "Gated Proc",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "processor",
+            hooks: ["on_render"],
+            instance_schema: { type: "object", properties: { label: { type: "string" } } },
+            route_option_schema: { type: "object", properties: {} }
+        };
+        export function onRender() { return { outcome: "continue" }; }
+    "#;
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": proc_js, "enabled": false })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/gated-proc/instances",
+            Some(json!({ "name": "Blocked Inst", "config": { "label": "x" } })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "disabled JS processor must reject instance creation: {err}"
     );
 }

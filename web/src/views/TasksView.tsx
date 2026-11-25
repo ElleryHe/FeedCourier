@@ -56,9 +56,16 @@ const DELIVERED_WARNING_MARKERS = [
 ] as const;
 
 function hasDeliveredWarning(task: DeliveryTaskDto): boolean {
-  if (task.status !== "delivered" || !task.diagnostic_log) return false;
-  return DELIVERED_WARNING_MARKERS.some((marker) =>
-    task.diagnostic_log?.includes(marker),
+  if (task.status !== "delivered") return false;
+  if (typeof task.has_warnings === "boolean") {
+    return task.has_warnings;
+  }
+  if (!task.diagnostic_log) return false;
+  return (
+    task.diagnostic_log.includes("[warn] ") ||
+    DELIVERED_WARNING_MARKERS.some((marker) =>
+      task.diagnostic_log?.includes(marker),
+    )
   );
 }
 
@@ -443,11 +450,7 @@ export function TasksView({ initialStatusFilter = "all" }: TasksViewProps) {
             variant="secondary"
             size="sm"
             onClick={() => setConfirmRetryAllOpen(true)}
-            disabled={
-              statusFilter !== "all" &&
-              statusFilter !== "dead_letter" &&
-              deadLetterCount === 0
-            }
+            disabled={deadLetterCount === 0 || retryMutation.isPending}
           >
             <RotateCcw className="h-3.5 w-3.5" />
             {m.tasks.retryAllDeadLetter}

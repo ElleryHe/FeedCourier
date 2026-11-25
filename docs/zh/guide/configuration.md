@@ -29,13 +29,13 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
 | `DB_READ_MAX_CONNECTIONS` | `8` | 正整数（`u32 >= 1`） | SQLite WAL 只读连接池的最大连接数（写连接池固定为 `1`）。 |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | 日志过滤指令 | 日志级别控制，排查问题时可设为 `feedcourier=debug,tower_http=debug`。 |
 | `LOG_FORMAT` | `text` | `text` / `json` | 标准输出（`docker logs`）格式：`text`（人类可读）或 `json`（结构化单行 JSON）。标准输出与日志库共用统一脱敏规则，自动掩码邮箱、密钥字段、Bot Token 及 URL 查询参数。 |
-| `LOG_STORE` | `sqlite` | `sqlite` / `clickhouse` / `off` | 内部结构化日志存储后端：`sqlite`（独立的 `<DATA_DIR>/logs.db`，不与业务库争写锁）、`clickhouse`（HTTP 批量写入，适合大规模部署）或 `off`。 |
+| `LOG_STORE` | `sqlite` | `sqlite` / `clickhouse` / `off` | 内部结构化日志存储后端：`sqlite`（独立的 `<DATA_DIR>/logs.db`，不与业务库争写锁）、`clickhouse`（HTTP 批量写入，适合大规模部署）或 `off`。日志关键词检索校验 **`2–128`** 个字符，未指定起始时间时自动默认仅检索最近 **24 小时**窗口，并强制执行 **5 秒**查询超时上限。 |
 | `LOG_STORE_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` | 写入日志库的最低日志级别。 |
 | `LOG_RETENTION_DAYS` | `7` | 正整数（`>= 1`） | 日志保留天数（SQLite 每小时清理；ClickHouse 自动设为表 `TTL`）。 |
 | `LOG_MAX_ROWS` | `100000` | 整数（`>= 100`） | SQLite `logs.db` 保留的最大行数上限（ClickHouse 模式下忽略）。 |
 | `LOG_CLICKHOUSE_URL` | *（未设置）* | `http://` 或 `https://` URL | ClickHouse HTTP 接口地址（如 `http://clickhouse:8123`，`LOG_STORE=clickhouse` 时必填）。视为运维可信地址，不走 SSRF 拦截但禁止重定向。 |
 | `LOG_CLICKHOUSE_DATABASE` | `feedcourier` | 标识符 | ClickHouse 目标数据库名（启动时自动创建）。 |
-| `LOG_CLICKHOUSE_TABLE` | `logs` | 标识符 | ClickHouse 目标 `MergeTree` 表名（启动时自动建表并按 `LOG_RETENTION_DAYS` 设置 `TTL`）。 |
+| `LOG_CLICKHOUSE_TABLE` | `logs` | 标识符 | ClickHouse 目标 `MergeTree` 表名（启动时自动建表并按 `LOG_RETENTION_DAYS` 设置 `TTL`；`ts` 以 UTC `YYYY-MM-DD HH:MM:SS.fff` 字符串序列化写入 `DateTime64(3, 'UTC')`，同时保留整型的毫秒时间戳 `ts_ms`）。 |
 | `LOG_CLICKHOUSE_USER` | *（未设置）* | 字符串 | 可选的 ClickHouse 用户名（`X-ClickHouse-User`）。 |
 | `LOG_CLICKHOUSE_PASSWORD` | *（未设置）* | 字符串 | 可选的 ClickHouse 密码（`X-ClickHouse-Key`）。 |
 
@@ -68,7 +68,9 @@ FeedCourier 的基础运行参数通过环境变量设置，而网络代理、�
    - 插件服务商实例（如 Link Rewrite / YOURLS）以及订阅源预览请求均支持独立开启 `use_proxy`。
 
 > [!WARNING]
-> **`use_proxy: true` 失败关闭（Fail-Closed）保证**：当订阅源、通道账号、预览请求或插件实例显式开启 `use_proxy: true` 但全局未配置任何 `OUTBOUND_PROXY`（或 WebUI 设置中的代理地址）时，FeedCourier 会**直接报错拦截**，绝不静默回退为直连而暴露宿主机真实出口 IP。
+> **`use_proxy: true` 失败关闭（Fail-Closed）与代理 DNS 边界**：
+> - 当订阅源、通道账号、预览请求或插件实例显式开启 `use_proxy: true` 但全局未配置任何 `OUTBOUND_PROXY`（或 WebUI 设置中的代理地址）时，FeedCourier 会**直接报错拦截**，绝不静默回退为直连而暴露宿主机真实出口 IP。
+> - 云元数据字面量 IP（`169.254.169.254`、`169.254.170.2`、`100.100.100.200`、`fd00:ec2::254` 及 IPv4 映射 IPv6 / NAT64 形式）与元数据主机名（`metadata.google.internal`、`metadata.goog`、`instance-data`）在直连与代理请求中均被强制拦截。直连与本地 DNS 解析代理（`socks5://`）还会在连接前解析 DNS 并拦截元数据 IP；远端 DNS 解析代理（`http://`、`https://`、`socks5h://`）由于 DNS 解析发生在代理服务端，客户端侧强制校验主机名与字面量 IP。
 
 ---
 

@@ -53,12 +53,13 @@ async fn main() -> AppResult<()> {
         runtime.outbox_notify().notify_one();
     }
 
-    let mcp_cancel = scheduler_handle.cancel_token().child_token();
+    let root_cancel = scheduler_handle.cancel_token().clone();
+    let mcp_cancel = root_cancel.child_token();
     let mcp_state = McpState::new(db.clone(), runtime.ingest().clone())
         .with_outbox_notify(runtime.outbox_notify())
         .with_runtime(runtime.clone())
         .with_log_store(log_store.clone())
-        .with_cancellation_token(mcp_cancel.clone());
+        .with_cancellation_token(mcp_cancel);
     let app_state = AppState::new(runtime);
     let app = build_full_router(app_state, mcp_state);
 
@@ -80,10 +81,10 @@ async fn main() -> AppResult<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(mcp_cancel))
+    .with_graceful_shutdown(shutdown_signal(root_cancel))
     .await?;
 
-    tracing::info!("HTTP server drained; stopping background scheduler");
+    tracing::info!("HTTP server drained; waiting for background scheduler shutdown");
     scheduler_handle.shutdown().await;
     db.close().await;
     tracing::info!("FeedCourier shut down cleanly");
@@ -92,7 +93,7 @@ async fn main() -> AppResult<()> {
     Ok(())
 }
 
-async fn shutdown_signal(mcp_cancel: CancellationToken) {
+async fn shutdown_signal(root_cancel: CancellationToken) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %err, "failed to install SIGINT handler");
@@ -118,13 +119,13 @@ async fn shutdown_signal(mcp_cancel: CancellationToken) {
 
     tokio::select! {
         () = ctrl_c => {
-            tracing::info!("SIGINT received, draining HTTP connections");
+            tracing::info!("SIGINT received, draining background scheduler and HTTP connections");
         }
         () = terminate => {
-            tracing::info!("SIGTERM received, draining HTTP connections");
+            tracing::info!("SIGTERM received, draining background scheduler and HTTP connections");
         }
     }
 
-    // Cancel open Streamable HTTP `/mcp` SSE streams so `axum::serve` drains without hanging.
-    mcp_cancel.cancel();
+    // Cancel the root scheduler token so background loops AND child `/mcp` SSE streams drain concurrently.
+    root_cancel.cancel();
 }

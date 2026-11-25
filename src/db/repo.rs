@@ -50,6 +50,18 @@ pub enum DeleteGuardOutcome {
     Conflict(Vec<(i64, String)>),
 }
 
+/// Atomic outcome of transactional JS plugin uninstall (`DELETE /api/v1/plugins/{id}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteJsPluginOutcome {
+    Deleted,
+    NotFound,
+    NotDeletable(String),
+    Conflict {
+        referencing_channels: Vec<(i64, String)>,
+        referencing_routes: Vec<(i64, String)>,
+    },
+}
+
 impl Database {
     // =========================================================================
     // Feeds CRUD & Polling State Machine
@@ -2910,18 +2922,25 @@ impl Database {
             .ok_or_else(|| AppError::NotFound(format!("plugin '{id}' not found")))?;
         let next_enabled = enabled.unwrap_or(current.enabled);
         let next_settings = settings_json.unwrap_or(&current.settings_json);
+        let next_disabled_reason: Option<String> = if enabled.is_some() {
+            None
+        } else {
+            current.disabled_reason.clone()
+        };
         let row = sqlx::query_as::<_, PluginRow>(
             r#"
             UPDATE plugins
             SET enabled = ?1,
                 settings_json = ?2,
-                updated_at = ?3
-            WHERE id = ?4
+                disabled_reason = ?3,
+                updated_at = ?4
+            WHERE id = ?5
             RETURNING *
             "#,
         )
         .bind(next_enabled)
         .bind(next_settings)
+        .bind(next_disabled_reason)
         .bind(now_unix())
         .bind(id)
         .fetch_one(&self.write_pool)
@@ -2929,10 +2948,30 @@ impl Database {
         Ok(row)
     }
 
+    /// Auto-disable an installed JS plugin (e.g. circuit breaker after repeated execution timeouts)
+    /// and record the human-readable `disabled_reason` for WebUI display.
+    pub async fn disable_plugin_with_reason(&self, id: &str, reason: &str) -> AppResult<bool> {
+        let res = sqlx::query(
+            r#"
+            UPDATE plugins
+            SET enabled = 0,
+                disabled_reason = ?1,
+                updated_at = ?2
+            WHERE id = ?3 AND source IN ('market', 'custom')
+            "#,
+        )
+        .bind(reason)
+        .bind(now_unix())
+        .bind(id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Insert or upgrade a JS plugin row (`source` in `'market' | 'custom'`).
     /// Preserves `settings_json` and `created_at` on in-place upgrade/version switch; when `enabled`
     /// is `Some(flag)`, applies that flag, otherwise preserves existing `enabled` (defaulting to
-    /// `true` for newly installed plugins).
+    /// `true` for newly installed plugins). Always clears any prior `disabled_reason`.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_js_plugin(
         &self,
@@ -2964,6 +3003,7 @@ impl Database {
                     script_sha256 = ?5,
                     manifest_json = ?6,
                     enabled = ?7,
+                    disabled_reason = NULL,
                     installed_at = ?8,
                     updated_at = ?8
                 WHERE id = ?9 AND source IN ('market', 'custom')
@@ -2988,8 +3028,8 @@ impl Database {
                 INSERT INTO plugins (
                     id, enabled, installed_version, settings_json, source, kind,
                     script_js, script_sha256, manifest_json, installed_at,
-                    created_at, updated_at
-                ) VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9)
+                    disabled_reason, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?9, ?9)
                 RETURNING *
                 "#,
             )
@@ -3008,22 +3048,77 @@ impl Database {
         Ok(row)
     }
 
-    /// Atomically delete an installed JS plugin (`source IN ('market', 'custom')`), optionally
-    /// cascading deletion of referencing channel accounts and stripping route plugin bindings.
-    pub async fn delete_js_plugin(
+    /// Atomically inspect referencing `channels` and `routes` for a JS plugin (`market` | `custom`)
+    /// inside a single `write_pool` transaction, returning [`DeleteJsPluginOutcome::Conflict`] when
+    /// referenced and `cascade == false`, or cascading deletion/stripping and removing the plugin.
+    pub async fn delete_js_plugin_guarded(
         &self,
         plugin_id: &str,
-        referencing_channel_ids: &[i64],
-        strip_from_route_ids: &[i64],
-    ) -> AppResult<bool> {
+        master_key: &MasterKey,
+        cascade: bool,
+    ) -> AppResult<DeleteJsPluginOutcome> {
         let mut tx = self.write_pool.begin().await?;
-        for ch_id in referencing_channel_ids {
+
+        let Some(row) = sqlx::query_as::<_, PluginRow>("SELECT * FROM plugins WHERE id = ?1")
+            .bind(plugin_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(DeleteJsPluginOutcome::NotFound);
+        };
+
+        if !matches!(row.source.as_str(), "market" | "custom") {
+            return Ok(DeleteJsPluginOutcome::NotDeletable(
+                "Only installed JS plugins can be deleted".to_string(),
+            ));
+        }
+
+        let plugin_channels: Vec<Channel> =
+            sqlx::query_as("SELECT * FROM channels WHERE kind = 'plugin' ORDER BY id ASC")
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut ref_channels: Vec<(i64, String)> = Vec::new();
+        for ch in plugin_channels {
+            if let Ok(ChannelConfig::Plugin(p)) = master_key.decrypt_json(&ch.encrypted_config)
+                && p.plugin_id == plugin_id
+            {
+                ref_channels.push((ch.id, ch.name));
+            }
+        }
+        let ref_ch_ids: Vec<i64> = ref_channels.iter().map(|(id, _)| *id).collect();
+
+        let all_routes: Vec<Route> = sqlx::query_as("SELECT * FROM routes ORDER BY id ASC")
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut ref_routes: Vec<(i64, String)> = Vec::new();
+        let mut strip_route_ids: Vec<i64> = Vec::new();
+        for route in all_routes {
+            let uses_channel = ref_ch_ids.contains(&route.channel_id);
+            let opts = route.options();
+            let uses_processor = opts.plugins.contains_key(plugin_id)
+                || opts.plugin_order.iter().any(|p| p == plugin_id);
+            if uses_channel || uses_processor {
+                ref_routes.push((route.id, route.name));
+                if uses_processor && !uses_channel {
+                    strip_route_ids.push(route.id);
+                }
+            }
+        }
+
+        if (!ref_channels.is_empty() || !ref_routes.is_empty()) && !cascade {
+            return Ok(DeleteJsPluginOutcome::Conflict {
+                referencing_channels: ref_channels,
+                referencing_routes: ref_routes,
+            });
+        }
+
+        for ch_id in &ref_ch_ids {
             sqlx::query("DELETE FROM channels WHERE id = ?1")
                 .bind(ch_id)
                 .execute(&mut *tx)
                 .await?;
         }
-        for route_id in strip_from_route_ids {
+        for route_id in &strip_route_ids {
             if let Some(route) = sqlx::query_as::<_, Route>("SELECT * FROM routes WHERE id = ?1")
                 .bind(route_id)
                 .fetch_optional(&mut *tx)
@@ -3047,7 +3142,11 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         tx.commit().await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() > 0 {
+            Ok(DeleteJsPluginOutcome::Deleted)
+        } else {
+            Ok(DeleteJsPluginOutcome::NotFound)
+        }
     }
 
     /// Fetch due persistent `plugin_events` ready for `on_delivered` dispatch.

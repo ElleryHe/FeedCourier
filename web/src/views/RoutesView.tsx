@@ -32,6 +32,7 @@ import type {
   FeedDto,
   PluginDto,
   PluginRouteOptionPropertySchema,
+  PluginRouteOptionSchema,
   RouteDto,
   RouteOptions,
   SystemLocale,
@@ -39,6 +40,12 @@ import type {
   UpdateRouteRequest,
 } from "@/api/types";
 import { PluginIcon } from "@/components/plugins/PluginIcon";
+import {
+  buildValidatedSchemaConfig,
+  initSchemaFieldValues,
+  type SchemaFieldValues,
+  SchemaFormFields,
+} from "@/components/plugins/SchemaFormFields";
 import {
   Badge,
   Button,
@@ -111,6 +118,38 @@ function extractConfiguredRoutePlugins(
     entries.push([pluginId, raw]);
   }
   return entries;
+}
+
+function isSpecialRouteOptionKey(
+  key: string,
+  prop?: PluginRouteOptionPropertySchema,
+): boolean {
+  return (
+    key === "provider_id" ||
+    key === "enabled" ||
+    (key === "strict_mode" && prop?.type === "boolean") ||
+    prop?.source === "plugin_instances"
+  );
+}
+
+function buildRemainingRouteOptionSchema(
+  rawSchema: PluginRouteOptionSchema | undefined,
+): Record<string, unknown> | null {
+  if (!rawSchema || !rawSchema.properties) return null;
+  const remainingProps: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rawSchema.properties)) {
+    if (isSpecialRouteOptionKey(k, v)) continue;
+    remainingProps[k] = v;
+  }
+  if (Object.keys(remainingProps).length === 0) return null;
+  const required = Array.isArray(rawSchema.required)
+    ? rawSchema.required.filter((k) => k in remainingProps)
+    : [];
+  return {
+    type: "object",
+    properties: remainingProps,
+    ...(required.length > 0 ? { required } : {}),
+  };
 }
 
 function cleanPluginOptionsForSubmit(
@@ -824,6 +863,23 @@ function RouteEditorModal({
     }
     return initial;
   });
+  const [pluginSchemaValues, setPluginSchemaValues] = useState<
+    Record<string, SchemaFieldValues>
+  >(() => {
+    const initial: Record<string, SchemaFieldValues> = {};
+    for (const [pid, cfg] of extractConfiguredRoutePlugins(
+      route?.options.plugins,
+    )) {
+      const target = plugins.find((p) => p.id === pid);
+      const remaining = buildRemainingRouteOptionSchema(
+        target?.manifest.route_option_schema,
+      );
+      if (remaining) {
+        initial[pid] = initSchemaFieldValues(remaining, cfg);
+      }
+    }
+    return initial;
+  });
   const [pluginOrder, setPluginOrder] = useState<string[]>(() => {
     const configured = extractConfiguredRoutePlugins(
       route?.options.plugins,
@@ -892,21 +948,7 @@ function RouteEditorModal({
         if (current.enabled === false) {
           delete current.enabled;
         }
-        const rawSchema = targetPlugin?.manifest.route_option_schema as
-          | {
-              required?: unknown;
-              properties?: Record<
-                string,
-                {
-                  type?: string;
-                  source?: string;
-                  enum?: unknown[];
-                  default?: unknown;
-                  nullable?: boolean;
-                }
-              >;
-            }
-          | undefined;
+        const rawSchema = targetPlugin?.manifest.route_option_schema;
         const requiredSet = new Set<string>(
           Array.isArray(rawSchema?.required)
             ? rawSchema.required.filter((k): k is string => typeof k === "string")
@@ -914,17 +956,13 @@ function RouteEditorModal({
         );
         const props = rawSchema?.properties ?? {};
         for (const [propKey, propSchema] of Object.entries(props)) {
+          if (!isSpecialRouteOptionKey(propKey, propSchema)) continue;
           if (current[propKey] !== undefined) continue;
           if (propSchema.default !== undefined && propSchema.default !== null) {
             current[propKey] = propSchema.default;
           } else if (
-            Array.isArray(propSchema.enum) &&
-            propSchema.enum.length > 0 &&
-            (requiredSet.has(propKey) || propSchema.nullable === false)
-          ) {
-            current[propKey] = propSchema.enum[0];
-          } else if (
-            propSchema.source === "plugin_instances" &&
+            (propKey === "provider_id" ||
+              propSchema.source === "plugin_instances") &&
             (requiredSet.has(propKey) || propSchema.nullable === false) &&
             targetPlugin &&
             targetPlugin.instances.length > 0
@@ -937,11 +975,29 @@ function RouteEditorModal({
         }
         return { ...prev, [pluginId]: current };
       });
+      const remainingSchema = buildRemainingRouteOptionSchema(
+        targetPlugin?.manifest.route_option_schema,
+      );
+      if (remainingSchema) {
+        setPluginSchemaValues((prev) => ({
+          ...prev,
+          [pluginId]: initSchemaFieldValues(
+            remainingSchema,
+            pluginOptions[pluginId],
+          ),
+        }));
+      }
       setPluginOrder((prev) =>
         prev.includes(pluginId) ? prev : [...prev, pluginId],
       );
     } else {
       setPluginOptions((prev) => {
+        const next = { ...prev };
+        delete next[pluginId];
+        return next;
+      });
+      setPluginSchemaValues((prev) => {
+        if (!(pluginId in prev)) return prev;
         const next = { ...prev };
         delete next[pluginId];
         return next;
@@ -1027,7 +1083,9 @@ function RouteEditorModal({
   };
 
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (
+      finalPlugins: Record<string, Record<string, unknown>>,
+    ) => {
       const options: RouteOptions = {
         ...(selectedChannel?.kind === "telegram"
           ? {
@@ -1040,12 +1098,10 @@ function RouteEditorModal({
         timezone: trimmedTz || null,
         active_windows: activeWindows,
         active_weekdays: [...activeWeekdays].sort((a, b) => a - b),
-        plugins: cleanPluginOptionsForSubmit(pluginOptions),
+        plugins: finalPlugins,
         plugin_order: visiblePlugins
           .map((p) => p.id)
-          .filter(
-            (id) => cleanPluginOptionsForSubmit(pluginOptions)[id] !== undefined,
-          ),
+          .filter((id) => finalPlugins[id] !== undefined),
       };
 
       if (isEdit && route) {
@@ -1125,7 +1181,47 @@ function RouteEditorModal({
       return;
     }
 
-    saveMutation.mutate();
+    const basePlugins = cleanPluginOptionsForSubmit(pluginOptions);
+    const finalPlugins: Record<string, Record<string, unknown>> = {};
+    for (const [pluginId, rawCfg] of Object.entries(basePlugins)) {
+      const targetPlugin = plugins.find((p) => p.id === pluginId);
+      const remainingSchema = buildRemainingRouteOptionSchema(
+        targetPlugin?.manifest.route_option_schema,
+      );
+      if (!remainingSchema) {
+        finalPlugins[pluginId] = rawCfg;
+        continue;
+      }
+      const remProps = (remainingSchema.properties ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const values =
+        pluginSchemaValues[pluginId] ??
+        initSchemaFieldValues(remainingSchema, rawCfg);
+      const { config, error } = buildValidatedSchemaConfig(
+        remainingSchema,
+        values,
+        false,
+        undefined,
+        m,
+      );
+      if (error || !config) {
+        const prefix = targetPlugin?.manifest.name ?? pluginId;
+        setFormError(`${prefix}: ${error ?? "Invalid plugin option"}`);
+        return;
+      }
+      const merged: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rawCfg)) {
+        if (!(k in remProps)) {
+          merged[k] = v;
+        }
+      }
+      Object.assign(merged, config);
+      finalPlugins[pluginId] = merged;
+    }
+
+    saveMutation.mutate(finalPlugins);
   };
 
   return (
@@ -1666,6 +1762,22 @@ function RouteEditorModal({
                   const propEntries = Object.entries(properties) as Array<
                     [string, PluginRouteOptionPropertySchema]
                   >;
+                  const instanceSelectEntries = propEntries.filter(
+                    ([propKey, schema]) =>
+                      propKey === "provider_id" ||
+                      schema.source === "plugin_instances",
+                  );
+                  const strictModeEntry = propEntries.find(
+                    ([propKey, schema]) =>
+                      propKey === "strict_mode" && schema.type === "boolean",
+                  );
+                  const remainingSchema = buildRemainingRouteOptionSchema(
+                    plugin.manifest.route_option_schema,
+                  );
+                  const hasAnyOption =
+                    instanceSelectEntries.length > 0 ||
+                    strictModeEntry !== undefined ||
+                    remainingSchema !== null;
                   const currentCfg = pluginOptions[plugin.id] ?? {};
                   const isDynamicProcessor = plugin.id !== "link-rewrite";
                   const isEnabledOnRoute =
@@ -1736,197 +1848,122 @@ function RouteEditorModal({
                       </div>
 
                       {(!isDynamicProcessor || isEnabledOnRoute) &&
-                        (propEntries.length === 0 ? (
+                        (!hasAnyOption ? (
                           <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
                             {m.routes.editor.pluginNoRouteOptionsHint}
                           </p>
                         ) : (
-                          <div className="grid gap-2.5 sm:grid-cols-2">
-                            {propEntries.map(([propKey, schema]) => {
+                          <div className="space-y-3">
+                            {instanceSelectEntries.map(([propKey, schema]) => {
                               const fieldVal = currentCfg[propKey];
                               const fieldId = `route-plugin-${plugin.id}-${propKey}`;
-
-                              if (
-                                schema.type === "select" &&
-                                schema.source === "plugin_instances"
-                              ) {
-                                const selectedId =
-                                  typeof fieldVal === "number"
-                                    ? fieldVal
-                                    : null;
-                                const missingSelected =
-                                  selectedId !== null &&
-                                  !plugin.instances.some(
-                                    (i) => i.id === selectedId,
-                                  );
-
-                                return (
-                                  <div key={propKey} className="sm:col-span-2">
-                                    <Label htmlFor={fieldId}>
-                                      {schema.title || propKey}
-                                    </Label>
-                                    <Select
-                                      id={fieldId}
-                                      value={
-                                        selectedId !== null
-                                          ? String(selectedId)
-                                          : ""
-                                      }
-                                      onChange={(e) => {
-                                        const raw = e.target.value;
-                                        updatePluginField(
-                                          plugin.id,
-                                          propKey,
-                                          raw ? Number(raw) : null,
-                                        );
-                                      }}
-                                      className="mt-1 h-8 text-xs"
-                                    >
-                                      {schema.nullable !== false && (
-                                        <option value="">
-                                          {m.common.disabled}
-                                        </option>
-                                      )}
-                                      {missingSelected &&
-                                        selectedId !== null && (
-                                          <option value={String(selectedId)}>
-                                            {m.routes.editor.pluginsMissingProvider(
-                                              selectedId,
-                                            )}
-                                          </option>
-                                        )}
-                                      {plugin.instances.map((inst) => (
-                                        <option key={inst.id} value={inst.id}>
-                                          {inst.name}
-                                          {!inst.enabled
-                                            ? ` (${m.common.disabled})`
-                                            : ""}
-                                        </option>
-                                      ))}
-                                    </Select>
-                                    {plugin.instances.length === 0 && (
-                                      <FieldHint>
-                                        {m.routes.editor.pluginsNoProviders}
-                                      </FieldHint>
-                                    )}
-                                  </div>
+                              const selectedId =
+                                typeof fieldVal === "number" ? fieldVal : null;
+                              const missingSelected =
+                                selectedId !== null &&
+                                !plugin.instances.some(
+                                  (i) => i.id === selectedId,
                                 );
-                              }
-
-                              if (
-                                (schema.type === "select" ||
-                                  schema.type === "string") &&
-                                Array.isArray(schema.enum)
-                              ) {
-                                return (
-                                  <div key={propKey}>
-                                    <Label htmlFor={fieldId}>
-                                      {schema.title || propKey}
-                                    </Label>
-                                    <Select
-                                      id={fieldId}
-                                      value={
-                                        typeof fieldVal === "string"
-                                          ? fieldVal
-                                          : ""
-                                      }
-                                      onChange={(e) =>
-                                        updatePluginField(
-                                          plugin.id,
-                                          propKey,
-                                          e.target.value || null,
-                                        )
-                                      }
-                                      className="mt-1 h-8 text-xs"
-                                    >
-                                      {schema.nullable !== false && (
-                                        <option value="">
-                                          {m.common.disabled}
-                                        </option>
-                                      )}
-                                      {schema.enum.map((opt) => (
-                                        <option key={opt} value={opt}>
-                                          {opt}
-                                        </option>
-                                      ))}
-                                    </Select>
-                                  </div>
-                                );
-                              }
-
-                              if (schema.type === "boolean") {
-                                return (
-                                  <div key={propKey} className="sm:col-span-2">
-                                    <Switch
-                                      id={fieldId}
-                                      checked={
-                                        typeof fieldVal === "boolean"
-                                          ? fieldVal
-                                          : Boolean(schema.default)
-                                      }
-                                      onCheckedChange={(checked) =>
-                                        updatePluginField(
-                                          plugin.id,
-                                          propKey,
-                                          checked,
-                                        )
-                                      }
-                                      label={schema.title || propKey}
-                                      description={schema.description}
-                                    />
-                                  </div>
-                                );
-                              }
 
                               return (
                                 <div key={propKey}>
                                   <Label htmlFor={fieldId}>
                                     {schema.title || propKey}
                                   </Label>
-                                  <Input
+                                  <Select
                                     id={fieldId}
-                                    type={
-                                      schema.type === "number"
-                                        ? "number"
-                                        : "text"
-                                    }
                                     value={
-                                      fieldVal !== undefined &&
-                                      fieldVal !== null
-                                        ? String(fieldVal)
+                                      selectedId !== null
+                                        ? String(selectedId)
                                         : ""
                                     }
                                     onChange={(e) => {
                                       const raw = e.target.value;
-                                      if (!raw) {
-                                        updatePluginField(
-                                          plugin.id,
-                                          propKey,
-                                          null,
-                                        );
-                                      } else if (schema.type === "number") {
-                                        const num = Number(raw);
-                                        if (!Number.isNaN(num)) {
-                                          updatePluginField(
-                                            plugin.id,
-                                            propKey,
-                                            num,
-                                          );
-                                        }
-                                      } else {
-                                        updatePluginField(
-                                          plugin.id,
-                                          propKey,
-                                          raw,
-                                        );
-                                      }
+                                      updatePluginField(
+                                        plugin.id,
+                                        propKey,
+                                        raw ? Number(raw) : null,
+                                      );
                                     }}
-                                    placeholder={schema.placeholder}
                                     className="mt-1 h-8 text-xs"
-                                  />
+                                  >
+                                    {schema.nullable !== false && (
+                                      <option value="">
+                                        {m.common.disabled}
+                                      </option>
+                                    )}
+                                    {missingSelected && selectedId !== null && (
+                                      <option value={String(selectedId)}>
+                                        {m.routes.editor.pluginsMissingProvider(
+                                          selectedId,
+                                        )}
+                                      </option>
+                                    )}
+                                    {plugin.instances.map((inst) => (
+                                      <option key={inst.id} value={inst.id}>
+                                        {inst.name}
+                                        {!inst.enabled
+                                          ? ` (${m.common.disabled})`
+                                          : ""}
+                                      </option>
+                                    ))}
+                                  </Select>
+                                  {plugin.instances.length === 0 && (
+                                    <FieldHint>
+                                      {m.routes.editor.pluginsNoProviders}
+                                    </FieldHint>
+                                  )}
                                 </div>
                               );
                             })}
+
+                            {strictModeEntry && (() => {
+                              const [propKey, schema] = strictModeEntry;
+                              const fieldVal = currentCfg[propKey];
+                              const fieldId = `route-plugin-${plugin.id}-${propKey}`;
+                              return (
+                                <div key={propKey}>
+                                  <Switch
+                                    id={fieldId}
+                                    checked={
+                                      typeof fieldVal === "boolean"
+                                        ? fieldVal
+                                        : Boolean(schema.default)
+                                    }
+                                    onCheckedChange={(checked) =>
+                                      updatePluginField(
+                                        plugin.id,
+                                        propKey,
+                                        checked,
+                                      )
+                                    }
+                                    label={schema.title || propKey}
+                                    description={schema.description}
+                                  />
+                                </div>
+                              );
+                            })()}
+
+                            {remainingSchema && (
+                              <SchemaFormFields
+                                idPrefix={`route-plugin-${plugin.id}`}
+                                schema={remainingSchema}
+                                values={
+                                  pluginSchemaValues[plugin.id] ??
+                                  initSchemaFieldValues(
+                                    remainingSchema,
+                                    currentCfg,
+                                  )
+                                }
+                                onChange={(nextValues) => {
+                                  setPluginSchemaValues((prev) => ({
+                                    ...prev,
+                                    [plugin.id]: nextValues,
+                                  }));
+                                  setFormError(null);
+                                }}
+                              />
+                            )}
                           </div>
                         ))}
                     </div>

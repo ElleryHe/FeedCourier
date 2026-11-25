@@ -21,6 +21,9 @@ use crate::error::{AppError, AppResult};
 /// Cloud metadata IPv4 endpoint (`169.254.169.254`) used by AWS, GCP, Azure, OpenStack, etc.
 pub const CLOUD_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
+/// AWS ECS task metadata IPv4 endpoint (`169.254.170.2`).
+pub const AWS_ECS_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 170, 2);
+
 /// Alibaba Cloud ECS metadata IPv4 endpoint (`100.100.100.200`).
 pub const ALIBABA_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
@@ -549,6 +552,11 @@ pub fn check_hard_blocked_plugin_ip(hostname: &str, raw_ip: IpAddr) -> AppResult
                     "target '{hostname}' resolved to cloud metadata address 169.254.169.254"
                 )));
             }
+            if v4 == AWS_ECS_METADATA_IPV4 {
+                return Err(AppError::SsrfBlocked(format!(
+                    "target '{hostname}' resolved to cloud metadata address 169.254.170.2"
+                )));
+            }
             if v4 == ALIBABA_METADATA_IPV4 {
                 return Err(AppError::SsrfBlocked(format!(
                     "target '{hostname}' resolved to cloud metadata address 100.100.100.200"
@@ -629,48 +637,87 @@ pub fn check_hard_blocked_plugin_url(url: &Url) -> AppResult<()> {
 /// Connect-time DNS resolver used for admin-configured `format: "uri"` plugin origins (e.g.,
 /// self-hosted LAN/Docker `ntfy` or `Bark` servers): allows private/loopback/Docker hostnames
 /// while STILL rejecting cloud metadata, unspecified, and broadcast IPs at connect time.
-#[derive(Clone, Debug, Default)]
-pub struct PluginMetadataGuardDnsResolver;
+#[derive(Clone, Default)]
+pub struct PluginMetadataGuardDnsResolver {
+    custom_lookup: Option<CustomDnsLookup>,
+}
+
+impl fmt::Debug for PluginMetadataGuardDnsResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginMetadataGuardDnsResolver")
+            .field("has_custom_lookup", &self.custom_lookup.is_some())
+            .finish()
+    }
+}
+
+impl PluginMetadataGuardDnsResolver {
+    pub fn new() -> Self {
+        Self {
+            custom_lookup: None,
+        }
+    }
+
+    pub fn with_custom_lookup(lookup: CustomDnsLookup) -> Self {
+        Self {
+            custom_lookup: Some(lookup),
+        }
+    }
+
+    /// Resolve `host` and verify that NO resolved IP belongs to cloud metadata, unspecified, or
+    /// broadcast ranges. Used at connect time for direct calls and pre-connect for local-DNS
+    /// proxies (`socks5://`, `socks4://`).
+    pub async fn resolve_and_check_metadata(&self, host: &str) -> AppResult<Vec<IpAddr>> {
+        let clean = host
+            .trim()
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host.trim());
+        let ips: Vec<IpAddr> = if let Ok(ip) = IpAddr::from_str(clean) {
+            vec![ip]
+        } else if let Some(custom) = &self.custom_lookup {
+            (custom)(clean.to_string()).await.map_err(|err| {
+                AppError::Upstream(format!("DNS lookup failed for '{clean}': {err}"))
+            })?
+        } else {
+            let addrs = tokio::net::lookup_host((clean, 0u16))
+                .await
+                .map_err(|err| {
+                    AppError::Upstream(format!("DNS lookup failed for '{clean}': {err}"))
+                })?;
+            addrs.map(|sa| sa.ip()).collect()
+        };
+        if ips.is_empty() {
+            return Err(AppError::SsrfBlocked(format!(
+                "hostname '{clean}' resolved to zero IP addresses"
+            )));
+        }
+        for &ip in &ips {
+            check_hard_blocked_plugin_ip(clean, ip)?;
+        }
+        Ok(ips)
+    }
+}
 
 impl Resolve for PluginMetadataGuardDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
+        let this = self.clone();
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let clean = host
-                .trim()
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(host.trim());
-            let ips: Vec<IpAddr> = if let Ok(ip) = IpAddr::from_str(clean) {
-                vec![ip]
-            } else {
-                let addrs = tokio::net::lookup_host((clean, 0u16))
-                    .await
-                    .map_err(|err| {
-                        Box::new(std::io::Error::other(format!(
-                            "DNS lookup failed for '{clean}': {err}"
-                        ))) as Box<dyn StdError + Send + Sync>
-                    })?;
-                addrs.map(|sa| sa.ip()).collect()
-            };
-            if ips.is_empty() {
-                return Err(Box::new(SsrfBlockedError(format!(
-                    "hostname '{clean}' resolved to zero IP addresses"
-                ))) as Box<dyn StdError + Send + Sync>);
-            }
-            for &ip in &ips {
-                if let Err(AppError::SsrfBlocked(msg)) = check_hard_blocked_plugin_ip(clean, ip) {
+            match this.resolve_and_check_metadata(&host).await {
+                Ok(ips) => {
+                    let addrs: Addrs = Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+                    Ok(addrs)
+                }
+                Err(AppError::SsrfBlocked(msg)) => {
                     let detail = msg
                         .strip_prefix("SSRF guard blocked target: ")
                         .unwrap_or(&msg)
                         .to_string();
-                    return Err(
-                        Box::new(SsrfBlockedError(detail)) as Box<dyn StdError + Send + Sync>
-                    );
+                    Err(Box::new(SsrfBlockedError(detail)) as Box<dyn StdError + Send + Sync>)
                 }
+                Err(other) => Err(Box::new(std::io::Error::other(other.to_string()))
+                    as Box<dyn StdError + Send + Sync>),
             }
-            let addrs: Addrs = Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
-            Ok(addrs)
         })
     }
 }

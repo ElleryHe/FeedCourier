@@ -6,6 +6,7 @@
 
 use std::sync::LazyLock;
 
+use base64::Engine as _;
 use regex::Regex;
 
 use crate::crypto::mask_emails_in_text;
@@ -24,6 +25,10 @@ static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{4,}").expect("BEARER_RE must compile")
 });
 
+static BASIC_AUTH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bBasic\s+([A-Za-z0-9+/=]{4,})").expect("BASIC_AUTH_RE must compile")
+});
+
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(?:https?|smtps?|socks5h?|socks4a?)://[^\s"'<>)\]}]+"#)
         .expect("URL_RE must compile")
@@ -31,10 +36,37 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static KV_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(["']?)([A-Za-z0-9_-]*(?:token|password|passwd|secret|signature|api[_-]?key|apikey|authorization|cookie|credential|bearer|private[_-]?key)[A-Za-z0-9_-]*)(["']?)(\s*)([=:])(\s*)(?:("(?:\\.|[^"\\])+")|('(?:\\.|[^'\\])+')|((?:Bearer\s+)?[^\s,;&"'}\]]+))"#,
+        r#"(?i)((?:\\?["'])?)([A-Za-z0-9_-]*(?:token|password|passwd|passphrase|secret|signature|api[_-]?key|apikey|device[_-]?key|push[_-]?key|access[_-]?key|webhook[_-]?key|authorization|cookie|credential|bearer|private[_-]?key)[A-Za-z0-9_-]*)((?:\\?["'])?)(\s*)([=:])(\s*)(?:(\\"(?:\\\\\\"|\\\\|\\[^"]|[^"\\])+\\")|("(?:\\.|[^"\\])+")|('(?:\\.|[^'\\])+')|((?:(?:Bearer|Basic|Token|Digest)\s+)?[^\s,;&"'}\\]+))"#,
     )
     .expect("KV_SECRET_RE must compile")
 });
+
+fn is_likely_basic_auth_token(tok: &str) -> bool {
+    if tok.len() >= 4 {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(tok)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(tok));
+        if let Ok(bytes) = decoded
+            && let Ok(text) = std::str::from_utf8(&bytes)
+            && text.contains(':')
+        {
+            return true;
+        }
+    }
+    if tok.len() >= 8 {
+        if tok.ends_with('=')
+            || tok
+                .bytes()
+                .any(|b| b.is_ascii_digit() || matches!(b, b'+' | b'/'))
+        {
+            return true;
+        }
+        if tok.bytes().skip(1).any(|b| b.is_ascii_uppercase()) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Returns `true` when a structured tracing field name indicates secret material.
 pub fn is_sensitive_field_name(name: &str) -> bool {
@@ -50,11 +82,20 @@ pub fn is_sensitive_field_name(name: &str) -> bool {
         "token",
         "password",
         "passwd",
+        "passphrase",
         "secret",
         "signature",
         "api_key",
         "api-key",
         "apikey",
+        "device_key",
+        "device-key",
+        "push_key",
+        "push-key",
+        "access_key",
+        "access-key",
+        "webhook_key",
+        "webhook-key",
         "authorization",
         "cookie",
         "credential",
@@ -128,7 +169,8 @@ pub fn redact_text(raw: &str) -> String {
     // 3. Mask Telegram Bot API `/bot<token>/` path segments.
     let tg_cleaned = TG_BOT_PATH_RE.replace_all(&urls_cleaned, "/bot[redacted]/");
 
-    // 4. Mask inline `key=value`, `key: value`, quoted `key="value"`, and JSON `"key": "value"` secrets.
+    // 4. Mask inline `key=value`, `key: value`, quoted `key="value"`, JSON `"key": "value"`, and
+    //    debug-escaped JSON `\"key\":\"value\"` secrets.
     let kv_cleaned = KV_SECRET_RE.replace_all(&tg_cleaned, |caps: &regex::Captures<'_>| {
         let key = &caps[2];
         if !is_sensitive_field_name(key) {
@@ -140,21 +182,31 @@ pub fn redact_text(raw: &str) -> String {
         let sep = &caps[5];
         let ws_after = &caps[6];
         if caps.get(7).is_some() {
-            format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\"")
+            format!(r#"{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\""#)
         } else if caps.get(8).is_some() {
+            format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\"")
+        } else if caps.get(9).is_some() {
             format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}'[redacted]'")
-        } else if caps.get(9).is_some_and(|m| m.as_str() == "null") && !open_kq.is_empty() {
+        } else if caps.get(10).is_some_and(|m| m.as_str() == "null") && !open_kq.is_empty() {
             caps[0].to_string()
         } else {
             format!("{open_kq}{key}{close_kq}{sep}[redacted]")
         }
     });
 
-    // 5. Mask any remaining standalone `Bearer <token>` values.
+    // 5. Mask any remaining standalone `Bearer <token>` or `Basic <base64>` credentials.
     let bearer_cleaned = BEARER_RE.replace_all(&kv_cleaned, "Bearer [redacted]");
+    let basic_cleaned = BASIC_AUTH_RE.replace_all(&bearer_cleaned, |caps: &regex::Captures<'_>| {
+        let tok = &caps[1];
+        if is_likely_basic_auth_token(tok) {
+            "Basic [redacted]".to_string()
+        } else {
+            caps[0].to_string()
+        }
+    });
 
     // 6. Mask any remaining email addresses (`alice@example.com` -> `a***e@example.com`).
-    let email_cleaned = mask_emails_in_text(&bearer_cleaned);
+    let email_cleaned = mask_emails_in_text(&basic_cleaned);
 
     truncate_chars(&email_cleaned, MAX_LOG_VALUE_CHARS)
 }
@@ -316,5 +368,65 @@ mod tests {
         assert!(is_sensitive_field_name("cookie"));
         assert!(is_sensitive_field_name("private_key"));
         assert!(is_sensitive_field_name("credential"));
+        assert!(is_sensitive_field_name("device_key"));
+        assert!(is_sensitive_field_name("passphrase"));
+        assert!(is_sensitive_field_name("push_key"));
+        assert!(is_sensitive_field_name("access_key"));
+        assert!(is_sensitive_field_name("webhook_key"));
+        // Non-secret audit keys stay unmasked.
+        assert!(!is_sensitive_field_name("idempotency_key"));
+    }
+
+    #[test]
+    fn redacts_basic_auth_escaped_json_and_device_key_without_false_positives() {
+        // Basic auth in Authorization header and standalone Basic base64 token.
+        let basic_msg = "header Authorization: Basic dXNlcjpwYXNz and standalone Basic YWRtaW46c2VjcmV0 plus Basic settings and Basic Authentication prose";
+        let out = redact_text(basic_msg);
+        assert!(!out.contains("dXNlcjpwYXNz"), "header Basic leaked: {out}");
+        assert!(
+            !out.contains("YWRtaW46c2VjcmV0"),
+            "standalone Basic leaked: {out}"
+        );
+        assert!(
+            out.contains("Authorization:[redacted]"),
+            "unexpected: {out}"
+        );
+        assert!(out.contains("Basic [redacted]"), "unexpected: {out}");
+        assert!(
+            out.contains("Basic settings"),
+            "prose wrongly redacted: {out}"
+        );
+        assert!(
+            out.contains("Basic Authentication"),
+            "title-case prose wrongly redacted: {out}"
+        );
+
+        // Debug-escaped JSON strings produced by `tracing::debug!(?val)` (`record_debug`).
+        let escaped = r#"body="{\"password\":\"hunter2\",\"device_key\":\"dk_live_98765\",\"passphrase\":\"p@ss\",\"idempotency_key\":\"idem_abc\"}""#;
+        let esc_out = redact_text(escaped);
+        assert!(
+            !esc_out.contains("hunter2"),
+            "escaped password leaked: {esc_out}"
+        );
+        assert!(
+            !esc_out.contains("dk_live_98765"),
+            "escaped device_key leaked: {esc_out}"
+        );
+        assert!(
+            !esc_out.contains("p@ss"),
+            "escaped passphrase leaked: {esc_out}"
+        );
+        assert!(
+            esc_out.contains(r#"\"password\":\"[redacted]\""#),
+            "unexpected escaped format: {esc_out}"
+        );
+        assert!(
+            esc_out.contains(r#"\"device_key\":\"[redacted]\""#),
+            "unexpected escaped device_key format: {esc_out}"
+        );
+        assert!(
+            esc_out.contains(r#"\"idempotency_key\":\"idem_abc\""#),
+            "idempotency_key wrongly redacted: {esc_out}"
+        );
     }
 }

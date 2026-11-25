@@ -873,6 +873,7 @@ export const en = {
     backToPlugins: "Back to Plugins",
     globallyDisabledNotice:
       "This plugin is currently globally disabled. Routes referencing its providers will keep original content until you enable the plugin.",
+    autoDisabledLabel: "Auto-disabled",
     hooksLabel: "Hooks",
     permissionsLabel: "Permissions",
     homepageLink: "Homepage",
@@ -1086,6 +1087,10 @@ export const en = {
         `Currently installed: v${fromVersion}. Confirming will update this plugin in place to v${toVersion} while keeping existing channels and routes intact.`,
       alreadyInstalledSameNotice: (version: string) =>
         `Version v${version} is already installed. Confirming will reinstall this version in place.`,
+      replaceCustomWarning: (id: string, installedVersion?: string | null) =>
+        `Plugin "${id}"${installedVersion ? ` (v${installedVersion})` : ""} is currently installed as a custom plugin. Installing from the marketplace will permanently overwrite your custom script.`,
+      replaceCustomCheckbox:
+        "I understand and want to overwrite the existing custom plugin with the marketplace version",
       viewSourceBtn: "View Source",
       sourceModalTitle: (name: string) => `Plugin Source: ${name}`,
       sourceModalLoading: "Loading plugin source…",

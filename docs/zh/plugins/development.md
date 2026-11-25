@@ -93,7 +93,7 @@ export function deliver(input) {
 | 导出项 | 适用类型 / 钩子 | 超时预算 | 职责与返回值 |
 | :--- | :---: | :---: | :--- |
 | `meta` | 全部（必填） | 编译期 | 静态清单对象，声明 `id`、`name`、`version`、`api_version: "1"`、`kind`、`min_core`、`allowed_hosts`、字段 Schema 与 `hooks`。 |
-| `validate(input)` | 全部（可选） | `10s` | 校验 `{ scope: "account" \| "destination" \| "instance", config }`，返回 `{ ok: true, normalized_config? }` 或 `{ ok: false, error }`。 |
+| `validate(input)` | 全部（可选） | `10s` | 校验 `{ scope: "account" \| "destination" \| "instance", config }`，返回 `{ ok: true, normalized_config? }` 或 `{ ok: false, error }`。`normalized_config` 不得新增 `format: "uri"` 字段，也不得篡改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。 |
 | `test(input)` | 全部（可选） | `10s` | 对 `{ scope, account?, destination?, instance?, locale? }` 执行实时连通性测试，返回 `{ ok: true \| false, message?, error? }`。 |
 | `deliver(input)` | `kind: "channel"` | `30s` | 向自定义通道投递渲染后的文章，返回 `{ outcome, status_code?, external_id?, checkpoint?, retry_after_secs?, next_window_at?, diagnostic? }`。 |
 | `onRender(input)` | `hooks: ["on_render"]` | `15s` | 在通道渲染前改写 `content_html` / `primary_link`；返回的 HTML **强制再次经 `ammonia` 清洗**。 |
@@ -123,7 +123,7 @@ FeedCourier 会向每次沙箱执行注入只读的 `globalThis.fc` 宿主对象
 
 | 函数 | 签名 | 说明 |
 | :--- | :--- | :--- |
-| `fc.fetch` | `fc.fetch({ method?, url, headers?, body?, timeoutMs? }) -> { status, ok, headers, body }` | 同步 HTTP(S) 请求（通道/校验/测试/onDelivered 每次最多 4 次，`onRender` 最多 10 次；`timeoutMs` 限制 `100..=15000`；响应上限 `1 MiB`；禁止重定向；响应头键名统一小写）。执行双层白名单（`meta.allowed_hosts` 走 `ProtectedHttpClient` 防 SSRF + 管理员配置的 `format: "uri"` 精确 `(scheme, host, port)` 直连），永久硬拦截云元数据 IP，完整遵循通道/实例的 `use_proxy`。 |
+| `fc.fetch` | `fc.fetch({ method?, url, headers?, body?, timeoutMs? }) -> { status, ok, headers, body }` | 同步 HTTP(S) 请求（通道/校验/测试/onDelivered 每次最多 4 次，`onRender` 最多 10 次；`timeoutMs` 限制在 `100..=15000` 且自动截断至剩余钩子预算内；响应上限 `1 MiB`；禁止重定向；响应头键名统一小写）。每次调用前检查钩子取消标记，执行双层白名单（`meta.allowed_hosts` 走 `ProtectedHttpClient` 防 SSRF + 管理员显式提交的 `format: "uri"` 精确 `(scheme, host, port)` 直连），永久硬拦截云元数据 IP 与主机名（直连或代理均生效），完整遵循通道/实例的 `use_proxy`。 |
 | `fc.sha256` | `fc.sha256(input: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | 计算 UTF-8 字符串的 SHA-256 摘要（默认小写 `"hex"`）。 |
 | `fc.hmacSha256` | `fc.hmacSha256(message: string, secret: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | 计算 HMAC-SHA256 签名（默认小写 `"hex"`）。 |
 | `fc.md5` | `fc.md5(input: string) -> string` | 计算小写十六进制 MD5 摘要（适配传统 API 签名）。 |
@@ -141,10 +141,19 @@ FeedCourier 会向每次沙箱执行注入只读的 `globalThis.fc` 宿主对象
 ## 3. 沙箱与核心安全边界
 
 - **纯 Rust 隔离沙箱（`boa_engine`）**：沙箱内不暴露文件系统、`process`、环境变量、原生扩展、`import` 语句（`IdleModuleLoader`）或原始 Socket。所有钩子必须同步返回（返回 `Promise` 会被拒绝）。
-- **双层域名白名单校验**：向未列入 `meta.allowed_hosts` 且非管理员配置的 `format: "uri"` 精确 `(scheme, host, port)` 的目标发起 `fc.fetch()` 会在 DNS 解析前立即拒绝（`403 ssrf_blocked`）；云元数据地址（`169.254.169.254`、`100.100.100.200`、`fd00:ec2::254`、`0.0.0.0`、`::`、`metadata.google.internal`）与 HTTP `3xx` 重定向永久硬拦截。
-- **资源与载荷限制**：
+- **双层白名单与管理员显式 `format: "uri"` 策略**：
+  - 向未列入 `meta.allowed_hosts` 且非管理员显式提交的 `format: "uri"` 精确 `(scheme, host, port)` 的目标发起 `fc.fetch()` 会在 DNS 解析前立即拒绝（`403 ssrf_blocked`）。
+  - 仅**管理员显式提交的非空 `format: "uri"` 字段值**才会进入私网/LAN `admin_uri_origins` 白名单；Schema 中的 `default` 默认值**绝不会**被自动信任或持久化为管理员 URI 源站（例如 `ntfy.sh` / `api.day.app` 等默认公网主机必须列在 `meta.allowed_hosts` 中并经过标准 SSRF 防护）。
+  - 插件 `validate()` 返回的 `normalized_config` 不得新增 `format: "uri"` 字段，也不得修改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。
+- **云元数据硬拦截与代理 DNS 边界**：
+  - 云元数据字面量 IP（`169.254.169.254`、`169.254.170.2`、`100.100.100.200`、`fd00:ec2::254` 及 IPv4 映射 IPv6 / NAT64 形式）、未指定地址（`0.0.0.0`、`::`）、云元数据主机名（`metadata.google.internal`、`metadata.goog`、`instance-data`）以及 HTTP `3xx` 重定向在所有 `fc.fetch()` 调用中（无论直连或代理）永久硬拦截。
+  - 直连与本地 DNS 代理（`socks5://`）还会在连接前执行 DNS 解析并拦截云元数据 IP；远端 DNS 代理（`http://`、`https://`、`socks5h://`）因 DNS 解析在代理服务器侧完成，客户端侧执行主机名与字面量 IP 校验。
+- **资源上限、全局并发与自动熔断器**：
   - 单个插件脚本上限 **`512 KiB`**，单次 HTTP 响应上限 **`1 MiB`**。
-  - 每次调用受硬性 VM 预算（`loop_iteration_limit = 200,000`、`recursion_limit = 128`、`stack_size_limit = 64 KiB`）与超时约束（编译 `5s`，`validate`/`test`/`onDelivered` `10s`，`onRender` `15s`，`deliver` `30s`）。
+  - 全局 JS 沙箱并发执行上限为 **`4`** 个并发任务。
+  - 每次调用受硬性 VM 预算（`loop_iteration_limit = 200,000`、`recursion_limit = 128`、`stack_size_limit = 64 KiB`）与每钩子墙钟超时约束（编译 `5s`，`validate`/`test`/`onDelivered` `10s`，`onRender` `15s`，`deliver` `30s`）。每次 `fc.*` 宿主调用均检查取消标记（防止超时后仍发出 HTTP 请求），单次 `fc.fetch()` 超时会自动截断至剩余钩子预算内。
+  - **连续 3 次超时自动熔断器**：若某 JS 插件连续 3 次执行超时，FeedCourier 会自动全局禁用该插件并写入 `plugins.disabled_reason`（在 WebUI 与 `GET /api/v1/plugins` 中展示，手动重新启用后自动清除）。
+  - **`boa_engine` 0.22 已知限制**：`boa_engine` 0.22 不支持对纯 CPU 嵌套循环进行外部抢占中断，因此恶意纯 CPU 循环可能占用 4 个沙箱槽位中的 1 个，直到 Boa 自身的单循环迭代上限触发结束。
   - `onRender` 返回的 HTML 强制再次通过 `ammonia` 清洗。
   - `deliver` 返回的序列化 `checkpoint` 上限为 **`16 KiB`**。
 - **持久化 `on_delivered` 出队表**：任务标记为已投递时，在同一 SQLite 事务内向 `plugin_events` 写入事件，由独立后台协程按指数退避重试（`15s, 30s, 60s, 120s`，最多 **5 次**），不影响原任务状态与通道配额。

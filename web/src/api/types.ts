@@ -942,6 +942,7 @@ export interface DeliveryTaskDto {
   next_attempt_at: string | null;
   last_status_code: number | null;
   diagnostic_log: string | null;
+  has_warnings?: boolean;
   completed_at: string | null;
   created_at: string;
 }
@@ -1017,18 +1018,22 @@ export type PluginRuntime = "builtin" | "js";
 export type PluginSource = "builtin" | "market" | "custom";
 
 export interface PluginRouteOptionPropertySchema {
-  type: "select" | "boolean" | "string" | "number" | string;
+  type?: "select" | "boolean" | "string" | "number" | "integer" | "array" | string;
   title?: string;
   description?: string;
   source?: "plugin_instances" | string;
   nullable?: boolean;
-  enum?: string[];
+  enum?: Array<string | number>;
+  format?: string;
   default?: unknown;
   placeholder?: string;
+  items?: { type?: string };
+  "x-secret"?: boolean;
 }
 
 export interface PluginRouteOptionSchema {
   type?: string;
+  required?: string[];
   properties?: Record<string, PluginRouteOptionPropertySchema>;
 }
 
@@ -1095,6 +1100,7 @@ export interface PluginDto {
   compatibility_reason?: string | null;
   manifest: PluginManifestDto;
   enabled: boolean;
+  disabled_reason?: string | null;
   installed_version: string;
   settings: Record<string, unknown>;
   instance_count: number;
@@ -1107,6 +1113,7 @@ export interface InstallMarketPluginRequest {
   version?: string;
   enabled?: boolean;
   dry_run?: boolean;
+  replace_custom?: boolean;
 }
 
 export interface UploadJsPluginRequest {
@@ -1125,6 +1132,7 @@ export interface JsPluginPreviewResponse {
   compatibility_reason?: string | null;
   already_installed: boolean;
   installed_version?: string | null;
+  installed_source?: string | null;
   changelog?: string | null;
 }
 

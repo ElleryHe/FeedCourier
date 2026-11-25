@@ -93,7 +93,7 @@ export function deliver(input) {
 | Export | Kind / Hook | Budget | Contract |
 | :--- | :---: | :---: | :--- |
 | `meta` | All (required) | Compile-time | Static manifest object describing `id`, `name`, `version`, `api_version: "1"`, `kind`, `min_core`, `allowed_hosts`, schemas, and `hooks`. |
-| `validate(input)` | All (optional) | `10s` | Validates `{ scope: "account" \| "destination" \| "instance", config }`; returns `{ ok: true, normalized_config? }` or `{ ok: false, error }`. |
+| `validate(input)` | All (optional) | `10s` | Validates `{ scope: "account" \| "destination" \| "instance", config }`; returns `{ ok: true, normalized_config? }` or `{ ok: false, error }`. `normalized_config` cannot introduce a new `format: "uri"` field or alter the `(scheme, host, port)` origin of an existing `format: "uri"` field. |
 | `test(input)` | All (optional) | `10s` | Runs an interactive connectivity test for `{ scope, account?, destination?, instance?, locale? }`; returns `{ ok: true \| false, message?, error? }`. |
 | `deliver(input)` | `kind: "channel"` | `30s` | Delivers a rendered article to the custom channel. Returns `{ outcome, status_code?, external_id?, checkpoint?, retry_after_secs?, next_window_at?, diagnostic? }`. |
 | `onRender(input)` | `hooks: ["on_render"]` | `15s` | Transforms `content_html` / `primary_link` before channel rendering. Returned HTML is **always re-sanitized through `ammonia`**. |
@@ -123,7 +123,7 @@ FeedCourier injects a read-only `globalThis.fc` namespace into every sandboxed e
 
 | Function | Signature | Description |
 | :--- | :--- | :--- |
-| `fc.fetch` | `fc.fetch({ method?, url, headers?, body?, timeoutMs? }) -> { status, ok, headers, body }` | Synchronous HTTP(S) client (max 4 calls per channel/validate/test/onDelivered hook, 10 per `onRender`; `timeoutMs` clamped to `100..=15000`; `1 MiB` response cap; redirects disabled; lowercase response header keys). Enforces the dual allowlist (`meta.allowed_hosts` via `ProtectedHttpClient` SSRF guard + exact `(scheme, host, port)` admin-configured `format: "uri"` origins) and hard-blocks cloud metadata IPs. Honors channel/instance `use_proxy`. |
+| `fc.fetch` | `fc.fetch({ method?, url, headers?, body?, timeoutMs? }) -> { status, ok, headers, body }` | Synchronous HTTP(S) client (max 4 calls per channel/validate/test/onDelivered hook, 10 per `onRender`; `timeoutMs` clamped to `100..=15000` and capped to remaining hook deadline; `1 MiB` response cap; redirects disabled; lowercase response header keys). Checks hook cancellation before executing, enforces the dual allowlist (`meta.allowed_hosts` via `ProtectedHttpClient` SSRF guard + exact `(scheme, host, port)` origins explicitly submitted by an administrator in `format: "uri"` fields), and hard-blocks cloud metadata IPs/hostnames (direct or proxied). Honors channel/instance `use_proxy`. |
 | `fc.sha256` | `fc.sha256(input: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | SHA-256 digest of UTF-8 input (defaults to lowercase `"hex"`). |
 | `fc.hmacSha256` | `fc.hmacSha256(message: string, secret: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | HMAC-SHA256 signature (defaults to lowercase `"hex"`). |
 | `fc.md5` | `fc.md5(input: string) -> string` | Lowercase hex MD5 digest (useful for legacy API signatures). |
@@ -141,10 +141,19 @@ FeedCourier injects a read-only `globalThis.fc` namespace into every sandboxed e
 ## 3. Sandbox & Core Safety Boundaries
 
 - **Isolated Pure-Rust Engine (`boa_engine`)**: No filesystem, `process`, `env`, native addons, `import` statements (`IdleModuleLoader`), or raw sockets exist inside the sandbox. All hooks must execute synchronously (returning a `Promise` is rejected).
-- **Dual Network Allowlist Enforcement**: Any `fc.fetch()` attempt to a hostname not listed in `meta.allowed_hosts` or an administrator-configured `format: "uri"` field is rejected immediately before DNS resolution (`403 ssrf_blocked`). Cloud metadata IPs (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`, `0.0.0.0`, `::`, `metadata.google.internal`) and HTTP `3xx` redirects are unconditionally blocked.
-- **Resource Caps**:
+- **Dual Network Allowlist & Explicit-Admin `format: "uri"` Policy**:
+  - Any `fc.fetch()` attempt to a hostname not listed in `meta.allowed_hosts` or an administrator-submitted `format: "uri"` field is rejected immediately before DNS resolution (`403 ssrf_blocked`).
+  - Only **non-empty URI values explicitly submitted by an administrator** enter the private/LAN `admin_uri_origins` allowlist. Schema `default` values are **never** automatically trusted or persisted as admin URI origins — default public hosts (such as `ntfy.sh` or `api.day.app`) must be declared in `meta.allowed_hosts` and traverse standard SSRF validation.
+  - A plugin's `validate()` `normalized_config` cannot introduce a new `format: "uri"` field or alter the `(scheme, host, port)` origin of an existing `format: "uri"` field.
+- **Cloud Metadata Guard & Proxy Boundary**:
+  - Cloud metadata literal IPs (`169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, plus IPv4-mapped IPv6/NAT64 forms), unspecified addresses (`0.0.0.0`, `::`), metadata hostnames (`metadata.google.internal`, `metadata.goog`, `instance-data`), and HTTP `3xx` redirects are unconditionally blocked on all `fc.fetch()` calls (direct or proxied).
+  - Direct connections and local-DNS proxies (`socks5://`) also resolve DNS and block metadata IPs before connecting; remote-DNS proxies (`http://`, `https://`, `socks5h://`) enforce hostname and literal-IP checks client-side because DNS resolution occurs on the proxy server.
+- **Resource Caps, Concurrency & Circuit Breaker**:
   - Script source size is capped at **`512 KiB`**; HTTP response bodies are capped at **`1 MiB`**.
-  - Each invocation runs under hard VM limits (`loop_iteration_limit = 200,000`, `recursion_limit = 128`, `stack_size_limit = 64 KiB`) and wall-clock timeouts (`5s` compile, `10s` validate/test/onDelivered, `15s` `onRender`, `30s` `deliver`).
+  - Global JS execution concurrency is capped at **`4`** simultaneous executions across the process.
+  - Each invocation runs under hard VM limits (`loop_iteration_limit = 200,000`, `recursion_limit = 128`, `stack_size_limit = 64 KiB`) and per-hook wall-clock deadlines (`5s` compile, `10s` validate/test/onDelivered, `15s` `onRender`, `30s` `deliver`). Cancellation is checked at every `fc.*` host call (preventing post-timeout HTTP calls), and per-request `fc.fetch()` timeouts are clamped to the remaining hook budget.
+  - **3-Consecutive-Timeout Circuit Breaker**: If a JS plugin times out 3 times in a row, FeedCourier automatically disables it globally and records the reason in `plugins.disabled_reason` (surfaced in the WebUI and `GET /api/v1/plugins`; cleared upon manual re-enable).
+  - **Known `boa_engine` 0.22 Limitation**: `boa_engine` 0.22 has no external preemption interrupt for pure-CPU nested loops, so a malicious pure-CPU loop can occupy 1 of the 4 sandbox slots until Boa's own per-loop iteration limit finishes.
   - HTML returned by `onRender` is always re-sanitized via `ammonia`.
   - Serialized `checkpoint` JSON returned by `deliver` is capped at **`16 KiB`**.
 - **Durable `on_delivered` Outbox**: When a delivery succeeds, FeedCourier inserts one row into `plugin_events` **inside the same SQLite transaction** as marking `delivery_tasks.status = 'delivered'` for every enabled plugin declaring `on_delivered`. A dedicated background worker invokes `onDelivered` with exponential backoff (`15s, 30s, 60s, 120s`, max **5 attempts**) without affecting delivery status or channel quotas.
