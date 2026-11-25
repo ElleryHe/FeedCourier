@@ -923,18 +923,31 @@ async fn marketplace_install_sha256_upgrade_upload_source_and_cascade_delete() {
 async fn real_ntfy_and_bark_plugins_end_to_end_delivery_redaction_and_retry_mapping() {
     let h = JsHarness::new().await;
 
-    let ntfy_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../FeedCourier-Plugins/plugins/channels/ntfy/0.3.1/plugin.js");
-    let bark_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../FeedCourier-Plugins/plugins/channels/bark/0.3.1/plugin.js");
+    let ntfy_js = include_str!("fixtures/plugins/ntfy_0_3_1.js");
+    let bark_js = include_str!("fixtures/plugins/bark_0_3_1.js");
 
-    let ntfy_js = std::fs::read_to_string(&ntfy_path)
-        .unwrap_or_else(|e| panic!("failed reading {}: {e}", ntfy_path.display()));
-    let bark_js = std::fs::read_to_string(&bark_path)
-        .unwrap_or_else(|e| panic!("failed reading {}: {e}", bark_path.display()));
+    // Verify embedded test fixtures match the exact SHA-256 digests recorded in market_snapshot.json.
+    let snapshot: Value =
+        serde_json::from_str(feedcourier::plugins::MARKET_SNAPSHOT_JSON).expect("snapshot json");
+    for (plugin_id, script) in [("ntfy", ntfy_js), ("bark", bark_js)] {
+        let expected_sha = snapshot["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == plugin_id)
+            .and_then(|p| p["versions"].as_array())
+            .and_then(|vs| vs.iter().find(|v| v["version"] == "0.3.1"))
+            .and_then(|v| v["sha256"].as_str())
+            .expect("snapshot version sha256");
+        assert_eq!(
+            sha256_hex(script.as_bytes()),
+            expected_sha,
+            "fixture for '{plugin_id}' drifted from market_snapshot.json"
+        );
+    }
 
     // Upload both real official plugins into FeedCourier
-    for script in [&ntfy_js, &bark_js] {
+    for script in [ntfy_js, bark_js] {
         let (st, resp) = h
             .req(
                 Method::POST,
