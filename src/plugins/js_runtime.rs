@@ -108,13 +108,11 @@ const SSRF_ERR_PREFIX: &str = "SSRF_BLOCKED: ";
 const PROXY_ERR_PREFIX: &str = "PROXY_UNCONFIGURED: ";
 const JS_CANCELLED_ERR_MSG: &str = "JS plugin execution timed out / cancelled";
 
-/// Returns `true` when `err` represents a JS sandbox wall-clock timeout or cancellation.
+/// Returns `true` when `err` represents a JS sandbox wall-clock timeout (i.e. a plugin already
+/// executing inside the Boa sandbox exhausted its hook deadline — NOT a sandbox slot-wait timeout
+/// or a shorter per-request `fc.fetch` `timeoutMs` expiration).
 pub fn is_js_timeout_error(err: &AppError) -> bool {
-    matches!(
-        err,
-        AppError::Upstream(msg)
-            if msg.contains("timed out after ") || msg.contains(JS_CANCELLED_ERR_MSG)
-    )
+    matches!(err, AppError::JsSandboxTimeout(_))
 }
 
 fn format_timeout_label(timeout: Duration) -> String {
@@ -257,14 +255,71 @@ fn host_matches_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     false
 }
 
+fn is_private_or_local_default_host(host: &str) -> bool {
+    let norm = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    norm.is_empty()
+        || norm == "localhost"
+        || norm.ends_with(".localhost")
+        || norm.ends_with(".local")
+        || norm.ends_with(".internal")
+        || norm.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Returns `Some((default_url, origin))` when a `format: "uri"` property declares a non-empty,
+/// non-blocked public `default` URL whose hostname is explicitly covered by `allowed_hosts`.
+///
+/// Only such `allowed_hosts`-backed defaults may be auto-filled when omitted in API requests or
+/// pre-filled in WebUI forms; they remain on the standard public SSRF path (`allow_private = false`).
+fn uri_default_in_allowed_hosts(
+    prop: &Value,
+    allowed_hosts: &[String],
+) -> Option<(String, AllowedOrigin)> {
+    if allowed_hosts.is_empty() {
+        return None;
+    }
+    let raw = prop
+        .get("default")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let parsed = Url::parse(raw).ok()?;
+    check_hard_blocked_plugin_url(&parsed).ok()?;
+    let origin = AllowedOrigin::from_url(&parsed)?;
+    if is_private_or_local_default_host(&origin.host) {
+        return None;
+    }
+    if host_matches_allowed(&origin.host, allowed_hosts) {
+        Some((raw.to_string(), origin))
+    } else {
+        None
+    }
+}
+
 /// Extract all exact `(scheme, host, port)` origins from fields declared as `format: "uri"` in
 /// `schema` whose non-empty values were explicitly provided in `cfg`.
-///
-/// Security invariant: NEVER fall back to plugin-declared schema `default` values here. Default
-/// public hosts (e.g. `https://ntfy.sh`, `https://api.day.app`) must be declared in
-/// `meta.allowed_hosts` and traverse full SSRF protection; private/LAN origin bypass is strictly
-/// reserved for values explicitly persisted by an administrator.
 pub fn extract_uri_origins(schema: &Value, cfg: &Value) -> Vec<AllowedOrigin> {
+    extract_uri_origins_with_allowed_hosts(schema, cfg, &[])
+}
+
+/// Extract all exact `(scheme, host, port)` origins from `format: "uri"` fields that qualify for
+/// the private/LAN `admin_uri_origins` allowlist.
+///
+/// Security invariants:
+/// 1. NEVER fall back to plugin-declared schema `default` values here.
+/// 2. If a configured URI matches a `default` URL whose host is already covered by
+///    `meta.allowed_hosts` (e.g. `https://ntfy.sh`, `https://api.day.app`), exclude it from
+///    `admin_uri_origins` so requests traverse standard public DNS-rebinding SSRF protection
+///    (`allow_private_origin = false`).
+pub fn extract_uri_origins_with_allowed_hosts(
+    schema: &Value,
+    cfg: &Value,
+    allowed_hosts: &[String],
+) -> Vec<AllowedOrigin> {
     let mut out = Vec::new();
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return out;
@@ -285,9 +340,15 @@ pub fn extract_uri_origins(schema: &Value, cfg: &Value) -> Vec<AllowedOrigin> {
             && let Ok(parsed) = Url::parse(raw_url)
             && check_hard_blocked_plugin_url(&parsed).is_ok()
             && let Some(origin) = AllowedOrigin::from_url(&parsed)
-            && !out.contains(&origin)
         {
-            out.push(origin);
+            if let Some((_, default_origin)) = uri_default_in_allowed_hosts(prop, allowed_hosts)
+                && default_origin == origin
+            {
+                continue;
+            }
+            if !out.contains(&origin) {
+                out.push(origin);
+            }
         }
     }
     out
@@ -350,13 +411,25 @@ fn verify_uri_origins_preserved(schema: &Value, before: &Value, after: &Value) -
 
 /// Validate a config JSON object against a declarative JSON Schema (`type: object`, `required`, `properties`).
 pub fn validate_config_against_schema(schema: &Value, cfg: &Value) -> AppResult<Value> {
-    validate_config_against_schema_inner(schema, cfg, true)
+    validate_config_against_schema_inner(schema, cfg, true, &[])
+}
+
+/// Validate a config JSON object against a declarative JSON Schema using the plugin's
+/// `meta.allowed_hosts` to decide whether omitted `format: "uri"` fields may inherit a public
+/// `default` URL.
+pub fn validate_config_against_schema_with_allowed_hosts(
+    schema: &Value,
+    cfg: &Value,
+    allowed_hosts: &[String],
+) -> AppResult<Value> {
+    validate_config_against_schema_inner(schema, cfg, true, allowed_hosts)
 }
 
 fn validate_config_against_schema_inner(
     schema: &Value,
     cfg: &Value,
     apply_defaults: bool,
+    allowed_hosts: &[String],
 ) -> AppResult<Value> {
     let obj = cfg
         .as_object()
@@ -376,15 +449,24 @@ fn validate_config_against_schema_inner(
             let is_req = required.iter().any(|r| r == key);
             match obj.get(key) {
                 None | Some(Value::Null) => {
-                    // Never auto-inject plugin schema `default` values into `format: "uri"` fields;
-                    // only administrator-submitted URI values may join `admin_uri_origins`.
+                    // For `format: "uri"` fields, only auto-fill a schema `default` when its host
+                    // is a public domain declared in `meta.allowed_hosts` (e.g. `ntfy.sh`,
+                    // `api.day.app`). Non-`allowed_hosts` defaults are never auto-persisted.
                     let is_uri = prop.get("format").and_then(Value::as_str) == Some("uri");
-                    if apply_defaults
-                        && !is_uri
-                        && let Some(default_val) = prop.get("default")
-                    {
-                        normalized.insert(key.clone(), default_val.clone());
-                    } else if is_req {
+                    if apply_defaults {
+                        if is_uri {
+                            if let Some((default_url, _)) =
+                                uri_default_in_allowed_hosts(prop, allowed_hosts)
+                            {
+                                normalized.insert(key.clone(), Value::String(default_url));
+                                continue;
+                            }
+                        } else if let Some(default_val) = prop.get("default") {
+                            normalized.insert(key.clone(), default_val.clone());
+                            continue;
+                        }
+                    }
+                    if is_req {
                         return Err(AppError::Validation(format!(
                             "missing required field '{key}'"
                         )));
@@ -509,7 +591,7 @@ pub fn merge_config_against_schema(
         }
     }
 
-    validate_config_against_schema_inner(schema, &Value::Object(merged), false)
+    validate_config_against_schema_inner(schema, &Value::Object(merged), false, &[])
 }
 
 /// Redact secret fields in a config object using an explicit JSON schema.
@@ -780,8 +862,15 @@ fn fc_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     };
 
     let remaining = check_host_deadline(ctx)?;
+    let (state_deadline, state_cancelled) = {
+        let state = ctx
+            .get_data::<FcHostState>()
+            .ok_or_else(|| js_err("fc host state is missing"))?;
+        (state.deadline, Arc::clone(&state.cancelled))
+    };
     let effective_timeout = Duration::from_millis(timeout_ms).min(remaining);
     if effective_timeout.is_zero() {
+        state_cancelled.store(true, Ordering::Release);
         return Err(js_err(JS_CANCELLED_ERR_MSG));
     }
 
@@ -797,9 +886,20 @@ fn fc_fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     };
 
     let res = policy.rt_handle.block_on(async {
-        tokio::time::timeout(effective_timeout, policy.http.send_plugin_http(http_req))
-            .await
-            .map_err(|_| AppError::Upstream(JS_CANCELLED_ERR_MSG.to_string()))?
+        match tokio::time::timeout(effective_timeout, policy.http.send_plugin_http(http_req)).await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                if state_cancelled.load(Ordering::Acquire) || Instant::now() >= state_deadline {
+                    state_cancelled.store(true, Ordering::Release);
+                    Err(AppError::JsSandboxTimeout(JS_CANCELLED_ERR_MSG.to_string()))
+                } else {
+                    Err(AppError::Upstream(format!(
+                        "HTTP request timed out after {timeout_ms}ms"
+                    )))
+                }
+            }
+        }
     });
 
     // Re-check cancellation flag right after returning from HTTP so a cancelled invocation throws
@@ -1548,18 +1648,28 @@ impl JsPluginRuntime {
             Ok(Some(json_res))
         });
 
+        let timeout_err = || {
+            AppError::JsSandboxTimeout(format!(
+                "JS plugin '{}' {export_name}() timed out after {timeout_label}",
+                self.manifest.id,
+            ))
+        };
+
         match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(res)) => res,
+            Ok(Ok(res)) => {
+                if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    Err(timeout_err())
+                } else {
+                    res
+                }
+            }
             Ok(Err(join_err)) => Err(AppError::Internal(anyhow::anyhow!(
                 "JS plugin '{}' {export_name}() task panicked: {join_err}",
                 self.manifest.id
             ))),
             Err(_) => {
                 cancelled.store(true, Ordering::Release);
-                Err(AppError::Upstream(format!(
-                    "JS plugin '{}' {export_name}() timed out after {timeout_label}",
-                    self.manifest.id,
-                )))
+                Err(timeout_err())
             }
         }
     }
@@ -1596,12 +1706,20 @@ impl JsPluginRuntime {
             "instance" => &self.manifest.instance_schema,
             _ => &self.manifest.instance_schema,
         };
-        let validated = validate_config_against_schema(schema, config)?;
+        let validated = validate_config_against_schema_with_allowed_hosts(
+            schema,
+            config,
+            &self.manifest.allowed_hosts,
+        )?;
         if !self.has_validate {
             return Ok(validated);
         }
 
-        let origins = extract_uri_origins(schema, &validated);
+        let origins = extract_uri_origins_with_allowed_hosts(
+            schema,
+            &validated,
+            &self.manifest.allowed_hosts,
+        );
         let policy = self.build_fetch_policy(http, origins, use_proxy, JS_MAX_FETCH_CALLS_DEFAULT);
         let payload = json!({
             "scope": scope,
@@ -1626,7 +1744,12 @@ impl JsPluginRuntime {
             )));
         }
         if let Some(norm) = res.get("normalized_config").filter(|v| v.is_object()) {
-            let next = validate_config_against_schema_inner(schema, norm, false)?;
+            let next = validate_config_against_schema_inner(
+                schema,
+                norm,
+                false,
+                &self.manifest.allowed_hosts,
+            )?;
             verify_uri_origins_preserved(schema, &validated, &next)?;
             return Ok(next);
         }
@@ -1654,13 +1777,25 @@ impl JsPluginRuntime {
 
         let mut origins = Vec::new();
         if let Some(acct) = account {
-            origins.extend(extract_uri_origins(&self.manifest.account_schema, acct));
+            origins.extend(extract_uri_origins_with_allowed_hosts(
+                &self.manifest.account_schema,
+                acct,
+                &self.manifest.allowed_hosts,
+            ));
         }
         if let Some(dest) = destination {
-            origins.extend(extract_uri_origins(&self.manifest.destination_schema, dest));
+            origins.extend(extract_uri_origins_with_allowed_hosts(
+                &self.manifest.destination_schema,
+                dest,
+                &self.manifest.allowed_hosts,
+            ));
         }
         if let Some(inst) = instance {
-            origins.extend(extract_uri_origins(&self.manifest.instance_schema, inst));
+            origins.extend(extract_uri_origins_with_allowed_hosts(
+                &self.manifest.instance_schema,
+                inst,
+                &self.manifest.allowed_hosts,
+            ));
         }
 
         let policy = self.build_fetch_policy(http, origins, use_proxy, JS_MAX_FETCH_CALLS_DEFAULT);
@@ -1805,7 +1940,11 @@ impl Plugin for JsProcessorPlugin {
     }
 
     fn validate_instance_config(&self, cfg: &Value) -> AppResult<Value> {
-        validate_config_against_schema(&self.runtime.manifest.instance_schema, cfg)
+        validate_config_against_schema_with_allowed_hosts(
+            &self.runtime.manifest.instance_schema,
+            cfg,
+            &self.runtime.manifest.allowed_hosts,
+        )
     }
 
     fn merge_instance_config(&self, existing: &Value, patch: &Value) -> AppResult<Value> {
@@ -1865,7 +2004,11 @@ impl Plugin for JsProcessorPlugin {
                     )));
                 }
             }
-            validate_config_against_schema(&self.runtime.manifest.route_option_schema, option)?;
+            validate_config_against_schema_with_allowed_hosts(
+                &self.runtime.manifest.route_option_schema,
+                option,
+                &self.runtime.manifest.allowed_hosts,
+            )?;
         }
         Ok(())
     }
@@ -2035,9 +2178,16 @@ impl Plugin for JsProcessorPlugin {
             "write_cache": ctx.write_cache,
         });
 
-        let mut origins =
-            extract_uri_origins(&self.runtime.manifest.instance_schema, &instance_cfg);
-        for o in extract_uri_origins(&self.runtime.manifest.route_option_schema, &route_opt) {
+        let mut origins = extract_uri_origins_with_allowed_hosts(
+            &self.runtime.manifest.instance_schema,
+            &instance_cfg,
+            &self.runtime.manifest.allowed_hosts,
+        );
+        for o in extract_uri_origins_with_allowed_hosts(
+            &self.runtime.manifest.route_option_schema,
+            &route_opt,
+            &self.runtime.manifest.allowed_hosts,
+        ) {
             if !origins.contains(&o) {
                 origins.push(o);
             }
@@ -2410,10 +2560,15 @@ impl ChannelSender for JsChannelSender {
             "checkpoint": cp_value,
         });
 
-        let mut origins = extract_uri_origins(&runtime.manifest.account_schema, &acct_cfg.config);
-        origins.extend(extract_uri_origins(
+        let mut origins = extract_uri_origins_with_allowed_hosts(
+            &runtime.manifest.account_schema,
+            &acct_cfg.config,
+            &runtime.manifest.allowed_hosts,
+        );
+        origins.extend(extract_uri_origins_with_allowed_hosts(
             &runtime.manifest.destination_schema,
             &dest_cfg.config,
+            &runtime.manifest.allowed_hosts,
         ));
         let policy = runtime.build_fetch_policy(
             &self.http,

@@ -875,7 +875,11 @@ function RouteEditorModal({
         target?.manifest.route_option_schema,
       );
       if (remaining) {
-        initial[pid] = initSchemaFieldValues(remaining, cfg);
+        initial[pid] = initSchemaFieldValues(
+          remaining,
+          cfg,
+          target?.manifest.allowed_hosts,
+        );
       }
     }
     return initial;
@@ -984,6 +988,7 @@ function RouteEditorModal({
           [pluginId]: initSchemaFieldValues(
             remainingSchema,
             pluginOptions[pluginId],
+            targetPlugin?.manifest.allowed_hosts,
           ),
         }));
       }
@@ -1198,7 +1203,11 @@ function RouteEditorModal({
       >;
       const values =
         pluginSchemaValues[pluginId] ??
-        initSchemaFieldValues(remainingSchema, rawCfg);
+        initSchemaFieldValues(
+          remainingSchema,
+          rawCfg,
+          targetPlugin?.manifest.allowed_hosts,
+        );
       const { config, error } = buildValidatedSchemaConfig(
         remainingSchema,
         values,
@@ -1953,8 +1962,10 @@ function RouteEditorModal({
                                   initSchemaFieldValues(
                                     remainingSchema,
                                     currentCfg,
+                                    plugin.manifest.allowed_hosts,
                                   )
                                 }
+                                allowedHosts={plugin.manifest.allowed_hosts}
                                 onChange={(nextValues) => {
                                   setPluginSchemaValues((prev) => ({
                                     ...prev,

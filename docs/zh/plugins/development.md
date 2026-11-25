@@ -143,7 +143,7 @@ FeedCourier 会向每次沙箱执行注入只读的 `globalThis.fc` 宿主对象
 - **纯 Rust 隔离沙箱（`boa_engine`）**：沙箱内不暴露文件系统、`process`、环境变量、原生扩展、`import` 语句（`IdleModuleLoader`）或原始 Socket。所有钩子必须同步返回（返回 `Promise` 会被拒绝）。
 - **双层白名单与管理员显式 `format: "uri"` 策略**：
   - 向未列入 `meta.allowed_hosts` 且非管理员显式提交的 `format: "uri"` 精确 `(scheme, host, port)` 的目标发起 `fc.fetch()` 会在 DNS 解析前立即拒绝（`403 ssrf_blocked`）。
-  - 仅**管理员显式提交的非空 `format: "uri"` 字段值**才会进入私网/LAN `admin_uri_origins` 白名单；Schema 中的 `default` 默认值**绝不会**被自动信任或持久化为管理员 URI 源站（例如 `ntfy.sh` / `api.day.app` 等默认公网主机必须列在 `meta.allowed_hosts` 中并经过标准 SSRF 防护）。
+  - 仅**管理员显式提交的非空 `format: "uri"` 字段值**才会进入私网/LAN `admin_uri_origins` 白名单。`format: "uri"` 的 Schema `default` **仅当**其主机名是插件 `meta.allowed_hosts` 中声明的公网域名（如 `ntfy.sh` / `api.day.app`）时才允许前后端自动填充，且始终走公网 SSRF 防护（不豁免私网）；凡不在 `meta.allowed_hosts` 内的 URI `default` 一律不自动填充（前端仅作灰色 `placeholder` 提示）。
   - 插件 `validate()` 返回的 `normalized_config` 不得新增 `format: "uri"` 字段，也不得修改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。
 - **云元数据硬拦截与代理 DNS 边界**：
   - 云元数据字面量 IP（`169.254.169.254`、`169.254.170.2`、`100.100.100.200`、`fd00:ec2::254` 及 IPv4 映射 IPv6 / NAT64 形式）、未指定地址（`0.0.0.0`、`::`）、云元数据主机名（`metadata.google.internal`、`metadata.goog`、`instance-data`）以及 HTTP `3xx` 重定向在所有 `fc.fetch()` 调用中（无论直连或代理）永久硬拦截。

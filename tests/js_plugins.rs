@@ -2764,3 +2764,847 @@ async fn round3_market_install_returns_409_over_custom_plugin_and_disabled_js_pr
         "disabled JS processor must reject instance creation: {err}"
     );
 }
+
+#[tokio::test]
+async fn round4_circuit_breaker_ignores_short_fetch_timeout_and_slot_starvation_but_trips_on_swallowed_deadline()
+ {
+    let slow_srv = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow-short"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(350)))
+        .mount(&slow_srv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/hog"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(700)))
+        .mount(&slow_srv)
+        .await;
+
+    let h = JsHarness::new().await;
+    let short_fetch_js = r#"
+        export const meta = {
+            id: "short-fetch-chan",
+            name: "Short Fetch Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: {
+                type: "object",
+                properties: { base_url: { type: "string", format: "uri" } }
+            },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver(ctx) {
+            // Uncaught short per-request timeout inside a much longer hook budget must NOT trip
+            // the plugin circuit breaker.
+            fc.fetch({ method: "GET", url: ctx.account.base_url + "/slow-short", timeoutMs: 120 });
+            return { outcome: "delivered" };
+        }
+    "#;
+    let hog_js = r#"
+        export const meta = {
+            id: "hog-chan",
+            name: "Hog Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: {
+                type: "object",
+                properties: { base_url: { type: "string", format: "uri" } }
+            },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver(ctx) {
+            fc.fetch({ method: "GET", url: ctx.account.base_url + "/hog", timeoutMs: 5000 });
+            return { outcome: "delivered" };
+        }
+    "#;
+    let healthy_js = r#"
+        export const meta = {
+            id: "healthy-wait-chan",
+            name: "Healthy Wait Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: { type: "object", properties: {} },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver() { return { outcome: "delivered" }; }
+    "#;
+    let swallow_js = r#"
+        export const meta = {
+            id: "swallow-timeout-chan",
+            name: "Swallow Timeout Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            account_schema: {
+                type: "object",
+                properties: { base_url: { type: "string", format: "uri" } }
+            },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver(ctx) {
+            try {
+                fc.fetch({ method: "GET", url: ctx.account.base_url + "/slow-short", timeoutMs: 5000 });
+            } catch (_e) {
+                // Intentionally swallow deadline error and pretend delivery succeeded.
+                return { outcome: "delivered" };
+            }
+            return { outcome: "delivered" };
+        }
+    "#;
+    for js in [short_fetch_js, hog_js, healthy_js, swallow_js] {
+        let (st, resp) = h
+            .req(
+                Method::POST,
+                "/api/v1/plugins/upload",
+                Some(json!({ "script_js": js, "enabled": true })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "upload failed: {resp}");
+    }
+
+    // 1. Short per-request `timeoutMs` (120ms) inside a 2000ms hook budget: 4 consecutive failures
+    //    must retry normally and NEVER trip the circuit breaker.
+    h.dispatcher
+        .plugins()
+        .set_hook_timeout_override(Some(Duration::from_millis(2000)));
+    let (st, ch1) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Short Fetch Ch",
+                "kind": "plugin",
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "short-fetch-chan",
+                    "config": { "base_url": slow_srv.uri() }
+                },
+                "initial_destination": {
+                    "name": "Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch1_id = ch1["id"].as_i64().unwrap();
+    let dest1_id = ch1["destinations"][0]["id"].as_i64().unwrap();
+    let (feed1_id, entry1_id) = h
+        .seed_feed_and_entry("Short Fetch Item", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, route1) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Short Fetch Route",
+                "feed_ids": [feed1_id],
+                "channel_id": ch1_id,
+                "destination_id": dest1_id
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let task1_id =
+        h.db.enqueue_delivery_task(
+            route1["id"].as_i64().unwrap(),
+            ch1_id,
+            dest1_id,
+            entry1_id,
+            now_unix(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    for _ in 0..4 {
+        sqlx::query(
+            "UPDATE delivery_tasks SET status = 'queued', next_attempt_at = 0 WHERE id = ?1",
+        )
+        .bind(task1_id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+        h.dispatcher.drain_due_outbox_tasks(1).await.unwrap();
+    }
+    let row = h.db.get_plugin("short-fetch-chan").await.unwrap().unwrap();
+    assert!(
+        row.enabled && row.disabled_reason.is_none(),
+        "short fc.fetch timeoutMs must NEVER trip circuit breaker: {row:?}"
+    );
+    let t1 = h.db.get_delivery_task(task1_id).await.unwrap().unwrap();
+    assert!(
+        t1.diagnostic_log
+            .as_deref()
+            .is_some_and(|d| d.contains("timed out")
+                && !d.contains("JS plugin execution timed out / cancelled")),
+        "expected per-request HTTP timeout diagnostic, got: {:?}",
+        t1.diagnostic_log
+    );
+
+    // 2. Sandbox slot starvation: occupy all 4 global JS semaphore permits with `hog-chan` while
+    //    `healthy-wait-chan` times out waiting for a slot 3 times -> healthy plugin stays enabled!
+    let (st, hog_ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Hog Ch",
+                "kind": "plugin",
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "hog-chan",
+                    "config": { "base_url": slow_srv.uri() }
+                },
+                "initial_destination": {
+                    "name": "Hog Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let hog_ch_id = hog_ch["id"].as_i64().unwrap();
+    let hog_dest_id = hog_ch["destinations"][0]["id"].as_i64().unwrap();
+    let (st, healthy_ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Healthy Ch",
+                "kind": "plugin",
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "healthy-wait-chan",
+                    "config": {}
+                },
+                "initial_destination": {
+                    "name": "Healthy Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let healthy_ch_id = healthy_ch["id"].as_i64().unwrap();
+    let healthy_dest_id = healthy_ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed2_id, entry2_id) = h
+        .seed_feed_and_entry("Wait Item", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, healthy_route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Healthy Route",
+                "feed_ids": [feed2_id],
+                "channel_id": healthy_ch_id,
+                "destination_id": healthy_dest_id
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let healthy_task_id =
+        h.db.enqueue_delivery_task(
+            healthy_route["id"].as_i64().unwrap(),
+            healthy_ch_id,
+            healthy_dest_id,
+            entry2_id,
+            now_unix(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let hog_runtime = h
+        .dispatcher
+        .plugins()
+        .get_js("hog-chan")
+        .unwrap()
+        .runtime
+        .unwrap();
+    let hog_http = ProtectedHttpClient::new(NetSettings {
+        outbound_proxy_url: None,
+        ssrf_allowlist: vec![],
+    })
+    .unwrap();
+    let hog_acct = json!({ "base_url": slow_srv.uri() });
+    let hog_dest = json!({});
+    let _ = (hog_ch_id, hog_dest_id);
+
+    // Spawn 4 concurrent hog invocations via `test_config`? `hog-chan` only exports `deliver`, so
+    // invoke `JsChannelSender` directly or spawn 4 concurrent `onDelivered`-less hog calls by
+    // launching 4 tasks against `hog-chan` through `JsChannelSender`.
+    let hog_ch_row = h.db.get_channel(hog_ch_id).await.unwrap().unwrap();
+    let hog_dest_row = h.db.get_destination(hog_dest_id).await.unwrap().unwrap();
+    let hog_feed_row = h.db.get_feed(feed2_id).await.unwrap().unwrap();
+    let hog_entry_row = h.db.get_entry(entry2_id).await.unwrap().unwrap();
+    let hog_route_row =
+        h.db.get_route(healthy_route["id"].as_i64().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    let _ = (hog_runtime, hog_acct, hog_dest);
+
+    for _attempt in 0..3 {
+        // Launch 4 concurrent `hog-chan` deliveries with a 2s hook timeout so all 4 semaphore
+        // slots stay occupied for ~700ms.
+        h.dispatcher
+            .plugins()
+            .set_hook_timeout_override(Some(Duration::from_millis(2000)));
+        let mut hog_handles = Vec::new();
+        for _ in 0..4 {
+            let sender = JsChannelSender::new(h.dispatcher.plugins().clone(), hog_http.clone());
+            let ch = hog_ch_row.clone();
+            let dest = hog_dest_row.clone();
+            let feed = hog_feed_row.clone();
+            let entry = hog_entry_row.clone();
+            let route = hog_route_row.clone();
+            let acct = ChannelConfig::Plugin(PluginChannelConfig {
+                plugin_id: "hog-chan".to_string(),
+                config: json!({ "base_url": slow_srv.uri() }),
+            });
+            let dcfg = DestinationConfig::Plugin(PluginDestinationConfig { config: json!({}) });
+            hog_handles.push(tokio::spawn(async move {
+                let task = feedcourier::db::models::DeliveryTask {
+                    id: 0,
+                    route_id: route.id,
+                    channel_id: ch.id,
+                    destination_id: dest.id,
+                    entry_id: entry.id,
+                    status: DeliveryTaskStatus::Delivering,
+                    lease_until: None,
+                    checkpoint_json: None,
+                    attempt_count: 0,
+                    next_attempt_at: 0,
+                    last_status_code: None,
+                    diagnostic_log: None,
+                    completed_at: None,
+                    created_at: 0,
+                };
+                let ctx = feedcourier::channels::DeliveryContext {
+                    task: &task,
+                    route: &route,
+                    route_options: feedcourier::channels::RouteOptions::default(),
+                    timezone: chrono_tz::UTC,
+                    channel: &ch,
+                    destination: &dest,
+                    channel_config: &acct,
+                    destination_config: &dcfg,
+                    feed: &feed,
+                    entry: &entry,
+                    checkpoint: None,
+                    checkpoint_sink: None,
+                    overrides: feedcourier::plugins::RenderOverrides::default(),
+                    smtp_delivery: None,
+                };
+                let _ = sender.send(&ctx).await;
+            }));
+        }
+        // Give the 4 hog tasks a moment to acquire all 4 sandbox slots, then attempt to deliver
+        // `healthy-wait-chan` with a short 120ms timeout (guaranteed to time out waiting for a slot).
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        h.dispatcher
+            .plugins()
+            .set_hook_timeout_override(Some(Duration::from_millis(120)));
+        sqlx::query(
+            "UPDATE delivery_tasks SET status = 'queued', next_attempt_at = 0 WHERE id = ?1",
+        )
+        .bind(healthy_task_id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+        h.dispatcher.drain_due_outbox_tasks(1).await.unwrap();
+        for jh in hog_handles {
+            let _ = jh.await;
+        }
+    }
+
+    let healthy_row = h.db.get_plugin("healthy-wait-chan").await.unwrap().unwrap();
+    assert!(
+        healthy_row.enabled && healthy_row.disabled_reason.is_none(),
+        "slot-starvation timeout must NEVER disable healthy waiting plugin: {healthy_row:?}"
+    );
+    let healthy_task =
+        h.db.get_delivery_task(healthy_task_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        healthy_task
+            .diagnostic_log
+            .as_deref()
+            .is_some_and(|d| d.contains("waiting for JS sandbox slot")),
+        "expected slot-wait diagnostic, got: {:?}",
+        healthy_task.diagnostic_log
+    );
+
+    // 3. Even if a plugin catches the deadline error inside JS and returns `{ outcome: "delivered" }`,
+    //    exhausting the hook's wall-clock deadline MUST still return `JsSandboxTimeout` and trip
+    //    the circuit breaker on the 3rd consecutive timeout!
+    h.dispatcher
+        .plugins()
+        .set_hook_timeout_override(Some(Duration::from_millis(150)));
+    let (st, sw_ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Swallow Ch",
+                "kind": "plugin",
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "config": {
+                    "kind": "plugin",
+                    "plugin_id": "swallow-timeout-chan",
+                    "config": { "base_url": slow_srv.uri() }
+                },
+                "initial_destination": {
+                    "name": "Swallow Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let sw_ch_id = sw_ch["id"].as_i64().unwrap();
+    let sw_dest_id = sw_ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed3_id, entry3_id) = h
+        .seed_feed_and_entry("Swallow Item", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, sw_route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Swallow Route",
+                "feed_ids": [feed3_id],
+                "channel_id": sw_ch_id,
+                "destination_id": sw_dest_id
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let sw_task_id =
+        h.db.enqueue_delivery_task(
+            sw_route["id"].as_i64().unwrap(),
+            sw_ch_id,
+            sw_dest_id,
+            entry3_id,
+            now_unix(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    for _ in 0..3 {
+        sqlx::query(
+            "UPDATE delivery_tasks SET status = 'queued', next_attempt_at = 0 WHERE id = ?1",
+        )
+        .bind(sw_task_id)
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+        h.dispatcher.drain_due_outbox_tasks(1).await.unwrap();
+    }
+    let sw_row =
+        h.db.get_plugin("swallow-timeout-chan")
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(
+        !sw_row.enabled && sw_row.disabled_reason.is_some(),
+        "swallowed hook deadline overrun must still trip circuit breaker: {sw_row:?}"
+    );
+}
+
+#[tokio::test]
+async fn round4_allowed_hosts_uri_defaults_restore_api_ergonomics_without_private_bypass() {
+    let h = JsHarness::new().await;
+    let ntfy_js = include_str!("fixtures/plugins/ntfy_0_3_1.js");
+    let bark_js = include_str!("fixtures/plugins/bark_0_3_1.js");
+    for js in [ntfy_js, bark_js] {
+        let (st, resp) = h
+            .req(
+                Method::POST,
+                "/api/v1/plugins/upload",
+                Some(json!({ "script_js": js, "enabled": true })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "upload failed: {resp}");
+    }
+
+    // 1. REST API callers omitting `server_url` for official `ntfy` and `bark` succeed because
+    //    their defaults (`https://ntfy.sh`, `https://api.day.app`) belong to `meta.allowed_hosts`.
+    let (st, ntfy_ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "ntfy Default API",
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "ntfy", "config": {} },
+                "initial_destination": {
+                    "name": "Alerts",
+                    "config": { "kind": "plugin", "config": { "topic": "fc-alerts" } }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "ntfy default REST create failed: {ntfy_ch}"
+    );
+    assert_eq!(ntfy_ch["config"]["config"]["server_url"], "https://ntfy.sh");
+
+    let (st, bark_ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Bark Default API",
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "bark", "config": {} },
+                "initial_destination": {
+                    "config": { "kind": "plugin", "config": { "device_key": "dk_api_default_test" } }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::CREATED,
+        "bark default REST create failed: {bark_ch}"
+    );
+    assert_eq!(
+        bark_ch["config"]["config"]["server_url"],
+        "https://api.day.app"
+    );
+
+    // 2. Default public origins covered by `allowed_hosts` MUST NOT join `admin_uri_origins`
+    //    (they traverse standard public SSRF protection), while explicit custom LAN URLs do.
+    let ntfy_rt = h
+        .dispatcher
+        .plugins()
+        .get_js("ntfy")
+        .unwrap()
+        .runtime
+        .unwrap();
+    let default_origins = feedcourier::plugins::js_runtime::extract_uri_origins_with_allowed_hosts(
+        &ntfy_rt.manifest.account_schema,
+        &json!({ "server_url": "https://ntfy.sh" }),
+        &ntfy_rt.manifest.allowed_hosts,
+    );
+    assert!(
+        default_origins.is_empty(),
+        "allowed_hosts default must not receive private-origin bypass: {default_origins:?}"
+    );
+    let custom_lan_origins =
+        feedcourier::plugins::js_runtime::extract_uri_origins_with_allowed_hosts(
+            &ntfy_rt.manifest.account_schema,
+            &json!({ "server_url": "http://192.168.1.50:8080" }),
+            &ntfy_rt.manifest.allowed_hosts,
+        );
+    assert_eq!(custom_lan_origins.len(), 1);
+    assert_eq!(custom_lan_origins[0].host, "192.168.1.50");
+
+    // 3. Even if a malicious plugin lists `"127.0.0.1"` in `allowed_hosts` and sets a required
+    //    `format: "uri"` default to `"http://127.0.0.1:6379"`, literal IPs / localhost are NEVER
+    //    auto-filled!
+    let evil_ip_default_js = r#"
+        export const meta = {
+            id: "evil-ip-default",
+            name: "Evil IP Default",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            allowed_hosts: ["127.0.0.1"],
+            account_schema: {
+                type: "object",
+                required: ["server_url"],
+                properties: {
+                    server_url: { type: "string", format: "uri", default: "http://127.0.0.1:6379" }
+                }
+            },
+            destination_schema: { type: "object", properties: {} }
+        };
+        export function deliver() { return { outcome: "delivered" }; }
+    "#;
+    let (st, _) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/upload",
+            Some(json!({ "script_js": evil_ip_default_js, "enabled": true })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    let (st, err) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Evil Ch",
+                "kind": "plugin",
+                "config": { "kind": "plugin", "plugin_id": "evil-ip-default", "config": {} },
+                "initial_destination": {
+                    "name": "Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "literal IP URI default must never be auto-filled: {err}"
+    );
+}
+
+#[tokio::test]
+async fn round4_on_delivered_fail_closed_when_bound_instance_or_channel_disabled_or_deleted() {
+    let target_srv = MockServer::start().await;
+    let hits = Arc::new(Mutex::new(0usize));
+    let hits_clone = Arc::clone(&hits);
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(move |_req: &MockRequest| {
+            *hits_clone.lock().unwrap() += 1;
+            ResponseTemplate::new(200)
+        })
+        .mount(&target_srv)
+        .await;
+
+    // Allow loopback via `ssrf_allowlist` so a direct fallback to `allowed_hosts` WOULD succeed
+    // and increment `hits` if fail-closed protection were ever bypassed!
+    let h = JsHarness::with_options(None, vec!["127.0.0.1".to_string()]).await;
+
+    let proc_js = format!(
+        r#"
+        export const meta = {{
+            id: "proxy-proc",
+            name: "Proxy Proc",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "processor",
+            allowed_hosts: ["127.0.0.1"],
+            hooks: ["on_render", "on_delivered"],
+            instance_schema: {{
+                type: "object",
+                properties: {{
+                    use_proxy: {{ type: "boolean", default: true }}
+                }}
+            }},
+            route_option_schema: {{
+                type: "object",
+                properties: {{ provider_id: {{ type: "select", source: "plugin_instances" }} }}
+            }}
+        }};
+        export function onRender() {{ return {{ outcome: "continue" }}; }}
+        export function onDelivered() {{
+            fc.fetch({{ method: "POST", url: "{}/hook", body: "direct-leak" }});
+        }}
+        "#,
+        target_srv.uri()
+    );
+    let chan_js = format!(
+        r#"
+        export const meta = {{
+            id: "proxy-chan",
+            name: "Proxy Chan",
+            version: "0.1.0",
+            api_version: "1",
+            kind: "channel",
+            allowed_hosts: ["127.0.0.1"],
+            hooks: ["on_delivered"],
+            account_schema: {{ type: "object", properties: {{}} }},
+            destination_schema: {{ type: "object", properties: {{}} }}
+        }};
+        export function deliver() {{ return {{ outcome: "delivered" }}; }}
+        export function onDelivered() {{
+            fc.fetch({{ method: "POST", url: "{}/hook", body: "chan-direct-leak" }});
+        }}
+        "#,
+        target_srv.uri()
+    );
+    for js in [proc_js, chan_js] {
+        let (st, resp) = h
+            .req(
+                Method::POST,
+                "/api/v1/plugins/upload",
+                Some(json!({ "script_js": js, "enabled": true })),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "upload failed: {resp}");
+    }
+
+    // Create a `use_proxy: true` processor instance and a channel plugin account with `use_proxy: true`.
+    let (st, inst) = h
+        .req(
+            Method::POST,
+            "/api/v1/plugins/proxy-proc/instances",
+            Some(json!({
+                "name": "Proxy Inst",
+                "config": { "use_proxy": true },
+                "enabled": true
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let inst_id = inst["id"].as_i64().unwrap();
+
+    let (st, ch) = h
+        .req(
+            Method::POST,
+            "/api/v1/channels",
+            Some(json!({
+                "name": "Proxy Chan Acct",
+                "kind": "plugin",
+                "use_proxy": true,
+                "min_interval_secs": 0,
+                "jitter_max_secs": 0,
+                "config": { "kind": "plugin", "plugin_id": "proxy-chan", "config": {} },
+                "initial_destination": {
+                    "name": "Dest",
+                    "config": { "kind": "plugin", "config": {} }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let ch_id = ch["id"].as_i64().unwrap();
+    let dest_id = ch["destinations"][0]["id"].as_i64().unwrap();
+    let (feed_id, entry_id) = h
+        .seed_feed_and_entry("Proxy Guard Item", None, "<p>Body</p>", None, None, None)
+        .await;
+    let (st, route) = h
+        .req(
+            Method::POST,
+            "/api/v1/routes",
+            Some(json!({
+                "name": "Proxy Route",
+                "feed_ids": [feed_id],
+                "channel_id": ch_id,
+                "destination_id": dest_id,
+                "options": {
+                    "plugins": {
+                        "proxy-proc": { "provider_id": inst_id }
+                    }
+                }
+            })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let route_id = route["id"].as_i64().unwrap();
+
+    // Enqueue and deliver: this enqueues BOTH `proxy-proc` (with `provider_id: inst_id`) and
+    // `proxy-chan` (`channel.id: ch_id`) `on_delivered` events in `plugin_events`.
+    h.db.enqueue_delivery_task(route_id, ch_id, dest_id, entry_id, now_unix())
+        .await
+        .unwrap();
+    h.dispatcher.drain_due_outbox_tasks(5).await.unwrap();
+
+    let queued =
+        h.db.list_due_plugin_events(now_unix() + 60, 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        queued.len(),
+        2,
+        "expected 2 queued on_delivered events: {queued:?}"
+    );
+
+    // 1. Disable BOTH the processor instance AND the plugin channel before events are processed.
+    let (st, _) = h
+        .req(
+            Method::PATCH,
+            &format!("/api/v1/plugins/proxy-proc/instances/{inst_id}"),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = h
+        .req(
+            Method::PATCH,
+            &format!("/api/v1/channels/{ch_id}"),
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    assert_eq!(
+        h.dispatcher
+            .process_due_plugin_events_once(10)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        *hits.lock().unwrap(),
+        0,
+        "disabled instance/channel MUST NOT fall back to direct use_proxy=false dispatch"
+    );
+    // Both events must be rescheduled (`attempts == 1`), not dropped yet!
+    let deferred =
+        h.db.list_due_plugin_events(now_unix() + 3600, 10)
+            .await
+            .unwrap();
+    assert_eq!(deferred.len(), 2);
+    assert!(deferred.iter().all(|e| e.attempts == 1));
+
+    // 2. Delete the route, then delete BOTH the processor instance AND the plugin channel, make
+    //    events due again -> both must be dropped cleanly with ZERO outbound requests!
+    let (st, _) = h
+        .req(Method::DELETE, &format!("/api/v1/routes/{route_id}"), None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = h
+        .req(
+            Method::DELETE,
+            &format!("/api/v1/plugins/proxy-proc/instances/{inst_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = h
+        .req(Method::DELETE, &format!("/api/v1/channels/{ch_id}"), None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+
+    sqlx::query("UPDATE plugin_events SET next_attempt_at = 0")
+        .execute(h.db.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        h.dispatcher
+            .process_due_plugin_events_once(10)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        *hits.lock().unwrap(),
+        0,
+        "deleted instance/channel MUST NOT fall back to direct use_proxy=false dispatch"
+    );
+    assert!(
+        h.db.list_due_plugin_events(now_unix() + 99999, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "events for deleted instance/channel must be dropped"
+    );
+}

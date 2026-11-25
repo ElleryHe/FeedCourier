@@ -3105,6 +3105,7 @@ function SchemaProviderModal({
     initSchemaFieldValues(
       plugin.manifest.instance_schema,
       isEdit ? instance?.config : undefined,
+      plugin.manifest.allowed_hosts,
     ),
   );
   const [formError, setFormError] = useState<string | null>(null);
@@ -3207,6 +3208,7 @@ function SchemaProviderModal({
           onChange={setFieldValues}
           isEdit={isEdit}
           existingConfig={instance?.config}
+          allowedHosts={plugin.manifest.allowed_hosts}
         />
 
         <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">

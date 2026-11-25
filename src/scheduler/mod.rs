@@ -36,8 +36,8 @@ use crate::db::models::{
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
-use crate::plugins::js_runtime::{JsChannelSender, extract_uri_origins};
-use crate::plugins::{MarketIndexCache, PluginRegistry};
+use crate::plugins::js_runtime::{JsChannelSender, extract_uri_origins_with_allowed_hosts};
+use crate::plugins::{MarketIndexCache, PluginKind, PluginRegistry};
 use crate::schedule::{has_schedule, next_allowed_at, resolve_route_timezone};
 
 /// Default lease duration in seconds granted when a worker claims a `delivery_tasks` row.
@@ -1702,25 +1702,117 @@ impl DeliveryDispatcher {
             let mut admin_origins = Vec::new();
             let mut use_proxy = false;
 
-            // Only load the specific processor `provider_id` recorded on this delivery event
-            // (eliminating cross-instance URI origin / proxy crosstalk).
-            if let Some(pid) = payload
-                .get("provider_id")
-                .and_then(serde_json::Value::as_i64)
-                && let Ok(Some(inst)) = self.inner.db.get_plugin_instance(pid).await
-                && inst.plugin_id == ev.plugin_id
-                && inst.enabled
-                && let Ok(cfg) = self
-                    .inner
-                    .master_key
-                    .decrypt_json::<serde_json::Value>(&inst.encrypted_config)
-            {
-                if cfg.get("use_proxy").and_then(serde_json::Value::as_bool) == Some(true) {
-                    use_proxy = true;
-                }
-                for o in extract_uri_origins(&runtime.manifest.instance_schema, &cfg) {
-                    if !admin_origins.contains(&o) {
-                        admin_origins.push(o);
+            // Fail-closed proxy/origin guard for processor events bound to a specific `provider_id`:
+            // if the bound instance was deleted, mismatched, or undecryptable, drop the event;
+            // if disabled or transiently unreadable, defer up to `MAX_PLUGIN_EVENT_ATTEMPTS` —
+            // NEVER fall through with `use_proxy = false`.
+            if let Some(pid_val) = payload.get("provider_id").filter(|v| !v.is_null()) {
+                let Some(pid) = pid_val.as_i64() else {
+                    processed += 1;
+                    warn!(
+                        plugin_id = %ev.plugin_id,
+                        event_id = ev.id,
+                        "dropping on_delivered event with malformed provider_id"
+                    );
+                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                    continue;
+                };
+                match self.inner.db.get_plugin_instance(pid).await {
+                    Ok(Some(inst)) if inst.plugin_id == ev.plugin_id => {
+                        if !inst.enabled {
+                            processed += 1;
+                            let next_attempts = ev.attempts + 1;
+                            if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    provider_id = pid,
+                                    "dropping on_delivered event after max deferrals while bound instance is disabled"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                            } else {
+                                let _ = self
+                                    .inner
+                                    .db
+                                    .reschedule_plugin_event(
+                                        ev.id,
+                                        next_attempts,
+                                        now.saturating_add(300),
+                                    )
+                                    .await;
+                            }
+                            continue;
+                        }
+                        match self
+                            .inner
+                            .master_key
+                            .decrypt_json::<serde_json::Value>(&inst.encrypted_config)
+                        {
+                            Ok(cfg) => {
+                                if cfg.get("use_proxy").and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                                {
+                                    use_proxy = true;
+                                }
+                                for o in extract_uri_origins_with_allowed_hosts(
+                                    &runtime.manifest.instance_schema,
+                                    &cfg,
+                                    &runtime.manifest.allowed_hosts,
+                                ) {
+                                    if !admin_origins.contains(&o) {
+                                        admin_origins.push(o);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                processed += 1;
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    provider_id = pid,
+                                    error = %err,
+                                    "dropping on_delivered event after bound instance config decrypt failure"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        processed += 1;
+                        warn!(
+                            plugin_id = %ev.plugin_id,
+                            event_id = ev.id,
+                            provider_id = pid,
+                            "dropping on_delivered event for deleted or mismatched plugin instance"
+                        );
+                        let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        processed += 1;
+                        let next_attempts = ev.attempts + 1;
+                        if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                            warn!(
+                                plugin_id = %ev.plugin_id,
+                                event_id = ev.id,
+                                provider_id = pid,
+                                error = %err,
+                                "dropping on_delivered event after repeated DB read failures"
+                            );
+                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        } else {
+                            let _ = self
+                                .inner
+                                .db
+                                .reschedule_plugin_event(
+                                    ev.id,
+                                    next_attempts,
+                                    now.saturating_add(300),
+                                )
+                                .await;
+                        }
+                        continue;
                     }
                 }
             }
@@ -1731,41 +1823,234 @@ impl DeliveryDispatcher {
                 && let Ok(Some(route)) = self.inner.db.get_route(route_id).await
                 && let Some(opt) = route.options().plugins.get(&ev.plugin_id)
             {
-                for o in extract_uri_origins(&runtime.manifest.route_option_schema, opt) {
+                for o in extract_uri_origins_with_allowed_hosts(
+                    &runtime.manifest.route_option_schema,
+                    opt,
+                    &runtime.manifest.allowed_hosts,
+                ) {
                     if !admin_origins.contains(&o) {
                         admin_origins.push(o);
                     }
                 }
             }
-            if let Some(ch_id) = payload
-                .get("channel")
-                .and_then(|c| c.get("id"))
-                .and_then(serde_json::Value::as_i64)
-                && let Ok(Some(ch)) = self.inner.db.get_channel(ch_id).await
-                && ch.kind == ChannelKind::Plugin
-                && let Ok(ChannelConfig::Plugin(p)) =
-                    self.inner.master_key.decrypt_json(&ch.encrypted_config)
-                && p.plugin_id == ev.plugin_id
-            {
-                use_proxy = ch.use_proxy;
-                for o in extract_uri_origins(&runtime.manifest.account_schema, &p.config) {
-                    if !admin_origins.contains(&o) {
-                        admin_origins.push(o);
-                    }
-                }
-                if let Some(dest_id) = payload
-                    .get("destination")
-                    .and_then(|d| d.get("id"))
+            // Fail-closed proxy/origin guard for channel plugin events (`kind = "channel"`):
+            // deleted/mismatched/undecryptable channels or destinations drop the event; disabled
+            // channels or destinations defer up to `MAX_PLUGIN_EVENT_ATTEMPTS`.
+            if js_plugin.manifest.kind == PluginKind::Channel {
+                let Some(ch_id) = payload
+                    .get("channel")
+                    .and_then(|c| c.get("id"))
                     .and_then(serde_json::Value::as_i64)
-                    && let Ok(Some(dest)) = self.inner.db.get_destination(dest_id).await
-                    && dest.channel_id == ch.id
-                    && let Ok(DestinationConfig::Plugin(dp)) =
-                        self.inner.master_key.decrypt_json(&dest.encrypted_config)
-                {
-                    for o in extract_uri_origins(&runtime.manifest.destination_schema, &dp.config) {
-                        if !admin_origins.contains(&o) {
-                            admin_origins.push(o);
+                else {
+                    processed += 1;
+                    warn!(
+                        plugin_id = %ev.plugin_id,
+                        event_id = ev.id,
+                        "dropping channel on_delivered event missing channel id"
+                    );
+                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                    continue;
+                };
+                match self.inner.db.get_channel(ch_id).await {
+                    Ok(Some(ch)) if ch.kind == ChannelKind::Plugin => {
+                        let plugin_acct = match self
+                            .inner
+                            .master_key
+                            .decrypt_json::<ChannelConfig>(&ch.encrypted_config)
+                        {
+                            Ok(ChannelConfig::Plugin(p)) if p.plugin_id == ev.plugin_id => p,
+                            Ok(_) => {
+                                processed += 1;
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    channel_id = ch_id,
+                                    "dropping channel on_delivered event with mismatched channel plugin_id"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                continue;
+                            }
+                            Err(err) => {
+                                processed += 1;
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    channel_id = ch_id,
+                                    error = %err,
+                                    "dropping channel on_delivered event after channel config decrypt failure"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                continue;
+                            }
+                        };
+                        if !ch.enabled {
+                            processed += 1;
+                            let next_attempts = ev.attempts + 1;
+                            if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    channel_id = ch_id,
+                                    "dropping channel on_delivered event after max deferrals while channel is disabled"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                            } else {
+                                let _ = self
+                                    .inner
+                                    .db
+                                    .reschedule_plugin_event(
+                                        ev.id,
+                                        next_attempts,
+                                        now.saturating_add(300),
+                                    )
+                                    .await;
+                            }
+                            continue;
                         }
+                        use_proxy = ch.use_proxy;
+                        for o in extract_uri_origins_with_allowed_hosts(
+                            &runtime.manifest.account_schema,
+                            &plugin_acct.config,
+                            &runtime.manifest.allowed_hosts,
+                        ) {
+                            if !admin_origins.contains(&o) {
+                                admin_origins.push(o);
+                            }
+                        }
+                        if let Some(dest_id) = payload
+                            .get("destination")
+                            .and_then(|d| d.get("id"))
+                            .and_then(serde_json::Value::as_i64)
+                        {
+                            match self.inner.db.get_destination(dest_id).await {
+                                Ok(Some(dest)) if dest.channel_id == ch.id => {
+                                    if !dest.enabled {
+                                        processed += 1;
+                                        let next_attempts = ev.attempts + 1;
+                                        if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                            warn!(
+                                                plugin_id = %ev.plugin_id,
+                                                event_id = ev.id,
+                                                destination_id = dest_id,
+                                                "dropping channel on_delivered event after max deferrals while destination is disabled"
+                                            );
+                                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                        } else {
+                                            let _ = self
+                                                .inner
+                                                .db
+                                                .reschedule_plugin_event(
+                                                    ev.id,
+                                                    next_attempts,
+                                                    now.saturating_add(300),
+                                                )
+                                                .await;
+                                        }
+                                        continue;
+                                    }
+                                    match self
+                                        .inner
+                                        .master_key
+                                        .decrypt_json::<DestinationConfig>(&dest.encrypted_config)
+                                    {
+                                        Ok(DestinationConfig::Plugin(dp)) => {
+                                            for o in extract_uri_origins_with_allowed_hosts(
+                                                &runtime.manifest.destination_schema,
+                                                &dp.config,
+                                                &runtime.manifest.allowed_hosts,
+                                            ) {
+                                                if !admin_origins.contains(&o) {
+                                                    admin_origins.push(o);
+                                                }
+                                            }
+                                        }
+                                        Ok(_) | Err(_) => {
+                                            processed += 1;
+                                            warn!(
+                                                plugin_id = %ev.plugin_id,
+                                                event_id = ev.id,
+                                                destination_id = dest_id,
+                                                "dropping channel on_delivered event after destination config decrypt failure"
+                                            );
+                                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Ok(_) => {
+                                    processed += 1;
+                                    warn!(
+                                        plugin_id = %ev.plugin_id,
+                                        event_id = ev.id,
+                                        destination_id = dest_id,
+                                        "dropping channel on_delivered event for deleted or mismatched destination"
+                                    );
+                                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    processed += 1;
+                                    let next_attempts = ev.attempts + 1;
+                                    if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                        warn!(
+                                            plugin_id = %ev.plugin_id,
+                                            event_id = ev.id,
+                                            destination_id = dest_id,
+                                            error = %err,
+                                            "dropping channel on_delivered event after repeated destination DB errors"
+                                        );
+                                        let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                    } else {
+                                        let _ = self
+                                            .inner
+                                            .db
+                                            .reschedule_plugin_event(
+                                                ev.id,
+                                                next_attempts,
+                                                now.saturating_add(300),
+                                            )
+                                            .await;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        processed += 1;
+                        warn!(
+                            plugin_id = %ev.plugin_id,
+                            event_id = ev.id,
+                            channel_id = ch_id,
+                            "dropping channel on_delivered event for deleted or non-plugin channel"
+                        );
+                        let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        processed += 1;
+                        let next_attempts = ev.attempts + 1;
+                        if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                            warn!(
+                                plugin_id = %ev.plugin_id,
+                                event_id = ev.id,
+                                channel_id = ch_id,
+                                error = %err,
+                                "dropping channel on_delivered event after repeated channel DB errors"
+                            );
+                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        } else {
+                            let _ = self
+                                .inner
+                                .db
+                                .reschedule_plugin_event(
+                                    ev.id,
+                                    next_attempts,
+                                    now.saturating_add(300),
+                                )
+                                .await;
+                        }
+                        continue;
                     }
                 }
             }

@@ -22,7 +22,7 @@ use crate::error::{AppError, AppResult};
 use crate::net::{OutboundRequest, ProtectedHttpClient};
 
 use self::js_runtime::{
-    JS_MAX_SCRIPT_BYTES, JsPluginRuntime, JsProcessorPlugin, compile_js_plugin_sync,
+    JS_MAX_SCRIPT_BYTES, JsPluginRuntime, JsProcessorPlugin, compile_js_plugin,
 };
 use self::link_rewrite::LinkRewritePlugin;
 
@@ -579,15 +579,9 @@ impl PluginRegistry {
                     continue;
                 };
 
-                let script_for_compile = script_js.clone();
-                let compile_res = tokio::task::spawn_blocking(move || {
-                    compile_js_plugin_sync(&script_for_compile)
-                })
-                .await;
-
-                let compiled = match compile_res {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(err)) => {
+                let compiled = match compile_js_plugin(script_js.clone()).await {
+                    Ok(c) => c,
+                    Err(err) => {
                         let (persisted_compat, persisted_reason) = check_plugin_compatibility(
                             &fallback_manifest.api_version,
                             fallback_manifest.min_core.as_deref(),
@@ -609,29 +603,6 @@ impl PluginRegistry {
                             plugin_id = %row.id,
                             error = %err,
                             "persisted JS plugin failed compilation; keeping incompatible placeholder"
-                        );
-                        enabled_by_id.insert(row.id.clone(), false);
-                        js_plugins.insert(
-                            row.id.clone(),
-                            JsPluginEntry {
-                                source: row.source,
-                                manifest: fallback_manifest,
-                                script_sha256: row.script_sha256,
-                                runtime: None,
-                                enabled: false,
-                                compatible: false,
-                                compatibility_reason: Some(reason),
-                                disabled_reason: row.disabled_reason,
-                            },
-                        );
-                        continue;
-                    }
-                    Err(join_err) => {
-                        let reason = format!("JS plugin compiler task panicked: {join_err}");
-                        tracing::warn!(
-                            plugin_id = %row.id,
-                            error = %join_err,
-                            "persisted JS plugin compiler task panicked; keeping incompatible placeholder"
                         );
                         enabled_by_id.insert(row.id.clone(), false);
                         js_plugins.insert(

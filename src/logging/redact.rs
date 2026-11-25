@@ -29,6 +29,13 @@ static BASIC_AUTH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bBasic\s+([A-Za-z0-9+/=]{4,})").expect("BASIC_AUTH_RE must compile")
 });
 
+static DIGEST_AUTH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\bDigest\s+(?:[A-Za-z0-9_-]+\s*=\s*(?:"(?:\\.|[^"\\])*"|[^\s,;\]]+)(?:\s*,\s*)?)+"#,
+    )
+    .expect("DIGEST_AUTH_RE must compile")
+});
+
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(?:https?|smtps?|socks5h?|socks4a?)://[^\s"'<>)\]}]+"#)
         .expect("URL_RE must compile")
@@ -36,7 +43,7 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static KV_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)((?:\\?["'])?)([A-Za-z0-9_-]*(?:token|password|passwd|passphrase|secret|signature|api[_-]?key|apikey|device[_-]?key|push[_-]?key|access[_-]?key|webhook[_-]?key|authorization|cookie|credential|bearer|private[_-]?key)[A-Za-z0-9_-]*)((?:\\?["'])?)(\s*)([=:])(\s*)(?:(\\"(?:\\\\\\"|\\\\|\\[^"]|[^"\\])+\\")|("(?:\\.|[^"\\])+")|('(?:\\.|[^'\\])+')|((?:(?:Bearer|Basic|Token|Digest)\s+)?[^\s,;&"'}\\]+))"#,
+        r#"(?i)((?:\\{0,2}["'])?)([A-Za-z0-9_-]*(?:token|password|passwd|passphrase|secret|signature|api[_-]?key|apikey|device[_-]?key|push[_-]?key|access[_-]?key|webhook[_-]?key|authorization|cookie|credential|bearer|private[_-]?key)[A-Za-z0-9_-]*)((?:\\{0,2}["'])?)(\s*)([=:])(\s*)(?:(\\\\"(?:\\\\\\"|\\\\[^"]|[^"\\])+\\\\")|(\\"(?:\\\\\\"|\\\\|\\[^"]|[^"\\])+\\")|("(?:\\.|[^"\\])+")|('(?:\\.|[^'\\])+')|(Digest\s+(?:[A-Za-z0-9_-]+\s*=\s*(?:"(?:\\.|[^"\\])*"|[^\s,;\]]+)(?:\s*,\s*)?)+|(?:(?:Bearer|Basic|Token)\s+)?[^\s,;&"'}\]\\]+))"#,
     )
     .expect("KV_SECRET_RE must compile")
 });
@@ -75,6 +82,7 @@ pub fn is_sensitive_field_name(name: &str) -> bool {
         lower.as_str(),
         "token_id" | "token_name" | "token_scope" | "token_prefix" | "token_count" | "tokens_count"
     ) || lower.starts_with("has_")
+        || lower.ends_with("_hint")
     {
         return false;
     }
@@ -182,19 +190,21 @@ pub fn redact_text(raw: &str) -> String {
         let sep = &caps[5];
         let ws_after = &caps[6];
         if caps.get(7).is_some() {
-            format!(r#"{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\""#)
+            format!(r#"{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\\"[redacted]\\""#)
         } else if caps.get(8).is_some() {
-            format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\"")
+            format!(r#"{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\""#)
         } else if caps.get(9).is_some() {
+            format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}\"[redacted]\"")
+        } else if caps.get(10).is_some() {
             format!("{open_kq}{key}{close_kq}{ws_before}{sep}{ws_after}'[redacted]'")
-        } else if caps.get(10).is_some_and(|m| m.as_str() == "null") && !open_kq.is_empty() {
+        } else if caps.get(11).is_some_and(|m| m.as_str() == "null") && !open_kq.is_empty() {
             caps[0].to_string()
         } else {
             format!("{open_kq}{key}{close_kq}{sep}[redacted]")
         }
     });
 
-    // 5. Mask any remaining standalone `Bearer <token>` or `Basic <base64>` credentials.
+    // 5. Mask any remaining standalone `Bearer <token>`, `Basic <base64>`, or `Digest ...` credentials.
     let bearer_cleaned = BEARER_RE.replace_all(&kv_cleaned, "Bearer [redacted]");
     let basic_cleaned = BASIC_AUTH_RE.replace_all(&bearer_cleaned, |caps: &regex::Captures<'_>| {
         let tok = &caps[1];
@@ -204,9 +214,10 @@ pub fn redact_text(raw: &str) -> String {
             caps[0].to_string()
         }
     });
+    let digest_cleaned = DIGEST_AUTH_RE.replace_all(&basic_cleaned, "Digest [redacted]");
 
     // 6. Mask any remaining email addresses (`alice@example.com` -> `a***e@example.com`).
-    let email_cleaned = mask_emails_in_text(&basic_cleaned);
+    let email_cleaned = mask_emails_in_text(&digest_cleaned);
 
     truncate_chars(&email_cleaned, MAX_LOG_VALUE_CHARS)
 }
@@ -427,6 +438,54 @@ mod tests {
         assert!(
             esc_out.contains(r#"\"idempotency_key\":\"idem_abc\""#),
             "idempotency_key wrongly redacted: {esc_out}"
+        );
+
+        // R2-P2-2 & R2-P3-1: `*_hint` metadata stays non-secret; bracketed unquoted values
+        // preserve `]`; double-escaped JSON quotes and multi-segment Digest headers are redacted.
+        assert!(!is_sensitive_field_name("device_key_hint"));
+        assert!(!is_sensitive_field_name("access_key_hint"));
+        assert!(!is_sensitive_field_name("signature_hint"));
+
+        let bracketed = "meta [authorization=tok_secret_123] ok";
+        let bracketed_out = redact_text(bracketed);
+        assert!(
+            !bracketed_out.contains("tok_secret_123"),
+            "bracketed secret leaked: {bracketed_out}"
+        );
+        assert!(
+            bracketed_out.contains("[authorization=[redacted]] ok"),
+            "closing bracket was eaten: {bracketed_out}"
+        );
+
+        let double_escaped =
+            r#"outer=\\"{\"password\":\\"nested_pw_42\\",\"device_key\":\\"dk_nested_77\\"}\\""#;
+        let double_out = redact_text(double_escaped);
+        assert!(
+            !double_out.contains("nested_pw_42"),
+            "double-escaped password leaked: {double_out}"
+        );
+        assert!(
+            !double_out.contains("dk_nested_77"),
+            "double-escaped device_key leaked: {double_out}"
+        );
+
+        let digest_msg = r#"Authorization: Digest username="Mufasa", realm="test@host", nonce="dcd98b71", response="6629fae49393a05397450978507c4ef1" and standalone Digest username="bob", response="deadbeef1234" plus Digest summary ready"#;
+        let digest_out = redact_text(digest_msg);
+        assert!(
+            !digest_out.contains("6629fae49393a05397450978507c4ef1"),
+            "Digest header response leaked: {digest_out}"
+        );
+        assert!(
+            !digest_out.contains("dcd98b71"),
+            "Digest header nonce leaked: {digest_out}"
+        );
+        assert!(
+            !digest_out.contains("deadbeef1234"),
+            "standalone Digest response leaked: {digest_out}"
+        );
+        assert!(
+            digest_out.contains("Digest summary ready"),
+            "prose Digest wrongly redacted: {digest_out}"
         );
     }
 }

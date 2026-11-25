@@ -41,6 +41,61 @@ function isSafeHttpUrl(raw: string): boolean {
   }
 }
 
+function isPrivateOrLocalDefaultHost(normHost: string): boolean {
+  return (
+    !normHost ||
+    normHost === "localhost" ||
+    normHost.endsWith(".localhost") ||
+    normHost.endsWith(".local") ||
+    normHost.endsWith(".internal") ||
+    normHost.includes(":") ||
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(normHost)
+  );
+}
+
+/**
+ * Returns true only when a `format: "uri"` schema default is a valid public HTTP(S) URL whose
+ * hostname is explicitly covered by the plugin's declared `meta.allowed_hosts`.
+ */
+export function isUriDefaultAllowed(
+  rawDefault: unknown,
+  allowedHosts?: readonly string[],
+): boolean {
+  if (
+    typeof rawDefault !== "string" ||
+    !allowedHosts ||
+    allowedHosts.length === 0
+  ) {
+    return false;
+  }
+  const trimmed = rawDefault.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    const norm = parsed.hostname
+      .trim()
+      .replace(/^\[/, "")
+      .replace(/\]$/, "")
+      .replace(/\.+$/, "")
+      .toLowerCase();
+    if (isPrivateOrLocalDefaultHost(norm)) return false;
+    return allowedHosts.some((rawPattern) => {
+      const pattern = rawPattern.trim().replace(/\.+$/, "").toLowerCase();
+      if (!pattern) return false;
+      if (pattern.startsWith("*.")) {
+        const dotSuffix = pattern.slice(1);
+        return norm.length > dotSuffix.length && norm.endsWith(dotSuffix);
+      }
+      return norm === pattern;
+    });
+  } catch {
+    return false;
+  }
+}
+
 export type SchemaFieldValue = string | boolean | null;
 export type SchemaFieldValues = Record<string, SchemaFieldValue>;
 
@@ -57,11 +112,20 @@ const SENSITIVE_FIELD_KEYWORDS = [
   "token",
   "password",
   "passwd",
+  "passphrase",
   "secret",
   "signature",
   "api_key",
   "api-key",
   "apikey",
+  "device_key",
+  "device-key",
+  "push_key",
+  "push-key",
+  "access_key",
+  "access-key",
+  "webhook_key",
+  "webhook-key",
   "authorization",
   "cookie",
   "credential",
@@ -78,7 +142,11 @@ export function isSchemaSecretProperty(
     return true;
   }
   const lower = key.toLowerCase();
-  if (NON_SECRET_METADATA_KEYS.has(lower) || lower.startsWith("has_")) {
+  if (
+    NON_SECRET_METADATA_KEYS.has(lower) ||
+    lower.startsWith("has_") ||
+    lower.endsWith("_hint")
+  ) {
     return false;
   }
   return SENSITIVE_FIELD_KEYWORDS.some((kw) => lower.includes(kw));
@@ -121,6 +189,7 @@ export function parseObjectSchema(
 export function initSchemaFieldValues(
   schema: Record<string, unknown> | null | undefined,
   existingConfig?: Record<string, unknown>,
+  allowedHosts?: readonly string[],
 ): SchemaFieldValues {
   const parsed = parseObjectSchema(schema);
   const initial: SchemaFieldValues = {};
@@ -145,7 +214,13 @@ export function initSchemaFieldValues(
     } else if (existing !== undefined && existing !== null) {
       initial[key] = String(existing);
     } else if (prop.default !== undefined && prop.default !== null) {
-      initial[key] = String(prop.default);
+      if (prop.format === "uri") {
+        initial[key] = isUriDefaultAllowed(prop.default, allowedHosts)
+          ? String(prop.default)
+          : "";
+      } else {
+        initial[key] = String(prop.default);
+      }
     } else if (
       parsed.required.has(key) &&
       Array.isArray(prop.enum) &&
@@ -338,6 +413,7 @@ export function SchemaFormFields({
   onChange,
   isEdit = false,
   existingConfig,
+  allowedHosts,
 }: {
   idPrefix: string;
   schema: Record<string, unknown> | null | undefined;
@@ -345,6 +421,7 @@ export function SchemaFormFields({
   onChange: (next: SchemaFieldValues) => void;
   isEdit?: boolean;
   existingConfig?: Record<string, unknown>;
+  allowedHosts?: readonly string[];
 }) {
   const { m } = useI18n();
   const parsed = parseObjectSchema(schema);
@@ -436,6 +513,16 @@ export function SchemaFormFields({
               ? "url"
               : "text";
 
+        const fallbackUriPlaceholder =
+          !isSecret &&
+          prop.format === "uri" &&
+          !prop.placeholder &&
+          typeof prop.default === "string" &&
+          prop.default.trim().length > 0 &&
+          !isUriDefaultAllowed(prop.default, allowedHosts)
+            ? prop.default.trim()
+            : undefined;
+
         const placeholder = isSecret
           ? isClearedSecret
             ? m.plugins.providerModal.secretWillClearPlaceholder
@@ -445,7 +532,7 @@ export function SchemaFormFields({
                 : m.plugins.providerModal.genericSecretStoredPlaceholder
               : prop.placeholder ||
                 m.plugins.providerModal.genericSecretPlaceholder
-          : prop.placeholder;
+          : prop.placeholder || fallbackUriPlaceholder;
 
         return (
           <div key={key}>

@@ -18,14 +18,14 @@ description: "在 FeedCourier (v0.3.1+) 中通过 WebUI 插件市场一键安装
 - **纯 Rust 进程内沙箱（`boa_engine`）**：每次调用在独立沙箱上下文中执行，完全隔离本地文件系统、环境变量、子进程与原始 Socket。
 - **显式 `allowed_hosts` + 管理员显式提交 `format: "uri"` 策略**：`fc.fetch()` 仅允许请求以下两类目标：
   1. 插件在 `meta.allowed_hosts` 中显式声明的公网域名（例如 `ntfy.sh` 或 `api.day.app`），这些域名会直接展示在插件市场卡片与安装确认弹窗中，并全程经过连接层防 DNS Rebinding SSRF 的 `ProtectedHttpClient`。
-  2. **仅由管理员显式提交的非空 `format: "uri"` 字段**所对应的精确 `(scheme, host, port)`（如自建 LAN / Docker 的 `ntfy` 或 `Bark` `server_url`），可精确放行直连而**无需放宽订阅源的全局 `SSRF_ALLOWLIST`**。Schema 中的 `default` 默认值**绝不会**被自动信任或持久化为管理员 URI 白名单（例如 `ntfy.sh` / `api.day.app` 等默认公网主机必须列在 `meta.allowed_hosts` 中并接受标准 SSRF 校验）；同时，插件 `validate()` 返回的 `normalized_config` 不得新增 `format: "uri"` 字段，也不得篡改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。
+  2. **仅由管理员显式提交的非空 `format: "uri"` 字段**所对应的精确 `(scheme, host, port)`（如自建 LAN / Docker 的 `ntfy` 或 `Bark` `server_url`），可精确放行直连而**无需放宽订阅源的全局 `SSRF_ALLOWLIST`**。`format: "uri"` 的 Schema `default` **仅当**其主机名是插件自身 `meta.allowed_hosts` 中声明的公网域名（如 `ntfy.sh`、`api.day.app`）时才允许前后端自动填充，且始终走公网 SSRF 防护（不赋予私网直连豁免）；凡不在 `meta.allowed_hosts` 内的 URI `default` 一律不自动填充（前端仅作灰色 `placeholder` 提示）。同时，插件 `validate()` 返回的 `normalized_config` 不得新增 `format: "uri"` 字段，也不得篡改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。
 - **云元数据硬拦截、代理 DNS 边界与 `use_proxy` 支持**：
   - 云元数据字面量 IP（`169.254.169.254`、`169.254.170.2`、`100.100.100.200`、`fd00:ec2::254` 及 IPv4 映射 IPv6 / NAT64 形式）、未指定地址（`0.0.0.0`、`::`）、云元数据主机名（`metadata.google.internal`、`metadata.goog`、`instance-data`）以及 HTTP `3xx` 重定向在所有 `fc.fetch()` 调用中（无论直连还是走代理）**永久硬拦截**。
   - 直连与本地 DNS 解析代理（`socks5://`）还会在建立连接前解析 DNS 并拦截指向云元数据 IP 的记录；远端 DNS 解析代理（`http://`、`https://`、`socks5h://`）由于 DNS 解析发生在代理服务端，客户端侧强制执行主机名与字面量 IP 校验。
   - 插件通道账号（`ChannelKind::Plugin`）完整支持账号级 **使用出站代理**（`use_proxy`）开关（未配置全局 `OUTBOUND_PROXY` 时 fail-closed 报错）。
 - **并发上限、超时取消与连续超时熔断**：
   - 全局最多同时运行 **4** 个 JS 沙箱执行任务；每个钩子均带有墙钟超时预算，且在每次 `fc.*` 宿主调用前检查取消标记（避免超时后仍发起 HTTP 请求），单次 `fc.fetch()` 的 `timeoutMs` 也会自动截断至剩余钩子预算内。
-  - 若某个 JS 插件连续触发 **3 次执行超时**，自动熔断器会将其全局禁用并在 `plugins.disabled_reason` 中记录原因，WebUI 插件卡片与详情页顶部会以醒目的红色 **已自动禁用** 警告横幅提示管理员排查。
+  - 若某个 JS 插件连续触发 **3 次钩子总预算超时**（与等待共享沙箱槽位超时及单次 `fc.fetch()` 的短 `timeoutMs` 超时严格区分，避免误杀健康插件），自动熔断器会将其全局禁用并在 `plugins.disabled_reason` 中记录原因，WebUI 插件卡片与详情页顶部会以醒目的红色 **已自动禁用** 警告横幅提示管理员排查。
   - 边界说明：`boa_engine` 0.22 尚不提供针对纯 CPU 嵌套循环的外部抢占中断，因此恶意纯 CPU 死循环可能会占用 4 个沙箱槽位中的 1 个，直至 Boa 自身的单循环迭代上限触发退出。
 - **SHA-256 完整性校验与凭据静态加密**：从市场下载的插件脚本在预览与安装前均强制校验 `index.json` 中声明的 SHA-256 摘要；`account_schema` / `destination_schema` 中标记为敏感的字段（`format: "password"` 或 `x-secret: true`）均使用 `MasterKey`（ChaCha20-Poly1305）加密落盘并在所有接口中脱敏。
 

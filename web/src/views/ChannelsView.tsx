@@ -2079,11 +2079,16 @@ function ChannelAccountModal({
       initSchemaFieldValues(
         selectedPlugin?.manifest.account_schema,
         initialPluginAcct?.config,
+        selectedPlugin?.manifest.allowed_hosts,
       ),
   );
   const [pluginInitDestValues, setPluginInitDestValues] =
     useState<SchemaFieldValues>(() =>
-      initSchemaFieldValues(selectedPlugin?.manifest.destination_schema),
+      initSchemaFieldValues(
+        selectedPlugin?.manifest.destination_schema,
+        undefined,
+        selectedPlugin?.manifest.allowed_hosts,
+      ),
     );
   const hydratedAcctPluginRef = useRef<string | null>(
     selectedPlugin ? selectedPlugin.id : null,
@@ -2105,13 +2110,18 @@ function ChannelAccountModal({
           isEdit && initialPluginAcct?.plugin_id === selectedPlugin.id
             ? initialPluginAcct.config
             : undefined,
+          selectedPlugin.manifest.allowed_hosts,
         ),
       );
     }
     if (!isEdit && hydratedDestPluginRef.current !== selectedPlugin.id) {
       hydratedDestPluginRef.current = selectedPlugin.id;
       setPluginInitDestValues(
-        initSchemaFieldValues(selectedPlugin.manifest.destination_schema),
+        initSchemaFieldValues(
+          selectedPlugin.manifest.destination_schema,
+          undefined,
+          selectedPlugin.manifest.allowed_hosts,
+        ),
       );
     }
   }, [selectedPlugin, selectedPluginId, isEdit, initialPluginAcct]);
@@ -2202,9 +2212,19 @@ function ChannelAccountModal({
       setSelectedPluginId(plugin.id);
       hydratedAcctPluginRef.current = plugin.id;
       hydratedDestPluginRef.current = plugin.id;
-      setPluginAcctValues(initSchemaFieldValues(plugin.manifest.account_schema));
+      setPluginAcctValues(
+        initSchemaFieldValues(
+          plugin.manifest.account_schema,
+          undefined,
+          plugin.manifest.allowed_hosts,
+        ),
+      );
       setPluginInitDestValues(
-        initSchemaFieldValues(plugin.manifest.destination_schema),
+        initSchemaFieldValues(
+          plugin.manifest.destination_schema,
+          undefined,
+          plugin.manifest.allowed_hosts,
+        ),
       );
     }
     setFormError(null);
@@ -2780,6 +2800,7 @@ function ChannelAccountModal({
                 onChange={setPluginAcctValues}
                 isEdit={isEdit}
                 existingConfig={initialPluginAcct?.config}
+                allowedHosts={selectedPlugin.manifest.allowed_hosts}
               />
             </div>
           ) : null)}
@@ -2982,6 +3003,7 @@ function ChannelAccountModal({
                       schema={selectedPlugin.manifest.destination_schema}
                       values={pluginInitDestValues}
                       onChange={setPluginInitDestValues}
+                      allowedHosts={selectedPlugin.manifest.allowed_hosts}
                     />
                   ) : null)}
               </div>
@@ -3030,6 +3052,7 @@ function DestinationModal({
       initSchemaFieldValues(
         plugin?.manifest.destination_schema,
         initialPluginDest?.config,
+        plugin?.manifest.allowed_hosts,
       ),
   );
   const hydratedPluginRef = useRef<string | null>(plugin ? plugin.id : null);
@@ -3042,6 +3065,7 @@ function DestinationModal({
         initSchemaFieldValues(
           plugin.manifest.destination_schema,
           initialPluginDest?.config,
+          plugin.manifest.allowed_hosts,
         ),
       );
     }
@@ -3383,6 +3407,7 @@ function DestinationModal({
                 onChange={setPluginDestValues}
                 isEdit={isEdit}
                 existingConfig={initialPluginDest?.config}
+                allowedHosts={plugin?.manifest.allowed_hosts}
               />
             )}
           </div>
