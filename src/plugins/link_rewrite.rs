@@ -209,10 +209,24 @@ impl LinkRewritePlugin {
             name: "Link Rewrite (YOURLS)".to_string(),
             version: crate::config::VERSION.to_string(),
             api_version: PLUGIN_API_VERSION.to_string(),
+            kind: super::PluginKind::Processor,
+            runtime: super::PluginRuntime::Builtin,
+            min_core: None,
             category: "links".to_string(),
             icon: "link".to_string(),
             description: "Rewrite outgoing article links using self-hosted YOURLS short-link providers at delivery time with SQLite caching and per-route selection.".to_string(),
+            description_i18n: std::collections::BTreeMap::from([
+                (
+                    "en".to_string(),
+                    "Rewrite outgoing article links using self-hosted YOURLS short-link providers at delivery time with SQLite caching and per-route selection.".to_string(),
+                ),
+                (
+                    "zh".to_string(),
+                    "在投递时通过自建 YOURLS 短链服务改写文章外链，支持 SQLite 缓存与按路由选择。".to_string(),
+                ),
+            ]),
             homepage: "https://feedcourier.ellery.me/plugins/link-rewrite".to_string(),
+            allowed_hosts: vec![],
             hooks: vec![HookKind::OnRender],
             permissions: vec![PluginPermission::Network],
             instance_schema: json!({
@@ -246,6 +260,9 @@ impl LinkRewritePlugin {
                     }
                 }
             }),
+            account_schema: json!({}),
+            destination_schema: json!({}),
+            capabilities: json!({}),
         };
         Self { manifest }
     }
@@ -379,6 +396,32 @@ impl Plugin for LinkRewritePlugin {
         ))
     }
 
+    async fn effective_strict_mode(&self, ctx: &RenderContext<'_>) -> bool {
+        let Some(raw_opt) = ctx.plugin_route_config else {
+            return false;
+        };
+        if raw_opt.get("strict_mode").and_then(Value::as_bool) == Some(true) {
+            return true;
+        }
+        let Ok(route_opt) = serde_json::from_value::<LinkRewriteRouteOption>(raw_opt.clone())
+        else {
+            return false;
+        };
+        let Some(provider_id) = route_opt.provider_id else {
+            return false;
+        };
+        if let Ok(Some(instance)) = ctx.db.get_plugin_instance(provider_id).await
+            && instance.plugin_id == LINK_REWRITE_PLUGIN_ID
+            && instance.enabled
+            && let Ok(provider_cfg) = ctx
+                .master_key
+                .decrypt_json::<YourlsProviderConfig>(&instance.encrypted_config)
+        {
+            return provider_cfg.strict_mode;
+        }
+        false
+    }
+
     async fn on_render(
         &self,
         ctx: &RenderContext<'_>,
@@ -396,7 +439,7 @@ impl Plugin for LinkRewritePlugin {
         };
 
         let Some(instance) = ctx.db.get_plugin_instance(provider_id).await? else {
-            out.warnings.push(format!(
+            out.push_warning(format!(
                 "Link Rewrite: provider #{provider_id} not found; kept original URLs"
             ));
             return Ok(PluginResult::Continue);
@@ -405,7 +448,7 @@ impl Plugin for LinkRewritePlugin {
             return Ok(PluginResult::Continue);
         }
         if !instance.enabled {
-            out.warnings.push(format!(
+            out.push_warning(format!(
                 "Link Rewrite: provider '{}' is disabled; kept original URLs",
                 instance.name
             ));
@@ -585,23 +628,6 @@ impl Plugin for LinkRewritePlugin {
             });
         }
 
-        if failed_count > 0 {
-            let ok_count = resolved_map.len();
-            let err_hint = first_error.unwrap_or_else(|| "YOURLS request failed".to_string());
-            out.warnings.push(format!(
-                "Link Rewrite partial ({ok_count}/{} rewritten, {failed_count} kept original: {err_hint})",
-                candidate_urls.len()
-            ));
-        } else if truncated_cap {
-            out.warnings.push(format!(
-                "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} new uncached links; remaining uncached links kept original"
-            ));
-        } else if candidate_cap_hit {
-            out.warnings.push(format!(
-                "Link Rewrite capped at {MAX_CANDIDATE_URLS_PER_ENTRY} unique candidate links per entry; remaining links kept original"
-            ));
-        }
-
         // 5. Apply resolved short links to primary link and HTML `<a href>` attributes.
         if let Some(p_url) = primary_url
             && let Some(short) = resolved_map.get(p_url)
@@ -613,6 +639,23 @@ impl Plugin for LinkRewritePlugin {
             && !resolved_map.is_empty()
         {
             out.content_html = Some(rewrite_anchor_hrefs(html, &resolved_map));
+        }
+
+        if failed_count > 0 {
+            let ok_count = resolved_map.len();
+            let err_hint = first_error.unwrap_or_else(|| "YOURLS request failed".to_string());
+            out.push_warning(format!(
+                "Link Rewrite partial ({ok_count}/{} rewritten, {failed_count} kept original: {err_hint})",
+                candidate_urls.len()
+            ));
+        } else if truncated_cap {
+            out.push_warning(format!(
+                "Link Rewrite capped at {MAX_REWRITE_URLS_PER_ENTRY} new uncached links; remaining uncached links kept original"
+            ));
+        } else if candidate_cap_hit {
+            out.push_warning(format!(
+                "Link Rewrite capped at {MAX_CANDIDATE_URLS_PER_ENTRY} unique candidate links per entry; remaining links kept original"
+            ));
         }
 
         Ok(PluginResult::Continue)

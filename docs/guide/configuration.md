@@ -28,6 +28,16 @@ FeedCourier requires only `DATA_DIR` and `LISTEN_ADDR` for a standard deployment
 | `RETENTION_HOURS` | `24` | Hours after discovery to retain article HTML and media metadata once all delivery tasks for that entry have finished. |
 | `DB_READ_MAX_CONNECTIONS` | `8` | Maximum concurrent connections in the read-only SQLite connection pool (minimum `1`). |
 | `RUST_LOG` | `feedcourier=info,tower_http=info` | Log level filter (supports `debug`, `warn`, `error`, or module targets such as `feedcourier::scheduler=debug`). |
+| `LOG_FORMAT` | `text` | Stdout (`docker logs`) format: `text` (human-readable) or `json` (structured single-line JSON). Sensitive fields, emails, tokens, and URL query strings are automatically redacted in both stdout and stored logs. |
+| `LOG_STORE` | `sqlite` | Internal structured log backend: `sqlite` (isolated `<DATA_DIR>/logs.db` WAL database), `clickhouse` (HTTP `JSONEachRow` sink for high-volume deployments), or `off`. Keyword searches against the log store validate **`2–128`** characters, default to a **24-hour** lookback window when no lower time bound is specified, and enforce a **5-second** query timeout. |
+| `LOG_STORE_LEVEL` | `info` | Minimum log level persisted into the log store (`trace`, `debug`, `info`, `warn`, `error`). |
+| `LOG_RETENTION_DAYS` | `7` | Retention window in days for stored logs (pruned hourly in SQLite; enforced via table `TTL` in ClickHouse; minimum `1`). |
+| `LOG_MAX_ROWS` | `100000` | Maximum number of rows kept in SQLite `<DATA_DIR>/logs.db` (minimum `100`; ignored when `LOG_STORE=clickhouse`). |
+| `LOG_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint URL (e.g. `http://clickhouse:8123`; required when `LOG_STORE=clickhouse`). Treated as an operator-trusted internal address (not blocked by `SSRF_ALLOWLIST`; redirects remain disabled). |
+| `LOG_CLICKHOUSE_DATABASE` | `feedcourier` | ClickHouse target database name (created automatically if missing). |
+| `LOG_CLICKHOUSE_TABLE` | `logs` | ClickHouse `MergeTree` target table name (created automatically with `TTL ts + INTERVAL LOG_RETENTION_DAYS DAY`; `ts` is serialized as UTC `YYYY-MM-DD HH:MM:SS.fff` strings for `DateTime64(3, 'UTC')` alongside integer `ts_ms` epoch milliseconds). |
+| `LOG_CLICKHOUSE_USER` | *(unset)* | Optional ClickHouse HTTP username (`X-ClickHouse-User`). |
+| `LOG_CLICKHOUSE_PASSWORD` | *(unset)* | Optional ClickHouse HTTP password (`X-ClickHouse-Key`). |
 
 ::: warning Environment Overrides vs. Persisted Settings
 - If **`ADMIN_PASSWORD`** is set in the environment, FeedCourier updates the administrator password on **every startup**, which can also be used to recover access if you forget your password. **`ADMIN_USERNAME`** behaves the same way for the username; while it is set, the WebUI shows a hint that the username is managed by the environment.
@@ -83,8 +93,9 @@ Setting a global proxy URL does not route all traffic through the proxy automati
 - **Plugin Providers (e.g., Link Rewrite / YOURLS)**: Routes outbound plugin API calls through the global outbound proxy.
 - **Feed Previews**: Both the WebUI preview drawer and the MCP `preview_feed_latest` tool accept a `use_proxy` toggle per preview request.
 
-::: warning Fail-Closed `use_proxy: true` Guarantee
-If a feed, channel account, feed preview, or plugin instance has `use_proxy: true` enabled while **no global `OUTBOUND_PROXY`** (or fallback proxy URL in **Settings** / environment) is configured, FeedCourier **fails closed** with an explicit error instead of silently falling back to a direct connection and leaking the host's egress IP.
+::: warning Fail-Closed `use_proxy: true` & Proxy DNS Boundary
+- If a feed, channel account, feed preview, or plugin instance has `use_proxy: true` enabled while **no global `OUTBOUND_PROXY`** (or fallback proxy URL in **Settings** / environment) is configured, FeedCourier **fails closed** with an explicit error instead of silently falling back to a direct connection and leaking the host's egress IP.
+- Cloud metadata literal IPs (`169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, including IPv4-mapped IPv6/NAT64 forms) and metadata hostnames (`metadata.google.internal`, `metadata.goog`, `instance-data`) are blocked on both direct and proxied requests. Direct connections and local-DNS proxies (`socks5://`) also resolve DNS and block metadata IPs before connecting, while remote-DNS proxies (`http://`, `https://`, `socks5h://`) enforce hostname and literal-IP checks client-side because DNS resolution occurs on the proxy server.
 :::
 
 ---

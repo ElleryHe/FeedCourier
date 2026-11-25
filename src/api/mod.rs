@@ -202,8 +202,20 @@ pub fn build_api_only_router(state: AppState) -> Router {
         )
         // Plugins & Marketplace
         .route("/api/v1/plugins", get(handlers::list_plugins))
+        .route(
+            "/api/v1/plugins/install",
+            post(handlers::install_market_plugin),
+        )
+        .route("/api/v1/plugins/upload", post(handlers::upload_js_plugin))
         .route("/api/v1/plugins/market", get(handlers::get_plugin_market))
-        .route("/api/v1/plugins/{id}", patch(handlers::update_plugin))
+        .route(
+            "/api/v1/plugins/{id}",
+            patch(handlers::update_plugin).delete(handlers::delete_js_plugin),
+        )
+        .route(
+            "/api/v1/plugins/{id}/source",
+            get(handlers::get_plugin_source),
+        )
         .route(
             "/api/v1/plugins/{id}/instances",
             get(handlers::list_plugin_instances).post(handlers::create_plugin_instance),

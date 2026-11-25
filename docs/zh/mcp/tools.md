@@ -149,8 +149,10 @@ FeedCourier 的 `/mcp` 接口共提供 **10 个工具（Tools）**，分为只�
     {
       "id": "link-rewrite",
       "name": "Link Rewrite (YOURLS)",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "api_version": "1",
+      "kind": "processor",
+      "runtime": "builtin",
       "enabled": true,
       "hooks": ["on_render"],
       "instances": [

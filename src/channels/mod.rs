@@ -27,6 +27,7 @@ pub enum ChannelKind {
     Smtp,
     Telegram,
     Notion,
+    Plugin,
 }
 
 impl ChannelKind {
@@ -35,6 +36,7 @@ impl ChannelKind {
             Self::Smtp => "smtp",
             Self::Telegram => "telegram",
             Self::Notion => "notion",
+            Self::Plugin => "plugin",
         }
     }
 }
@@ -53,8 +55,9 @@ impl FromStr for ChannelKind {
             "smtp" => Ok(Self::Smtp),
             "telegram" => Ok(Self::Telegram),
             "notion" => Ok(Self::Notion),
+            "plugin" => Ok(Self::Plugin),
             other => Err(AppError::Validation(format!(
-                "unsupported channel kind '{other}' (expected smtp, telegram, or notion)"
+                "unsupported channel kind '{other}' (expected smtp, telegram, notion, or plugin)"
             ))),
         }
     }
@@ -239,6 +242,24 @@ pub struct NotionDestinationConfig {
     pub column_mapping: NotionColumnMapping,
 }
 
+/// Decrypted account-level configuration for a channel plugin (`ChannelKind::Plugin`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginChannelConfig {
+    /// Installed channel plugin ID (`plugins.id` where `kind = 'channel'`).
+    pub plugin_id: String,
+    /// Schema-validated account configuration object encrypted at rest.
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+/// Decrypted destination-level configuration for a channel plugin (`ChannelKind::Plugin`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDestinationConfig {
+    /// Schema-validated destination target object encrypted at rest.
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
 /// Decrypted account-level channel configuration stored encrypted in `channels.encrypted_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -246,6 +267,7 @@ pub enum ChannelConfig {
     Smtp(SmtpChannelConfig),
     Telegram(TelegramChannelConfig),
     Notion(NotionChannelConfig),
+    Plugin(PluginChannelConfig),
 }
 
 impl ChannelConfig {
@@ -255,6 +277,7 @@ impl ChannelConfig {
             Self::Smtp(_) => ChannelKind::Smtp,
             Self::Telegram(_) => ChannelKind::Telegram,
             Self::Notion(_) => ChannelKind::Notion,
+            Self::Plugin(_) => ChannelKind::Plugin,
         }
     }
 
@@ -304,6 +327,14 @@ impl ChannelConfig {
             Self::Notion(cfg) => {
                 compute_credential_group_key("notion", cfg.integration_secret.trim())
             }
+            Self::Plugin(cfg) => {
+                let canonical = serde_json::to_string(&cfg.config).unwrap_or_default();
+                let digest = sha256_hex(canonical.as_bytes());
+                compute_credential_group_key(
+                    "plugin",
+                    &format!("{}:{digest}", cfg.plugin_id.trim()),
+                )
+            }
         }
     }
 
@@ -343,7 +374,7 @@ impl ChannelConfig {
                     ),
                 )
             }
-            Self::Telegram(_) | Self::Notion(_) => self.credential_group_key(),
+            Self::Telegram(_) | Self::Notion(_) | Self::Plugin(_) => self.credential_group_key(),
         }
     }
 
@@ -399,6 +430,19 @@ impl ChannelConfig {
                 }
                 Ok(())
             }
+            Self::Plugin(cfg) => {
+                if cfg.plugin_id.trim().is_empty() {
+                    return Err(AppError::Validation(
+                        "Plugin channel plugin_id must not be empty".to_string(),
+                    ));
+                }
+                if !cfg.config.is_object() {
+                    return Err(AppError::Validation(
+                        "Plugin channel config must be a JSON object".to_string(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -425,6 +469,11 @@ impl ChannelConfig {
                 "kind": "notion",
                 "secret_hint": mask_secret(&cfg.integration_secret),
             }),
+            Self::Plugin(cfg) => serde_json::json!({
+                "kind": "plugin",
+                "plugin_id": cfg.plugin_id,
+                "config": crate::plugins::js_runtime::redact_config_generic(&cfg.config),
+            }),
         }
     }
 }
@@ -437,6 +486,7 @@ pub enum DestinationConfig {
     Smtp(SmtpDestinationConfig),
     Telegram(TelegramDestinationConfig),
     Notion(NotionDestinationConfig),
+    Plugin(PluginDestinationConfig),
 }
 
 impl DestinationConfig {
@@ -446,6 +496,7 @@ impl DestinationConfig {
             Self::Smtp(_) => ChannelKind::Smtp,
             Self::Telegram(_) => ChannelKind::Telegram,
             Self::Notion(_) => ChannelKind::Notion,
+            Self::Plugin(_) => ChannelKind::Plugin,
         }
     }
 
@@ -502,6 +553,14 @@ impl DestinationConfig {
                 }
                 cfg.column_mapping.validate()
             }
+            Self::Plugin(cfg) => {
+                if !cfg.config.is_object() {
+                    return Err(AppError::Validation(
+                        "Plugin destination config must be a JSON object".to_string(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -524,6 +583,10 @@ impl DestinationConfig {
                 "database_id": cfg.database_id,
                 "parent_page_id": cfg.parent_page_id,
                 "column_mapping": cfg.column_mapping,
+            }),
+            Self::Plugin(cfg) => serde_json::json!({
+                "kind": "plugin",
+                "config": crate::plugins::js_runtime::redact_config_generic(&cfg.config),
             }),
         }
     }
@@ -716,6 +779,10 @@ pub struct RouteOptions {
     /// Per-plugin route options keyed by plugin ID (e.g. `{"link-rewrite": {"provider_id": 3}}`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins: BTreeMap<String, serde_json::Value>,
+    /// Optional explicit execution order for `on_render` plugins on this route.
+    /// Plugins present in `plugins` but omitted from `plugin_order` run afterwards in ID order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_order: Vec<String>,
 }
 
 const fn default_true() -> bool {
@@ -732,6 +799,7 @@ impl Default for RouteOptions {
             active_windows: Vec::new(),
             active_weekdays: Vec::new(),
             plugins: BTreeMap::new(),
+            plugin_order: Vec::new(),
         }
     }
 }
@@ -766,6 +834,11 @@ pub enum DeliveryCheckpoint {
         /// Populated once page creation is confirmed.
         #[serde(default)]
         page_id: Option<String>,
+    },
+    /// Opaque channel plugin checkpoint state (capped at 16 KiB).
+    Plugin {
+        #[serde(default)]
+        state: serde_json::Value,
     },
 }
 

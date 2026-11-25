@@ -288,6 +288,7 @@ pub async fn totp_enable(
         .delete_setting(SETTING_ADMIN_TOTP_PENDING)
         .await?;
     let codes = issue_recovery_codes(&state).await?;
+    tracing::info!("administrator enabled TOTP two-factor authentication");
     Ok((
         StatusCode::OK,
         Json(RecoveryCodesResponse {
@@ -309,6 +310,7 @@ pub async fn totp_disable(
     }
     require_second_factor(&state, Some(&req.code)).await?;
     clear_totp_state(&state).await?;
+    tracing::info!("administrator disabled TOTP two-factor authentication");
     Ok(Json(build_account_dto(&state).await?))
 }
 

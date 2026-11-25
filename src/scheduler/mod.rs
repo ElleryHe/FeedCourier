@@ -26,17 +26,18 @@ use crate::channels::{
     DeliveryOutcome, DestinationConfig, RouteOptions, SmtpDeliveryPlan, SmtpDeliveryRecipient,
 };
 use crate::config::AppConfig;
-use crate::crypto::MasterKey;
+use crate::crypto::{MasterKey, sha256_hex};
 use crate::db::Database;
 use crate::db::models::{
-    AppLocale, Channel, DeliveryTask, DeliveryTaskStatus, Feed, FeedHealthStatus, Route,
-    SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL, SETTING_SSRF_ALLOWLIST, SmtpRecipientStatus,
-    now_unix,
+    AppLocale, Channel, ChannelDestination, DeliveryTask, DeliveryTaskStatus, Entry, Feed,
+    FeedHealthStatus, NewPluginEvent, Route, SETTING_LOCALE, SETTING_OUTBOUND_PROXY_URL,
+    SETTING_SSRF_ALLOWLIST, SmtpRecipientStatus, now_unix,
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::IngestEngine;
 use crate::net::{NetSettings, OutboundRequest, ProtectedHttpClient};
-use crate::plugins::{MarketIndexCache, PluginRegistry};
+use crate::plugins::js_runtime::{JsChannelSender, extract_uri_origins_with_allowed_hosts};
+use crate::plugins::{MarketIndexCache, PluginKind, PluginRegistry};
 use crate::schedule::{has_schedule, next_allowed_at, resolve_route_timezone};
 
 /// Default lease duration in seconds granted when a worker claims a `delivery_tasks` row.
@@ -66,6 +67,12 @@ pub const DEFAULT_OUTBOX_TICK: Duration = Duration::from_secs(2);
 
 /// Default cadence for running `NOT EXISTS` payload GC, session cleanup, and `PRAGMA optimize` (`1h`).
 pub const DEFAULT_MAINTENANCE_TICK: Duration = Duration::from_secs(3600);
+
+/// Default cadence for dispatching persisted `on_delivered` plugin events (`5s`).
+pub const DEFAULT_PLUGIN_EVENTS_TICK: Duration = Duration::from_secs(5);
+
+/// Maximum delivery attempts for persisted `on_delivered` plugin events before dropping.
+pub const MAX_PLUGIN_EVENT_ATTEMPTS: i64 = 5;
 
 /// Hard per-feed timeout (`90s`) guarding against stalled upstream streams or Readability extractions.
 pub const DEFAULT_SINGLE_FEED_POLL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -227,21 +234,30 @@ struct DispatcherInner {
     smtp_sender: SmtpSender,
     telegram_sender: RwLock<TelegramSender>,
     notion_sender: Arc<NotionSender>,
+    plugin_sender: JsChannelSender,
     media_fetcher: Arc<ProtectedMediaFetcher>,
     plugins: PluginRegistry,
     market_cache: MarketIndexCache,
+    log_store: crate::logging::LogStoreHandle,
+    started_at: i64,
+    poller_panics: Arc<std::sync::atomic::AtomicU64>,
+    outbox_panics: Arc<std::sync::atomic::AtomicU64>,
+    maintenance_panics: Arc<std::sync::atomic::AtomicU64>,
+    plugin_events_panics: Arc<std::sync::atomic::AtomicU64>,
     smtp_per_recipient_delay: Duration,
     /// In-memory per-`credential_group_key` next allowed send timestamp (`min_interval_secs + jitter`).
     pacing_next_allowed_at: Mutex<HashMap<String, i64>>,
     poller_wakeup: Arc<Notify>,
     outbox_wakeup: Arc<Notify>,
     maintenance_wakeup: Arc<Notify>,
+    plugin_events_wakeup: Arc<Notify>,
     task_lease_secs: i64,
     max_delivery_attempts: i64,
     poll_concurrency: usize,
     poller_tick: Duration,
     outbox_tick: Duration,
     maintenance_tick: Duration,
+    plugin_events_tick: Duration,
 }
 
 impl Clone for DispatcherInner {
@@ -266,20 +282,29 @@ impl Clone for DispatcherInner {
             smtp_sender: self.smtp_sender.clone(),
             telegram_sender: RwLock::new(tg),
             notion_sender: Arc::clone(&self.notion_sender),
+            plugin_sender: self.plugin_sender.clone(),
             media_fetcher: Arc::clone(&self.media_fetcher),
             plugins: self.plugins.clone(),
             market_cache: self.market_cache.clone(),
+            log_store: self.log_store.clone(),
+            started_at: self.started_at,
+            poller_panics: Arc::clone(&self.poller_panics),
+            outbox_panics: Arc::clone(&self.outbox_panics),
+            maintenance_panics: Arc::clone(&self.maintenance_panics),
+            plugin_events_panics: Arc::clone(&self.plugin_events_panics),
             smtp_per_recipient_delay: self.smtp_per_recipient_delay,
             pacing_next_allowed_at: Mutex::new(pacing),
             poller_wakeup: Arc::clone(&self.poller_wakeup),
             outbox_wakeup: Arc::clone(&self.outbox_wakeup),
             maintenance_wakeup: Arc::clone(&self.maintenance_wakeup),
+            plugin_events_wakeup: Arc::clone(&self.plugin_events_wakeup),
             task_lease_secs: self.task_lease_secs,
             max_delivery_attempts: self.max_delivery_attempts,
             poll_concurrency: self.poll_concurrency,
             poller_tick: self.poller_tick,
             outbox_tick: self.outbox_tick,
             maintenance_tick: self.maintenance_tick,
+            plugin_events_tick: self.plugin_events_tick,
         }
     }
 }
@@ -333,6 +358,7 @@ impl DeliveryDispatcher {
         .with_locale(initial_locale);
         let notion_sender = Arc::new(NotionSender::new(net_settings.outbound_proxy_url)?);
         let plugins = PluginRegistry::with_builtins();
+        let plugin_sender = JsChannelSender::new(plugins.clone(), http.clone()).with_db(db.clone());
         let market_cache = MarketIndexCache::new(config.plugin_index_url.clone());
 
         Ok(Self {
@@ -345,22 +371,60 @@ impl DeliveryDispatcher {
                 smtp_sender,
                 telegram_sender: RwLock::new(telegram_sender),
                 notion_sender,
+                plugin_sender,
                 media_fetcher,
                 plugins,
                 market_cache,
+                log_store: crate::logging::LogStoreHandle::disabled(),
+                started_at: now_unix(),
+                poller_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                outbox_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                maintenance_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                plugin_events_panics: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 smtp_per_recipient_delay: Duration::from_secs(1),
                 pacing_next_allowed_at: Mutex::new(HashMap::new()),
                 poller_wakeup: Arc::new(Notify::new()),
                 outbox_wakeup: Arc::new(Notify::new()),
                 maintenance_wakeup: Arc::new(Notify::new()),
+                plugin_events_wakeup: Arc::new(Notify::new()),
                 task_lease_secs: DEFAULT_TASK_LEASE_SECS,
                 max_delivery_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
                 poll_concurrency: DEFAULT_FEED_POLL_CONCURRENCY,
                 poller_tick: DEFAULT_POLLER_TICK,
                 outbox_tick: DEFAULT_OUTBOX_TICK,
                 maintenance_tick: DEFAULT_MAINTENANCE_TICK,
+                plugin_events_tick: DEFAULT_PLUGIN_EVENTS_TICK,
             }),
         })
+    }
+
+    /// Attach the initialized log store handle so maintenance prunes stored logs and
+    /// runtime diagnostics can inspect log store health/size.
+    pub fn with_log_store(self, log_store: crate::logging::LogStoreHandle) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.log_store = log_store;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn log_store(&self) -> &crate::logging::LogStoreHandle {
+        &self.inner.log_store
+    }
+
+    pub fn started_at(&self) -> i64 {
+        self.inner.started_at
+    }
+
+    /// Return `(poller_panics, outbox_panics, maintenance_panics, plugin_events_panics)`.
+    pub fn panic_counts(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.inner.poller_panics.load(Ordering::Relaxed),
+            self.inner.outbox_panics.load(Ordering::Relaxed),
+            self.inner.maintenance_panics.load(Ordering::Relaxed),
+            self.inner.plugin_events_panics.load(Ordering::Relaxed),
+        )
     }
 
     /// Construct a [`DeliveryDispatcher`] resolving initial [`NetSettings`] and [`AppLocale`]
@@ -380,6 +444,11 @@ impl DeliveryDispatcher {
             .inner
             .plugins
             .sync_builtin_rows(&dispatcher.inner.db)
+            .await?;
+        dispatcher
+            .inner
+            .plugins
+            .reload_from_db(&dispatcher.inner.db)
             .await?;
         if let Some(locale) = persisted_locale {
             dispatcher.set_locale(locale);
@@ -525,6 +594,10 @@ impl DeliveryDispatcher {
         &self.inner.notion_sender
     }
 
+    pub fn plugin_sender(&self) -> &JsChannelSender {
+        &self.inner.plugin_sender
+    }
+
     pub fn media_fetcher(&self) -> Arc<ProtectedMediaFetcher> {
         Arc::clone(&self.inner.media_fetcher)
     }
@@ -537,6 +610,11 @@ impl DeliveryDispatcher {
     /// Shared `Notify` handle waking the outbox dispatcher loop (e.g. for `McpState::with_outbox_notify`).
     pub fn outbox_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.inner.outbox_wakeup)
+    }
+
+    /// Shared `Notify` handle waking the persisted `on_delivered` plugin events loop.
+    pub fn plugin_events_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.inner.plugin_events_wakeup)
     }
 
     /// Wake the background feed poller loop immediately.
@@ -552,6 +630,11 @@ impl DeliveryDispatcher {
     /// Wake the background maintenance/GC loop immediately.
     pub fn notify_maintenance(&self) {
         self.inner.maintenance_wakeup.notify_one();
+    }
+
+    /// Wake the persisted `on_delivered` plugin events dispatcher loop immediately.
+    pub fn notify_plugin_events(&self) {
+        self.inner.plugin_events_wakeup.notify_one();
     }
 
     /// Hot-reload `outbound_proxy_url` and `ssrf_allowlist` atomically across
@@ -1084,6 +1167,17 @@ impl DeliveryDispatcher {
         };
 
         if let Some(retry) = plugin_retry {
+            warn!(
+                task_id = task.id,
+                feed_id = feed.id,
+                route_id = route.id,
+                channel_id = channel.id,
+                destination_id = destination.id,
+                plugin_id = %retry.plugin_id,
+                retry_after_secs = retry.retry_after_secs,
+                diagnostic = %retry.diagnostic,
+                "on_render plugin requested delivery retry"
+            );
             self.handle_transient_retry(
                 &task,
                 &channel,
@@ -1098,6 +1192,28 @@ impl DeliveryDispatcher {
             return Ok(true);
         }
 
+        let on_delivered_plugins: Vec<(String, Option<i64>)> = self
+            .inner
+            .plugins
+            .on_delivered_subscriber_ids(
+                &route_options,
+                match &channel_config {
+                    ChannelConfig::Plugin(p) => Some(p.plugin_id.as_str()),
+                    _ => None,
+                },
+            )
+            .into_iter()
+            .map(|pid| {
+                let provider_id = route_options
+                    .plugins
+                    .get(&pid)
+                    .and_then(|opt| opt.get("provider_id"))
+                    .and_then(serde_json::Value::as_i64);
+                (pid, provider_id)
+            })
+            .collect();
+
+        let send_started = std::time::Instant::now();
         let checkpoint_sink = self.inner.db.rich_checkpoint_sink(
             task.id,
             destination.id,
@@ -1128,22 +1244,40 @@ impl DeliveryDispatcher {
                 sender.send(&ctx).await
             }
             ChannelKind::Notion => self.inner.notion_sender.send(&ctx).await,
+            ChannelKind::Plugin => self.inner.plugin_sender.send(&ctx).await,
         };
+        let duration_ms = send_started.elapsed().as_millis() as u64;
 
         let completed_now = now_unix();
         match send_result {
             Ok(outcome) => {
                 self.apply_delivery_outcome(
                     &task,
+                    &entry,
+                    &feed,
+                    &route,
                     &channel,
+                    &destination,
+                    &on_delivered_plugins,
                     effective_min_interval,
                     effective_jitter_max,
                     completed_now,
+                    duration_ms,
                     outcome,
                 )
                 .await?;
             }
             Err(err) => {
+                warn!(
+                    task_id = task.id,
+                    feed_id = feed.id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    duration_ms,
+                    error = %err,
+                    "delivery adapter returned unexpected error"
+                );
                 self.apply_unexpected_send_error(&task, &channel, completed_now, err)
                     .await?;
             }
@@ -1391,6 +1525,7 @@ impl DeliveryDispatcher {
             ChannelKind::Smtp => self.inner.smtp_sender.send(&ctx).await,
             ChannelKind::Telegram => self.telegram_sender().send(&ctx).await,
             ChannelKind::Notion => self.inner.notion_sender.send(&ctx).await,
+            ChannelKind::Plugin => self.inner.plugin_sender.send(&ctx).await,
         };
 
         let entry_title = entry
@@ -1418,8 +1553,30 @@ impl DeliveryDispatcher {
 
     /// Drain up to `max_tasks` currently due outbox tasks sequentially.
     pub async fn drain_due_outbox_tasks(&self, max_tasks: usize) -> AppResult<usize> {
+        self.drain_due_outbox_tasks_inner(max_tasks, None).await
+    }
+
+    /// Drain up to `max_tasks` currently due outbox tasks sequentially, checking `cancel` before
+    /// claiming each task so graceful shutdown finishes the current delivery without starting another.
+    pub async fn drain_due_outbox_tasks_cancellable(
+        &self,
+        max_tasks: usize,
+        cancel: &CancellationToken,
+    ) -> AppResult<usize> {
+        self.drain_due_outbox_tasks_inner(max_tasks, Some(cancel))
+            .await
+    }
+
+    async fn drain_due_outbox_tasks_inner(
+        &self,
+        max_tasks: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> AppResult<usize> {
         let mut processed = 0usize;
         while processed < max_tasks {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
             if !self.process_next_outbox_task().await? {
                 break;
             }
@@ -1435,6 +1592,7 @@ impl DeliveryDispatcher {
     ///
     /// Returns the number of entry payloads purged.
     pub async fn run_maintenance_once(&self) -> AppResult<u64> {
+        let started = std::time::Instant::now();
         let now = now_unix();
         let purged_entries = self
             .inner
@@ -1444,6 +1602,13 @@ impl DeliveryDispatcher {
         let purged_sessions = self.inner.db.purge_expired_sessions(now).await?;
         let purged_ledger = self.inner.db.purge_expired_quota_ledger(now).await?;
         let purged_link_cache = self.inner.db.purge_stale_plugin_link_cache(now).await?;
+        let purged_logs = match self.inner.log_store.prune().await {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(error = %err, "failed to prune stored logs during maintenance");
+                0
+            }
+        };
         self.inner.db.run_pragma_optimize().await?;
 
         {
@@ -1455,18 +1620,513 @@ impl DeliveryDispatcher {
             guard.retain(|_, ts| *ts > now);
         }
 
-        debug!(
+        let duration_ms = started.elapsed().as_millis() as u64;
+        info!(
             purged_entries,
             purged_sessions,
             purged_ledger,
             purged_link_cache,
+            purged_logs,
+            duration_ms,
             "completed scheduled database maintenance cycle"
         );
         Ok(purged_entries)
     }
 
-    /// Spawn the 3 background loops (`poller`, `outbox`, `maintenance`) controlled by a shared
-    /// [`CancellationToken`] and immediate wakeup [`Notify`] handles.
+    /// Dispatch up to `limit` due persisted `on_delivered` plugin events.
+    ///
+    /// At-least-once delivery with `X-FeedCourier-Idempotency-Key` and exponential backoff up to
+    /// [`MAX_PLUGIN_EVENT_ATTEMPTS`] (`15s, 30s, 60s, 120s`); permanently dropped after max attempts
+    /// without affecting the already-delivered task status or channel quotas.
+    pub async fn process_due_plugin_events_once(&self, limit: i64) -> AppResult<usize> {
+        self.process_due_plugin_events_cancellable(limit, &CancellationToken::new())
+            .await
+    }
+
+    /// Shutdown-aware variant of [`Self::process_due_plugin_events_once`]: aborts immediately
+    /// when `cancel` is triggered (including mid-HTTP request against an unreachable sidecar),
+    /// leaving unacknowledged `plugin_events` rows intact in SQLite for the next startup.
+    pub async fn process_due_plugin_events_cancellable(
+        &self,
+        limit: i64,
+        cancel: &CancellationToken,
+    ) -> AppResult<usize> {
+        if cancel.is_cancelled() {
+            return Ok(0);
+        }
+        let now = now_unix();
+        let events = self.inner.db.list_due_plugin_events(now, limit).await?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut processed = 0usize;
+        for ev in events {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let Some(js_plugin) = self.inner.plugins.get_js(&ev.plugin_id) else {
+                processed += 1;
+                warn!(
+                    plugin_id = %ev.plugin_id,
+                    event_id = ev.id,
+                    "dropping on_delivered event for uninstalled JS plugin"
+                );
+                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                continue;
+            };
+            if !js_plugin.enabled || !js_plugin.compatible || js_plugin.runtime.is_none() {
+                processed += 1;
+                let next_attempts = ev.attempts + 1;
+                if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                    warn!(
+                        plugin_id = %ev.plugin_id,
+                        event_id = ev.id,
+                        "dropping on_delivered event after max deferrals while plugin disabled or incompatible"
+                    );
+                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                } else {
+                    let _ = self
+                        .inner
+                        .db
+                        .reschedule_plugin_event(ev.id, next_attempts, now.saturating_add(300))
+                        .await;
+                }
+                continue;
+            }
+            let runtime = js_plugin
+                .runtime
+                .as_ref()
+                .expect("enabled compatible plugin has runtime");
+            let payload: serde_json::Value =
+                serde_json::from_str(&ev.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+            let mut admin_origins = Vec::new();
+            let mut use_proxy = false;
+
+            // Fail-closed proxy/origin guard for processor events bound to a specific `provider_id`:
+            // if the bound instance was deleted, mismatched, or undecryptable, drop the event;
+            // if disabled or transiently unreadable, defer up to `MAX_PLUGIN_EVENT_ATTEMPTS` —
+            // NEVER fall through with `use_proxy = false`.
+            if let Some(pid_val) = payload.get("provider_id").filter(|v| !v.is_null()) {
+                let Some(pid) = pid_val.as_i64() else {
+                    processed += 1;
+                    warn!(
+                        plugin_id = %ev.plugin_id,
+                        event_id = ev.id,
+                        "dropping on_delivered event with malformed provider_id"
+                    );
+                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                    continue;
+                };
+                match self.inner.db.get_plugin_instance(pid).await {
+                    Ok(Some(inst)) if inst.plugin_id == ev.plugin_id => {
+                        if !inst.enabled {
+                            processed += 1;
+                            let next_attempts = ev.attempts + 1;
+                            if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    provider_id = pid,
+                                    "dropping on_delivered event after max deferrals while bound instance is disabled"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                            } else {
+                                let _ = self
+                                    .inner
+                                    .db
+                                    .reschedule_plugin_event(
+                                        ev.id,
+                                        next_attempts,
+                                        now.saturating_add(300),
+                                    )
+                                    .await;
+                            }
+                            continue;
+                        }
+                        match self
+                            .inner
+                            .master_key
+                            .decrypt_json::<serde_json::Value>(&inst.encrypted_config)
+                        {
+                            Ok(cfg) => {
+                                if cfg.get("use_proxy").and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                                {
+                                    use_proxy = true;
+                                }
+                                for o in extract_uri_origins_with_allowed_hosts(
+                                    &runtime.manifest.instance_schema,
+                                    &cfg,
+                                    &runtime.manifest.allowed_hosts,
+                                ) {
+                                    if !admin_origins.contains(&o) {
+                                        admin_origins.push(o);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                processed += 1;
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    provider_id = pid,
+                                    error = %err,
+                                    "dropping on_delivered event after bound instance config decrypt failure"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        processed += 1;
+                        warn!(
+                            plugin_id = %ev.plugin_id,
+                            event_id = ev.id,
+                            provider_id = pid,
+                            "dropping on_delivered event for deleted or mismatched plugin instance"
+                        );
+                        let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        processed += 1;
+                        let next_attempts = ev.attempts + 1;
+                        if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                            warn!(
+                                plugin_id = %ev.plugin_id,
+                                event_id = ev.id,
+                                provider_id = pid,
+                                error = %err,
+                                "dropping on_delivered event after repeated DB read failures"
+                            );
+                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        } else {
+                            let _ = self
+                                .inner
+                                .db
+                                .reschedule_plugin_event(
+                                    ev.id,
+                                    next_attempts,
+                                    now.saturating_add(300),
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if let Some(route_id) = payload
+                .get("route")
+                .and_then(|r| r.get("id"))
+                .and_then(serde_json::Value::as_i64)
+                && let Ok(Some(route)) = self.inner.db.get_route(route_id).await
+                && let Some(opt) = route.options().plugins.get(&ev.plugin_id)
+            {
+                for o in extract_uri_origins_with_allowed_hosts(
+                    &runtime.manifest.route_option_schema,
+                    opt,
+                    &runtime.manifest.allowed_hosts,
+                ) {
+                    if !admin_origins.contains(&o) {
+                        admin_origins.push(o);
+                    }
+                }
+            }
+            // Fail-closed proxy/origin guard for channel plugin events (`kind = "channel"`):
+            // deleted/mismatched/undecryptable channels or destinations drop the event; disabled
+            // channels or destinations defer up to `MAX_PLUGIN_EVENT_ATTEMPTS`.
+            if js_plugin.manifest.kind == PluginKind::Channel {
+                let Some(ch_id) = payload
+                    .get("channel")
+                    .and_then(|c| c.get("id"))
+                    .and_then(serde_json::Value::as_i64)
+                else {
+                    processed += 1;
+                    warn!(
+                        plugin_id = %ev.plugin_id,
+                        event_id = ev.id,
+                        "dropping channel on_delivered event missing channel id"
+                    );
+                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                    continue;
+                };
+                match self.inner.db.get_channel(ch_id).await {
+                    Ok(Some(ch)) if ch.kind == ChannelKind::Plugin => {
+                        let plugin_acct = match self
+                            .inner
+                            .master_key
+                            .decrypt_json::<ChannelConfig>(&ch.encrypted_config)
+                        {
+                            Ok(ChannelConfig::Plugin(p)) if p.plugin_id == ev.plugin_id => p,
+                            Ok(_) => {
+                                processed += 1;
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    channel_id = ch_id,
+                                    "dropping channel on_delivered event with mismatched channel plugin_id"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                continue;
+                            }
+                            Err(err) => {
+                                processed += 1;
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    channel_id = ch_id,
+                                    error = %err,
+                                    "dropping channel on_delivered event after channel config decrypt failure"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                continue;
+                            }
+                        };
+                        if !ch.enabled {
+                            processed += 1;
+                            let next_attempts = ev.attempts + 1;
+                            if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                warn!(
+                                    plugin_id = %ev.plugin_id,
+                                    event_id = ev.id,
+                                    channel_id = ch_id,
+                                    "dropping channel on_delivered event after max deferrals while channel is disabled"
+                                );
+                                let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                            } else {
+                                let _ = self
+                                    .inner
+                                    .db
+                                    .reschedule_plugin_event(
+                                        ev.id,
+                                        next_attempts,
+                                        now.saturating_add(300),
+                                    )
+                                    .await;
+                            }
+                            continue;
+                        }
+                        use_proxy = ch.use_proxy;
+                        for o in extract_uri_origins_with_allowed_hosts(
+                            &runtime.manifest.account_schema,
+                            &plugin_acct.config,
+                            &runtime.manifest.allowed_hosts,
+                        ) {
+                            if !admin_origins.contains(&o) {
+                                admin_origins.push(o);
+                            }
+                        }
+                        if let Some(dest_id) = payload
+                            .get("destination")
+                            .and_then(|d| d.get("id"))
+                            .and_then(serde_json::Value::as_i64)
+                        {
+                            match self.inner.db.get_destination(dest_id).await {
+                                Ok(Some(dest)) if dest.channel_id == ch.id => {
+                                    if !dest.enabled {
+                                        processed += 1;
+                                        let next_attempts = ev.attempts + 1;
+                                        if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                            warn!(
+                                                plugin_id = %ev.plugin_id,
+                                                event_id = ev.id,
+                                                destination_id = dest_id,
+                                                "dropping channel on_delivered event after max deferrals while destination is disabled"
+                                            );
+                                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                        } else {
+                                            let _ = self
+                                                .inner
+                                                .db
+                                                .reschedule_plugin_event(
+                                                    ev.id,
+                                                    next_attempts,
+                                                    now.saturating_add(300),
+                                                )
+                                                .await;
+                                        }
+                                        continue;
+                                    }
+                                    match self
+                                        .inner
+                                        .master_key
+                                        .decrypt_json::<DestinationConfig>(&dest.encrypted_config)
+                                    {
+                                        Ok(DestinationConfig::Plugin(dp)) => {
+                                            for o in extract_uri_origins_with_allowed_hosts(
+                                                &runtime.manifest.destination_schema,
+                                                &dp.config,
+                                                &runtime.manifest.allowed_hosts,
+                                            ) {
+                                                if !admin_origins.contains(&o) {
+                                                    admin_origins.push(o);
+                                                }
+                                            }
+                                        }
+                                        Ok(_) | Err(_) => {
+                                            processed += 1;
+                                            warn!(
+                                                plugin_id = %ev.plugin_id,
+                                                event_id = ev.id,
+                                                destination_id = dest_id,
+                                                "dropping channel on_delivered event after destination config decrypt failure"
+                                            );
+                                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Ok(_) => {
+                                    processed += 1;
+                                    warn!(
+                                        plugin_id = %ev.plugin_id,
+                                        event_id = ev.id,
+                                        destination_id = dest_id,
+                                        "dropping channel on_delivered event for deleted or mismatched destination"
+                                    );
+                                    let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    processed += 1;
+                                    let next_attempts = ev.attempts + 1;
+                                    if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                                        warn!(
+                                            plugin_id = %ev.plugin_id,
+                                            event_id = ev.id,
+                                            destination_id = dest_id,
+                                            error = %err,
+                                            "dropping channel on_delivered event after repeated destination DB errors"
+                                        );
+                                        let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                                    } else {
+                                        let _ = self
+                                            .inner
+                                            .db
+                                            .reschedule_plugin_event(
+                                                ev.id,
+                                                next_attempts,
+                                                now.saturating_add(300),
+                                            )
+                                            .await;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        processed += 1;
+                        warn!(
+                            plugin_id = %ev.plugin_id,
+                            event_id = ev.id,
+                            channel_id = ch_id,
+                            "dropping channel on_delivered event for deleted or non-plugin channel"
+                        );
+                        let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        processed += 1;
+                        let next_attempts = ev.attempts + 1;
+                        if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                            warn!(
+                                plugin_id = %ev.plugin_id,
+                                event_id = ev.id,
+                                channel_id = ch_id,
+                                error = %err,
+                                "dropping channel on_delivered event after repeated channel DB errors"
+                            );
+                            let _ = self.inner.db.delete_plugin_event(ev.id).await;
+                        } else {
+                            let _ = self
+                                .inner
+                                .db
+                                .reschedule_plugin_event(
+                                    ev.id,
+                                    next_attempts,
+                                    now.saturating_add(300),
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
+                }
+            }
+            let event_timeout = self
+                .inner
+                .plugins
+                .effective_hook_timeout(crate::plugins::js_runtime::JS_HOOK_DEFAULT_TIMEOUT);
+            let send_outcome = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                res = runtime.dispatch_on_delivered_with_timeout(
+                    &self.inner.http,
+                    &ev.idempotency_key,
+                    &payload,
+                    admin_origins,
+                    use_proxy,
+                    event_timeout,
+                ) => res,
+            };
+            processed += 1;
+            match send_outcome {
+                Ok(()) => {
+                    self.inner.plugins.reset_js_timeout(&ev.plugin_id);
+                    debug!(
+                        plugin_id = %ev.plugin_id,
+                        event_id = ev.id,
+                        "dispatched on_delivered plugin event"
+                    );
+                    self.inner.db.delete_plugin_event(ev.id).await?;
+                }
+                Err(err) => {
+                    if crate::plugins::js_runtime::is_js_timeout_error(&err) {
+                        let _ = self
+                            .inner
+                            .plugins
+                            .record_js_timeout(&self.inner.db, &ev.plugin_id, "onDelivered")
+                            .await;
+                    }
+                    let next_attempts = ev.attempts + 1;
+                    if next_attempts >= MAX_PLUGIN_EVENT_ATTEMPTS {
+                        error!(
+                            plugin_id = %ev.plugin_id,
+                            event_id = ev.id,
+                            attempts = next_attempts,
+                            error = %err,
+                            "dropping on_delivered plugin event after max retries"
+                        );
+                        self.inner.db.delete_plugin_event(ev.id).await?;
+                    } else {
+                        let shift = u32::try_from((next_attempts - 1).clamp(0, 6)).unwrap_or(0);
+                        let delay_secs = 15_i64 << shift;
+                        warn!(
+                            plugin_id = %ev.plugin_id,
+                            event_id = ev.id,
+                            attempts = next_attempts,
+                            retry_in_secs = delay_secs,
+                            error = %err,
+                            "on_delivered plugin event failed; scheduling retry"
+                        );
+                        self.inner
+                            .db
+                            .reschedule_plugin_event(
+                                ev.id,
+                                next_attempts,
+                                now.saturating_add(delay_secs),
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+        Ok(processed)
+    }
+
+    /// Spawn the 4 background loops (`poller`, `outbox`, `maintenance`, `plugin_events`) controlled
+    /// by a shared [`CancellationToken`] and immediate wakeup [`Notify`] handles.
     pub fn spawn(&self) -> SchedulerHandle {
         let cancel = CancellationToken::new();
 
@@ -1499,6 +2159,10 @@ impl DeliveryDispatcher {
                             warn!(error = %err, "poller loop tick failed");
                         }
                         Err(_) => {
+                            dispatcher
+                                .inner
+                                .poller_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             error!("poller loop caught unexpected panic; continuing next tick");
                         }
                     }
@@ -1525,10 +2189,12 @@ impl DeliveryDispatcher {
                         break;
                     }
                     while !token.is_cancelled() {
-                        let drain_fut = AssertUnwindSafe(
-                            dispatcher.drain_due_outbox_tasks(DEFAULT_OUTBOX_DRAIN_LIMIT),
-                        )
-                        .catch_unwind();
+                        let drain_fut =
+                            AssertUnwindSafe(dispatcher.drain_due_outbox_tasks_cancellable(
+                                DEFAULT_OUTBOX_DRAIN_LIMIT,
+                                &token,
+                            ))
+                            .catch_unwind();
                         match drain_fut.await {
                             Ok(Ok(n)) if n == DEFAULT_OUTBOX_DRAIN_LIMIT => {
                                 tokio::task::yield_now().await;
@@ -1539,6 +2205,10 @@ impl DeliveryDispatcher {
                                 break;
                             }
                             Err(_) => {
+                                dispatcher
+                                    .inner
+                                    .outbox_panics
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 error!(
                                     "outbox dispatcher loop caught unexpected panic; continuing next tick"
                                 );
@@ -1576,6 +2246,10 @@ impl DeliveryDispatcher {
                             warn!(error = %err, "maintenance loop tick failed");
                         }
                         Err(_) => {
+                            dispatcher
+                                .inner
+                                .maintenance_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             error!(
                                 "maintenance loop caught unexpected panic; continuing next tick"
                             );
@@ -1585,12 +2259,54 @@ impl DeliveryDispatcher {
             })
         };
 
-        info!("spawned background poller, outbox worker, and maintenance loops");
+        let plugin_events_handle = {
+            let dispatcher = self.clone();
+            let token = cancel.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(dispatcher.inner.plugin_events_tick);
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => break,
+                        _ = dispatcher.inner.plugin_events_wakeup.notified() => {}
+                        _ = interval.tick() => {}
+                    }
+                    if token.is_cancelled() {
+                        break;
+                    }
+                    let ev_fut = AssertUnwindSafe(
+                        dispatcher.process_due_plugin_events_cancellable(64, &token),
+                    )
+                    .catch_unwind();
+                    match ev_fut.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "plugin_events loop tick failed");
+                        }
+                        Err(_) => {
+                            dispatcher
+                                .inner
+                                .plugin_events_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            error!(
+                                "plugin_events loop caught unexpected panic; continuing next tick"
+                            );
+                        }
+                    }
+                }
+            })
+        };
+
+        info!("spawned background poller, outbox worker, maintenance, and plugin_events loops");
         SchedulerHandle {
             cancel,
             poller_handle,
             outbox_handle,
             maintenance_handle,
+            plugin_events_handle,
         }
     }
 
@@ -1659,15 +2375,23 @@ impl DeliveryDispatcher {
         *slot = (*slot).max(next_allowed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_delivery_outcome(
         &self,
         task: &DeliveryTask,
+        entry: &Entry,
+        feed: &Feed,
+        route: &Route,
         channel: &Channel,
+        destination: &ChannelDestination,
+        on_delivered_plugins: &[(String, Option<i64>)],
         effective_min_interval: i64,
         effective_jitter_max: i64,
         completed_now: i64,
+        duration_ms: u64,
         outcome: DeliveryOutcome,
     ) -> AppResult<()> {
+        let feed_id = feed.id;
         match outcome {
             DeliveryOutcome::Delivered {
                 status_code,
@@ -1681,21 +2405,75 @@ impl DeliveryDispatcher {
                         .update_channel_capabilities(channel.id, &caps)
                         .await?;
                 }
+                let mut plugin_events = Vec::with_capacity(on_delivered_plugins.len());
+                for (plugin_id, provider_id) in on_delivered_plugins {
+                    let idempotency_key =
+                        sha256_hex(format!("on_delivered:{plugin_id}:{}", task.id).as_bytes());
+                    let payload_json = serde_json::to_string(&serde_json::json!({
+                        "task_id": task.id,
+                        "provider_id": provider_id,
+                        "entry": {
+                            "id": entry.id,
+                            "title": entry.title,
+                            "url": entry.canonical_url,
+                        },
+                        "feed": {
+                            "id": feed.id,
+                            "title": feed.title,
+                        },
+                        "route": {
+                            "id": route.id,
+                            "name": route.name,
+                        },
+                        "channel": {
+                            "id": channel.id,
+                            "kind": channel.kind.as_str(),
+                        },
+                        "destination": {
+                            "id": destination.id,
+                            "name": destination.name,
+                        },
+                        "status_code": status_code,
+                        "delivered_at": completed_now,
+                    }))?;
+                    plugin_events.push(NewPluginEvent {
+                        plugin_id: plugin_id.clone(),
+                        event: "on_delivered".to_string(),
+                        idempotency_key,
+                        payload_json,
+                    });
+                }
                 self.inner
                     .db
-                    .mark_task_delivered(
+                    .mark_task_delivered_with_events(
                         task.id,
                         completed_now,
                         status_code,
                         checkpoint.as_ref(),
                         diagnostic.as_deref(),
+                        &plugin_events,
                     )
                     .await?;
+                if !plugin_events.is_empty() {
+                    self.notify_plugin_events();
+                }
                 self.record_pacing_after_delivery_limits(
                     &channel.credential_group_key,
                     effective_min_interval,
                     effective_jitter_max,
                     completed_now,
+                );
+                info!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    channel_kind = %channel.kind,
+                    attempt = task.attempt_count,
+                    status_code,
+                    duration_ms,
+                    "outbox task delivered"
                 );
             }
             DeliveryOutcome::Deferred {
@@ -1714,6 +2492,17 @@ impl DeliveryDispatcher {
                     .db
                     .mark_task_deferred(task.id, target_window, None, checkpoint.as_ref(), &diag)
                     .await?;
+                info!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    next_attempt_at = target_window,
+                    duration_ms,
+                    reason = %diagnostic,
+                    "outbox task deferred"
+                );
             }
             DeliveryOutcome::PermanentFailure {
                 status_code,
@@ -1730,6 +2519,19 @@ impl DeliveryDispatcher {
                         &diagnostic,
                     )
                     .await?;
+                error!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    channel_kind = %channel.kind,
+                    attempt = task.attempt_count,
+                    status_code,
+                    duration_ms,
+                    diagnostic = %diagnostic,
+                    "outbox task permanently failed (dead_letter)"
+                );
             }
             DeliveryOutcome::Retry {
                 retry_after_secs,
@@ -1758,9 +2560,34 @@ impl DeliveryDispatcher {
                             &diagnostic,
                         )
                         .await?;
+                    debug!(
+                        task_id = task.id,
+                        feed_id,
+                        route_id = task.route_id,
+                        channel_id = channel.id,
+                        destination_id = task.destination_id,
+                        status_code = 202,
+                        poll_delay_secs = poll_delay,
+                        duration_ms,
+                        "outbox task deferred for Notion async poll"
+                    );
                     return Ok(());
                 }
 
+                warn!(
+                    task_id = task.id,
+                    feed_id,
+                    route_id = task.route_id,
+                    channel_id = channel.id,
+                    destination_id = task.destination_id,
+                    channel_kind = %channel.kind,
+                    attempt = task.attempt_count,
+                    status_code,
+                    cooldown = cooldown_credential_group,
+                    duration_ms,
+                    diagnostic = %diagnostic,
+                    "outbox task transient failure; scheduling retry"
+                );
                 self.handle_transient_retry(
                     task,
                     channel,
@@ -1896,12 +2723,13 @@ pub struct DebugPushResult {
     pub entry_url: Option<String>,
 }
 
-/// Handle owning the spawned background scheduler tasks (`poller`, `outbox`, `maintenance`).
+/// Handle owning the spawned background scheduler tasks (`poller`, `outbox`, `maintenance`, `plugin_events`).
 pub struct SchedulerHandle {
     cancel: CancellationToken,
     poller_handle: JoinHandle<()>,
     outbox_handle: JoinHandle<()>,
     maintenance_handle: JoinHandle<()>,
+    plugin_events_handle: JoinHandle<()>,
 }
 
 impl fmt::Debug for SchedulerHandle {
@@ -1923,13 +2751,14 @@ impl SchedulerHandle {
         self.cancel.cancel();
     }
 
-    /// Signal graceful cancellation and await all three background loops to exit cleanly.
+    /// Signal graceful cancellation and await all background loops to exit cleanly.
     pub async fn shutdown(self) {
         self.cancel.cancel();
         let _ = tokio::join!(
             self.poller_handle,
             self.outbox_handle,
-            self.maintenance_handle
+            self.maintenance_handle,
+            self.plugin_events_handle
         );
     }
 }

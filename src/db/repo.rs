@@ -50,6 +50,18 @@ pub enum DeleteGuardOutcome {
     Conflict(Vec<(i64, String)>),
 }
 
+/// Atomic outcome of transactional JS plugin uninstall (`DELETE /api/v1/plugins/{id}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteJsPluginOutcome {
+    Deleted,
+    NotFound,
+    NotDeletable(String),
+    Conflict {
+        referencing_channels: Vec<(i64, String)>,
+        referencing_routes: Vec<(i64, String)>,
+    },
+}
+
 impl Database {
     // =========================================================================
     // Feeds CRUD & Polling State Machine
@@ -1673,6 +1685,21 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Immediately expire leases on orphaned `delivering` tasks left behind by an unclean shutdown.
+    ///
+    /// Safe because FeedCourier operates on a single-writer local SQLite instance: at startup no
+    /// other worker holds those leases. Preserves `checkpoint_json` and `attempt_count` intact so
+    /// the outbox worker reconciles and resumes immediately instead of waiting for `DEFAULT_TASK_LEASE_SECS`.
+    pub async fn reclaim_orphaned_deliveries(&self, now: i64) -> AppResult<u64> {
+        let res = sqlx::query(
+            "UPDATE delivery_tasks SET lease_until = ?1 WHERE status = 'delivering' AND (lease_until IS NULL OR lease_until > ?1)",
+        )
+        .bind(now)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Persist raw `checkpoint_json` mid-flight without changing task status.
     pub async fn save_task_checkpoint(&self, task_id: i64, checkpoint_json: &str) -> AppResult<()> {
         sqlx::query("UPDATE delivery_tasks SET checkpoint_json = ?1 WHERE id = ?2")
@@ -1702,6 +1729,28 @@ impl Database {
         status_code: Option<i32>,
         checkpoint: Option<&DeliveryCheckpoint>,
         diagnostic_log: Option<&str>,
+    ) -> AppResult<DeliveryTask> {
+        self.mark_task_delivered_with_events(
+            task_id,
+            completed_at,
+            status_code,
+            checkpoint,
+            diagnostic_log,
+            &[],
+        )
+        .await
+    }
+
+    /// Same as [`mark_task_delivered`], additionally enqueuing persistent `plugin_events` rows
+    /// inside the exact same SQLite write transaction for at-least-once `on_delivered` delivery.
+    pub async fn mark_task_delivered_with_events(
+        &self,
+        task_id: i64,
+        completed_at: i64,
+        status_code: Option<i32>,
+        checkpoint: Option<&DeliveryCheckpoint>,
+        diagnostic_log: Option<&str>,
+        plugin_events: &[crate::db::models::NewPluginEvent],
     ) -> AppResult<DeliveryTask> {
         let checkpoint_json = checkpoint.map(serde_json::to_string).transpose()?;
         let mut tx = self.write_pool.begin().await?;
@@ -1743,6 +1792,23 @@ impl Database {
         .bind(row.channel_id)
         .execute(&mut *tx)
         .await?;
+
+        for ev in plugin_events {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO plugin_events (
+                    plugin_id, event, idempotency_key, payload_json, attempts, next_attempt_at, created_at
+                ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)
+                "#,
+            )
+            .bind(&ev.plugin_id)
+            .bind(&ev.event)
+            .bind(&ev.idempotency_key)
+            .bind(&ev.payload_json)
+            .bind(completed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(row)
@@ -2856,23 +2922,275 @@ impl Database {
             .ok_or_else(|| AppError::NotFound(format!("plugin '{id}' not found")))?;
         let next_enabled = enabled.unwrap_or(current.enabled);
         let next_settings = settings_json.unwrap_or(&current.settings_json);
+        let next_disabled_reason: Option<String> = if enabled.is_some() {
+            None
+        } else {
+            current.disabled_reason.clone()
+        };
         let row = sqlx::query_as::<_, PluginRow>(
             r#"
             UPDATE plugins
             SET enabled = ?1,
                 settings_json = ?2,
-                updated_at = ?3
-            WHERE id = ?4
+                disabled_reason = ?3,
+                updated_at = ?4
+            WHERE id = ?5
             RETURNING *
             "#,
         )
         .bind(next_enabled)
         .bind(next_settings)
+        .bind(next_disabled_reason)
         .bind(now_unix())
         .bind(id)
         .fetch_one(&self.write_pool)
         .await?;
         Ok(row)
+    }
+
+    /// Auto-disable an installed JS plugin (e.g. circuit breaker after repeated execution timeouts)
+    /// and record the human-readable `disabled_reason` for WebUI display.
+    pub async fn disable_plugin_with_reason(&self, id: &str, reason: &str) -> AppResult<bool> {
+        let res = sqlx::query(
+            r#"
+            UPDATE plugins
+            SET enabled = 0,
+                disabled_reason = ?1,
+                updated_at = ?2
+            WHERE id = ?3 AND source IN ('market', 'custom')
+            "#,
+        )
+        .bind(reason)
+        .bind(now_unix())
+        .bind(id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Insert or upgrade a JS plugin row (`source` in `'market' | 'custom'`).
+    /// Preserves `settings_json` and `created_at` on in-place upgrade/version switch; when `enabled`
+    /// is `Some(flag)`, applies that flag, otherwise preserves existing `enabled` (defaulting to
+    /// `true` for newly installed plugins). Always clears any prior `disabled_reason`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_js_plugin(
+        &self,
+        id: &str,
+        source: &str,
+        kind: &str,
+        version: &str,
+        script_js: &str,
+        script_sha256: &str,
+        manifest_json: &str,
+        enabled: Option<bool>,
+    ) -> AppResult<PluginRow> {
+        let now = now_unix();
+        let existing = self.get_plugin(id).await?;
+        let row = if let Some(cur) = existing {
+            if cur.source == "builtin" {
+                return Err(AppError::Conflict(format!(
+                    "Built-in plugin '{id}' cannot be overwritten by a JS plugin"
+                )));
+            }
+            let next_enabled = enabled.unwrap_or(cur.enabled);
+            sqlx::query_as::<_, PluginRow>(
+                r#"
+                UPDATE plugins
+                SET source = ?1,
+                    kind = ?2,
+                    installed_version = ?3,
+                    script_js = ?4,
+                    script_sha256 = ?5,
+                    manifest_json = ?6,
+                    enabled = ?7,
+                    disabled_reason = NULL,
+                    installed_at = ?8,
+                    updated_at = ?8
+                WHERE id = ?9 AND source IN ('market', 'custom')
+                RETURNING *
+                "#,
+            )
+            .bind(source)
+            .bind(kind)
+            .bind(version)
+            .bind(script_js)
+            .bind(script_sha256)
+            .bind(manifest_json)
+            .bind(next_enabled)
+            .bind(now)
+            .bind(id)
+            .fetch_one(&self.write_pool)
+            .await?
+        } else {
+            let init_enabled = enabled.unwrap_or(true);
+            sqlx::query_as::<_, PluginRow>(
+                r#"
+                INSERT INTO plugins (
+                    id, enabled, installed_version, settings_json, source, kind,
+                    script_js, script_sha256, manifest_json, installed_at,
+                    disabled_reason, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?9, ?9)
+                RETURNING *
+                "#,
+            )
+            .bind(id)
+            .bind(init_enabled)
+            .bind(version)
+            .bind(source)
+            .bind(kind)
+            .bind(script_js)
+            .bind(script_sha256)
+            .bind(manifest_json)
+            .bind(now)
+            .fetch_one(&self.write_pool)
+            .await?
+        };
+        Ok(row)
+    }
+
+    /// Atomically inspect referencing `channels` and `routes` for a JS plugin (`market` | `custom`)
+    /// inside a single `write_pool` transaction, returning [`DeleteJsPluginOutcome::Conflict`] when
+    /// referenced and `cascade == false`, or cascading deletion/stripping and removing the plugin.
+    pub async fn delete_js_plugin_guarded(
+        &self,
+        plugin_id: &str,
+        master_key: &MasterKey,
+        cascade: bool,
+    ) -> AppResult<DeleteJsPluginOutcome> {
+        let mut tx = self.write_pool.begin().await?;
+
+        let Some(row) = sqlx::query_as::<_, PluginRow>("SELECT * FROM plugins WHERE id = ?1")
+            .bind(plugin_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(DeleteJsPluginOutcome::NotFound);
+        };
+
+        if !matches!(row.source.as_str(), "market" | "custom") {
+            return Ok(DeleteJsPluginOutcome::NotDeletable(
+                "Only installed JS plugins can be deleted".to_string(),
+            ));
+        }
+
+        let plugin_channels: Vec<Channel> =
+            sqlx::query_as("SELECT * FROM channels WHERE kind = 'plugin' ORDER BY id ASC")
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut ref_channels: Vec<(i64, String)> = Vec::new();
+        for ch in plugin_channels {
+            if let Ok(ChannelConfig::Plugin(p)) = master_key.decrypt_json(&ch.encrypted_config)
+                && p.plugin_id == plugin_id
+            {
+                ref_channels.push((ch.id, ch.name));
+            }
+        }
+        let ref_ch_ids: Vec<i64> = ref_channels.iter().map(|(id, _)| *id).collect();
+
+        let all_routes: Vec<Route> = sqlx::query_as("SELECT * FROM routes ORDER BY id ASC")
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut ref_routes: Vec<(i64, String)> = Vec::new();
+        let mut strip_route_ids: Vec<i64> = Vec::new();
+        for route in all_routes {
+            let uses_channel = ref_ch_ids.contains(&route.channel_id);
+            let opts = route.options();
+            let uses_processor = opts.plugins.contains_key(plugin_id)
+                || opts.plugin_order.iter().any(|p| p == plugin_id);
+            if uses_channel || uses_processor {
+                ref_routes.push((route.id, route.name));
+                if uses_processor && !uses_channel {
+                    strip_route_ids.push(route.id);
+                }
+            }
+        }
+
+        if (!ref_channels.is_empty() || !ref_routes.is_empty()) && !cascade {
+            return Ok(DeleteJsPluginOutcome::Conflict {
+                referencing_channels: ref_channels,
+                referencing_routes: ref_routes,
+            });
+        }
+
+        for ch_id in &ref_ch_ids {
+            sqlx::query("DELETE FROM channels WHERE id = ?1")
+                .bind(ch_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for route_id in &strip_route_ids {
+            if let Some(route) = sqlx::query_as::<_, Route>("SELECT * FROM routes WHERE id = ?1")
+                .bind(route_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                let mut opts = route.options();
+                opts.plugins.remove(plugin_id);
+                opts.plugin_order.retain(|p| p != plugin_id);
+                let opts_json = serde_json::to_string(&opts)?;
+                sqlx::query("UPDATE routes SET options_json = ?1, updated_at = ?2 WHERE id = ?3")
+                    .bind(opts_json)
+                    .bind(now_unix())
+                    .bind(route_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        let res =
+            sqlx::query("DELETE FROM plugins WHERE id = ?1 AND source IN ('market', 'custom')")
+                .bind(plugin_id)
+                .execute(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        if res.rows_affected() > 0 {
+            Ok(DeleteJsPluginOutcome::Deleted)
+        } else {
+            Ok(DeleteJsPluginOutcome::NotFound)
+        }
+    }
+
+    /// Fetch due persistent `plugin_events` ready for `on_delivered` dispatch.
+    pub async fn list_due_plugin_events(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> AppResult<Vec<crate::db::models::PluginEventRow>> {
+        let rows = sqlx::query_as::<_, crate::db::models::PluginEventRow>(
+            r#"
+            SELECT * FROM plugin_events
+            WHERE next_attempt_at <= ?1
+            ORDER BY next_attempt_at ASC, id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(now)
+        .bind(limit.max(1))
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn delete_plugin_event(&self, event_id: i64) -> AppResult<()> {
+        sqlx::query("DELETE FROM plugin_events WHERE id = ?1")
+            .bind(event_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reschedule_plugin_event(
+        &self,
+        event_id: i64,
+        attempts: i64,
+        next_attempt_at: i64,
+    ) -> AppResult<()> {
+        sqlx::query("UPDATE plugin_events SET attempts = ?1, next_attempt_at = ?2 WHERE id = ?3")
+            .bind(attempts)
+            .bind(next_attempt_at)
+            .bind(event_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn list_plugin_instances(
@@ -3789,4 +4107,233 @@ impl Database {
         .ok_or_else(|| AppError::NotFound(format!("SMTP recipient {recipient_id} not found")))?;
         Ok(row)
     }
+
+    /// Aggregate runtime queue, feed health, failure hotspot, and cooldown diagnostics.
+    pub async fn get_debug_runtime_db_stats(&self, now: i64) -> AppResult<DebugRuntimeDbStats> {
+        let mut queue_by_status = std::collections::BTreeMap::new();
+        let status_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM delivery_tasks GROUP BY status")
+                .fetch_all(&self.read_pool)
+                .await?;
+        for (status, count) in status_rows {
+            queue_by_status.insert(status, count);
+        }
+
+        let oldest_due_at: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT MIN(next_attempt_at)
+            FROM delivery_tasks
+            WHERE status IN ('queued', 'retrying', 'deferred')
+              AND next_attempt_at <= ?1
+            "#,
+        )
+        .bind(now)
+        .fetch_one(&self.read_pool)
+        .await?;
+        let oldest_due_wait_secs = oldest_due_at.map(|ts| now.saturating_sub(ts).max(0));
+
+        let expired_lease_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_tasks WHERE status = 'delivering' AND lease_until IS NOT NULL AND lease_until <= ?1",
+        )
+        .bind(now)
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        let pending_plugin_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_events")
+            .fetch_one(&self.read_pool)
+            .await?;
+
+        let mut feeds_by_health = std::collections::BTreeMap::new();
+        let health_rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT health_status, COUNT(*) FROM feeds GROUP BY health_status")
+                .fetch_all(&self.read_pool)
+                .await?;
+        for (health, count) in health_rows {
+            feeds_by_health.insert(health, count);
+        }
+
+        let since_24h = now.saturating_sub(86_400);
+        let failing_feed_rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, title, consecutive_failures, last_error
+            FROM feeds
+            WHERE consecutive_failures > 0 AND updated_at >= ?1
+            ORDER BY consecutive_failures DESC, updated_at DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(since_24h)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let top_failing_feeds = failing_feed_rows
+            .into_iter()
+            .map(
+                |(feed_id, title, consecutive_failures, last_error)| DebugFailingFeed {
+                    feed_id,
+                    title,
+                    consecutive_failures,
+                    last_error,
+                },
+            )
+            .collect();
+
+        let failing_dest_rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            r#"
+            SELECT dt.destination_id, cd.name, c.kind, COUNT(*) AS fail_cnt
+            FROM delivery_tasks dt
+            JOIN channel_destinations cd ON cd.id = dt.destination_id
+            JOIN channels c ON c.id = dt.channel_id
+            WHERE dt.status IN ('retrying', 'dead_letter')
+              AND dt.created_at >= ?1
+            GROUP BY dt.destination_id, cd.name, c.kind
+            ORDER BY fail_cnt DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(since_24h)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let top_failing_destinations = failing_dest_rows
+            .into_iter()
+            .map(
+                |(destination_id, destination_name, channel_kind, failure_count)| {
+                    DebugFailingDestination {
+                        destination_id,
+                        destination_name,
+                        channel_kind,
+                        failure_count,
+                    }
+                },
+            )
+            .collect();
+
+        let cooldown_rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            r#"
+            SELECT id, name, kind, cooldown_until
+            FROM channels
+            WHERE cooldown_until IS NOT NULL AND cooldown_until > ?1
+            ORDER BY cooldown_until ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.read_pool)
+        .await?;
+        let active_cooldowns = cooldown_rows
+            .into_iter()
+            .map(
+                |(channel_id, channel_name, channel_kind, cooldown_until)| DebugCooldownChannel {
+                    channel_id,
+                    channel_name,
+                    channel_kind,
+                    cooldown_until,
+                },
+            )
+            .collect();
+
+        Ok(DebugRuntimeDbStats {
+            queue_by_status,
+            oldest_due_wait_secs,
+            expired_lease_count,
+            pending_plugin_events,
+            feeds_by_health,
+            top_failing_feeds,
+            top_failing_destinations,
+            active_cooldowns,
+        })
+    }
+
+    /// Fetch enriched metadata for a single delivery task (used by internal task tracing).
+    pub async fn get_delivery_task_detail(
+        &self,
+        task_id: i64,
+    ) -> AppResult<Option<DebugTaskDetail>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                dt.*,
+                e.feed_id AS joined_feed_id,
+                e.title AS joined_entry_title,
+                f.title AS joined_feed_title,
+                r.name AS joined_route_name,
+                c.name AS joined_channel_name,
+                c.kind AS joined_channel_kind,
+                cd.name AS joined_destination_name
+            FROM delivery_tasks dt
+            LEFT JOIN entries e ON e.id = dt.entry_id
+            LEFT JOIN feeds f ON f.id = e.feed_id
+            LEFT JOIN routes r ON r.id = dt.route_id
+            LEFT JOIN channels c ON c.id = dt.channel_id
+            LEFT JOIN channel_destinations cd ON cd.id = dt.destination_id
+            WHERE dt.id = ?1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.read_pool)
+        .await?
+        .map(|r| -> Result<DebugTaskDetail, sqlx::Error> {
+            use sqlx::{FromRow, Row};
+            let task = DeliveryTask::from_row(&r)?;
+            Ok(DebugTaskDetail {
+                task,
+                feed_id: r.try_get("joined_feed_id")?,
+                entry_title: r.try_get("joined_entry_title")?,
+                feed_title: r.try_get("joined_feed_title")?,
+                route_name: r.try_get("joined_route_name")?,
+                channel_name: r.try_get("joined_channel_name")?,
+                channel_kind: r.try_get("joined_channel_kind")?,
+                destination_name: r.try_get("joined_destination_name")?,
+            })
+        })
+        .transpose()?;
+
+        Ok(row)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugFailingFeed {
+    pub feed_id: i64,
+    pub title: String,
+    pub consecutive_failures: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugFailingDestination {
+    pub destination_id: i64,
+    pub destination_name: String,
+    pub channel_kind: String,
+    pub failure_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugCooldownChannel {
+    pub channel_id: i64,
+    pub channel_name: String,
+    pub channel_kind: String,
+    pub cooldown_until: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugRuntimeDbStats {
+    pub queue_by_status: std::collections::BTreeMap<String, i64>,
+    pub oldest_due_wait_secs: Option<i64>,
+    pub expired_lease_count: i64,
+    pub pending_plugin_events: i64,
+    pub feeds_by_health: std::collections::BTreeMap<String, i64>,
+    pub top_failing_feeds: Vec<DebugFailingFeed>,
+    pub top_failing_destinations: Vec<DebugFailingDestination>,
+    pub active_cooldowns: Vec<DebugCooldownChannel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugTaskDetail {
+    pub task: DeliveryTask,
+    pub feed_id: Option<i64>,
+    pub entry_title: Option<String>,
+    pub feed_title: Option<String>,
+    pub route_name: Option<String>,
+    pub channel_name: Option<String>,
+    pub channel_kind: Option<String>,
+    pub destination_name: Option<String>,
 }

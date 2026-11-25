@@ -1,28 +1,29 @@
-//! Built-in FeedCourier Plugin Framework (Plugin Protocol v1) and Marketplace Index client.
-//!
-//! Phase 1 (v0.3.0): First-party plugins implement [`Plugin`] in Rust and compile directly into
-//! the single binary, while sharing the exact manifest schema (`api_version = "1"`), SQLite tables
-//! (`plugins`, `plugin_instances`, `plugin_link_cache`), and hook lifecycle designed for a future
-//! WASM/Extism third-party sandbox runtime.
+//! FeedCourier Plugin Framework (Plugin Protocol v1) — Built-in Rust Plugins, In-Process
+//! Pure-Rust JS Sandbox Plugins (`boa_engine`), and Marketplace Index Client.
 
+pub mod js_runtime;
 pub mod link_rewrite;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use url::Url;
 
 use crate::channels::RouteOptions;
-use crate::crypto::MasterKey;
+use crate::crypto::{MasterKey, constant_time_eq, sha256_hex};
 use crate::db::Database;
 use crate::db::models::{Channel, ChannelDestination, Entry, Feed, Route};
 use crate::error::{AppError, AppResult};
 use crate::net::{OutboundRequest, ProtectedHttpClient};
 
+use self::js_runtime::{
+    JS_MAX_SCRIPT_BYTES, JsPluginRuntime, JsProcessorPlugin, compile_js_plugin,
+};
 use self::link_rewrite::LinkRewritePlugin;
 
 /// Current stable plugin protocol version (`api_version`).
@@ -46,10 +47,53 @@ pub const MARKET_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Maximum response size accepted for a remote marketplace `index.json` (`1 MiB`).
 const MAX_MARKET_INDEX_BYTES: usize = 1024 * 1024;
 
+/// Per-plugin execution wall-clock timeout inside `run_on_render`.
+const ON_RENDER_PLUGIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Fixed warning prefix prepended to all plugin/delivery warnings persisted into `diagnostic_log`
+/// so backend DTOs and WebUI warning badges never rely solely on fragile prose matching.
+pub const DELIVERY_WARNING_PREFIX: &str = "[warn] ";
+
+/// Consecutive JS execution timeouts before the circuit breaker automatically disables a plugin.
+pub const JS_CIRCUIT_BREAKER_TIMEOUT_THRESHOLD: u32 = 3;
+
+/// Plugin category distinguishing delivery-time processors from delivery channel adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginKind {
+    #[default]
+    Processor,
+    Channel,
+}
+
+impl PluginKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Processor => "processor",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+/// Execution runtime for a plugin (`builtin` compiled into Rust binary vs in-process `js` sandbox).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntime {
+    #[default]
+    Builtin,
+    Js,
+}
+
+impl PluginRuntime {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Js => "js",
+        }
+    }
+}
+
 /// Supported plugin hook points in Protocol v1.
-///
-/// `OnRender` executes in v0.3.0; `OnIngest` and `OnDelivered` are reserved in the manifest and
-/// protocol schema for upcoming releases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
@@ -65,29 +109,118 @@ pub enum PluginPermission {
     Network,
 }
 
+fn default_empty_object() -> Value {
+    json!({})
+}
+
 /// Static plugin metadata & declarative UI schema matching `schema/manifest.schema.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(default = "default_api_version")]
     pub api_version: String,
+    #[serde(default)]
+    pub kind: PluginKind,
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_core: Option<String>,
+    #[serde(default)]
     pub category: String,
+    #[serde(default)]
     pub icon: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
+    #[serde(default)]
     pub homepage: String,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
     pub hooks: Vec<HookKind>,
+    #[serde(default)]
     pub permissions: Vec<PluginPermission>,
-    /// Declarative schema describing per-provider/instance configuration fields.
+    /// Declarative schema describing per-provider/instance configuration fields (processor plugins).
+    #[serde(default = "default_empty_object")]
     pub instance_schema: Value,
     /// Declarative schema describing per-route plugin controls (e.g. provider dropdown).
+    #[serde(default = "default_empty_object")]
     pub route_option_schema: Value,
+    /// Declarative schema describing account-level fields (`kind = "channel"`).
+    #[serde(default = "default_empty_object")]
+    pub account_schema: Value,
+    /// Declarative schema describing destination-level fields (`kind = "channel"`).
+    #[serde(default = "default_empty_object")]
+    pub destination_schema: Value,
+    /// Optional channel capabilities (e.g. `supports_html`, `max_text_len`).
+    #[serde(default = "default_empty_object")]
+    pub capabilities: Value,
+}
+
+/// Check whether a plugin declaring `api_version` and optional `min_core` is compatible with
+/// the running FeedCourier core version (`crate::config::VERSION`).
+pub fn check_plugin_compatibility(
+    api_version: &str,
+    min_core: Option<&str>,
+) -> (bool, Option<String>) {
+    if api_version.trim() != PLUGIN_API_VERSION {
+        return (
+            false,
+            Some(format!(
+                "Incompatible plugin protocol v{} (core supports v{PLUGIN_API_VERSION})",
+                api_version.trim()
+            )),
+        );
+    }
+    if let Some(req) = min_core.map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(req_v) = parse_semver_triple(req) else {
+            return (false, Some(format!("Invalid min_core SemVer '{req}'")));
+        };
+        let Some(core_v) = parse_semver_triple(crate::config::VERSION) else {
+            return (
+                false,
+                Some(format!(
+                    "Unable to parse core version '{}'",
+                    crate::config::VERSION
+                )),
+            );
+        };
+        if core_v < req_v {
+            return (false, Some(format!("Requires FeedCourier >= {req}")));
+        }
+    }
+    (true, None)
+}
+
+pub(crate) fn parse_semver_triple(raw: &str) -> Option<(u64, u64, u64)> {
+    let clean = raw
+        .trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = clean.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Returns `true` when a route-level plugin option is active (non-null and not explicitly
+/// disabled via `{"enabled": false}`).
+pub fn is_route_plugin_enabled(opt: &Value) -> bool {
+    if opt.is_null() {
+        return false;
+    }
+    opt.get("enabled").and_then(Value::as_bool) != Some(false)
 }
 
 /// Non-destructive per-delivery overrides produced by `on_render` plugins.
-///
-/// The underlying persisted `Entry` is never mutated so multi-route deliveries and archival
-/// properties (`entry.canonical_url` for Telegram previews and Notion `Link` column) remain intact.
 #[derive(Debug, Clone, Default)]
 pub struct RenderOverrides {
     pub content_html: Option<String>,
@@ -96,6 +229,20 @@ pub struct RenderOverrides {
 }
 
 impl RenderOverrides {
+    /// Append a delivery warning guaranteed to start with [`DELIVERY_WARNING_PREFIX`].
+    pub fn push_warning(&mut self, msg: impl AsRef<str>) {
+        let trimmed = msg.as_ref().trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.starts_with(DELIVERY_WARNING_PREFIX) {
+            self.warnings.push(trimmed.to_string());
+        } else {
+            self.warnings
+                .push(format!("{DELIVERY_WARNING_PREFIX}{trimmed}"));
+        }
+    }
+
     /// Effective HTML body (`overrides.content_html`, falling back to `entry.content_html`).
     pub fn effective_content_html<'a>(&'a self, entry: &'a Entry) -> Option<&'a str> {
         self.content_html
@@ -140,7 +287,7 @@ pub enum PluginResult {
     },
 }
 
-/// First-party Rust plugin trait (Protocol v1).
+/// Plugin trait implemented by both compiled-in Rust plugins and in-process JS processor plugins.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -160,6 +307,15 @@ pub trait Plugin: Send + Sync {
     /// Execute an interactive connectivity test for a provider/instance config.
     async fn test_instance(&self, http: &ProtectedHttpClient, cfg: &Value) -> AppResult<String>;
 
+    /// Resolve whether failures/timeouts of this plugin on the current route must retry delivery
+    /// rather than falling back to original content (merging route-level and instance-level flags).
+    async fn effective_strict_mode(&self, ctx: &RenderContext<'_>) -> bool {
+        ctx.plugin_route_config
+            .and_then(|cfg| cfg.get("strict_mode"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// Transform article links/content immediately before a channel adapter renders the delivery.
     async fn on_render(
         &self,
@@ -176,22 +332,56 @@ pub struct PluginRetry {
     pub retry_after_secs: Option<u64>,
 }
 
-/// Registry holding all compiled-in FeedCourier plugins.
+/// Cached runtime metadata for an installed JS plugin (`processor` or `channel`).
+///
+/// Even when a persisted JS plugin fails to compile or is incompatible with the running core,
+/// it remains present in [`PluginRegistry`] with `compatible = false` and `runtime = None` so
+/// the WebUI can display it (allowing upgrade or uninstall) and channel tasks degrade to
+/// `Deferred` rather than dead-lettering.
+#[derive(Clone)]
+pub struct JsPluginEntry {
+    pub source: String,
+    pub manifest: PluginManifest,
+    pub script_sha256: Option<String>,
+    pub runtime: Option<Arc<JsPluginRuntime>>,
+    pub enabled: bool,
+    pub compatible: bool,
+    pub compatibility_reason: Option<String>,
+    pub disabled_reason: Option<String>,
+}
+
+struct RegistryCache {
+    loaded_from_db: bool,
+    enabled_by_id: HashMap<String, bool>,
+    js_plugins: HashMap<String, JsPluginEntry>,
+    js_processors: HashMap<String, Arc<dyn Plugin>>,
+    consecutive_timeouts: HashMap<String, u32>,
+    hook_timeout_override: Option<Duration>,
+}
+
+/// Registry holding built-in Rust plugins plus in-memory cached JS plugins & enabled flags.
 #[derive(Clone)]
 pub struct PluginRegistry {
-    plugins: Vec<Arc<dyn Plugin>>,
-    by_id: HashMap<String, Arc<dyn Plugin>>,
+    builtins: Arc<Vec<Arc<dyn Plugin>>>,
+    builtins_by_id: Arc<HashMap<String, Arc<dyn Plugin>>>,
+    cache: Arc<RwLock<RegistryCache>>,
 }
 
 impl fmt::Debug for PluginRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ids: Vec<&str> = self
-            .plugins
+        let builtin_ids: Vec<&str> = self
+            .builtins
             .iter()
             .map(|p| p.manifest().id.as_str())
             .collect();
+        let js_ids: Vec<String> = self
+            .cache
+            .read()
+            .map(|g| g.js_plugins.keys().cloned().collect())
+            .unwrap_or_default();
         f.debug_struct("PluginRegistry")
-            .field("plugins", &ids)
+            .field("builtins", &builtin_ids)
+            .field("js_plugins", &js_ids)
             .finish()
     }
 }
@@ -203,55 +393,429 @@ impl Default for PluginRegistry {
 }
 
 impl PluginRegistry {
-    /// Construct a registry containing all built-in v0.3.0 plugins.
+    /// Construct a registry containing all built-in plugins (JS plugins are loaded via `reload_from_db`).
     pub fn with_builtins() -> Self {
         let builtins: Vec<Arc<dyn Plugin>> = vec![Arc::new(LinkRewritePlugin::new())];
-        let mut by_id = HashMap::with_capacity(builtins.len());
+        let mut builtins_by_id = HashMap::with_capacity(builtins.len());
         for p in &builtins {
-            by_id.insert(p.manifest().id.clone(), Arc::clone(p));
+            builtins_by_id.insert(p.manifest().id.clone(), Arc::clone(p));
         }
         Self {
-            plugins: builtins,
-            by_id,
+            builtins: Arc::new(builtins),
+            builtins_by_id: Arc::new(builtins_by_id),
+            cache: Arc::new(RwLock::new(RegistryCache {
+                loaded_from_db: false,
+                enabled_by_id: HashMap::new(),
+                js_plugins: HashMap::new(),
+                js_processors: HashMap::new(),
+                consecutive_timeouts: HashMap::new(),
+                hook_timeout_override: None,
+            })),
         }
     }
 
+    /// Return built-in Rust plugins only.
     pub fn list(&self) -> &[Arc<dyn Plugin>] {
-        &self.plugins
+        &self.builtins
     }
 
-    pub fn get(&self, id: &str) -> Option<&Arc<dyn Plugin>> {
-        self.by_id.get(id.trim())
+    pub fn is_builtin(&self, id: &str) -> bool {
+        self.builtins_by_id.contains_key(id.trim())
+    }
+
+    /// Look up any processor plugin (built-in or JS) implementing [`Plugin`].
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Plugin>> {
+        let trimmed = id.trim();
+        if let Some(p) = self.builtins_by_id.get(trimmed) {
+            return Some(Arc::clone(p));
+        }
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.js_processors.get(trimmed).cloned())
+    }
+
+    /// Look up an installed JS plugin entry (`processor` or `channel`).
+    pub fn get_js(&self, id: &str) -> Option<JsPluginEntry> {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.js_plugins.get(id.trim()).cloned())
+    }
+
+    /// Return all installed JS plugins sorted by ID.
+    pub fn list_js(&self) -> Vec<JsPluginEntry> {
+        let mut list: Vec<JsPluginEntry> = self
+            .cache
+            .read()
+            .map(|g| g.js_plugins.values().cloned().collect())
+            .unwrap_or_default();
+        list.sort_by(|a, b| a.manifest.id.cmp(&b.manifest.id));
+        list
+    }
+
+    /// Return the manifest for any installed plugin (built-in or JS).
+    pub fn get_manifest(&self, id: &str) -> Option<PluginManifest> {
+        let trimmed = id.trim();
+        if let Some(p) = self.builtins_by_id.get(trimmed) {
+            return Some(p.manifest().clone());
+        }
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.js_plugins.get(trimmed).map(|p| p.manifest.clone()))
+    }
+
+    /// Override JS hook wall-clock timeouts (intended for deterministic timeout/circuit-breaker tests).
+    pub fn set_hook_timeout_override(&self, timeout: Option<Duration>) {
+        if let Ok(mut guard) = self.cache.write() {
+            guard.hook_timeout_override = timeout;
+        }
+    }
+
+    /// Resolve the effective wall-clock timeout for a JS plugin hook.
+    pub fn effective_hook_timeout(&self, default: Duration) -> Duration {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|g| g.hook_timeout_override)
+            .unwrap_or(default)
+    }
+
+    /// Record a JS plugin execution timeout; after [`JS_CIRCUIT_BREAKER_TIMEOUT_THRESHOLD`] (3)
+    /// consecutive timeouts, automatically disables the plugin in SQLite with `disabled_reason`
+    /// and reloads the in-memory registry. Returns `true` if the circuit breaker tripped.
+    pub async fn record_js_timeout(&self, db: &Database, plugin_id: &str, hook: &str) -> bool {
+        let count = {
+            let Ok(mut guard) = self.cache.write() else {
+                return false;
+            };
+            let entry = guard
+                .consecutive_timeouts
+                .entry(plugin_id.to_string())
+                .or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        if count >= JS_CIRCUIT_BREAKER_TIMEOUT_THRESHOLD {
+            let reason = format!(
+                "Auto-disabled by circuit breaker after {count} consecutive execution timeouts (last hook: {hook})"
+            );
+            tracing::error!(
+                plugin_id,
+                hook,
+                consecutive_timeouts = count,
+                "JS plugin circuit breaker tripped; auto-disabling plugin"
+            );
+            if let Err(err) = db.disable_plugin_with_reason(plugin_id, &reason).await {
+                tracing::warn!(
+                    plugin_id,
+                    error = %err,
+                    "failed to persist JS plugin circuit-breaker disable"
+                );
+                return false;
+            }
+            if let Err(err) = self.reload_from_db(db).await {
+                tracing::warn!(
+                    plugin_id,
+                    error = %err,
+                    "failed to reload plugin registry after circuit-breaker disable"
+                );
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Reset consecutive timeout tracking for `plugin_id` after a healthy execution or admin action.
+    pub fn reset_js_timeout(&self, plugin_id: &str) {
+        if let Ok(mut guard) = self.cache.write() {
+            guard.consecutive_timeouts.remove(plugin_id);
+        }
     }
 
     /// Ensure every built-in plugin has a row in SQLite `plugins` (idempotent; preserves `enabled`).
     pub async fn sync_builtin_rows(&self, db: &Database) -> AppResult<()> {
-        for plugin in &self.plugins {
+        for plugin in self.builtins.iter() {
             let m = plugin.manifest();
             db.ensure_plugin_row(&m.id, &m.version).await?;
         }
         Ok(())
     }
 
-    /// Validate all entries in `route_options.plugins` before creating or updating a route.
-    pub async fn validate_route_plugins(
-        &self,
-        db: &Database,
-        route_plugins: &std::collections::BTreeMap<String, Value>,
-    ) -> AppResult<()> {
-        for (plugin_id, opt_val) in route_plugins {
-            if opt_val.is_null() {
-                continue;
+    /// Reload all plugin enabled states and installed JS plugins from SQLite into memory.
+    /// Called at startup and immediately after any plugin install/upload/update/delete mutation.
+    ///
+    /// Persisted JS plugins that fail to compile or fail `api_version`/`min_core` checks are
+    /// retained as `compatible = false` placeholder entries recovered from `manifest_json` so they
+    /// remain visible, uninstallable, and upgradeable in WebUI while channel tasks defer cleanly.
+    pub async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
+        let rows = db.list_plugins().await?;
+        let mut enabled_by_id = HashMap::with_capacity(rows.len());
+        let mut js_plugins = HashMap::new();
+        let mut js_processors: HashMap<String, Arc<dyn Plugin>> = HashMap::new();
+
+        for row in rows {
+            enabled_by_id.insert(row.id.clone(), row.enabled);
+            if matches!(row.source.as_str(), "market" | "custom") {
+                let fallback_manifest = fallback_manifest_from_row(&row);
+                let Some(script_js) = row.script_js.clone() else {
+                    let reason = "Missing persisted JS plugin source script".to_string();
+                    tracing::warn!(plugin_id = %row.id, "{reason}; marking plugin incompatible");
+                    enabled_by_id.insert(row.id.clone(), false);
+                    js_plugins.insert(
+                        row.id.clone(),
+                        JsPluginEntry {
+                            source: row.source,
+                            manifest: fallback_manifest,
+                            script_sha256: row.script_sha256,
+                            runtime: None,
+                            enabled: false,
+                            compatible: false,
+                            compatibility_reason: Some(reason),
+                            disabled_reason: row.disabled_reason,
+                        },
+                    );
+                    continue;
+                };
+
+                let compiled = match compile_js_plugin(script_js.clone()).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let (persisted_compat, persisted_reason) = check_plugin_compatibility(
+                            &fallback_manifest.api_version,
+                            fallback_manifest.min_core.as_deref(),
+                        );
+                        let reason = if !persisted_compat {
+                            persisted_reason.unwrap_or_else(|| {
+                                format!(
+                                    "Failed to compile JS plugin: {}",
+                                    crate::logging::redact::redact_text(&err.to_string())
+                                )
+                            })
+                        } else {
+                            format!(
+                                "Failed to compile JS plugin: {}",
+                                crate::logging::redact::redact_text(&err.to_string())
+                            )
+                        };
+                        tracing::warn!(
+                            plugin_id = %row.id,
+                            error = %err,
+                            "persisted JS plugin failed compilation; keeping incompatible placeholder"
+                        );
+                        enabled_by_id.insert(row.id.clone(), false);
+                        js_plugins.insert(
+                            row.id.clone(),
+                            JsPluginEntry {
+                                source: row.source,
+                                manifest: fallback_manifest,
+                                script_sha256: row.script_sha256,
+                                runtime: None,
+                                enabled: false,
+                                compatible: false,
+                                compatibility_reason: Some(reason),
+                                disabled_reason: row.disabled_reason,
+                            },
+                        );
+                        continue;
+                    }
+                };
+
+                // Allow persisted manifest_json (e.g. after downgrade or tests) to surface
+                // min_core / api_version compatibility checks consistently.
+                let mut runtime = JsPluginRuntime::from_compiled(script_js, compiled);
+                if let Some(manifest_json) = row.manifest_json.as_deref()
+                    && let Ok(persisted_manifest) =
+                        serde_json::from_str::<PluginManifest>(manifest_json)
+                {
+                    runtime.manifest.api_version = persisted_manifest.api_version;
+                    runtime.manifest.min_core = persisted_manifest.min_core;
+                }
+                runtime.manifest.runtime = PluginRuntime::Js;
+
+                let (compatible, compatibility_reason) = check_plugin_compatibility(
+                    &runtime.manifest.api_version,
+                    runtime.manifest.min_core.as_deref(),
+                );
+                if !compatible {
+                    tracing::warn!(
+                        plugin_id = %row.id,
+                        reason = compatibility_reason.as_deref().unwrap_or("incompatible"),
+                        "persisted JS plugin is incompatible with current core; disabling runtime execution"
+                    );
+                }
+                let effective_enabled = row.enabled && compatible;
+                enabled_by_id.insert(row.id.clone(), effective_enabled);
+
+                let manifest = runtime.manifest.clone();
+                let script_sha256 = Some(runtime.script_sha256.clone());
+                let runtime_opt = if compatible {
+                    let runtime_arc = Arc::new(runtime);
+                    if manifest.kind == PluginKind::Processor {
+                        let proc_plugin =
+                            JsProcessorPlugin::new(Arc::clone(&runtime_arc), self.clone());
+                        js_processors.insert(row.id.clone(), Arc::new(proc_plugin));
+                    }
+                    Some(runtime_arc)
+                } else {
+                    None
+                };
+                js_plugins.insert(
+                    row.id.clone(),
+                    JsPluginEntry {
+                        source: row.source,
+                        manifest,
+                        script_sha256,
+                        runtime: runtime_opt,
+                        enabled: effective_enabled,
+                        compatible,
+                        compatibility_reason,
+                        disabled_reason: row.disabled_reason,
+                    },
+                );
             }
-            let plugin = self.get(plugin_id).ok_or_else(|| {
-                AppError::Validation(format!("unknown plugin '{plugin_id}' in route options"))
-            })?;
-            plugin.validate_route_option(db, opt_val).await?;
+        }
+
+        if let Ok(mut guard) = self.cache.write() {
+            guard.loaded_from_db = true;
+            guard.enabled_by_id = enabled_by_id;
+            guard.js_plugins = js_plugins;
+            guard.js_processors = js_processors;
         }
         Ok(())
     }
 
-    /// Execute the `on_render` hook chain for every enabled plugin referenced by `route_options`.
+    /// Check whether a plugin is enabled using the in-memory cache (falling back to DB only if
+    /// `reload_from_db` has not been invoked yet, e.g. in isolated unit tests).
+    async fn is_plugin_enabled(&self, db: &Database, id: &str) -> AppResult<bool> {
+        if let Ok(guard) = self.cache.read()
+            && guard.loaded_from_db
+        {
+            return Ok(guard.enabled_by_id.get(id).copied().unwrap_or(false));
+        }
+        Ok(db.get_plugin(id).await?.is_some_and(|r| r.enabled))
+    }
+
+    /// Validate all entries in `route_options.plugins` and `route_options.plugin_order`.
+    pub async fn validate_route_plugins(
+        &self,
+        db: &Database,
+        route_options: &RouteOptions,
+    ) -> AppResult<()> {
+        for (plugin_id, opt_val) in &route_options.plugins {
+            if opt_val.is_null() {
+                continue;
+            }
+            let route_enabled = is_route_plugin_enabled(opt_val);
+            if let Some(js) = self.get_js(plugin_id) {
+                if js.manifest.kind != PluginKind::Processor {
+                    return Err(AppError::Validation(format!(
+                        "plugin '{plugin_id}' is a '{}' plugin and cannot be attached to a route",
+                        js.manifest.kind.as_str()
+                    )));
+                }
+                if route_enabled {
+                    if !js.compatible || js.runtime.is_none() {
+                        return Err(AppError::Validation(format!(
+                            "plugin '{plugin_id}' is incompatible with current core: {}",
+                            js.compatibility_reason
+                                .as_deref()
+                                .unwrap_or("version mismatch")
+                        )));
+                    }
+                    if !js.enabled {
+                        return Err(AppError::Validation(format!(
+                            "plugin '{plugin_id}' is disabled; enable it before using it in a route"
+                        )));
+                    }
+                }
+                if let Some(plugin) = self.get(plugin_id) {
+                    plugin.validate_route_option(db, opt_val).await?;
+                }
+                continue;
+            }
+            let plugin = self.get(plugin_id).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "unknown processor plugin '{plugin_id}' in route options"
+                ))
+            })?;
+            plugin.validate_route_option(db, opt_val).await?;
+        }
+        if route_options.plugin_order.len() > 64 {
+            return Err(AppError::Validation(
+                "route options.plugin_order must not exceed 64 entries".to_string(),
+            ));
+        }
+        let mut seen_order = HashSet::with_capacity(route_options.plugin_order.len());
+        for pid in &route_options.plugin_order {
+            js_runtime::validate_plugin_id(pid)?;
+            if !seen_order.insert(pid.as_str()) {
+                return Err(AppError::Validation(format!(
+                    "duplicate plugin id '{pid}' in route options.plugin_order"
+                )));
+            }
+            let known_processor = self.get(pid).is_some()
+                || self
+                    .get_js(pid)
+                    .is_some_and(|j| j.manifest.kind == PluginKind::Processor);
+            if !known_processor {
+                return Err(AppError::Validation(format!(
+                    "unknown processor plugin '{pid}' in route options.plugin_order"
+                )));
+            }
+            if !route_options.plugins.get(pid).is_some_and(|v| !v.is_null()) {
+                return Err(AppError::Validation(format!(
+                    "plugin '{pid}' in route options.plugin_order is not configured in options.plugins"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute the ordered list of enabled JS plugins subscribed to `HookKind::OnDelivered`
+    /// for a completed delivery task (route-configured processor plugins + optional channel plugin).
+    pub fn on_delivered_subscriber_ids(
+        &self,
+        route_options: &RouteOptions,
+        channel_plugin_id: Option<&str>,
+    ) -> Vec<String> {
+        let Ok(guard) = self.cache.read() else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+
+        for (pid, opt) in &route_options.plugins {
+            if !is_route_plugin_enabled(opt) {
+                continue;
+            }
+            if let Some(js) = guard.js_plugins.get(pid)
+                && js.enabled
+                && js.compatible
+                && js.runtime.is_some()
+                && js.manifest.hooks.contains(&HookKind::OnDelivered)
+                && seen.insert(pid.clone())
+            {
+                out.push(pid.clone());
+            }
+        }
+        if let Some(ch_pid) = channel_plugin_id
+            && let Some(js) = guard.js_plugins.get(ch_pid)
+            && js.enabled
+            && js.compatible
+            && js.runtime.is_some()
+            && js.manifest.hooks.contains(&HookKind::OnDelivered)
+            && seen.insert(ch_pid.to_string())
+        {
+            out.push(ch_pid.to_string());
+        }
+        out
+    }
+
+    /// Execute the `on_render` hook chain for every enabled plugin referenced by `route_options`,
+    /// honoring `route_options.plugin_order`, enforcing per-plugin timeouts, rolling back partial
+    /// overrides on failure/timeout, and isolating non-strict plugin failures into delivery warnings.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_on_render(
         &self,
@@ -271,18 +835,73 @@ impl PluginRegistry {
             return Ok((overrides, None));
         }
 
-        for plugin in &self.plugins {
-            let manifest = plugin.manifest();
-            let Some(route_cfg) = route_options.plugins.get(&manifest.id) else {
+        // Build deterministic execution sequence: explicit `plugin_order` first, then remaining keys.
+        let mut ordered_ids: Vec<&str> = Vec::with_capacity(route_options.plugins.len());
+        let mut seen: HashSet<&str> = HashSet::new();
+        for pid in &route_options.plugin_order {
+            if let Some(opt) = route_options.plugins.get(pid)
+                && is_route_plugin_enabled(opt)
+                && seen.insert(pid.as_str())
+            {
+                ordered_ids.push(pid.as_str());
+            }
+        }
+        for (pid, opt) in &route_options.plugins {
+            if is_route_plugin_enabled(opt) && seen.insert(pid.as_str()) {
+                ordered_ids.push(pid.as_str());
+            }
+        }
+
+        for plugin_id in ordered_ids {
+            let Some(route_cfg) = route_options.plugins.get(plugin_id) else {
                 continue;
             };
-            if route_cfg.is_null() {
+            let Some(plugin) = self.get(plugin_id) else {
+                // If an installed JS processor plugin became incompatible / failed to compile,
+                // honor `strict_mode` (retry) vs graceful warning instead of silently vanishing.
+                if let Some(js) = self.get_js(plugin_id)
+                    && js.manifest.kind == PluginKind::Processor
+                    && !js.compatible
+                {
+                    let reason = js
+                        .compatibility_reason
+                        .as_deref()
+                        .unwrap_or("incompatible with current core");
+                    let msg = format!(
+                        "{DELIVERY_WARNING_PREFIX}Plugin '{plugin_id}' is incompatible ({reason}); kept original"
+                    );
+                    let mut strict_mode = route_cfg
+                        .get("strict_mode")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !strict_mode
+                        && let Some(pid) = route_cfg.get("provider_id").and_then(Value::as_i64)
+                        && let Ok(Some(inst)) = db.get_plugin_instance(pid).await
+                        && inst.plugin_id == plugin_id
+                        && let Ok(decrypted) =
+                            master_key.decrypt_json::<Value>(&inst.encrypted_config)
+                        && decrypted.get("strict_mode").and_then(Value::as_bool) == Some(true)
+                    {
+                        strict_mode = true;
+                    }
+                    if strict_mode {
+                        return Ok((
+                            overrides,
+                            Some(PluginRetry {
+                                plugin_id: plugin_id.to_string(),
+                                diagnostic: msg,
+                                retry_after_secs: None,
+                            }),
+                        ));
+                    }
+                    overrides.push_warning(msg);
+                }
+                continue;
+            };
+            if !plugin.manifest().hooks.contains(&HookKind::OnRender) {
                 continue;
             }
-            let Some(row) = db.get_plugin(&manifest.id).await? else {
-                continue;
-            };
-            if !row.enabled {
+            if !self.is_plugin_enabled(db, plugin_id).await? {
                 continue;
             }
 
@@ -300,25 +919,142 @@ impl PluginRegistry {
                 write_cache,
             };
 
-            match plugin.on_render(&ctx, &mut overrides).await? {
-                PluginResult::Continue => {}
-                PluginResult::Retry {
+            let strict_mode = plugin.effective_strict_mode(&ctx).await;
+            let prev_overrides = overrides.clone();
+            let is_js = plugin.manifest().runtime == PluginRuntime::Js;
+            // For JS plugins, add a small slack over the inner sandbox deadline so `invoke_export`
+            // cancels `FcHostState` and updates the circuit breaker before the outer guard fires.
+            let base_timeout = self.effective_hook_timeout(ON_RENDER_PLUGIN_TIMEOUT);
+            let outer_timeout = if is_js {
+                base_timeout.saturating_add(Duration::from_millis(250))
+            } else {
+                base_timeout
+            };
+
+            let started = Instant::now();
+            let run_res =
+                tokio::time::timeout(outer_timeout, plugin.on_render(&ctx, &mut overrides)).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+
+            match run_res {
+                Ok(Ok(PluginResult::Continue)) => {
+                    tracing::debug!(
+                        plugin_id,
+                        route_id = route.id,
+                        duration_ms,
+                        "on_render plugin completed"
+                    );
+                }
+                Ok(Ok(PluginResult::Retry {
                     diagnostic,
                     retry_after_secs,
-                } => {
+                })) => {
+                    overrides = prev_overrides;
                     return Ok((
                         overrides,
                         Some(PluginRetry {
-                            plugin_id: manifest.id.clone(),
+                            plugin_id: plugin_id.to_string(),
                             diagnostic,
                             retry_after_secs,
                         }),
                     ));
                 }
+                Ok(Err(err)) => {
+                    overrides = prev_overrides;
+                    let msg = format!(
+                        "{DELIVERY_WARNING_PREFIX}Plugin '{plugin_id}' failed ({}): kept original",
+                        crate::logging::redact::redact_text(&err.to_string())
+                    );
+                    tracing::warn!(
+                        plugin_id,
+                        route_id = route.id,
+                        duration_ms,
+                        strict_mode,
+                        error = %err,
+                        "on_render plugin returned error"
+                    );
+                    if strict_mode {
+                        return Ok((
+                            overrides,
+                            Some(PluginRetry {
+                                plugin_id: plugin_id.to_string(),
+                                diagnostic: msg,
+                                retry_after_secs: None,
+                            }),
+                        ));
+                    }
+                    overrides.push_warning(msg);
+                }
+                Err(_) => {
+                    overrides = prev_overrides;
+                    if is_js {
+                        let _ = self.record_js_timeout(db, plugin_id, "onRender").await;
+                    }
+                    let msg = format!(
+                        "{DELIVERY_WARNING_PREFIX}Plugin '{plugin_id}' timed out after {}s; kept original",
+                        base_timeout.as_secs().max(1)
+                    );
+                    tracing::warn!(
+                        plugin_id,
+                        route_id = route.id,
+                        duration_ms,
+                        strict_mode,
+                        "on_render plugin timed out"
+                    );
+                    if strict_mode {
+                        return Ok((
+                            overrides,
+                            Some(PluginRetry {
+                                plugin_id: plugin_id.to_string(),
+                                diagnostic: msg,
+                                retry_after_secs: None,
+                            }),
+                        ));
+                    }
+                    overrides.push_warning(msg);
+                }
             }
         }
 
         Ok((overrides, None))
+    }
+}
+
+/// Recover a fallback [`PluginManifest`] from a persisted SQLite `plugins` row when compilation
+/// fails or `script_js` is absent, ensuring incompatible plugins remain visible in WebUI.
+fn fallback_manifest_from_row(row: &crate::db::models::PluginRow) -> PluginManifest {
+    if let Some(raw_json) = row.manifest_json.as_deref()
+        && let Ok(mut parsed) = serde_json::from_str::<PluginManifest>(raw_json)
+    {
+        parsed.runtime = PluginRuntime::Js;
+        return parsed;
+    }
+    let kind = if row.kind == "channel" {
+        PluginKind::Channel
+    } else {
+        PluginKind::Processor
+    };
+    PluginManifest {
+        id: row.id.clone(),
+        name: row.id.clone(),
+        version: row.installed_version.clone(),
+        api_version: PLUGIN_API_VERSION.to_string(),
+        kind,
+        runtime: PluginRuntime::Js,
+        min_core: None,
+        category: String::new(),
+        icon: String::new(),
+        description: String::new(),
+        description_i18n: BTreeMap::new(),
+        homepage: String::new(),
+        allowed_hosts: Vec::new(),
+        hooks: Vec::new(),
+        permissions: Vec::new(),
+        instance_schema: json!({}),
+        route_option_schema: json!({}),
+        account_schema: json!({}),
+        destination_schema: json!({}),
+        capabilities: json!({}),
     }
 }
 
@@ -341,15 +1077,33 @@ const fn default_schema_version() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketPluginVersionEntry {
+    pub version: String,
+    #[serde(default)]
+    pub min_core: Option<String>,
+    pub path: String,
+    pub sha256: String,
+    #[serde(default)]
+    pub changelog_path: Option<String>,
+    #[serde(default)]
+    pub changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPluginEntry {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub latest: Option<String>,
     #[serde(default = "default_api_version")]
     pub api_version: String,
-    /// `"builtin"` or `"external"` / `"coming_soon"`.
+    /// `"builtin"`, `"processor"`, `"channel"`, or `"external"` / `"coming_soon"`.
     #[serde(default = "default_market_kind")]
     pub kind: String,
+    /// `"builtin"` or `"js"`.
+    #[serde(default)]
+    pub runtime: Option<String>,
     #[serde(default)]
     pub min_core: Option<String>,
     #[serde(default)]
@@ -359,13 +1113,19 @@ pub struct MarketPluginEntry {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub description_i18n: BTreeMap<String, String>,
+    #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
     pub hooks: Vec<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub versions: Vec<MarketPluginVersionEntry>,
 }
 
 fn default_api_version() -> String {
@@ -432,10 +1192,6 @@ impl MarketIndexCache {
         &self.index_url
     }
 
-    /// Return the marketplace index, using the 6h cache for remote entries (or 60s negative-cache
-    /// TTL for snapshot fallbacks), fetching remotely via the SSRF-guarded client when stale, and
-    /// gracefully falling back to the compiled snapshot on failure without clobbering an existing
-    /// fresh remote cache entry.
     pub async fn get_index(
         &self,
         http: &ProtectedHttpClient,
@@ -518,5 +1274,347 @@ impl MarketIndexCache {
             }
         }
         (snapshot, "snapshot")
+    }
+
+    /// Download a versioned `plugin.js` script relative to `index_url` and strictly verify its
+    /// SHA-256 fingerprint before allowing compilation or installation.
+    pub async fn fetch_plugin_script(
+        &self,
+        http: &ProtectedHttpClient,
+        relative_path: &str,
+        expected_sha256: &str,
+    ) -> AppResult<String> {
+        let rel = relative_path.trim();
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.contains("..")
+            || rel.contains("://")
+            || rel.contains('\\')
+            || !rel.ends_with(".js")
+        {
+            return Err(AppError::Validation(format!(
+                "invalid marketplace plugin script path '{rel}'"
+            )));
+        }
+        let expected_norm = expected_sha256.trim().to_ascii_lowercase();
+        if expected_norm.len() != 64 || !expected_norm.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::Validation(format!(
+                "invalid marketplace plugin sha256 '{expected_sha256}'"
+            )));
+        }
+
+        let base = Url::parse(&self.index_url).map_err(|err| {
+            AppError::Config(format!(
+                "invalid plugin marketplace index URL '{}': {err}",
+                self.index_url
+            ))
+        })?;
+        let script_url = base.join(rel).map_err(|err| {
+            AppError::Validation(format!(
+                "failed to resolve marketplace plugin script URL for '{rel}': {err}"
+            ))
+        })?;
+
+        let use_proxy = http.settings().outbound_proxy_url.is_some();
+        let req = OutboundRequest::new(script_url.as_str())
+            .use_proxy(use_proxy)
+            .timeout(Duration::from_secs(15))
+            .max_bytes(JS_MAX_SCRIPT_BYTES);
+
+        let resp = http.get_bytes(req).await.map_err(|err| {
+            AppError::Upstream(format!(
+                "failed to download plugin script from '{script_url}': {err}"
+            ))
+        })?;
+        if !resp.status.is_success() {
+            return Err(AppError::Upstream(format!(
+                "marketplace returned HTTP {} downloading '{rel}'",
+                resp.status
+            )));
+        }
+
+        let actual_sha256 = sha256_hex(&resp.bytes);
+        if !constant_time_eq(actual_sha256.as_bytes(), expected_norm.as_bytes()) {
+            return Err(AppError::Validation(format!(
+                "downloaded plugin script '{rel}' failed SHA-256 verification (expected {expected_norm}, got {actual_sha256})"
+            )));
+        }
+
+        String::from_utf8(resp.bytes.to_vec()).map_err(|err| {
+            AppError::Validation(format!(
+                "downloaded plugin script '{rel}' is not valid UTF-8: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_plugin_compatibility_rejects_malformed_min_core() {
+        let (ok, reason) = check_plugin_compatibility("1", Some("abc"));
+        assert!(!ok);
+        assert!(reason.unwrap().contains("Invalid min_core"));
+
+        let (ok, reason) = check_plugin_compatibility("1", Some("1.2"));
+        assert!(!ok);
+        assert!(reason.unwrap().contains("Invalid min_core"));
+
+        let (ok, reason) = check_plugin_compatibility("1", Some("1.2.3.4"));
+        assert!(!ok);
+        assert!(reason.unwrap().contains("Invalid min_core"));
+
+        let (ok, reason) = check_plugin_compatibility("1", Some("0.3.0"));
+        assert!(ok && reason.is_none());
+    }
+
+    #[test]
+    fn is_route_plugin_enabled_honors_explicit_false() {
+        assert!(!is_route_plugin_enabled(&Value::Null));
+        assert!(is_route_plugin_enabled(&serde_json::json!({})));
+        assert!(is_route_plugin_enabled(
+            &serde_json::json!({ "enabled": true })
+        ));
+        assert!(!is_route_plugin_enabled(
+            &serde_json::json!({ "enabled": false })
+        ));
+    }
+
+    struct MutatingErrorPlugin {
+        manifest: PluginManifest,
+        strict: bool,
+    }
+
+    #[async_trait]
+    impl Plugin for MutatingErrorPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+        fn validate_instance_config(&self, cfg: &Value) -> AppResult<Value> {
+            Ok(cfg.clone())
+        }
+        fn merge_instance_config(&self, _existing: &Value, patch: &Value) -> AppResult<Value> {
+            Ok(patch.clone())
+        }
+        fn redact_instance_config(&self, cfg: &Value) -> Value {
+            cfg.clone()
+        }
+        async fn validate_route_option(&self, _db: &Database, _option: &Value) -> AppResult<()> {
+            Ok(())
+        }
+        async fn test_instance(
+            &self,
+            _http: &ProtectedHttpClient,
+            _cfg: &Value,
+        ) -> AppResult<String> {
+            Ok("ok".to_string())
+        }
+        async fn effective_strict_mode(&self, _ctx: &RenderContext<'_>) -> bool {
+            self.strict
+        }
+        async fn on_render(
+            &self,
+            _ctx: &RenderContext<'_>,
+            out: &mut RenderOverrides,
+        ) -> AppResult<PluginResult> {
+            out.content_html = Some("<p>CORRUPTED_PARTIAL</p>".to_string());
+            Err(AppError::Upstream("boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_on_render_rolls_back_partial_overrides_and_honors_effective_strict_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::AppConfig::with_data_dir(dir.path());
+        let db = Database::from_config(&cfg).await.unwrap();
+        let master_key = MasterKey::from_config(&cfg).unwrap();
+        let http = ProtectedHttpClient::new(crate::net::NetSettings::default()).unwrap();
+
+        let make_manifest = |id: &str| PluginManifest {
+            id: id.to_string(),
+            name: id.to_string(),
+            version: "1.0.0".to_string(),
+            api_version: "1".to_string(),
+            kind: PluginKind::Processor,
+            runtime: PluginRuntime::Builtin,
+            min_core: None,
+            category: "content".to_string(),
+            icon: "wand".to_string(),
+            description: "test".to_string(),
+            description_i18n: BTreeMap::new(),
+            homepage: "https://example.com".to_string(),
+            allowed_hosts: vec![],
+            hooks: vec![HookKind::OnRender],
+            permissions: vec![],
+            instance_schema: serde_json::json!({}),
+            route_option_schema: serde_json::json!({}),
+            account_schema: serde_json::json!({}),
+            destination_schema: serde_json::json!({}),
+            capabilities: serde_json::json!({}),
+        };
+
+        let non_strict: Arc<dyn Plugin> = Arc::new(MutatingErrorPlugin {
+            manifest: make_manifest("p-nonstrict"),
+            strict: false,
+        });
+        let strict_plug: Arc<dyn Plugin> = Arc::new(MutatingErrorPlugin {
+            manifest: make_manifest("p-strict"),
+            strict: true,
+        });
+        let registry = PluginRegistry {
+            builtins: Arc::new(vec![Arc::clone(&non_strict), Arc::clone(&strict_plug)]),
+            builtins_by_id: Arc::new(HashMap::from([
+                ("p-nonstrict".to_string(), non_strict),
+                ("p-strict".to_string(), strict_plug),
+            ])),
+            cache: Arc::new(RwLock::new(RegistryCache {
+                loaded_from_db: true,
+                enabled_by_id: HashMap::from([
+                    ("p-nonstrict".to_string(), true),
+                    ("p-strict".to_string(), true),
+                ]),
+                js_plugins: HashMap::new(),
+                js_processors: HashMap::new(),
+                consecutive_timeouts: HashMap::new(),
+                hook_timeout_override: None,
+            })),
+        };
+
+        let feed = crate::db::models::Feed {
+            id: 1,
+            url: "https://example.com/rss".to_string(),
+            title: "Feed".to_string(),
+            site_url: None,
+            favicon_url: None,
+            tags_json: "[]".to_string(),
+            poll_interval_secs: 1800,
+            fetch_full_content: false,
+            use_proxy: false,
+            etag: None,
+            last_modified: None,
+            health_status: crate::db::models::FeedHealthStatus::Active,
+            consecutive_failures: 0,
+            last_error: None,
+            next_poll_at: Some(0),
+            silent_init: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let entry = crate::db::models::Entry {
+            id: 1,
+            feed_id: 1,
+            fingerprint_sha256: "a".repeat(64),
+            canonical_url: Some("https://example.com/1".to_string()),
+            title: Some("Title".to_string()),
+            author: None,
+            published_at: None,
+            discovered_at: 0,
+            first_sentence: None,
+            summary_text: None,
+            content_html: Some("<p>ORIGINAL</p>".to_string()),
+            media_json: None,
+            payload_purged_at: None,
+        };
+        let channel = crate::db::models::Channel {
+            id: 1,
+            name: "Ch".to_string(),
+            kind: crate::channels::ChannelKind::Plugin,
+            encrypted_config: vec![],
+            credential_group_key: "k".to_string(),
+            capabilities_json: "{}".to_string(),
+            min_interval_secs: 0,
+            jitter_max_secs: 0,
+            hourly_quota: None,
+            daily_quota: None,
+            use_proxy: false,
+            cooldown_until: None,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let dest = crate::db::models::ChannelDestination {
+            id: 1,
+            channel_id: 1,
+            name: "Dest".to_string(),
+            encrypted_config: vec![],
+            enabled: true,
+            auto_paused: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let route = crate::db::models::Route {
+            id: 1,
+            name: "R".to_string(),
+            feed_ids_json: "[1]".to_string(),
+            match_tags_json: "[]".to_string(),
+            channel_id: 1,
+            destination_id: 1,
+            include_keywords_json: "[]".to_string(),
+            exclude_keywords_json: "[]".to_string(),
+            include_regex: None,
+            exclude_regex: None,
+            options_json: "{}".to_string(),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        // 1. Non-strict error rolls back CORRUPTED_PARTIAL and records warning.
+        let mut opts1 = RouteOptions::default();
+        opts1
+            .plugins
+            .insert("p-nonstrict".to_string(), serde_json::json!({}));
+        let (ov1, retry1) = registry
+            .run_on_render(
+                &db,
+                &master_key,
+                &http,
+                &entry,
+                &feed,
+                &route,
+                &opts1,
+                &channel,
+                &dest,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(retry1.is_none());
+        assert_eq!(
+            ov1.content_html, None,
+            "partial mutation must be rolled back"
+        );
+        assert_eq!(ov1.warnings.len(), 1);
+
+        // 2. Instance-level strict_mode (via effective_strict_mode) returns PluginRetry + rolls back!
+        let mut opts2 = RouteOptions::default();
+        opts2
+            .plugins
+            .insert("p-strict".to_string(), serde_json::json!({}));
+        let (ov2, retry2) = registry
+            .run_on_render(
+                &db,
+                &master_key,
+                &http,
+                &entry,
+                &feed,
+                &route,
+                &opts2,
+                &channel,
+                &dest,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            retry2.is_some(),
+            "effective_strict_mode=true must bubble PluginRetry instead of falling back"
+        );
+        assert_eq!(
+            ov2.content_html, None,
+            "partial mutation must be rolled back"
+        );
     }
 }

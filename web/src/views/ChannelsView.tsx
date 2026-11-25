@@ -12,6 +12,7 @@ import {
   MessageSquare,
   Pencil,
   Plus,
+  Puzzle,
   Radio,
   RefreshCw,
   RotateCcw,
@@ -23,7 +24,7 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api, getReferencingRoutesConflict } from "@/api/client";
 import {
   type ChannelAccountCreate,
@@ -39,6 +40,7 @@ import {
   type NotionColumnMapping,
   type NotionInspectSchemaResponse,
   type NotionStandardFieldKey,
+  type PluginDto,
   type RouteReferenceDto,
   type SmtpRecipientDto,
   type SmtpRecipientStatus,
@@ -47,6 +49,14 @@ import {
   type UpdateChannelRequest,
   type UpdateDestinationRequest,
 } from "@/api/types";
+import { PluginIcon } from "@/components/plugins/PluginIcon";
+import {
+  buildValidatedSchemaConfig,
+  formatSchemaConfigSummary,
+  initSchemaFieldValues,
+  type SchemaFieldValues,
+  SchemaFormFields,
+} from "@/components/plugins/SchemaFormFields";
 import {
   Badge,
   type BadgeVariant,
@@ -137,6 +147,8 @@ function kindDefaults(kind: ChannelKind) {
       return { icon: MessageSquare, defaultInterval: 3, defaultJitter: 2 };
     case "notion":
       return { icon: Database, defaultInterval: 2, defaultJitter: 2 };
+    case "plugin":
+      return { icon: Puzzle, defaultInterval: 3, defaultJitter: 2 };
   }
 }
 
@@ -242,6 +254,20 @@ export function ChannelsView() {
     queryKey: ["settings"],
     queryFn: () => api.settings.get(),
   });
+
+  const pluginsQuery = useQuery({
+    queryKey: ["plugins"],
+    queryFn: () => api.plugins.list(),
+  });
+
+  const channelPlugins = useMemo(
+    () => (pluginsQuery.data ?? []).filter((p) => p.kind === "channel"),
+    [pluginsQuery.data],
+  );
+  const pluginsById = useMemo(
+    () => new Map(channelPlugins.map((p) => [p.id, p])),
+    [channelPlugins],
+  );
 
   const toggleSmtpRecipients = (destId: number) => {
     setExpandedSmtpDests((prev) => ({
@@ -412,6 +438,7 @@ export function ChannelsView() {
               { id: "telegram", label: m.channels.kindLabels.telegram },
               { id: "smtp", label: m.channels.kindLabels.smtp },
               { id: "notion", label: m.channels.kindLabels.notion },
+              { id: "plugin", label: m.channels.kindLabels.plugin },
             ] as const
           ).map((tab) => (
             <button
@@ -673,6 +700,33 @@ export function ChannelsView() {
                         </div>
                       </div>
                     )}
+
+                    {ch.config.kind === "plugin" && (
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                        <Badge variant="mono" className="text-[10px]">
+                          {pluginsById.get(ch.config.plugin_id)?.manifest
+                            .name ?? ch.config.plugin_id}
+                        </Badge>
+                        {formatSchemaConfigSummary(ch.config.config).map(
+                          (entry) => (
+                            <div
+                              key={entry.key}
+                              className="flex items-center gap-1"
+                            >
+                              <span className="text-zinc-500">
+                                {entry.key}:
+                              </span>
+                              <span className="inline-flex items-center gap-1 font-mono text-[11px]">
+                                {entry.isSecretHint && (
+                                  <Lock className="h-3 w-3 text-zinc-400" />
+                                )}
+                                {entry.value}
+                              </span>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {ch.capabilities.fallback_reason && (
@@ -817,6 +871,20 @@ export function ChannelsView() {
                                       </span>
                                     </>
                                   )}
+                                  {dest.config.kind === "plugin" &&
+                                    formatSchemaConfigSummary(
+                                      dest.config.config,
+                                    ).map((entry) => (
+                                      <span
+                                        key={entry.key}
+                                        className="truncate font-mono"
+                                      >
+                                        <span className="font-sans text-zinc-400">
+                                          {entry.key}:{" "}
+                                        </span>
+                                        {entry.value}
+                                      </span>
+                                    ))}
                                 </div>
                                 {isSmtp && dest.auto_paused && (
                                   <p className="text-[11px] text-amber-700 dark:text-amber-400">
@@ -915,6 +983,8 @@ export function ChannelsView() {
           open={accountModalOpen}
           onClose={() => setAccountModalOpen(false)}
           channel={editingChannel}
+          channelPlugins={channelPlugins}
+          pluginsLoading={pluginsQuery.isLoading}
         />
       )}
 
@@ -925,6 +995,12 @@ export function ChannelsView() {
           onClose={() => setDestModalState(null)}
           channel={destModalState.channel}
           destination={destModalState.destination}
+          plugin={
+            destModalState.channel.config.kind === "plugin"
+              ? pluginsById.get(destModalState.channel.config.plugin_id)
+              : undefined
+          }
+          pluginsLoading={pluginsQuery.isLoading}
         />
       )}
 
@@ -1968,17 +2044,88 @@ function ChannelAccountModal({
   open,
   onClose,
   channel,
+  channelPlugins,
+  pluginsLoading,
 }: {
   open: boolean;
   onClose: () => void;
   channel: ChannelDto | null;
+  channelPlugins: PluginDto[];
+  pluginsLoading: boolean;
 }) {
-  const { m } = useI18n();
+  const { m, locale } = useI18n();
   const toast = useToast();
   const queryClient = useQueryClient();
   const isEdit = channel !== null;
+  const enabledChannelPlugins = useMemo(
+    () => channelPlugins.filter((p) => p.enabled && p.compatible),
+    [channelPlugins],
+  );
 
   const [kind, setKind] = useState<ChannelKind>(channel?.kind ?? "telegram");
+  const initialPluginAcct =
+    channel?.config.kind === "plugin" ? channel.config : undefined;
+  const [selectedPluginId, setSelectedPluginId] = useState<string>(
+    initialPluginAcct?.plugin_id ?? enabledChannelPlugins[0]?.id ?? "",
+  );
+  const selectedPlugin = useMemo(
+    () =>
+      channelPlugins.find((p) => p.id === selectedPluginId) ??
+      (isEdit ? null : (enabledChannelPlugins[0] ?? null)),
+    [channelPlugins, enabledChannelPlugins, isEdit, selectedPluginId],
+  );
+  const [pluginAcctValues, setPluginAcctValues] = useState<SchemaFieldValues>(
+    () =>
+      initSchemaFieldValues(
+        selectedPlugin?.manifest.account_schema,
+        initialPluginAcct?.config,
+        selectedPlugin?.manifest.allowed_hosts,
+      ),
+  );
+  const [pluginInitDestValues, setPluginInitDestValues] =
+    useState<SchemaFieldValues>(() =>
+      initSchemaFieldValues(
+        selectedPlugin?.manifest.destination_schema,
+        undefined,
+        selectedPlugin?.manifest.allowed_hosts,
+      ),
+    );
+  const hydratedAcctPluginRef = useRef<string | null>(
+    selectedPlugin ? selectedPlugin.id : null,
+  );
+  const hydratedDestPluginRef = useRef<string | null>(
+    selectedPlugin ? selectedPlugin.id : null,
+  );
+
+  useEffect(() => {
+    if (!selectedPlugin) return;
+    if (!selectedPluginId) {
+      setSelectedPluginId(selectedPlugin.id);
+    }
+    if (hydratedAcctPluginRef.current !== selectedPlugin.id) {
+      hydratedAcctPluginRef.current = selectedPlugin.id;
+      setPluginAcctValues(
+        initSchemaFieldValues(
+          selectedPlugin.manifest.account_schema,
+          isEdit && initialPluginAcct?.plugin_id === selectedPlugin.id
+            ? initialPluginAcct.config
+            : undefined,
+          selectedPlugin.manifest.allowed_hosts,
+        ),
+      );
+    }
+    if (!isEdit && hydratedDestPluginRef.current !== selectedPlugin.id) {
+      hydratedDestPluginRef.current = selectedPlugin.id;
+      setPluginInitDestValues(
+        initSchemaFieldValues(
+          selectedPlugin.manifest.destination_schema,
+          undefined,
+          selectedPlugin.manifest.allowed_hosts,
+        ),
+      );
+    }
+  }, [selectedPlugin, selectedPluginId, isEdit, initialPluginAcct]);
+
   const [name, setName] = useState(channel?.name ?? "");
   const [minIntervalSecs, setMinIntervalSecs] = useState<number>(
     channel?.min_interval_secs ??
@@ -2053,7 +2200,7 @@ function ChannelAccountModal({
 
   const [formError, setFormError] = useState<string | null>(null);
 
-  const handleKindSwitch = (nextKind: ChannelKind) => {
+  const handleKindSwitch = (nextKind: ChannelKind, plugin?: PluginDto) => {
     setKind(nextKind);
     const defaults = kindDefaults(nextKind);
     setMinIntervalSecs(defaults.defaultInterval);
@@ -2061,11 +2208,33 @@ function ChannelAccountModal({
     if (nextKind === "smtp") {
       setUseProxy(false);
     }
+    if (nextKind === "plugin" && plugin) {
+      setSelectedPluginId(plugin.id);
+      hydratedAcctPluginRef.current = plugin.id;
+      hydratedDestPluginRef.current = plugin.id;
+      setPluginAcctValues(
+        initSchemaFieldValues(
+          plugin.manifest.account_schema,
+          undefined,
+          plugin.manifest.allowed_hosts,
+        ),
+      );
+      setPluginInitDestValues(
+        initSchemaFieldValues(
+          plugin.manifest.destination_schema,
+          undefined,
+          plugin.manifest.allowed_hosts,
+        ),
+      );
+    }
     setFormError(null);
   };
 
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (validatedPlugin?: {
+      acctConfig: Record<string, unknown>;
+      destConfig?: Record<string, unknown>;
+    }) => {
       const parsedHourly = hourlyQuota.trim()
         ? Number(hourlyQuota.trim())
         : null;
@@ -2094,12 +2263,17 @@ function ChannelAccountModal({
             bot_token: tgBotToken.trim() ? tgBotToken.trim() : null,
             api_base_url: tgApiBaseUrl.trim() || null,
           };
-        } else {
+        } else if (kind === "notion") {
           configPatch = {
             kind: "notion",
             integration_secret: notionSecret.trim()
               ? notionSecret.trim()
               : null,
+          };
+        } else {
+          configPatch = {
+            kind: "plugin",
+            config: validatedPlugin?.acctConfig ?? {},
           };
         }
 
@@ -2134,10 +2308,16 @@ function ChannelAccountModal({
           bot_token: tgBotToken.trim(),
           api_base_url: tgApiBaseUrl.trim() || null,
         };
-      } else {
+      } else if (kind === "notion") {
         configCreate = {
           kind: "notion",
           integration_secret: notionSecret.trim(),
+        };
+      } else {
+        configCreate = {
+          kind: "plugin",
+          plugin_id: selectedPlugin?.id ?? selectedPluginId,
+          config: validatedPlugin?.acctConfig ?? {},
         };
       }
 
@@ -2158,7 +2338,7 @@ function ChannelAccountModal({
               ? Number(initTgThreadId.trim())
               : null,
           };
-        } else {
+        } else if (kind === "notion") {
           destConfig = {
             kind: "notion",
             data_source_id:
@@ -2167,6 +2347,11 @@ function ChannelAccountModal({
             database_id: initNotionDest.databaseId,
             parent_page_id: initNotionDest.parentPageId.trim() || null,
             column_mapping: initNotionDest.columnMapping,
+          };
+        } else {
+          destConfig = {
+            kind: "plugin",
+            config: validatedPlugin?.destConfig ?? {},
           };
         }
 
@@ -2209,6 +2394,45 @@ function ChannelAccountModal({
 
     if (isEdit && !name.trim()) {
       setFormError(m.channels.wizard.errors.emptyName);
+      return;
+    }
+
+    if (kind === "plugin") {
+      if (pluginsLoading) return;
+      if (!selectedPlugin) {
+        setFormError(m.plugins.js.errSelectPlugin);
+        return;
+      }
+      const acctRes = buildValidatedSchemaConfig(
+        selectedPlugin.manifest.account_schema,
+        pluginAcctValues,
+        isEdit,
+        initialPluginAcct?.config,
+        m,
+      );
+      if (acctRes.error || !acctRes.config) {
+        setFormError(acctRes.error);
+        return;
+      }
+      let destCfg: Record<string, unknown> | undefined;
+      if (!isEdit && includeInitialDest) {
+        const destRes = buildValidatedSchemaConfig(
+          selectedPlugin.manifest.destination_schema,
+          pluginInitDestValues,
+          false,
+          undefined,
+          m,
+        );
+        if (destRes.error || !destRes.config) {
+          setFormError(destRes.error);
+          return;
+        }
+        destCfg = destRes.config;
+      }
+      saveMutation.mutate({
+        acctConfig: acctRes.config,
+        destConfig: destCfg,
+      });
       return;
     }
 
@@ -2262,7 +2486,7 @@ function ChannelAccountModal({
       }
     }
 
-    saveMutation.mutate();
+    saveMutation.mutate(undefined);
   };
 
   return (
@@ -2281,7 +2505,11 @@ function ChannelAccountModal({
           <Button variant="outline" onClick={onClose}>
             {m.common.cancel}
           </Button>
-          <Button onClick={handleSubmit} loading={saveMutation.isPending}>
+          <Button
+            onClick={handleSubmit}
+            loading={saveMutation.isPending}
+            disabled={kind === "plugin" && (pluginsLoading || !selectedPlugin)}
+          >
             {isEdit
               ? m.channels.wizard.saveChannel
               : m.channels.wizard.createChannel}
@@ -2292,7 +2520,7 @@ function ChannelAccountModal({
       <form onSubmit={handleSubmit} className="space-y-5">
         {/* Kind Selector (Create only) */}
         {!isEdit && (
-          <div className="grid grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
             {(["telegram", "smtp", "notion"] as const).map((k) => {
               const meta = kindMeta(k, m);
               const Icon = meta.icon;
@@ -2310,6 +2538,30 @@ function ChannelAccountModal({
                 >
                   <Icon className="h-4 w-4 shrink-0" />
                   <span className="text-xs font-semibold">{meta.label}</span>
+                </button>
+              );
+            })}
+            {enabledChannelPlugins.map((plugin) => {
+              const selected =
+                kind === "plugin" && selectedPlugin?.id === plugin.id;
+              return (
+                <button
+                  key={plugin.id}
+                  type="button"
+                  onClick={() => handleKindSwitch("plugin", plugin)}
+                  className={`flex cursor-pointer items-center gap-2.5 rounded-lg border p-3 text-left transition-colors ${
+                    selected
+                      ? "border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900"
+                      : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300"
+                  }`}
+                >
+                  <PluginIcon
+                    icon={plugin.manifest.icon}
+                    className="h-4 w-4 shrink-0"
+                  />
+                  <span className="truncate text-xs font-semibold">
+                    {plugin.manifest.name}
+                  </span>
                 </button>
               );
             })}
@@ -2332,7 +2584,11 @@ function ChannelAccountModal({
                 ? m.channels.wizard.namePlaceholderSmtp
                 : kind === "telegram"
                   ? m.channels.wizard.namePlaceholderTg
-                  : m.channels.wizard.namePlaceholderNotion
+                  : kind === "notion"
+                    ? m.channels.wizard.namePlaceholderNotion
+                    : m.plugins.js.pluginNamePlaceholder(
+                        selectedPlugin?.manifest.name ?? "Plugin",
+                      )
             }
             className="mt-1.5"
           />
@@ -2516,6 +2772,39 @@ function ChannelAccountModal({
           </div>
         )}
 
+        {kind === "plugin" &&
+          (pluginsLoading && !selectedPlugin ? (
+            <div className="rounded-xl border border-zinc-200 p-4 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+              {m.plugins.loading}
+            </div>
+          ) : selectedPlugin ? (
+            <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+              <div>
+                <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+                  {m.plugins.js.pluginAccountHeading(
+                    selectedPlugin.manifest.name,
+                  )}
+                </h3>
+                {(selectedPlugin.manifest.description_i18n?.[locale] ||
+                  selectedPlugin.manifest.description) && (
+                  <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                    {selectedPlugin.manifest.description_i18n?.[locale] ||
+                      selectedPlugin.manifest.description}
+                  </p>
+                )}
+              </div>
+              <SchemaFormFields
+                idPrefix="ch-plugin-acct"
+                schema={selectedPlugin.manifest.account_schema}
+                values={pluginAcctValues}
+                onChange={setPluginAcctValues}
+                isEdit={isEdit}
+                existingConfig={initialPluginAcct?.config}
+                allowedHosts={selectedPlugin.manifest.allowed_hosts}
+              />
+            </div>
+          ) : null)}
+
         {/* Shared Pacing, Jitter, Quotas & Proxy */}
         <div className="space-y-3.5 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
           <div>
@@ -2631,7 +2920,9 @@ function ChannelAccountModal({
                         ? m.channels.wizard.destModal.namePlaceholderSmtp
                         : kind === "telegram"
                           ? m.channels.wizard.destModal.namePlaceholderTg
-                          : m.channels.wizard.destModal.namePlaceholderNotion
+                          : kind === "notion"
+                            ? m.channels.wizard.destModal.namePlaceholderNotion
+                            : m.plugins.js.pluginDestPlaceholder
                     }
                     className="mt-1"
                   />
@@ -2700,6 +2991,21 @@ function ChannelAccountModal({
                     onError={setFormError}
                   />
                 )}
+
+                {kind === "plugin" &&
+                  (pluginsLoading && !selectedPlugin ? (
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                      {m.plugins.loading}
+                    </p>
+                  ) : selectedPlugin ? (
+                    <SchemaFormFields
+                      idPrefix="ch-init-plugin-dest"
+                      schema={selectedPlugin.manifest.destination_schema}
+                      values={pluginInitDestValues}
+                      onChange={setPluginInitDestValues}
+                      allowedHosts={selectedPlugin.manifest.allowed_hosts}
+                    />
+                  ) : null)}
               </div>
             )}
           </div>
@@ -2720,11 +3026,15 @@ function DestinationModal({
   onClose,
   channel,
   destination,
+  plugin,
+  pluginsLoading,
 }: {
   open: boolean;
   onClose: () => void;
   channel: ChannelDto;
   destination: ChannelDestinationDto | null;
+  plugin?: PluginDto;
+  pluginsLoading: boolean;
 }) {
   const { m } = useI18n();
   const toast = useToast();
@@ -2734,6 +3044,32 @@ function DestinationModal({
 
   const [name, setName] = useState(destination?.name ?? "");
   const [enabled, setEnabled] = useState<boolean>(destination?.enabled ?? true);
+
+  const initialPluginDest =
+    destination?.config.kind === "plugin" ? destination.config : undefined;
+  const [pluginDestValues, setPluginDestValues] = useState<SchemaFieldValues>(
+    () =>
+      initSchemaFieldValues(
+        plugin?.manifest.destination_schema,
+        initialPluginDest?.config,
+        plugin?.manifest.allowed_hosts,
+      ),
+  );
+  const hydratedPluginRef = useRef<string | null>(plugin ? plugin.id : null);
+
+  useEffect(() => {
+    if (!plugin) return;
+    if (hydratedPluginRef.current !== plugin.id) {
+      hydratedPluginRef.current = plugin.id;
+      setPluginDestValues(
+        initSchemaFieldValues(
+          plugin.manifest.destination_schema,
+          initialPluginDest?.config,
+          plugin.manifest.allowed_hosts,
+        ),
+      );
+    }
+  }, [plugin, initialPluginDest]);
 
   const initialSmtp =
     destination?.config.kind === "smtp" ? destination.config : undefined;
@@ -2775,7 +3111,7 @@ function DestinationModal({
   const [formError, setFormError] = useState<string | null>(null);
 
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (validatedPluginDest?: Record<string, unknown>) => {
       if (isEdit && destination) {
         let patchConfig: DestinationPatch;
         if (channel.kind === "smtp") {
@@ -2792,7 +3128,7 @@ function DestinationModal({
               ? Number(tgThreadId.trim())
               : null,
           };
-        } else {
+        } else if (channel.kind === "notion") {
           patchConfig = {
             kind: "notion",
             data_source_id:
@@ -2800,6 +3136,11 @@ function DestinationModal({
             database_id: notionDest.databaseId,
             parent_page_id: notionDest.parentPageId.trim() || null,
             column_mapping: notionDest.columnMapping,
+          };
+        } else {
+          patchConfig = {
+            kind: "plugin",
+            config: validatedPluginDest ?? {},
           };
         }
 
@@ -2826,7 +3167,7 @@ function DestinationModal({
             ? Number(tgThreadId.trim())
             : null,
         };
-      } else {
+      } else if (channel.kind === "notion") {
         createConfig = {
           kind: "notion",
           data_source_id:
@@ -2834,6 +3175,11 @@ function DestinationModal({
           database_id: notionDest.databaseId,
           parent_page_id: notionDest.parentPageId.trim() || null,
           column_mapping: notionDest.columnMapping,
+        };
+      } else {
+        createConfig = {
+          kind: "plugin",
+          config: validatedPluginDest ?? {},
         };
       }
 
@@ -2870,6 +3216,27 @@ function DestinationModal({
       return;
     }
 
+    if (channel.kind === "plugin") {
+      if (pluginsLoading) return;
+      if (!plugin) {
+        setFormError(m.plugins.js.errSelectPlugin);
+        return;
+      }
+      const res = buildValidatedSchemaConfig(
+        plugin.manifest.destination_schema,
+        pluginDestValues,
+        isEdit,
+        initialPluginDest?.config,
+        m,
+      );
+      if (res.error || !res.config) {
+        setFormError(res.error);
+        return;
+      }
+      saveMutation.mutate(res.config);
+      return;
+    }
+
     if (channel.kind === "smtp") {
       if (smtpTo.length === 0) {
         setFormError(m.channels.wizard.errors.smtpToRequired);
@@ -2896,7 +3263,7 @@ function DestinationModal({
       }
     }
 
-    saveMutation.mutate();
+    saveMutation.mutate(undefined);
   };
 
   return (
@@ -2915,7 +3282,11 @@ function DestinationModal({
           <Button variant="outline" onClick={onClose}>
             {m.common.cancel}
           </Button>
-          <Button onClick={handleSubmit} loading={saveMutation.isPending}>
+          <Button
+            onClick={handleSubmit}
+            loading={saveMutation.isPending}
+            disabled={channel.kind === "plugin" && (pluginsLoading || !plugin)}
+          >
             {isEdit
               ? m.channels.wizard.destModal.saveBtn
               : m.channels.wizard.destModal.createBtn}
@@ -2939,7 +3310,9 @@ function DestinationModal({
                 ? m.channels.wizard.destModal.namePlaceholderSmtp
                 : channel.kind === "telegram"
                   ? m.channels.wizard.destModal.namePlaceholderTg
-                  : m.channels.wizard.destModal.namePlaceholderNotion
+                  : channel.kind === "notion"
+                    ? m.channels.wizard.destModal.namePlaceholderNotion
+                    : m.plugins.js.pluginDestPlaceholder
             }
             className="mt-1.5"
           />
@@ -3012,6 +3385,31 @@ function DestinationModal({
               useProxy={channel.use_proxy}
               onError={setFormError}
             />
+          </div>
+        )}
+
+        {channel.kind === "plugin" && (
+          <div className="space-y-3 rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
+            <h3 className="text-xs font-semibold tracking-wider text-zinc-500 uppercase">
+              {m.plugins.js.pluginDestHeading(
+                plugin?.manifest.name ?? m.channels.kindLabels.plugin,
+              )}
+            </h3>
+            {pluginsLoading && !plugin ? (
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                {m.plugins.loading}
+              </p>
+            ) : (
+              <SchemaFormFields
+                idPrefix="dest-plugin"
+                schema={plugin?.manifest.destination_schema}
+                values={pluginDestValues}
+                onChange={setPluginDestValues}
+                isEdit={isEdit}
+                existingConfig={initialPluginDest?.config}
+                allowedHosts={plugin?.manifest.allowed_hosts}
+              />
+            )}
           </div>
         )}
 

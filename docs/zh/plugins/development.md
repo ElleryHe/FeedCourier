@@ -1,110 +1,192 @@
 ---
-description: "FeedCourier 插件协议 v1（Protocol v1）开发手册：manifest.schema.json 字段规范、on_render/on_ingest/on_delivered 钩子生命周期、向 ElleryHe/FeedCourier-Plugins 提交上架 PR 与第二阶段 WASM 沙箱路线图。"
+description: "FeedCourier Plugin API v1（plugin.js）开发手册：单文件 ES 模块导出契约、globalThis.fc 宿主工具函数、boa_engine 沙箱边界、node --test 单元测试与插件市场提交指南。"
 ---
 
-# 插件开发手册（Protocol v1）
+# 插件开发手册（Plugin API v1 / `plugin.js`）
 
-FeedCourier 定义了一套稳定的 **插件协议 v1（`api_version: "1"`）**，由第一方内置 Rust 插件、官方市场索引仓库（[`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)）以及规划中的第二阶段 WASM 沙箱运行时共同遵循。
+FeedCourier 定义了一套稳定的 **Plugin API v1（`api_version: "1"`）**，由第一方内置 Rust 插件、进程内沙箱 **JS 插件**（`runtime: "js"`，`v0.3.1+` 基于纯 Rust `boa_engine`）以及官方插件市场仓库（[`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)）共同遵循。
+
+每个 JS 插件都是一个**零外部运行时依赖的单文件 ES 模块（`plugin.js`）**，管理员既可在 WebUI 插件市场一键安装，也可直接上传自定义 `.js` 文件。
 
 ---
 
-## 1. 清单规范（`schema/manifest.schema.json`）
+## 1. 单文件 `plugin.js` 导出契约
 
-市场注册表中的每个插件以独立的 `registry/<id>.json` 文件声明，严格遵循 JSON Schema **Draft 2020-12**（`additionalProperties: false`）：
+一个标准 `plugin.js` 需导出静态 `meta` 元数据对象，以及与其 `kind` 和 `hooks` 对应的处理函数：
 
-```json
-{
-  "id": "link-rewrite",
-  "name": "Link Rewrite (YOURLS)",
-  "version": "0.3.0",
-  "api_version": "1",
-  "kind": "builtin",
-  "min_core": "0.3.0",
-  "category": "links",
-  "icon": "link",
-  "description": "Rewrite outgoing article links using one or more self-hosted YOURLS short-link providers at delivery time, with SQLite caching, domain exclusions, and optional strict retry mode.",
-  "homepage": "https://feedcourier.ellery.me/plugins/link-rewrite",
-  "repository": "https://github.com/ElleryHe/FeedCourier",
-  "hooks": ["on_render"],
-  "permissions": ["network"]
+```js
+export const meta = {
+  id: "my-channel",
+  name: "My Custom Channel",
+  version: "0.1.0",
+  api_version: "1",
+  kind: "channel", // "channel" | "processor"
+  runtime: "js",
+  min_core: "0.3.1",
+  category: "delivery",
+  icon: "bell",
+  description: "Delivers FeedCourier articles to My Custom Channel.",
+  description_i18n: {
+    "zh-CN": "将 FeedCourier 文章推送至自定义通道。"
+  },
+  homepage: "https://feedcourier.ellery.me/plugins/js-plugins",
+  hooks: [], // 例如 ["on_render"] 或 ["on_delivered"]
+  permissions: ["network"],
+  allowed_hosts: ["api.example.com"],
+  account_schema: {
+    type: "object",
+    required: ["server_url"],
+    properties: {
+      server_url: {
+        type: "string",
+        format: "uri",
+        title: "Server URL",
+        default: "https://api.example.com"
+      },
+      access_token: {
+        type: "string",
+        format: "password",
+        "x-secret": true,
+        title: "Access Token"
+      }
+    }
+  },
+  destination_schema: {
+    type: "object",
+    required: ["target"],
+    properties: {
+      target: { type: "string", title: "Target Room / Topic" }
+    }
+  }
+};
+
+export function validate(input) {
+  // input: { scope: "account" | "destination" | "instance", config }
+  return { ok: true, normalized_config: input.config };
+}
+
+export function test(input) {
+  // input: { scope, account?, destination?, instance?, config?, locale? }
+  const res = fc.fetch({ method: "GET", url: "https://api.example.com/ping", timeoutMs: 8000 });
+  return { ok: res.ok, message: res.ok ? "Connected" : `HTTP ${res.status}` };
+}
+
+export function deliver(input) {
+  // input: { idempotency_key, task_id, attempt, account, destination, entry, feed, route, checkpoint }
+  const body = fc.truncateUtf8Bytes(input.entry.summary_text || input.entry.title || "", 3500);
+  const res = fc.fetch({
+    method: "POST",
+    url: `${input.account.server_url.replace(/\/+$/, "")}/send`,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target: input.destination.target, title: input.entry.title, body }),
+    timeoutMs: 15000
+  });
+  if (res.status === 429) return { outcome: "retry", status_code: 429, retry_after_secs: 60 };
+  if (res.status >= 500) return { outcome: "retry", status_code: res.status, diagnostic: `Upstream HTTP ${res.status}` };
+  if (!res.ok) return { outcome: "permanent_failure", status_code: res.status, diagnostic: `HTTP ${res.status}` };
+  return { outcome: "delivered", status_code: res.status };
 }
 ```
 
-### 字段说明
+### 支持的导出函数
 
-| 字段名 | 类型 | 约束 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `id` | `string` | `^[a-z0-9][a-z0-9-]{1,47}$` | 全局唯一的小写短横线标识（2–48 字符），必须与 `registry/<id>.json` 文件名完全一致。 |
-| `name` | `string` | `2..=80` 字符 | 在 WebUI 与文档站展示的插件名称。 |
-| `version` | `string` | SemVer 2.0.0 | 插件语义化版本号（如 `"0.3.0"`）。 |
-| `api_version` | `string` | 固定值 `"1"` | FeedCourier 插件协议版本。 |
-| `kind` | `string` | `"builtin"` \| `"external"` \| `"coming_soon"` | `"builtin"` 仅限编译进 FeedCourier 主二进制的第一方插件；社区条目使用 `"external"` 或 `"coming_soon"`。 |
-| `min_core` | `string` | SemVer 2.0.0 | 要求兼容的最低 FeedCourier 核心版本。 |
-| `category` | `string` | `"links"` \| `"content"` \| `"media"` \| `"delivery"` \| `"analytics"` \| `"security"` \| `"other"` | 市场分类标签，用于筛选。 |
-| `icon` | `string` | `^[a-z0-9][a-z0-9-]{0,31}$` | 市场卡片渲染使用的图标名称（如 `"link"`）。 |
-| `description` | `string` | `10..=280` 字符 | 简明扼要的插件功能介绍。 |
-| `homepage` | `string` | `https://` URL | 插件文档或项目主页链接（不得包含内嵌账号密码）。 |
-| `repository` | `string` | `https://` URL | 公开源码仓库链接（不得包含内嵌账号密码）。 |
-| `hooks` | `string[]` | 去重、至少 1 项；`"on_render"` \| `"on_ingest"` \| `"on_delivered"` | 插件声明实现的协议钩子。 |
-| `permissions` | `string[]` | 去重；`"network"` | 插件声明的能力权限；纯本地变换传 `[]`，需发起外部 HTTP 请求时声明 `"network"`。 |
+| 导出项 | 适用类型 / 钩子 | 超时预算 | 职责与返回值 |
+| :--- | :---: | :---: | :--- |
+| `meta` | 全部（必填） | 编译期 | 静态清单对象，声明 `id`、`name`、`version`、`api_version: "1"`、`kind`、`min_core`、`allowed_hosts`、字段 Schema 与 `hooks`。 |
+| `validate(input)` | 全部（可选） | `10s` | 校验 `{ scope: "account" \| "destination" \| "instance", config }`，返回 `{ ok: true, normalized_config? }` 或 `{ ok: false, error }`。`normalized_config` 不得新增 `format: "uri"` 字段，也不得篡改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。 |
+| `test(input)` | 全部（可选） | `10s` | 对 `{ scope, account?, destination?, instance?, locale? }` 执行实时连通性测试，返回 `{ ok: true \| false, message?, error? }`。 |
+| `deliver(input)` | `kind: "channel"` | `30s` | 向自定义通道投递渲染后的文章，返回 `{ outcome, status_code?, external_id?, checkpoint?, retry_after_secs?, next_window_at?, diagnostic? }`。 |
+| `onRender(input)` | `hooks: ["on_render"]` | `15s` | 在通道渲染前改写 `content_html` / `primary_link`；返回的 HTML **强制再次经 `ammonia` 清洗**。 |
+| `onDelivered(input)` | `hooks: ["on_delivered"]` | `10s` | 接收来自持久化 `plugin_events` 队列的至少一次投递完成回调（最多 5 次指数退避重试）。 |
 
-### 运行时声明式 UI Schema
+### `deliver(input)` 参数与结果枚举
 
-运行时接口 `GET /api/v1/plugins` 返回的 `PluginManifest` 还包含两段 JSON Schema 子集，供 WebUI 动态生成表单控件：
-
-- **`instance_schema`**：定义服务商实例的配置字段（加密保存于 `plugin_instances.encrypted_config`，支持 `"format": "password"` 密码框、枚举、布尔开关与字符串数组）。
-- **`route_option_schema`**：定义路由级插件控件（保存于 `routes.options_json -> $.plugins.<plugin_id>`；`v0.3.0` 支持基于 `plugin_instances` 的 `select` 下拉框、`boolean` 开关与 `string` 输入框）。
+- **输入字段**：
+  - `idempotency_key`：确定性 SHA-256 幂等键（调试推送每次独立生成）
+  - `task_id`、`attempt`：当前任务 ID 与重试次数
+  - `account`、`destination`：已解密的账号与目的地配置对象
+  - `entry`：`{ title, url, summary_text, plain_text, content_html, author, published_at, published_local, media }`（`published_local` 为路由时区 `YYYY-MM-DD HH:MM`）
+  - `feed`：`{ id, title, url, site_url, favicon_url }`
+  - `route`：`{ id, name, locale, timezone }`
+  - `checkpoint`：上次投递记录的断点 JSON 或 `null`
+- **返回 `outcome`**：
+  - `"delivered"`：投递成功（可选附带 `status_code`、`external_id`、`checkpoint`、`diagnostic`）
+  - `"retry"`：临时错误，支持返回 `retry_after_secs`（上游 `429` 或指定 `retry_after_secs` 会触发账号凭据组冷却）
+  - `"permanent_failure"`：不可重试的永久错误（任务转入 `dead_letter`）
+  - `"deferred"`：不消耗尝试次数的延后投递（可选 `next_window_at` 或 `retry_after_secs`）
 
 ---
 
-## 2. 钩子生命周期（Protocol v1）
+## 2. 宿主工具函数（`globalThis.fc`）
 
-```mermaid
-flowchart LR
-    Ingest["订阅源抓取与去重\n(on_ingest — 预留)"] --> Outbox["SQLite 发件箱任务"]
-    Outbox --> Render["on_render 钩子\n(v0.3.0 已启用)"]
-    Render --> Deliver["通道适配器投递\n(SMTP / Telegram / Notion)"]
-    Deliver --> Post["投递完成回调\n(on_delivered — 预留)"]
+FeedCourier 会向每次沙箱执行注入只读的 `globalThis.fc` 宿主对象（插件须仅使用纯 ECMAScript 与 `globalThis.fc`，不可依赖 `import`、`fetch`、`URL`、`Buffer` 或 `TextEncoder`）：
+
+| 函数 | 签名 | 说明 |
+| :--- | :--- | :--- |
+| `fc.fetch` | `fc.fetch({ method?, url, headers?, body?, timeoutMs? }) -> { status, ok, headers, body }` | 同步 HTTP(S) 请求（通道/校验/测试/onDelivered 每次最多 4 次，`onRender` 最多 10 次；`timeoutMs` 限制在 `100..=15000` 且自动截断至剩余钩子预算内；响应上限 `1 MiB`；禁止重定向；响应头键名统一小写）。每次调用前检查钩子取消标记，执行双层白名单（`meta.allowed_hosts` 走 `ProtectedHttpClient` 防 SSRF + 管理员显式提交的 `format: "uri"` 精确 `(scheme, host, port)` 直连），永久硬拦截云元数据 IP 与主机名（直连或代理均生效），完整遵循通道/实例的 `use_proxy`。 |
+| `fc.sha256` | `fc.sha256(input: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | 计算 UTF-8 字符串的 SHA-256 摘要（默认小写 `"hex"`）。 |
+| `fc.hmacSha256` | `fc.hmacSha256(message: string, secret: string, encoding?: "hex" \| "base64" \| "base64url") -> string` | 计算 HMAC-SHA256 签名（默认小写 `"hex"`）。 |
+| `fc.md5` | `fc.md5(input: string) -> string` | 计算小写十六进制 MD5 摘要（适配传统 API 签名）。 |
+| `fc.base64Encode` | `fc.base64Encode(input: string) -> string` | UTF-8 文本的标准 Base64 编码（用于 `Basic` 认证头或 RFC 2047 标题编码）。 |
+| `fc.base64Decode` | `fc.base64Decode(b64: string) -> string` | 解码标准或 URL-safe Base64 为 UTF-8 字符串。 |
+| `fc.base64UrlEncode` | `fc.base64UrlEncode(input: string) -> string` | 无填充 URL-safe Base64 编码（RFC 4648）。 |
+| `fc.utf8ByteLength` | `fc.utf8ByteLength(str: string) -> number` | 计算字符串的精确 UTF-8 字节长度。 |
+| `fc.truncateUtf8Bytes` | `fc.truncateUtf8Bytes(str: string, maxBytes: number) -> string` | 按 UTF-8 字节上限在合法 Unicode 码点边界安全截断文本（适合 ntfy / APNs / Bark 4 KB 载荷限制）。 |
+| `fc.htmlToText` | `fc.htmlToText(html: string) -> string` | 将 HTML 片段转换为干净的纯文本。 |
+| `fc.unixNow` | `fc.unixNow() -> number` | 返回当前 UTC Unix 秒级时间戳。 |
+| `fc.uuid` | `fc.uuid() -> string` | 生成随机 RFC 4122 UUID v4 字符串。 |
+
+---
+
+## 3. 沙箱与核心安全边界
+
+- **纯 Rust 隔离沙箱（`boa_engine`）**：沙箱内不暴露文件系统、`process`、环境变量、原生扩展、`import` 语句（`IdleModuleLoader`）或原始 Socket。所有钩子必须同步返回（返回 `Promise` 会被拒绝）。
+- **双层白名单与管理员显式 `format: "uri"` 策略**：
+  - 向未列入 `meta.allowed_hosts` 且非管理员显式提交的 `format: "uri"` 精确 `(scheme, host, port)` 的目标发起 `fc.fetch()` 会在 DNS 解析前立即拒绝（`403 ssrf_blocked`）。
+  - 仅**管理员显式提交的非空 `format: "uri"` 字段值**才会进入私网/LAN `admin_uri_origins` 白名单。`format: "uri"` 的 Schema `default` **仅当**其主机名是插件 `meta.allowed_hosts` 中声明的公网域名（如 `ntfy.sh` / `api.day.app`）时才允许前后端自动填充，且始终走公网 SSRF 防护（不豁免私网）；凡不在 `meta.allowed_hosts` 内的 URI `default` 一律不自动填充（前端仅作灰色 `placeholder` 提示）。
+  - 插件 `validate()` 返回的 `normalized_config` 不得新增 `format: "uri"` 字段，也不得修改已有 `format: "uri"` 字段的 `(scheme, host, port)` 源站。
+- **云元数据硬拦截与代理 DNS 边界**：
+  - 云元数据字面量 IP（`169.254.169.254`、`169.254.170.2`、`100.100.100.200`、`fd00:ec2::254` 及 IPv4 映射 IPv6 / NAT64 形式）、未指定地址（`0.0.0.0`、`::`）、云元数据主机名（`metadata.google.internal`、`metadata.goog`、`instance-data`）以及 HTTP `3xx` 重定向在所有 `fc.fetch()` 调用中（无论直连或代理）永久硬拦截。
+  - 直连与本地 DNS 代理（`socks5://`）还会在连接前执行 DNS 解析并拦截云元数据 IP；远端 DNS 代理（`http://`、`https://`、`socks5h://`）因 DNS 解析在代理服务器侧完成，客户端侧执行主机名与字面量 IP 校验。
+- **资源上限、全局并发与自动熔断器**：
+  - 单个插件脚本上限 **`512 KiB`**，单次 HTTP 响应上限 **`1 MiB`**。
+  - 全局 JS 沙箱并发执行上限为 **`4`** 个并发任务。
+  - 每次调用受硬性 VM 预算（`loop_iteration_limit = 200,000`、`recursion_limit = 128`、`stack_size_limit = 64 KiB`）与每钩子墙钟超时约束（编译 `5s`，`validate`/`test`/`onDelivered` `10s`，`onRender` `15s`，`deliver` `30s`）。每次 `fc.*` 宿主调用均检查取消标记（防止超时后仍发出 HTTP 请求），单次 `fc.fetch()` 超时会自动截断至剩余钩子预算内。
+  - **连续 3 次超时自动熔断器**：若某 JS 插件连续 3 次执行超时，FeedCourier 会自动全局禁用该插件并写入 `plugins.disabled_reason`（在 WebUI 与 `GET /api/v1/plugins` 中展示，手动重新启用后自动清除）。
+  - **`boa_engine` 0.22 已知限制**：`boa_engine` 0.22 不支持对纯 CPU 嵌套循环进行外部抢占中断，因此恶意纯 CPU 循环可能占用 4 个沙箱槽位中的 1 个，直到 Boa 自身的单循环迭代上限触发结束。
+  - `onRender` 返回的 HTML 强制再次通过 `ammonia` 清洗。
+  - `deliver` 返回的序列化 `checkpoint` 上限为 **`16 KiB`**。
+- **持久化 `on_delivered` 出队表**：任务标记为已投递时，在同一 SQLite 事务内向 `plugin_events` 写入事件，由独立后台协程按指数退避重试（`15s, 30s, 60s, 120s`，最多 **5 次**），不影响原任务状态与通道配额。
+
+---
+
+## 4. 插件市场与单元测试（`ElleryHe/FeedCourier-Plugins`）
+
+官方与社区 JS 插件统一托管在 **[`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)**（内置 **`ntfy`** 与 **`bark`** 官方通道插件），支持使用 Node.js 24+ 直接运行零依赖单元测试：
+
+```bash
+cd FeedCourier-Plugins
+node --test tests/*.test.mjs
+node scripts/build-index.mjs --check --verify-index
 ```
 
-| 钩子 | `v0.3.0` 状态 | 执行时机与语义 |
-| :--- | :---: | :--- |
-| **`on_render`** | **已启用** | 在每次发件箱投递（及调试推送）解密凭据后、调用 `sender.send()` 之前执行。接收只读 `RenderContext`（含 `entry`、`feed`、`route`、`route_options`、`channel`、`destination`、`plugin_route_config`、`write_cache`），并写入非破坏式的 `RenderOverrides`（`content_html`、`primary_link`、`warnings`），绝不修改入库的 `entries`。返回 `PluginResult::Continue` 或 `PluginResult::Retry { diagnostic, retry_after_secs }`。 |
-| **`on_ingest`** | *预留* | 已在 Protocol v1 协议与枚举中预留，用于未来在抓取入库、任务扇出前执行内容增强或规范化处理。 |
-| **`on_delivered`** | *预留* | 已在 Protocol v1 协议与枚举中预留，用于未来在投递完成后触发审计、Webhook 或统计回调。 |
+### 注册表条目与 `index.json` 字段
 
-### 核心安全不变量
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `id`、`name`、`version`、`api_version` | `string` | 唯一短横线 ID、展示名称、最新 SemVer 版本号、固定 `"1"`。 |
+| `kind` | `string` | `"builtin"` \| `"channel"` \| `"processor"` \| `"coming_soon"`。 |
+| `runtime` | `string` | `"builtin"` \| `"js"`。 |
+| `min_core` | `string` | 最低兼容的 FeedCourier 核心版本（安装前由后端与 WebUI 自动校验）。 |
+| `category`、`icon`、`description`、`description_i18n` | `string` / `object` | 市场分类筛选、图标与多语言简介（如 `{ "en": "...", "zh": "..." }`）。 |
+| `homepage`、`repository` | `string` | 严格 `https://` 文档与源码仓库地址。 |
+| `allowed_hosts` | `string[]` | 插件允许通过 `fc.fetch()` 访问的公网域名列表（在 WebUI 卡片与安装弹窗中显式展示）。 |
+| `latest`、`versions` | `string` / `object[]` | 版本列表（`{ version, min_core, path, sha256, changelog_path?, changelog? }`），一键安装时强制执行 SHA-256 校验。 |
+| `hooks`、`permissions` | `string[]` | 钩子声明（`on_render`、`on_delivered`）与权限声明（`["network"]`）。 |
+| `account_schema`、`destination_schema`、`instance_schema`、`route_option_schema` | `object` | 驱动 WebUI 动态表单的 JSON Schema（`format: "password"` 或 `x-secret: true` 字段自动加密与脱敏）。 |
 
-1. **强制防 SSRF 出站约束**：插件的所有出站 HTTP 请求都必须通过 `ProtectedHttpClient`（`src/net/ssrf.rs`）发出，执行连接期 DNS IP 校验、逐跳重定向检查、响应体积上限并遵循 `SSRF_ALLOWLIST`。
-2. **凭据加密与分级脱敏**：服务商配置以 `MasterKey`（ChaCha20-Poly1305）加密存储于 `plugin_instances.encrypted_config`；插件必须实现 `redact_instance_config` 与 `merge_instance_config`，确保 `/api/v1/plugins*` 与 MCP `list_plugins` 绝不泄露密钥明文。
-3. **引用删除保护**：删除仍被 `routes.options_json` 引用的服务商实例时，后端拒绝删除并返回 `409 Conflict` 及引用路由清单。
+### 向 `ElleryHe/FeedCourier-Plugins` 提交上架
 
----
-
-## 3. 向 `ElleryHe/FeedCourier-Plugins` 提交插件上架
-
-社区开发者可通过 Pull Request 将开源 Protocol v1 插件（`kind: "external"` 或 `"coming_soon"`）收录到官方市场 **[`ElleryHe/FeedCourier-Plugins`](https://github.com/ElleryHe/FeedCourier-Plugins)**：
-
-1. Fork `ElleryHe/FeedCourier-Plugins` 并基于 `main` 创建新分支。
-2. 按照 `schema/manifest.schema.json` 新增 `registry/<your-plugin-id>.json`。
-3. 使用 Node.js 24+ 在本地运行零依赖校验脚本：
-   ```bash
-   node scripts/build-index.mjs --check
-   ```
-4. **请勿在 PR 中手动修改 `index.json`。** PR 阶段由 `validate.yml` 执行 Schema 校验，合入 `main` 后由 `build-index.yml` 自动重新生成并提交 `index.json`。
-5. 按 PR 模板完成核对清单：
-   - 唯一插件 ID 且与 `registry/<id>.json` 文件名一致
-   - 合法的 `api_version: "1"`、SemVer 格式的 `version` / `min_core` 与 `https://` 链接
-   - 采用 `AGPL-3.0` 或经 OSI 认可的开源协议
-   - 完整披露安全与 SSRF 信息（出站域名/自托管端点、权限声明、凭据处理方式）
-   - 标明已验证兼容的 FeedCourier 核心版本
-
----
-
-## 4. 第二阶段路线图：WASM 沙箱运行时
-
-`v0.3.0` 率先将 Protocol v1 清单规范、SQLite 表结构、REST / MCP 契约与 `on_render` 覆盖语义定稳，为后续 **第二阶段 WASM / Extism 第三方插件运行时** 铺平道路：
-
-- **宿主强制能力沙箱**：第三方 `.wasm` 插件不拥有直接访问网络套接字或本地文件系统的权限；声明了 `permissions: ["network"]` 的插件只能通过 FeedCourier 宿主提供的防 SSRF HTTP 函数发起请求。
-- **确定性资源隔离**：对单次钩子调用施加 CPU Fuel / 超时与内存上限，防止异常插件拖慢或阻塞发件箱调度器。
-- **零迁移平滑演进**：现有的 `plugins`、`plugin_instances`、`plugin_link_cache` 与 `routes.options_json` 结构完全向前兼容，后续可直接承载第三方 WASM 插件实例。
+1. Fork `ElleryHe/FeedCourier-Plugins`，新增 `plugins/<channels|processors>/<id>/<version>/plugin.js`、`CHANGELOG.md`、`plugins/<channels|processors>/<id>/README.md`（及 `README.zh-CN.md`）与 `tests/<id>.test.mjs`。
+2. 在本地运行 `node --test tests/*.test.mjs` 与 `node scripts/build-index.mjs --check` 验证通过。
+3. **请勿在 PR 中手动修改 `index.json`。** PR 阶段由 GitHub Actions 自动校验，合入 `main` 后自动重新生成 `index.json` 与所有版本的 `sha256` 校验值。

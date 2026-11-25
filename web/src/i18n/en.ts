@@ -395,6 +395,7 @@ export const en = {
       smtp: "SMTP Email",
       telegram: "Telegram Bot",
       notion: "Notion",
+      plugin: "Plugin Channel",
     },
     pacingLine: (
       minDur: string,
@@ -652,7 +653,7 @@ export const en = {
         dailyQuotaLabel: "Daily Quota (Opt)",
         proxyLabel: "Use Outbound Proxy",
         proxyDesc:
-          "Route API requests (Telegram / Notion) for all destinations of this account through the global outbound proxy.",
+          "Route API requests (Telegram / Notion / public Plugin Channel hosts) for all destinations of this account through the global outbound proxy.",
         smtpNoProxyNote:
           "SMTP connects directly over native TCP/TLS and does not use HTTP/SOCKS outbound proxies.",
         enabledLabel: "Account Enabled",
@@ -843,13 +844,20 @@ export const en = {
       pluginWarningPluginDisabled: "Plugin globally disabled",
       pluginWarningProviderMissing: "Selected provider missing",
       pluginWarningProviderDisabled: "Selected provider disabled",
+      pluginOrderHint:
+        "Use arrows to control execution order when multiple processor plugins run on this route.",
+      pluginMoveUp: "Move up",
+      pluginMoveDown: "Move down",
+      pluginEnableOnRoute: "Enable on this route",
+      pluginNoRouteOptionsHint:
+        "Enabled on this route. This plugin has no extra route-level options.",
     },
   },
 
   plugins: {
     title: "Plugins & Extensions",
     subtitle:
-      "Extend FeedCourier's delivery pipeline with built-in plugins and discover upcoming extensions from the plugin marketplace.",
+      "Extend FeedCourier with built-in plugins, one-click sandboxed JS plugins from the marketplace, or custom single-file .js plugins.",
     tabs: {
       installed: "Installed",
       marketplace: "Marketplace",
@@ -865,6 +873,7 @@ export const en = {
     backToPlugins: "Back to Plugins",
     globallyDisabledNotice:
       "This plugin is currently globally disabled. Routes referencing its providers will keep original content until you enable the plugin.",
+    autoDisabledLabel: "Auto-disabled",
     hooksLabel: "Hooks",
     permissionsLabel: "Permissions",
     homepageLink: "Homepage",
@@ -945,6 +954,8 @@ export const en = {
       signatureStoredPlaceholder: (hint: string) =>
         `Stored (${hint}) — leave blank to keep`,
       secretPreserveHint: "Leave blank to keep the currently stored secret.",
+      clearStoredSecretLabel: "Clear stored secret",
+      secretWillClearPlaceholder: "Stored secret will be cleared on save",
       usernameLabel: "Username",
       usernamePlaceholder: "admin",
       passwordLabel: "Password",
@@ -1014,13 +1025,100 @@ export const en = {
       kindBuiltin: "Built-in",
       kindExternal: "External",
       kindComingSoon: "Coming Soon",
-      wasmUpcomingBadge: "External / Upcoming WASM",
+      kindJsProcessor: "JS · Processor",
+      kindJsChannel: "JS · Channel",
+      customSourceBadge: "Custom",
       installedBadge: "Installed",
       enabledBadge: "Enabled",
       enableAndConfigureBtn: "Enable & Configure",
       configureBtn: "Configure",
+      installBtn: "Install",
+      updateToBtn: (version: string) => `Update to v${version}`,
+      switchVersionBtn: "Versions",
+      allowedHostsLabel: "Allowed hosts",
       homepageBtn: "Homepage",
       repositoryBtn: "Repository",
+      incompatibleBadge: "Incompatible",
+      incompatibleNotice: (reason: string) =>
+        `Runtime execution is paused because this plugin is incompatible with the running FeedCourier core (${reason}).`,
+    },
+    js: {
+      uploadBtn: "Import Custom Plugin (.js)",
+      uploadModalTitle: "Import Custom JS Plugin",
+      uploadModalDesc:
+        "Upload a single-file plugin.js (Plugin API v1) or paste its source below. FeedCourier compiles and validates its exported meta inside the in-process JS sandbox before installing.",
+      fileInputLabel: "Select .js File",
+      fileInputBtn: "Choose .js File",
+      fileLoadedHint: (name: string) => `Loaded ${name}`,
+      sourceLabel: "Plugin Source (plugin.js)",
+      sourcePlaceholder:
+        'export const meta = { id: "my-plugin", name: "My Plugin", ... };',
+      sourceHint:
+        "Single-file ES module exporting meta and hook/channel handlers (validate, test, deliver, onRender, or onDelivered).",
+      enabledLabel: "Enable immediately after install",
+      overwriteLabel: "Overwrite if plugin ID is already installed",
+      overwriteRequiredHint: (id: string, version: string) =>
+        `Plugin "${id}" (v${version}) is already installed. Check the overwrite option below to replace it in place (existing channels and routes are preserved).`,
+      previewBtn: "Preview & Validate",
+      installConfirmBtn: "Confirm & Install",
+      updateConfirmBtn: "Confirm & Update",
+      previewHeading: "Compiled Plugin Preview",
+      errSourceRequired: "Upload a .js file or paste plugin.js source code first.",
+      toastInstalled: "Plugin installed",
+      toastUpdated: "Plugin updated",
+      toastInstallFailed: "Failed to install plugin",
+      installModalTitle: (name: string) => `Install ${name}`,
+      updateModalTitle: (name: string) => `Update ${name}`,
+      installModalDesc:
+        "Review the verified SHA-256 checksum, allowed outbound hosts, and version changelog before installing this sandboxed JS plugin.",
+      versionLabel: "Version",
+      versionInstalledSuffix: " (installed)",
+      sha256Label: "Verified SHA-256",
+      copySha256Btn: "Copy SHA-256",
+      toastSha256Copied: "SHA-256 checksum copied",
+      allowedHostsHeading: "Allowed Outbound Hosts",
+      allowedHostsNone: "No hardcoded public hosts declared",
+      securityNotice:
+        "Sandbox network boundary: JS plugins run in-process without filesystem or shell access. fc.fetch may only reach declared allowed hosts plus explicit administrator-configured URI fields (private/LAN IPs still require SSRF_ALLOWLIST).",
+      changelogHeading: "Release Changelog",
+      previewLoading: "Fetching and validating plugin script…",
+      previewErrorTitle: "Failed to preview plugin:",
+      alreadyInstalledUpgradeNotice: (fromVersion: string, toVersion: string) =>
+        `Currently installed: v${fromVersion}. Confirming will update this plugin in place to v${toVersion} while keeping existing channels and routes intact.`,
+      alreadyInstalledSameNotice: (version: string) =>
+        `Version v${version} is already installed. Confirming will reinstall this version in place.`,
+      replaceCustomWarning: (id: string, installedVersion?: string | null) =>
+        `Plugin "${id}"${installedVersion ? ` (v${installedVersion})` : ""} is currently installed as a custom plugin. Installing from the marketplace will permanently overwrite your custom script.`,
+      replaceCustomCheckbox:
+        "I understand and want to overwrite the existing custom plugin with the marketplace version",
+      viewSourceBtn: "View Source",
+      sourceModalTitle: (name: string) => `Plugin Source: ${name}`,
+      sourceModalLoading: "Loading plugin source…",
+      sourceModalError: "Failed to load plugin source:",
+      copySourceBtn: "Copy Source",
+      toastSourceCopied: "Plugin source copied",
+      uninstallBtn: "Uninstall",
+      deleteConfirmTitle: "Uninstall Plugin",
+      deleteConfirmDesc: (name: string) =>
+        `Uninstall plugin "${name}" and remove its stored script?`,
+      deleteConfirmBtn: "Uninstall",
+      deleteCascadeTitle: "Plugin Is Referenced",
+      deleteCascadeDesc: (name: string, channels: number, routes: number) =>
+        `Plugin "${name}" is used by ${channels} channel(s) and ${routes} route(s). Uninstalling with cascade will also delete those channel accounts and strip it from referencing routes.`,
+      deleteCascadeBtn: "Uninstall Plugin & References",
+      conflictChannelsLabel: "Referencing Channels",
+      toastDeleted: "Plugin uninstalled",
+      toastDeleteFailed: "Failed to uninstall plugin",
+      channelSummaryTitle: "Channel Delivery Plugin",
+      channelSummaryDesc:
+        "This sandboxed JS plugin provides a custom delivery channel adapter. Configure accounts and destinations for it in the Channels tab.",
+      accountSchemaFields: (count: number) => `Account fields (${count})`,
+      destSchemaFields: (count: number) => `Destination fields (${count})`,
+      pluginAccountHeading: (name: string) => `${name} Account`,
+      pluginDestHeading: (name: string) => `${name} Destination`,
+      pluginNamePlaceholder: (name: string) => `e.g. ${name} (auto-filled if blank)`,
+      pluginDestPlaceholder: "Auto-derived if blank",
+      errSelectPlugin: "Select an enabled channel plugin.",
     },
   },
 
@@ -1038,9 +1136,8 @@ export const en = {
     colSelect: "Select",
     colEntry: "Entry",
     colRouteChannel: "Route → Destination",
-    colStatusLease: "Status & Checkpoint",
-    colAttemptsCode: "Attempts / Code",
-    colTiming: "Timing",
+    colStatusTiming: "Status & Timing",
+    colDiagnostics: "Diagnostics",
     colActions: "Actions",
     selectTaskAria: (id: number) => `Select task #${id}`,
     payloadPurged: (entryId: number) =>
@@ -1059,6 +1156,7 @@ export const en = {
       notionPage: (id: string) => `Notion page:${id}`,
       notionFcId: "Notion FC-ID check",
       notionDefault: "Notion checkpoint",
+      plugin: "Plugin checkpoint",
     },
     modal: {
       title: (id: number) => `Task #${id} Diagnostics`,
@@ -1166,21 +1264,28 @@ export const en = {
     errInvalidProxy:
       "Outbound proxy URL must start with http://, https://, socks5://, or socks5h://.",
     toastSettingsSaved: "Network settings saved",
-    mcpTitle: "MCP Server (/mcp) · Bearer Tokens",
+    mcpTitle: "MCP Server",
     mcpDesc:
-      "Streamable HTTP Model Context Protocol endpoint. Channel secrets and recipient addresses are never exposed to MCP clients, and external feed content is wrapped with untrusted-content tags.",
-    clientLabel: "Client / Agent Label",
-    clientPlaceholder: "Claude Desktop / Cursor",
-    scopeLabel: "Permission Scope",
-    scopeReadonlyTitle: "Readonly Inspection",
-    scopeAdminTitle: "Admin Management",
-    issueToken: "Issue MCP Token",
+      "Streamable HTTP endpoint for AI agents. Channel secrets stay locked inside the WebUI.",
+    copyEndpoint: "Copy endpoint URL",
+    toastEndpointCopied: "MCP endpoint URL copied",
+    clientLabel: "Token Name",
+    clientPlaceholder: "e.g. Claude Desktop or Cursor",
+    scopeLabel: "Scope",
+    scopeReadonlyShort: "Readonly",
+    scopeAdminShort: "Admin",
+    scopeReadonlyHint:
+      "Inspect feeds, routes, plugins, delivery failures, and preview entries without making changes.",
+    scopeAdminHint:
+      "Full orchestration: manage feeds & routes, pause/resume queue, retry dead letters, and debug push.",
+    viewTools: (count: number) => `View tools (${count})`,
+    hideTools: "Hide tools",
+    issueToken: "Issue Token",
     errEmptyTokenLabel:
       "Enter a descriptive token label (e.g. Claude Desktop).",
     loadingTokens: "Loading MCP tokens…",
-    emptyTokensTitle: "No MCP tokens issued yet",
-    emptyTokensDesc:
-      "Issue a readonly or admin Bearer token above to connect Claude Desktop, Cursor, or another MCP client.",
+    emptyTokensInline:
+      "No MCP tokens issued yet. Create a readonly or admin token above to connect Claude Desktop, Cursor, or another MCP client.",
     colName: "Name",
     colPrefix: "Token Prefix",
     colScope: "Scope",
@@ -1192,15 +1297,22 @@ export const en = {
     toastTokenRevoked: "MCP token revoked",
     toastRevokeFailed: "Failed to revoke token",
     toastTokenCopied: "Bearer token copied",
-    toastJsonCopied: "MCP client JSON copied",
+    toastJsonCopied: "MCP client config copied",
     revealTitle: "Save Your New MCP Bearer Token",
     revealDesc:
       "Only the SHA-256 hash is stored in SQLite. This plaintext token is shown only once.",
     revealConfirm: "I Have Saved This Token",
     plaintextLabel: (scope: string) => `Plaintext Bearer Token (${scope})`,
     copyToken: "Copy Token",
-    clientJsonLabel: "MCP Client JSON Configuration",
-    copyJson: "Copy JSON",
+    clientJsonLabel: "Client Configuration",
+    clientTabClaude: "Claude Desktop",
+    clientTabCursor: "Cursor",
+    clientTabGeneric: "Generic JSON",
+    clientTabClaudeHint:
+      "Add to claude_desktop_config.json (or paste the endpoint URL directly under Settings → Connectors).",
+    clientTabCursorHint: "Add to .cursor/mcp.json in your workspace or home directory.",
+    clientTabGenericHint: "Standard Streamable HTTP MCP client configuration.",
+    copyJson: "Copy Config",
     revokeModalTitle: "Revoke MCP Token",
     revokeModalDesc: (name: string, prefix: string) =>
       `Immediately revoke "${name}" (${prefix}…)? Connected MCP clients using this token will receive 401 Unauthorized.`,

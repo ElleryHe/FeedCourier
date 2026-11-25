@@ -277,6 +277,7 @@ pub async fn auth_login(
 
     if !(password_ok && username_ok) {
         LOGIN_LIMITER.record_failure();
+        tracing::warn!("WebUI login failed: invalid credentials");
         return Err(AppError::Unauthorized(
             "Invalid username or password".to_string(),
         ));
@@ -293,6 +294,7 @@ pub async fn auth_login(
     }
 
     LOGIN_LIMITER.reset();
+    tracing::info!("WebUI administrator signed in");
     issue_session_response(&state).await
 }
 
@@ -312,6 +314,7 @@ pub async fn auth_login_2fa(
     if !verify_second_factor(&state, &req.code).await? {
         LOGIN_LIMITER.record_failure();
         record_challenge_failure(&req.mfa_token);
+        tracing::warn!("WebUI 2FA login verification failed");
         return Err(AppError::Unauthorized(
             "Invalid verification code".to_string(),
         ));
@@ -319,6 +322,7 @@ pub async fn auth_login_2fa(
 
     consume_challenge(&req.mfa_token);
     LOGIN_LIMITER.reset();
+    tracing::info!("WebUI administrator signed in with 2FA");
     issue_session_response(&state).await
 }
 

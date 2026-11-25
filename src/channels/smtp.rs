@@ -1053,7 +1053,11 @@ impl ChannelSender for SmtpSender {
                 plan.recipients.len()
             )];
             if !bounced_notes.is_empty() {
-                diag_parts.push(format!("hard-bounced: {}", bounced_notes.join("; ")));
+                diag_parts.push(format!(
+                    "{}hard-bounced: {}",
+                    crate::plugins::DELIVERY_WARNING_PREFIX,
+                    bounced_notes.join("; ")
+                ));
             }
             for w in &ctx.overrides.warnings {
                 diag_parts.push(w.clone());

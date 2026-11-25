@@ -9,9 +9,9 @@ use serde_json::Value;
 use crate::channels::notion::normalize_notion_id;
 use crate::channels::{
     ChannelConfig, ChannelKind, DeliveryCheckpoint, DestinationConfig, NotionChannelConfig,
-    NotionColumnMapping, NotionDestinationConfig, RouteOptions, SmtpChannelConfig,
-    SmtpDestinationConfig, SmtpSecurity, TelegramChannelConfig, TelegramDeliveryMode,
-    TelegramDestinationConfig,
+    NotionColumnMapping, NotionDestinationConfig, PluginChannelConfig, PluginDestinationConfig,
+    RouteOptions, SmtpChannelConfig, SmtpDestinationConfig, SmtpSecurity, TelegramChannelConfig,
+    TelegramDeliveryMode, TelegramDestinationConfig,
 };
 use crate::config::{LICENSE_SPDX, REPO_URL, VERSION};
 use crate::crypto::MasterKey;
@@ -22,7 +22,7 @@ use crate::db::models::{
 };
 use crate::error::{AppError, AppResult};
 use crate::ingest::ContentFilterRules;
-use crate::plugins::PluginManifest;
+use crate::plugins::{PluginKind, PluginManifest, PluginRuntime};
 
 /// Deserialize an optional nullable field (`T | null | undefined` in TypeScript PATCH payloads):
 /// - Omitted JSON field -> `None` (keep existing value)
@@ -435,7 +435,7 @@ impl ChannelDestinationDto {
         kind: ChannelKind,
         master_key: &MasterKey,
     ) -> AppResult<Self> {
-        Self::from_model_with_summary(dest, kind, master_key, None)
+        Self::from_model_with_schema(dest, kind, master_key, None, None)
     }
 
     pub fn from_model_with_summary(
@@ -444,13 +444,30 @@ impl ChannelDestinationDto {
         master_key: &MasterKey,
         smtp_summary: Option<SmtpRecipientSummary>,
     ) -> AppResult<Self> {
+        Self::from_model_with_schema(dest, kind, master_key, smtp_summary, None)
+    }
+
+    pub fn from_model_with_schema(
+        dest: ChannelDestination,
+        kind: ChannelKind,
+        master_key: &MasterKey,
+        smtp_summary: Option<SmtpRecipientSummary>,
+        plugin_dest_schema: Option<&Value>,
+    ) -> AppResult<Self> {
         let decrypted: DestinationConfig = master_key.decrypt_json(&dest.encrypted_config)?;
+        let config_view = match (&decrypted, plugin_dest_schema) {
+            (DestinationConfig::Plugin(p), Some(schema)) => serde_json::json!({
+                "kind": "plugin",
+                "config": crate::plugins::js_runtime::redact_config_with_schema(schema, &p.config),
+            }),
+            _ => decrypted.view(),
+        };
         Ok(Self {
             id: dest.id,
             channel_id: dest.channel_id,
             name: dest.name,
             kind,
-            config: decrypted.view(),
+            config: config_view,
             enabled: dest.enabled,
             auto_paused: dest.auto_paused,
             smtp_summary,
@@ -498,6 +515,10 @@ pub enum DestinationPatch {
         #[serde(default)]
         column_mapping: Option<NotionColumnMapping>,
     },
+    Plugin {
+        #[serde(default)]
+        config: Option<Value>,
+    },
 }
 
 impl DestinationPatch {
@@ -506,10 +527,19 @@ impl DestinationPatch {
             Self::Smtp { .. } => ChannelKind::Smtp,
             Self::Telegram { .. } => ChannelKind::Telegram,
             Self::Notion { .. } => ChannelKind::Notion,
+            Self::Plugin { .. } => ChannelKind::Plugin,
         }
     }
 
     pub fn apply_to(&self, existing: &DestinationConfig) -> AppResult<DestinationConfig> {
+        self.apply_to_with_schema(existing, None)
+    }
+
+    pub fn apply_to_with_schema(
+        &self,
+        existing: &DestinationConfig,
+        plugin_schema: Option<&Value>,
+    ) -> AppResult<DestinationConfig> {
         match (existing, self) {
             (
                 DestinationConfig::Smtp(cur),
@@ -589,6 +619,23 @@ impl DestinationPatch {
                 merged.validate()?;
                 Ok(merged)
             }
+            (DestinationConfig::Plugin(cur), Self::Plugin { config }) => {
+                let next_cfg = match config {
+                    Some(patch_val) => {
+                        let empty = serde_json::json!({});
+                        crate::plugins::js_runtime::merge_config_against_schema(
+                            plugin_schema.unwrap_or(&empty),
+                            &cur.config,
+                            patch_val,
+                        )?
+                    }
+                    None => cur.config.clone(),
+                };
+                let merged =
+                    DestinationConfig::Plugin(PluginDestinationConfig { config: next_cfg });
+                merged.validate()?;
+                Ok(merged)
+            }
             (existing_cfg, patch) => Err(AppError::Validation(format!(
                 "cannot change destination kind from '{}' to '{}'",
                 existing_cfg.kind(),
@@ -633,15 +680,34 @@ impl ChannelDto {
         destinations: Vec<ChannelDestination>,
         master_key: &MasterKey,
     ) -> AppResult<Self> {
+        Self::from_model_with_schema(channel, destinations, master_key, None, None)
+    }
+
+    pub fn from_model_with_schema(
+        channel: Channel,
+        destinations: Vec<ChannelDestination>,
+        master_key: &MasterKey,
+        plugin_account_schema: Option<&Value>,
+        plugin_destination_schema: Option<&Value>,
+    ) -> AppResult<Self> {
         let decrypted: ChannelConfig = master_key.decrypt_json(&channel.encrypted_config)?;
-        let redacted_view = decrypted.redacted_view();
+        let redacted_view = match (&decrypted, plugin_account_schema) {
+            (ChannelConfig::Plugin(p), Some(schema)) => serde_json::json!({
+                "kind": "plugin",
+                "plugin_id": p.plugin_id,
+                "config": crate::plugins::js_runtime::redact_config_with_schema(schema, &p.config),
+            }),
+            _ => decrypted.redacted_view(),
+        };
         let capabilities = channel.capabilities_value();
         let mut dest_dtos = Vec::with_capacity(destinations.len());
         for d in destinations {
-            dest_dtos.push(ChannelDestinationDto::from_model(
+            dest_dtos.push(ChannelDestinationDto::from_model_with_schema(
                 d,
                 channel.kind,
                 master_key,
+                None,
+                plugin_destination_schema,
             )?);
         }
 
@@ -725,6 +791,10 @@ pub enum ChannelTargetPatch {
         #[serde(default)]
         integration_secret: Option<String>,
     },
+    Plugin {
+        #[serde(default)]
+        config: Option<Value>,
+    },
 }
 
 impl ChannelTargetPatch {
@@ -733,11 +803,21 @@ impl ChannelTargetPatch {
             Self::Smtp { .. } => ChannelKind::Smtp,
             Self::Telegram { .. } => ChannelKind::Telegram,
             Self::Notion { .. } => ChannelKind::Notion,
+            Self::Plugin { .. } => ChannelKind::Plugin,
         }
     }
 
     /// Merge this patch onto `existing`, returning `(merged_config, telegram_endpoint_changed)`.
     pub fn apply_to(&self, existing: &ChannelConfig) -> AppResult<(ChannelConfig, bool)> {
+        self.apply_to_with_schema(existing, None)
+    }
+
+    /// Schema-aware merge for `ChannelConfig` patches (preserves secret fields on `ChannelKind::Plugin`).
+    pub fn apply_to_with_schema(
+        &self,
+        existing: &ChannelConfig,
+        plugin_schema: Option<&Value>,
+    ) -> AppResult<(ChannelConfig, bool)> {
         match (existing, self) {
             (
                 ChannelConfig::Smtp(cur),
@@ -816,6 +896,25 @@ impl ChannelTargetPatch {
                 };
                 let merged = ChannelConfig::Notion(NotionChannelConfig {
                     integration_secret: next_secret,
+                });
+                merged.validate()?;
+                Ok((merged, false))
+            }
+            (ChannelConfig::Plugin(cur), Self::Plugin { config }) => {
+                let next_cfg = match config {
+                    Some(patch_val) => {
+                        let empty = serde_json::json!({});
+                        crate::plugins::js_runtime::merge_config_against_schema(
+                            plugin_schema.unwrap_or(&empty),
+                            &cur.config,
+                            patch_val,
+                        )?
+                    }
+                    None => cur.config.clone(),
+                };
+                let merged = ChannelConfig::Plugin(PluginChannelConfig {
+                    plugin_id: cur.plugin_id.clone(),
+                    config: next_cfg,
                 });
                 merged.validate()?;
                 Ok((merged, false))
@@ -1002,8 +1101,34 @@ pub struct DeliveryTaskDto {
     pub next_attempt_at: Option<String>,
     pub last_status_code: Option<i32>,
     pub diagnostic_log: Option<String>,
+    /// `true` when `status == Delivered` and one or more non-fatal plugin/recipient warnings were
+    /// recorded in `diagnostic_log` (either with the canonical `[warn] ` prefix or legacy markers).
+    pub has_warnings: bool,
     pub completed_at: Option<String>,
     pub created_at: String,
+}
+
+pub fn diagnostic_has_warning(status: DeliveryTaskStatus, diagnostic_log: Option<&str>) -> bool {
+    if status != DeliveryTaskStatus::Delivered {
+        return false;
+    }
+    let Some(log) = diagnostic_log else {
+        return false;
+    };
+    if log.contains(crate::plugins::DELIVERY_WARNING_PREFIX) {
+        return true;
+    }
+    [
+        "Link Rewrite partial",
+        "hard-bounced",
+        "is disabled; kept original",
+        "not found; kept original",
+        "failed (",
+        "timed out after",
+        "capped at",
+    ]
+    .iter()
+    .any(|marker| log.contains(marker))
 }
 
 impl DeliveryTaskDto {
@@ -1018,6 +1143,7 @@ impl DeliveryTaskDto {
             Some((fid, ftitle)) => (Some(fid), Some(ftitle)),
             None => (None, None),
         };
+        let has_warnings = diagnostic_has_warning(detail.status, detail.diagnostic_log.as_deref());
 
         Self {
             id: detail.id,
@@ -1040,6 +1166,7 @@ impl DeliveryTaskDto {
             next_attempt_at: Some(unix_to_rfc3339(detail.next_attempt_at)),
             last_status_code: detail.last_status_code,
             diagnostic_log: detail.diagnostic_log,
+            has_warnings,
             completed_at: detail.completed_at.map(unix_to_rfc3339),
             created_at: unix_to_rfc3339(detail.created_at),
         }
@@ -1139,6 +1266,18 @@ pub struct PluginInstanceDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginDto {
     pub id: String,
+    pub source: String,
+    pub kind: PluginKind,
+    pub runtime: PluginRuntime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    pub compatible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     pub manifest: PluginManifest,
     pub enabled: bool,
     pub installed_version: String,
@@ -1146,6 +1285,75 @@ pub struct PluginDto {
     pub instance_count: usize,
     pub instances: Vec<PluginInstanceDto>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallMarketPluginRequest {
+    pub plugin_id: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Must be explicitly `true` to replace an already-installed `source = "custom"` plugin with
+    /// the official marketplace version.
+    #[serde(default)]
+    pub replace_custom: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadJsPluginRequest {
+    pub script_js: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub allow_overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsPluginPreviewResponse {
+    pub source: String,
+    pub manifest: PluginManifest,
+    pub script_sha256: String,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    pub compatible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_reason: Option<String>,
+    pub already_installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSourceResponse {
+    pub id: String,
+    pub source: String,
+    pub version: String,
+    pub script_sha256: String,
+    pub script_js: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelReferenceDto {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConflictBody {
+    pub error: String,
+    pub code: &'static str,
+    pub message: String,
+    pub referencing_channels: Vec<ChannelReferenceDto>,
+    pub referencing_routes: Vec<RouteReferenceDto>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1192,21 +1400,50 @@ pub struct MarketQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketPluginVersionDto {
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_core: Option<String>,
+    pub path: String,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketPluginItemDto {
     pub id: String,
     pub name: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
     pub api_version: String,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
     pub min_core: Option<String>,
     pub category: String,
     pub icon: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub description_i18n: BTreeMap<String, String>,
     pub homepage: Option<String>,
     pub repository: Option<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     pub hooks: Vec<String>,
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub versions: Vec<MarketPluginVersionDto>,
+    pub compatible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_reason: Option<String>,
     pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    pub update_available: bool,
     pub enabled: bool,
 }
 
@@ -1345,6 +1582,9 @@ pub fn normalize_channel_config_on_create(cfg: &mut ChannelConfig) -> AppResult<
         ChannelConfig::Notion(notion) => {
             notion.integration_secret = notion.integration_secret.trim().to_string();
         }
+        ChannelConfig::Plugin(plugin) => {
+            plugin.plugin_id = plugin.plugin_id.trim().to_string();
+        }
     }
     cfg.validate()
 }
@@ -1369,6 +1609,7 @@ pub fn normalize_destination_config_on_create(cfg: &mut DestinationConfig) -> Ap
                 _ => None,
             };
         }
+        DestinationConfig::Plugin(_) => {}
     }
     cfg.validate()
 }

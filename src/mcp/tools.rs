@@ -340,6 +340,8 @@ pub struct McpPluginSummary {
     pub name: String,
     pub version: String,
     pub api_version: String,
+    pub kind: crate::plugins::PluginKind,
+    pub runtime: crate::plugins::PluginRuntime,
     pub enabled: bool,
     pub hooks: Vec<crate::plugins::HookKind>,
     pub instances: Vec<McpPluginInstanceSummary>,
@@ -481,6 +483,78 @@ struct ResetAndPollResponse {
 #[derive(Debug, Serialize)]
 struct RetryDeadTasksResponse {
     requeued_count: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct DebugQueryLogsParams {
+    /// Minimum log level (`"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`).
+    pub min_level: Option<String>,
+    /// Module target prefix (e.g. `"feedcourier::scheduler"`).
+    pub target_prefix: Option<String>,
+    /// Inclusive lower bound timestamp (RFC 3339 string, Unix seconds, or Unix milliseconds).
+    pub since: Option<serde_json::Value>,
+    /// Inclusive upper bound timestamp (RFC 3339 string, Unix seconds, or Unix milliseconds).
+    pub until: Option<serde_json::Value>,
+    /// Case-insensitive substring filter applied to message and fields JSON.
+    pub contains: Option<String>,
+    pub task_id: Option<i64>,
+    pub feed_id: Option<i64>,
+    pub route_id: Option<i64>,
+    pub channel_id: Option<i64>,
+    pub destination_id: Option<i64>,
+    pub plugin_id: Option<String>,
+    /// Maximum log entries returned (default `100`, capped at `500`).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct DebugRuntimeSnapshotParams {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DebugTraceTaskParams {
+    /// Delivery task ID to trace.
+    pub task_id: i64,
+}
+
+fn parse_flexible_timestamp_ms(val: Option<&serde_json::Value>) -> Result<Option<i64>, String> {
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    if let Some(n) = v.as_i64() {
+        // Heuristic: values under 10^11 are Unix seconds; otherwise Unix milliseconds.
+        return Ok(Some(if n.abs() < 100_000_000_000 {
+            n.saturating_mul(1000)
+        } else {
+            n
+        }));
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return Ok(Some(if n.abs() < 100_000_000_000 {
+                n.saturating_mul(1000)
+            } else {
+                n
+            }));
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+            return Ok(Some(dt.timestamp_millis()));
+        }
+        return Err(format!(
+            "invalid timestamp '{trimmed}': expected RFC 3339 string or Unix timestamp"
+        ));
+    }
+    Err("timestamp must be an RFC 3339 string or integer Unix timestamp".to_string())
+}
+
+fn file_size_or_zero(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 // =============================================================================
@@ -660,7 +734,11 @@ impl McpServer {
         }
 
         let db = self.state.db();
-        let registry = crate::plugins::PluginRegistry::with_builtins();
+        let registry = self
+            .state
+            .runtime()
+            .map(|r| r.plugins().clone())
+            .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
 
         let rows = match db.list_plugins().await {
             Ok(r) => r,
@@ -684,7 +762,7 @@ impl McpServer {
                 });
         }
 
-        let plugins: Vec<McpPluginSummary> = registry
+        let mut plugins: Vec<McpPluginSummary> = registry
             .list()
             .iter()
             .map(|p| {
@@ -695,12 +773,34 @@ impl McpServer {
                     name: m.name.clone(),
                     version: m.version.clone(),
                     api_version: m.api_version.clone(),
+                    kind: m.kind,
+                    runtime: m.runtime,
                     enabled,
                     hooks: m.hooks.clone(),
                     instances: inst_by_plugin.remove(&m.id).unwrap_or_default(),
                 }
             })
             .collect();
+
+        for js_plugin in registry.list_js() {
+            let m = &js_plugin.manifest;
+            let enabled = js_plugin.enabled
+                && js_plugin.compatible
+                && row_by_id
+                    .get(&m.id)
+                    .map_or(js_plugin.enabled, |r| r.enabled);
+            plugins.push(McpPluginSummary {
+                id: m.id.clone(),
+                name: m.name.clone(),
+                version: m.version.clone(),
+                api_version: m.api_version.clone(),
+                kind: m.kind,
+                runtime: m.runtime,
+                enabled,
+                hooks: m.hooks.clone(),
+                instances: inst_by_plugin.remove(&m.id).unwrap_or_default(),
+            });
+        }
 
         tool_ok(&serde_json::json!({ "plugins": plugins }))
     }
@@ -1278,11 +1378,17 @@ impl McpServer {
                         .collect(),
                     active_weekdays: params.active_weekdays.clone().unwrap_or_default(),
                     plugins: params.plugins.clone().unwrap_or_default(),
+                    plugin_order: Vec::new(),
                 };
                 if let Err(err) = validate_schedule(&mut options) {
                     return Ok(tool_error_from_app(err));
                 }
-                if let Err(err) = validate_mcp_route_plugins(db, &options.plugins).await {
+                let registry = self
+                    .state
+                    .runtime()
+                    .map(|r| r.plugins().clone())
+                    .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
+                if let Err(err) = validate_mcp_route_plugins(&registry, db, &options).await {
                     return Ok(tool_error_from_app(err));
                 }
 
@@ -1431,11 +1537,20 @@ impl McpServer {
                     }
                     if let Some(plugins_map) = params.plugins.clone() {
                         current_opts.plugins = plugins_map;
+                        current_opts.plugin_order.retain(|id| {
+                            current_opts.plugins.get(id).is_some_and(|v| !v.is_null())
+                        });
                     }
                     if let Err(err) = validate_schedule(&mut current_opts) {
                         return Ok(tool_error_from_app(err));
                     }
-                    if let Err(err) = validate_mcp_route_plugins(db, &current_opts.plugins).await {
+                    let registry = self
+                        .state
+                        .runtime()
+                        .map(|r| r.plugins().clone())
+                        .unwrap_or_else(crate::plugins::PluginRegistry::with_builtins);
+                    if let Err(err) = validate_mcp_route_plugins(&registry, db, &current_opts).await
+                    {
                         return Ok(tool_error_from_app(err));
                     }
                     Some(current_opts)
@@ -1766,6 +1881,336 @@ impl McpServer {
             Err(err) => Ok(tool_error_from_app(err)),
         }
     }
+
+    #[rmcp::tool(
+        name = "debug_query_logs",
+        description = "Query redacted structured server logs from the internal log store (admin scope required).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn debug_query_logs(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DebugQueryLogsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(res) = ensure_admin_scope(&ctx, "debug_query_logs") {
+            return Ok(res);
+        }
+
+        let since_ms = match parse_flexible_timestamp_ms(params.since.as_ref()) {
+            Ok(v) => v,
+            Err(msg) => return Ok(tool_error("validation_error", msg)),
+        };
+        let until_ms = match parse_flexible_timestamp_ms(params.until.as_ref()) {
+            Ok(v) => v,
+            Err(msg) => return Ok(tool_error("validation_error", msg)),
+        };
+
+        let contains = match crate::logging::validate_log_keyword(params.contains.as_deref()) {
+            Ok(v) => v,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+
+        let query = crate::logging::LogQuery {
+            min_level: params.min_level,
+            target_prefix: params.target_prefix,
+            since_ms,
+            until_ms,
+            contains,
+            task_id: params.task_id,
+            feed_id: params.feed_id,
+            route_id: params.route_id,
+            channel_id: params.channel_id,
+            destination_id: params.destination_id,
+            plugin_id: params.plugin_id,
+            limit: params.limit.map(|v| v as usize),
+            ascending: false,
+        };
+
+        self.state.log_store().flush_now().await;
+        let result = self.state.log_store().query_logs(&query).await;
+        let wrapped_logs: Vec<serde_json::Value> = result
+            .logs
+            .into_iter()
+            .map(|rec| {
+                serde_json::json!({
+                    "ts_ms": rec.ts_ms,
+                    "level": rec.level,
+                    "target": rec.target,
+                    "message": wrap_untrusted_feed_text("log_message", &rec.message, 600),
+                    "fields_json": wrap_untrusted_feed_text("log_fields", &rec.fields_json, 600),
+                    "feed_id": rec.feed_id,
+                    "task_id": rec.task_id,
+                    "route_id": rec.route_id,
+                    "channel_id": rec.channel_id,
+                    "destination_id": rec.destination_id,
+                    "plugin_id": rec.plugin_id,
+                })
+            })
+            .collect();
+
+        tool_ok(&serde_json::json!({
+            "store": result.store,
+            "count": wrapped_logs.len(),
+            "logs": wrapped_logs,
+        }))
+    }
+
+    #[rmcp::tool(
+        name = "debug_runtime_snapshot",
+        description = "Inspect runtime health snapshot: queue depth, oldest due wait, expired leases, failing hotspots, cooldowns, DB/WAL sizes, and panic counts (admin scope required).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn debug_runtime_snapshot(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(_params): Parameters<DebugRuntimeSnapshotParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(res) = ensure_admin_scope(&ctx, "debug_runtime_snapshot") {
+            return Ok(res);
+        }
+
+        let now = now_unix();
+        let db = self.state.db();
+        let stats = match db.get_debug_runtime_db_stats(now).await {
+            Ok(s) => s,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+        let queue_state = match db.effective_outbox_queue_state(now).await {
+            Ok(qs) => qs,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        };
+        let log_store_status = self.state.log_store().status().await;
+
+        let (started_at, uptime_secs, panics, config_summary, db_sizes) = if let Some(runtime) =
+            self.state.runtime()
+        {
+            let started = runtime.started_at();
+            let (poller_p, outbox_p, maint_p, plugin_events_p) = runtime.panic_counts();
+            let cfg = runtime.config();
+            let net = runtime.http().settings();
+            let (effective_public_url, _) = db
+                .get_effective_public_url(cfg)
+                .await
+                .unwrap_or_else(|_| (cfg.public_url.clone(), false));
+            let db_path = cfg.db_path();
+            let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+            let summary = serde_json::json!({
+                "trust_proxy": cfg.trust_proxy,
+                "has_public_url": effective_public_url.is_some(),
+                "has_outbound_proxy": net.outbound_proxy_url.is_some(),
+                "ssrf_allowlist_count": net.ssrf_allowlist.len(),
+                "retention_hours": cfg.retention_hours,
+                "log_store": cfg.logging.store.as_str(),
+                "log_format": cfg.logging.format.as_str(),
+                "log_retention_days": cfg.logging.retention_days,
+            });
+            let sizes = serde_json::json!({
+                "main_db_bytes": file_size_or_zero(&db_path),
+                "main_wal_bytes": file_size_or_zero(&wal_path),
+                "logs_db_bytes": self.state.log_store().file_size_bytes(),
+            });
+            (
+                Some(started),
+                Some(now.saturating_sub(started).max(0)),
+                serde_json::json!({
+                    "poller": poller_p,
+                    "outbox": outbox_p,
+                    "maintenance": maint_p,
+                    "plugin_events": plugin_events_p,
+                }),
+                summary,
+                sizes,
+            )
+        } else {
+            (
+                None,
+                None,
+                serde_json::json!({
+                    "poller": 0,
+                    "outbox": 0,
+                    "maintenance": 0,
+                    "plugin_events": 0,
+                }),
+                serde_json::json!({ "log_store": self.state.log_store().backend_name() }),
+                serde_json::json!({ "logs_db_bytes": self.state.log_store().file_size_bytes() }),
+            )
+        };
+
+        let top_failing_feeds: Vec<serde_json::Value> = stats
+            .top_failing_feeds
+            .into_iter()
+            .map(|f| {
+                serde_json::json!({
+                    "feed_id": f.feed_id,
+                    "title": wrap_untrusted_feed_text("feed_title", &f.title, MAX_UNTRUSTED_SHORT_CHARS),
+                    "consecutive_failures": f.consecutive_failures,
+                    "last_error": wrap_optional_untrusted_text(
+                        "last_error",
+                        f.last_error.as_deref().map(crate::logging::redact::redact_text).as_deref(),
+                        MAX_UNTRUSTED_SHORT_CHARS,
+                    ),
+                })
+            })
+            .collect();
+
+        let top_failing_destinations: Vec<serde_json::Value> = stats
+            .top_failing_destinations
+            .into_iter()
+            .map(|d| {
+                serde_json::json!({
+                    "destination_id": d.destination_id,
+                    "destination_name": crate::logging::redact::redact_text(&d.destination_name),
+                    "channel_kind": d.channel_kind,
+                    "failure_count_24h": d.failure_count,
+                })
+            })
+            .collect();
+
+        let active_cooldowns: Vec<serde_json::Value> = stats
+            .active_cooldowns
+            .into_iter()
+            .map(|c| {
+                serde_json::json!({
+                    "channel_id": c.channel_id,
+                    "channel_name": crate::logging::redact::redact_text(&c.channel_name),
+                    "channel_kind": c.channel_kind,
+                    "cooldown_until": c.cooldown_until,
+                })
+            })
+            .collect();
+
+        tool_ok(&serde_json::json!({
+            "version": VERSION,
+            "now": now,
+            "started_at": started_at,
+            "uptime_secs": uptime_secs,
+            "config": config_summary,
+            "queue": {
+                "by_status": stats.queue_by_status,
+                "oldest_due_wait_secs": stats.oldest_due_wait_secs,
+                "expired_lease_count": stats.expired_lease_count,
+                "pending_plugin_events": stats.pending_plugin_events,
+                "paused": queue_state.paused,
+                "resume_at": queue_state.resume_at,
+            },
+            "feeds_by_health": stats.feeds_by_health,
+            "top_failing_feeds_24h": top_failing_feeds,
+            "top_failing_destinations_24h": top_failing_destinations,
+            "active_cooldowns": active_cooldowns,
+            "storage_bytes": db_sizes,
+            "panics": panics,
+            "log_store": log_store_status,
+        }))
+    }
+
+    #[rmcp::tool(
+        name = "debug_trace_task",
+        description = "Inspect a single delivery task's redacted state, checkpoint, diagnostic log, and chronological correlated log timeline (admin scope required).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn debug_trace_task(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DebugTraceTaskParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(res) = ensure_admin_scope(&ctx, "debug_trace_task") {
+            return Ok(res);
+        }
+
+        let Some(detail) = (match self
+            .state
+            .db()
+            .get_delivery_task_detail(params.task_id)
+            .await
+        {
+            Ok(row) => row,
+            Err(err) => return Ok(tool_error_from_app(err)),
+        }) else {
+            return Ok(tool_error(
+                "not_found",
+                format!("delivery task {} not found", params.task_id),
+            ));
+        };
+
+        self.state.log_store().flush_now().await;
+        let log_res = self
+            .state
+            .log_store()
+            .query_logs(&crate::logging::LogQuery {
+                task_id: Some(params.task_id),
+                limit: Some(200),
+                ascending: true,
+                ..crate::logging::LogQuery::default()
+            })
+            .await;
+
+        let timeline: Vec<serde_json::Value> = log_res
+            .logs
+            .into_iter()
+            .map(|rec| {
+                serde_json::json!({
+                    "ts_ms": rec.ts_ms,
+                    "level": rec.level,
+                    "target": rec.target,
+                    "message": wrap_untrusted_feed_text("log_message", &rec.message, 600),
+                    "fields_json": wrap_untrusted_feed_text("log_fields", &rec.fields_json, 600),
+                })
+            })
+            .collect();
+
+        let t = detail.task;
+        let redacted_cp = t
+            .checkpoint_json
+            .as_deref()
+            .map(crate::logging::redact::redact_text);
+        let redacted_diag = t
+            .diagnostic_log
+            .as_deref()
+            .map(crate::logging::redact::redact_text);
+
+        tool_ok(&serde_json::json!({
+            "task": {
+                "id": t.id,
+                "status": t.status,
+                "feed_id": detail.feed_id,
+                "entry_id": t.entry_id,
+                "route_id": t.route_id,
+                "channel_id": t.channel_id,
+                "destination_id": t.destination_id,
+                "channel_kind": detail.channel_kind,
+                "route_name": detail.route_name,
+                "channel_name": detail.channel_name.as_deref().map(crate::logging::redact::redact_text),
+                "destination_name": detail.destination_name.as_deref().map(crate::logging::redact::redact_text),
+                "entry_title": wrap_optional_untrusted_text("entry_title", detail.entry_title.as_deref(), MAX_UNTRUSTED_SHORT_CHARS),
+                "feed_title": wrap_optional_untrusted_text("feed_title", detail.feed_title.as_deref(), MAX_UNTRUSTED_SHORT_CHARS),
+                "attempt_count": t.attempt_count,
+                "last_status_code": t.last_status_code,
+                "next_attempt_at": t.next_attempt_at,
+                "lease_until": t.lease_until,
+                "created_at": t.created_at,
+                "completed_at": t.completed_at,
+                "checkpoint_json": wrap_optional_untrusted_text("checkpoint", redacted_cp.as_deref(), 600),
+                "diagnostic_log": wrap_optional_untrusted_text("diagnostic_log", redacted_diag.as_deref(), 600),
+            },
+            "log_store": log_res.store,
+            "logs": timeline,
+        }))
+    }
 }
 
 #[rmcp::tool_handler(router = self.tool_router)]
@@ -1778,6 +2223,63 @@ impl ServerHandler for McpServer {
                     .with_website_url(REPO_URL),
             )
             .with_instructions(build_mcp_instructions())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+        let is_admin = extract_authenticated_token(&context)
+            .is_ok_and(|tok| tok.scope == McpTokenScope::Admin);
+        let mut tools = self.tool_router.list_all();
+        if !is_admin {
+            tools.retain(|tool| !tool.name.starts_with("debug_"));
+        }
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let started = std::time::Instant::now();
+        let tool_name = request.name.to_string();
+        let auth_meta = extract_authenticated_token(&context)
+            .ok()
+            .map(|t| (t.name, t.scope.as_str().to_string()));
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let res = self.tool_router.call(tcc).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (token_name, token_scope) = auth_meta
+            .as_ref()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .unwrap_or(("unknown", "unknown"));
+        let is_error = match &res {
+            Ok(rmcp::model::CallToolResponse::Complete(r)) => r.is_error.unwrap_or(false),
+            Ok(_) => false,
+            Err(_) => true,
+        };
+        tracing::info!(
+            tool_name = %tool_name,
+            token_name = %token_name,
+            token_scope = %token_scope,
+            duration_ms,
+            is_error,
+            "handled MCP tool call"
+        );
+        res
     }
 }
 
@@ -1893,22 +2395,25 @@ fn normalize_optional_pattern(pattern: Option<String>) -> Option<String> {
 }
 
 async fn validate_mcp_route_plugins(
+    registry: &crate::plugins::PluginRegistry,
     db: &crate::db::Database,
-    route_plugins: &BTreeMap<String, serde_json::Value>,
+    route_options: &RouteOptions,
 ) -> crate::error::AppResult<()> {
-    let registry = crate::plugins::PluginRegistry::with_builtins();
-    registry.validate_route_plugins(db, route_plugins).await?;
-    for (plugin_id, opt_val) in route_plugins {
-        if opt_val.is_null() {
+    registry.validate_route_plugins(db, route_options).await?;
+    for (plugin_id, opt_val) in &route_options.plugins {
+        if !crate::plugins::is_route_plugin_enabled(opt_val) {
             continue;
         }
+        let plugin_row = db.get_plugin(plugin_id).await?;
+        let runtime_compat = registry
+            .get_js(plugin_id)
+            .is_none_or(|js| js.compatible && js.runtime.is_some());
+        if !plugin_row.is_some_and(|r| r.enabled) || !runtime_compat {
+            return Err(AppError::Validation(format!(
+                "plugin '{plugin_id}' is not enabled or is incompatible; enable a compatible version in the WebUI before configuring it on a route via MCP"
+            )));
+        }
         if let Some(provider_id) = opt_val.get("provider_id").and_then(|v| v.as_i64()) {
-            let plugin_row = db.get_plugin(plugin_id).await?;
-            if !plugin_row.is_some_and(|r| r.enabled) {
-                return Err(AppError::Validation(format!(
-                    "plugin '{plugin_id}' is not enabled; enable it in the WebUI before assigning a provider via MCP"
-                )));
-            }
             let inst = db.get_plugin_instance(provider_id).await?;
             if !inst.is_some_and(|i| i.enabled) {
                 return Err(AppError::Validation(format!(

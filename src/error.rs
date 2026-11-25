@@ -41,6 +41,9 @@ pub enum AppError {
     #[error("upstream error: {0}")]
     Upstream(String),
 
+    #[error("{0}")]
+    JsSandboxTimeout(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 
@@ -91,7 +94,9 @@ impl AppError {
                 message.clone(),
             ),
             Self::SsrfBlocked(_) => (StatusCode::FORBIDDEN, "ssrf_blocked", self.to_string()),
-            Self::Upstream(msg) => (StatusCode::BAD_GATEWAY, "upstream_error", msg.clone()),
+            Self::Upstream(msg) | Self::JsSandboxTimeout(msg) => {
+                (StatusCode::BAD_GATEWAY, "upstream_error", msg.clone())
+            }
             Self::Json(err) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_json",

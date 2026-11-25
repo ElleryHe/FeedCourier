@@ -186,6 +186,7 @@ impl IngestEngine {
         reset_circuit: bool,
         push_latest_one_if_silent: bool,
     ) -> AppResult<PollFeedOutcome> {
+        let poll_started = std::time::Instant::now();
         let mut feed = self
             .db
             .get_feed(feed_id)
@@ -235,6 +236,14 @@ impl IngestEngine {
                 )
                 .await?;
 
+            tracing::info!(
+                feed_id = feed.id,
+                not_modified = true,
+                new_entries = 0,
+                enqueued_tasks = 0,
+                duration_ms = poll_started.elapsed().as_millis() as u64,
+                "feed poll completed (304 Not Modified)"
+            );
             return Ok(PollFeedOutcome {
                 feed: updated_feed,
                 new_entries: 0,
@@ -393,6 +402,15 @@ impl IngestEngine {
             )
             .await?;
 
+        tracing::info!(
+            feed_id = feed.id,
+            not_modified = false,
+            new_entries,
+            enqueued_tasks,
+            status_code = resp.status.as_u16(),
+            duration_ms = poll_started.elapsed().as_millis() as u64,
+            "feed poll completed"
+        );
         Ok(PollFeedOutcome {
             feed: updated_feed,
             new_entries,
@@ -648,6 +666,13 @@ impl IngestEngine {
             (FeedHealthStatus::Backoff, Some(now.saturating_add(delay)))
         };
 
+        warn!(
+            feed_id = feed.id,
+            consecutive_failures = new_failures,
+            health_status = health_status.as_str(),
+            error = %error_msg,
+            "feed poll failed"
+        );
         self.db
             .record_feed_poll_failure(
                 feed.id,

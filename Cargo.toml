@@ -1,6 +1,6 @@
 [package]
 name = "feedcourier"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
@@ -102,6 +102,9 @@ rmcp = { version = "3.10", features = [
     "uuid",
 ] }
 schemars = "1.2"
+
+# Embedded JavaScript plugin runtime (pure Rust ECMAScript sandbox)
+boa_engine = { version = "0.22.0", default-features = false }
 
 # Embedded WebUI assets
 rust-embed = { version = "8.14", features = ["interpolate-folder-path", "mime-guess"] }

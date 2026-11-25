@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
   CalendarDays,
   ChevronDown,
   ChevronRight,
@@ -30,6 +32,7 @@ import type {
   FeedDto,
   PluginDto,
   PluginRouteOptionPropertySchema,
+  PluginRouteOptionSchema,
   RouteDto,
   RouteOptions,
   SystemLocale,
@@ -37,6 +40,12 @@ import type {
   UpdateRouteRequest,
 } from "@/api/types";
 import { PluginIcon } from "@/components/plugins/PluginIcon";
+import {
+  buildValidatedSchemaConfig,
+  initSchemaFieldValues,
+  type SchemaFieldValues,
+  SchemaFormFields,
+} from "@/components/plugins/SchemaFormFields";
 import {
   Badge,
   Button,
@@ -99,14 +108,48 @@ function extractConfiguredRoutePlugins(
   const entries: Array<[string, Record<string, unknown>]> = [];
   for (const [pluginId, raw] of Object.entries(pluginsMap)) {
     if (!isPlainObject(raw)) continue;
-    const hasActiveVal = Object.values(raw).some(
-      (v) => v !== null && v !== undefined && v !== "",
-    );
-    if (hasActiveVal) {
-      entries.push([pluginId, raw]);
+    if (raw.enabled === false) continue;
+    if (pluginId === "link-rewrite") {
+      const hasActiveVal = Object.values(raw).some(
+        (v) => v !== null && v !== undefined && v !== "",
+      );
+      if (!hasActiveVal) continue;
     }
+    entries.push([pluginId, raw]);
   }
   return entries;
+}
+
+function isSpecialRouteOptionKey(
+  key: string,
+  prop?: PluginRouteOptionPropertySchema,
+): boolean {
+  return (
+    key === "provider_id" ||
+    key === "enabled" ||
+    (key === "strict_mode" && prop?.type === "boolean") ||
+    prop?.source === "plugin_instances"
+  );
+}
+
+function buildRemainingRouteOptionSchema(
+  rawSchema: PluginRouteOptionSchema | undefined,
+): Record<string, unknown> | null {
+  if (!rawSchema || !rawSchema.properties) return null;
+  const remainingProps: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rawSchema.properties)) {
+    if (isSpecialRouteOptionKey(k, v)) continue;
+    remainingProps[k] = v;
+  }
+  if (Object.keys(remainingProps).length === 0) return null;
+  const required = Array.isArray(rawSchema.required)
+    ? rawSchema.required.filter((k) => k in remainingProps)
+    : [];
+  return {
+    type: "object",
+    properties: remainingProps,
+    ...(required.length > 0 ? { required } : {}),
+  };
 }
 
 function cleanPluginOptionsForSubmit(
@@ -114,14 +157,22 @@ function cleanPluginOptionsForSubmit(
 ): Record<string, Record<string, unknown>> {
   const out: Record<string, Record<string, unknown>> = {};
   for (const [pluginId, obj] of Object.entries(draft)) {
+    if (obj.enabled === false) continue;
     const cleaned: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
       if (v === null || v === undefined || v === "") continue;
       cleaned[k] = v;
     }
-    if (Object.keys(cleaned).length > 0) {
-      out[pluginId] = cleaned;
+    if (pluginId === "link-rewrite") {
+      if (
+        cleaned.provider_id === undefined ||
+        cleaned.provider_id === null ||
+        cleaned.provider_id === ""
+      ) {
+        continue;
+      }
     }
+    out[pluginId] = cleaned;
   }
   return out;
 }
@@ -299,6 +350,7 @@ export function RoutesView() {
             <option value="telegram">{m.channels.kindLabels.telegram}</option>
             <option value="smtp">{m.channels.kindLabels.smtp}</option>
             <option value="notion">{m.channels.kindLabels.notion}</option>
+            <option value="plugin">{m.channels.kindLabels.plugin}</option>
           </Select>
         </div>
 
@@ -811,32 +863,160 @@ function RouteEditorModal({
     }
     return initial;
   });
+  const [pluginSchemaValues, setPluginSchemaValues] = useState<
+    Record<string, SchemaFieldValues>
+  >(() => {
+    const initial: Record<string, SchemaFieldValues> = {};
+    for (const [pid, cfg] of extractConfiguredRoutePlugins(
+      route?.options.plugins,
+    )) {
+      const target = plugins.find((p) => p.id === pid);
+      const remaining = buildRemainingRouteOptionSchema(
+        target?.manifest.route_option_schema,
+      );
+      if (remaining) {
+        initial[pid] = initSchemaFieldValues(
+          remaining,
+          cfg,
+          target?.manifest.allowed_hosts,
+        );
+      }
+    }
+    return initial;
+  });
+  const [pluginOrder, setPluginOrder] = useState<string[]>(() => {
+    const configured = extractConfiguredRoutePlugins(
+      route?.options.plugins,
+    ).map(([pid]) => pid);
+    const saved = (route?.options.plugin_order ?? []).filter((id) =>
+      configured.includes(id),
+    );
+    for (const id of configured) {
+      if (!saved.includes(id)) saved.push(id);
+    }
+    return saved;
+  });
   const [pluginsSectionOpen, setPluginsSectionOpen] = useState<boolean>(
     () => extractConfiguredRoutePlugins(route?.options.plugins).length > 0,
   );
   const [enabled, setEnabled] = useState<boolean>(route?.enabled ?? true);
   const [formError, setFormError] = useState<string | null>(null);
 
-  const visiblePlugins = useMemo(
-    () =>
-      plugins.filter(
-        (p) =>
-          p.enabled ||
-          pluginOptions[p.id] !== undefined ||
-          initialPluginIds.has(p.id),
-      ),
-    [plugins, pluginOptions, initialPluginIds],
-  );
-  const activePluginCount = useMemo(
-    () => Object.keys(cleanPluginOptionsForSubmit(pluginOptions)).length,
+  const cleanedPluginOptions = useMemo(
+    () => cleanPluginOptionsForSubmit(pluginOptions),
     [pluginOptions],
   );
+
+  const visiblePlugins = useMemo(() => {
+    const filtered = plugins.filter(
+      (p) =>
+        p.kind !== "channel" &&
+        ((p.enabled && p.compatible) ||
+          pluginOptions[p.id] !== undefined ||
+          initialPluginIds.has(p.id)),
+    );
+    if (pluginOrder.length === 0) return filtered;
+    const rank = new Map<string, number>();
+    pluginOrder.forEach((id, idx) => rank.set(id, idx));
+    return [...filtered].sort((a, b) => {
+      const ra = rank.get(a.id) ?? Number.MAX_SAFE_INTEGER;
+      const rb = rank.get(b.id) ?? Number.MAX_SAFE_INTEGER;
+      if (ra !== rb) return ra - rb;
+      return a.id.localeCompare(b.id);
+    });
+  }, [plugins, pluginOptions, initialPluginIds, pluginOrder]);
+
+  const enabledPluginIds = useMemo(
+    () =>
+      visiblePlugins
+        .map((p) => p.id)
+        .filter((id) => cleanedPluginOptions[id] !== undefined),
+    [visiblePlugins, cleanedPluginOptions],
+  );
+
+  const movePlugin = (pluginId: string, direction: -1 | 1) => {
+    const idx = enabledPluginIds.indexOf(pluginId);
+    const target = idx + direction;
+    if (idx < 0 || target < 0 || target >= enabledPluginIds.length) return;
+    const next = [...enabledPluginIds];
+    [next[idx], next[target]] = [next[target], next[idx]];
+    setPluginOrder(next);
+  };
+  const activePluginCount = enabledPluginIds.length;
+
+  const toggleRoutePlugin = (pluginId: string, enabledOnRoute: boolean) => {
+    if (enabledOnRoute) {
+      const targetPlugin = plugins.find((p) => p.id === pluginId);
+      setPluginOptions((prev) => {
+        const current: Record<string, unknown> = { ...(prev[pluginId] ?? {}) };
+        if (current.enabled === false) {
+          delete current.enabled;
+        }
+        const rawSchema = targetPlugin?.manifest.route_option_schema;
+        const requiredSet = new Set<string>(
+          Array.isArray(rawSchema?.required)
+            ? rawSchema.required.filter((k): k is string => typeof k === "string")
+            : [],
+        );
+        const props = rawSchema?.properties ?? {};
+        for (const [propKey, propSchema] of Object.entries(props)) {
+          if (!isSpecialRouteOptionKey(propKey, propSchema)) continue;
+          if (current[propKey] !== undefined) continue;
+          if (propSchema.default !== undefined && propSchema.default !== null) {
+            current[propKey] = propSchema.default;
+          } else if (
+            (propKey === "provider_id" ||
+              propSchema.source === "plugin_instances") &&
+            (requiredSet.has(propKey) || propSchema.nullable === false) &&
+            targetPlugin &&
+            targetPlugin.instances.length > 0
+          ) {
+            const preferred =
+              targetPlugin.instances.find((i) => i.enabled) ??
+              targetPlugin.instances[0];
+            current[propKey] = preferred.id;
+          }
+        }
+        return { ...prev, [pluginId]: current };
+      });
+      const remainingSchema = buildRemainingRouteOptionSchema(
+        targetPlugin?.manifest.route_option_schema,
+      );
+      if (remainingSchema) {
+        setPluginSchemaValues((prev) => ({
+          ...prev,
+          [pluginId]: initSchemaFieldValues(
+            remainingSchema,
+            pluginOptions[pluginId],
+            targetPlugin?.manifest.allowed_hosts,
+          ),
+        }));
+      }
+      setPluginOrder((prev) =>
+        prev.includes(pluginId) ? prev : [...prev, pluginId],
+      );
+    } else {
+      setPluginOptions((prev) => {
+        const next = { ...prev };
+        delete next[pluginId];
+        return next;
+      });
+      setPluginSchemaValues((prev) => {
+        if (!(pluginId in prev)) return prev;
+        const next = { ...prev };
+        delete next[pluginId];
+        return next;
+      });
+      setPluginOrder((prev) => prev.filter((id) => id !== pluginId));
+    }
+  };
 
   const updatePluginField = (
     pluginId: string,
     propKey: string,
     value: unknown,
   ) => {
+    let removedLinkRewrite = false;
     setPluginOptions((prev) => {
       const nextPluginObj = { ...(prev[pluginId] ?? {}) };
       if (value === null || value === undefined || value === "") {
@@ -845,13 +1025,26 @@ function RouteEditorModal({
         nextPluginObj[propKey] = value;
       }
       const next = { ...prev };
-      if (Object.keys(nextPluginObj).length === 0) {
+      if (
+        pluginId === "link-rewrite" &&
+        Object.keys(nextPluginObj).length === 0
+      ) {
         delete next[pluginId];
+        removedLinkRewrite = true;
       } else {
         next[pluginId] = nextPluginObj;
       }
       return next;
     });
+    if (pluginId === "link-rewrite") {
+      if (removedLinkRewrite || value === null || value === undefined || value === "") {
+        setPluginOrder((prev) => prev.filter((id) => id !== pluginId));
+      } else {
+        setPluginOrder((prev) =>
+          prev.includes(pluginId) ? prev : [...prev, pluginId],
+        );
+      }
+    }
   };
 
   const selectedChannel = destinationsById.get(effectiveDestinationId)?.channel;
@@ -895,7 +1088,9 @@ function RouteEditorModal({
   };
 
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (
+      finalPlugins: Record<string, Record<string, unknown>>,
+    ) => {
       const options: RouteOptions = {
         ...(selectedChannel?.kind === "telegram"
           ? {
@@ -908,7 +1103,10 @@ function RouteEditorModal({
         timezone: trimmedTz || null,
         active_windows: activeWindows,
         active_weekdays: [...activeWeekdays].sort((a, b) => a - b),
-        plugins: cleanPluginOptionsForSubmit(pluginOptions),
+        plugins: finalPlugins,
+        plugin_order: visiblePlugins
+          .map((p) => p.id)
+          .filter((id) => finalPlugins[id] !== undefined),
       };
 
       if (isEdit && route) {
@@ -988,7 +1186,51 @@ function RouteEditorModal({
       return;
     }
 
-    saveMutation.mutate();
+    const basePlugins = cleanPluginOptionsForSubmit(pluginOptions);
+    const finalPlugins: Record<string, Record<string, unknown>> = {};
+    for (const [pluginId, rawCfg] of Object.entries(basePlugins)) {
+      const targetPlugin = plugins.find((p) => p.id === pluginId);
+      const remainingSchema = buildRemainingRouteOptionSchema(
+        targetPlugin?.manifest.route_option_schema,
+      );
+      if (!remainingSchema) {
+        finalPlugins[pluginId] = rawCfg;
+        continue;
+      }
+      const remProps = (remainingSchema.properties ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const values =
+        pluginSchemaValues[pluginId] ??
+        initSchemaFieldValues(
+          remainingSchema,
+          rawCfg,
+          targetPlugin?.manifest.allowed_hosts,
+        );
+      const { config, error } = buildValidatedSchemaConfig(
+        remainingSchema,
+        values,
+        false,
+        undefined,
+        m,
+      );
+      if (error || !config) {
+        const prefix = targetPlugin?.manifest.name ?? pluginId;
+        setFormError(`${prefix}: ${error ?? "Invalid plugin option"}`);
+        return;
+      }
+      const merged: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rawCfg)) {
+        if (!(k in remProps)) {
+          merged[k] = v;
+        }
+      }
+      Object.assign(merged, config);
+      finalPlugins[pluginId] = merged;
+    }
+
+    saveMutation.mutate(finalPlugins);
   };
 
   return (
@@ -1513,6 +1755,11 @@ function RouteEditorModal({
 
           {pluginsSectionOpen && (
             <div className="space-y-3 border-t border-zinc-100 p-4 dark:border-zinc-800">
+              {enabledPluginIds.length > 1 && (
+                <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                  {m.routes.editor.pluginOrderHint}
+                </p>
+              )}
               {visiblePlugins.length === 0 ? (
                 <p className="text-xs text-zinc-500 dark:text-zinc-400">
                   {m.routes.editor.pluginsNoneEnabled}
@@ -1524,7 +1771,27 @@ function RouteEditorModal({
                   const propEntries = Object.entries(properties) as Array<
                     [string, PluginRouteOptionPropertySchema]
                   >;
+                  const instanceSelectEntries = propEntries.filter(
+                    ([propKey, schema]) =>
+                      propKey === "provider_id" ||
+                      schema.source === "plugin_instances",
+                  );
+                  const strictModeEntry = propEntries.find(
+                    ([propKey, schema]) =>
+                      propKey === "strict_mode" && schema.type === "boolean",
+                  );
+                  const remainingSchema = buildRemainingRouteOptionSchema(
+                    plugin.manifest.route_option_schema,
+                  );
+                  const hasAnyOption =
+                    instanceSelectEntries.length > 0 ||
+                    strictModeEntry !== undefined ||
+                    remainingSchema !== null;
                   const currentCfg = pluginOptions[plugin.id] ?? {};
+                  const isDynamicProcessor = plugin.id !== "link-rewrite";
+                  const isEnabledOnRoute =
+                    cleanedPluginOptions[plugin.id] !== undefined;
+                  const enabledIdx = enabledPluginIds.indexOf(plugin.id);
 
                   return (
                     <div
@@ -1546,178 +1813,170 @@ function RouteEditorModal({
                             </Badge>
                           )}
                         </div>
+                        <div className="flex items-center gap-2">
+                          {isEnabledOnRoute && enabledPluginIds.length > 1 && (
+                            <div className="flex items-center gap-1">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={enabledIdx <= 0}
+                                onClick={() => movePlugin(plugin.id, -1)}
+                                title={m.routes.editor.pluginMoveUp}
+                                aria-label={m.routes.editor.pluginMoveUp}
+                                className="h-6 w-6"
+                              >
+                                <ArrowUp className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={
+                                  enabledIdx < 0 ||
+                                  enabledIdx === enabledPluginIds.length - 1
+                                }
+                                onClick={() => movePlugin(plugin.id, 1)}
+                                title={m.routes.editor.pluginMoveDown}
+                                aria-label={m.routes.editor.pluginMoveDown}
+                                className="h-6 w-6"
+                              >
+                                <ArrowDown className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          )}
+                          {isDynamicProcessor && (
+                            <Switch
+                              id={`route-plugin-enable-${plugin.id}`}
+                              checked={isEnabledOnRoute}
+                              onCheckedChange={(checked) =>
+                                toggleRoutePlugin(plugin.id, checked)
+                              }
+                              label={m.routes.editor.pluginEnableOnRoute}
+                            />
+                          )}
+                        </div>
                       </div>
 
-                      <div className="grid gap-2.5 sm:grid-cols-2">
-                        {propEntries.map(([propKey, schema]) => {
-                          const fieldVal = currentCfg[propKey];
-                          const fieldId = `route-plugin-${plugin.id}-${propKey}`;
+                      {(!isDynamicProcessor || isEnabledOnRoute) &&
+                        (!hasAnyOption ? (
+                          <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                            {m.routes.editor.pluginNoRouteOptionsHint}
+                          </p>
+                        ) : (
+                          <div className="space-y-3">
+                            {instanceSelectEntries.map(([propKey, schema]) => {
+                              const fieldVal = currentCfg[propKey];
+                              const fieldId = `route-plugin-${plugin.id}-${propKey}`;
+                              const selectedId =
+                                typeof fieldVal === "number" ? fieldVal : null;
+                              const missingSelected =
+                                selectedId !== null &&
+                                !plugin.instances.some(
+                                  (i) => i.id === selectedId,
+                                );
 
-                          if (
-                            schema.type === "select" &&
-                            schema.source === "plugin_instances"
-                          ) {
-                            const selectedId =
-                              typeof fieldVal === "number" ? fieldVal : null;
-                            const missingSelected =
-                              selectedId !== null &&
-                              !plugin.instances.some(
-                                (i) => i.id === selectedId,
-                              );
-
-                            return (
-                              <div key={propKey} className="sm:col-span-2">
-                                <Label htmlFor={fieldId}>
-                                  {schema.title || propKey}
-                                </Label>
-                                <Select
-                                  id={fieldId}
-                                  value={
-                                    selectedId !== null
-                                      ? String(selectedId)
-                                      : ""
-                                  }
-                                  onChange={(e) => {
-                                    const raw = e.target.value;
-                                    updatePluginField(
-                                      plugin.id,
-                                      propKey,
-                                      raw ? Number(raw) : null,
-                                    );
-                                  }}
-                                  className="mt-1 h-8 text-xs"
-                                >
-                                  {schema.nullable !== false && (
-                                    <option value="">
-                                      {m.common.disabled}
-                                    </option>
-                                  )}
-                                  {missingSelected && selectedId !== null && (
-                                    <option value={String(selectedId)}>
-                                      {m.routes.editor.pluginsMissingProvider(
-                                        selectedId,
-                                      )}
-                                    </option>
-                                  )}
-                                  {plugin.instances.map((inst) => (
-                                    <option key={inst.id} value={inst.id}>
-                                      {inst.name}
-                                      {!inst.enabled
-                                        ? ` (${m.common.disabled})`
-                                        : ""}
-                                    </option>
-                                  ))}
-                                </Select>
-                                {plugin.instances.length === 0 && (
-                                  <FieldHint>
-                                    {m.routes.editor.pluginsNoProviders}
-                                  </FieldHint>
-                                )}
-                              </div>
-                            );
-                          }
-
-                          if (
-                            schema.type === "select" &&
-                            Array.isArray(schema.enum)
-                          ) {
-                            return (
-                              <div key={propKey}>
-                                <Label htmlFor={fieldId}>
-                                  {schema.title || propKey}
-                                </Label>
-                                <Select
-                                  id={fieldId}
-                                  value={
-                                    typeof fieldVal === "string" ? fieldVal : ""
-                                  }
-                                  onChange={(e) =>
-                                    updatePluginField(
-                                      plugin.id,
-                                      propKey,
-                                      e.target.value || null,
-                                    )
-                                  }
-                                  className="mt-1 h-8 text-xs"
-                                >
-                                  {schema.nullable !== false && (
-                                    <option value="">
-                                      {m.common.disabled}
-                                    </option>
-                                  )}
-                                  {schema.enum.map((opt) => (
-                                    <option key={opt} value={opt}>
-                                      {opt}
-                                    </option>
-                                  ))}
-                                </Select>
-                              </div>
-                            );
-                          }
-
-                          if (schema.type === "boolean") {
-                            return (
-                              <div key={propKey} className="sm:col-span-2">
-                                <Switch
-                                  id={fieldId}
-                                  checked={
-                                    typeof fieldVal === "boolean"
-                                      ? fieldVal
-                                      : Boolean(schema.default)
-                                  }
-                                  onCheckedChange={(checked) =>
-                                    updatePluginField(
-                                      plugin.id,
-                                      propKey,
-                                      checked,
-                                    )
-                                  }
-                                  label={schema.title || propKey}
-                                  description={schema.description}
-                                />
-                              </div>
-                            );
-                          }
-
-                          return (
-                            <div key={propKey}>
-                              <Label htmlFor={fieldId}>
-                                {schema.title || propKey}
-                              </Label>
-                              <Input
-                                id={fieldId}
-                                type={
-                                  schema.type === "number" ? "number" : "text"
-                                }
-                                value={
-                                  fieldVal !== undefined && fieldVal !== null
-                                    ? String(fieldVal)
-                                    : ""
-                                }
-                                onChange={(e) => {
-                                  const raw = e.target.value;
-                                  if (!raw) {
-                                    updatePluginField(plugin.id, propKey, null);
-                                  } else if (schema.type === "number") {
-                                    const num = Number(raw);
-                                    if (!Number.isNaN(num)) {
+                              return (
+                                <div key={propKey}>
+                                  <Label htmlFor={fieldId}>
+                                    {schema.title || propKey}
+                                  </Label>
+                                  <Select
+                                    id={fieldId}
+                                    value={
+                                      selectedId !== null
+                                        ? String(selectedId)
+                                        : ""
+                                    }
+                                    onChange={(e) => {
+                                      const raw = e.target.value;
                                       updatePluginField(
                                         plugin.id,
                                         propKey,
-                                        num,
+                                        raw ? Number(raw) : null,
                                       );
+                                    }}
+                                    className="mt-1 h-8 text-xs"
+                                  >
+                                    {schema.nullable !== false && (
+                                      <option value="">
+                                        {m.common.disabled}
+                                      </option>
+                                    )}
+                                    {missingSelected && selectedId !== null && (
+                                      <option value={String(selectedId)}>
+                                        {m.routes.editor.pluginsMissingProvider(
+                                          selectedId,
+                                        )}
+                                      </option>
+                                    )}
+                                    {plugin.instances.map((inst) => (
+                                      <option key={inst.id} value={inst.id}>
+                                        {inst.name}
+                                        {!inst.enabled
+                                          ? ` (${m.common.disabled})`
+                                          : ""}
+                                      </option>
+                                    ))}
+                                  </Select>
+                                  {plugin.instances.length === 0 && (
+                                    <FieldHint>
+                                      {m.routes.editor.pluginsNoProviders}
+                                    </FieldHint>
+                                  )}
+                                </div>
+                              );
+                            })}
+
+                            {strictModeEntry && (() => {
+                              const [propKey, schema] = strictModeEntry;
+                              const fieldVal = currentCfg[propKey];
+                              const fieldId = `route-plugin-${plugin.id}-${propKey}`;
+                              return (
+                                <div key={propKey}>
+                                  <Switch
+                                    id={fieldId}
+                                    checked={
+                                      typeof fieldVal === "boolean"
+                                        ? fieldVal
+                                        : Boolean(schema.default)
                                     }
-                                  } else {
-                                    updatePluginField(plugin.id, propKey, raw);
-                                  }
+                                    onCheckedChange={(checked) =>
+                                      updatePluginField(
+                                        plugin.id,
+                                        propKey,
+                                        checked,
+                                      )
+                                    }
+                                    label={schema.title || propKey}
+                                    description={schema.description}
+                                  />
+                                </div>
+                              );
+                            })()}
+
+                            {remainingSchema && (
+                              <SchemaFormFields
+                                idPrefix={`route-plugin-${plugin.id}`}
+                                schema={remainingSchema}
+                                values={
+                                  pluginSchemaValues[plugin.id] ??
+                                  initSchemaFieldValues(
+                                    remainingSchema,
+                                    currentCfg,
+                                    plugin.manifest.allowed_hosts,
+                                  )
+                                }
+                                allowedHosts={plugin.manifest.allowed_hosts}
+                                onChange={(nextValues) => {
+                                  setPluginSchemaValues((prev) => ({
+                                    ...prev,
+                                    [plugin.id]: nextValues,
+                                  }));
+                                  setFormError(null);
                                 }}
-                                placeholder={schema.placeholder}
-                                className="mt-1 h-8 text-xs"
                               />
-                            </div>
-                          );
-                        })}
-                      </div>
+                            )}
+                          </div>
+                        ))}
                     </div>
                   );
                 })

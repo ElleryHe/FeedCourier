@@ -143,6 +143,34 @@ docker run -d --name feedcourier -p 8080:8080 -v "$(pwd)/data:/data" \
 
 ---
 
+## 版本升级与优雅停机 {#upgrading-and-graceful-shutdown}
+
+发件箱的全部待投递任务、断点进度（包括 SMTP 逐人已发记录、Telegram 媒体分批偏移与 Notion 页面/异步任务 ID）、文章去重指纹及配额账本均持久化保存在 `DATA_DIR`（`/data`）的 SQLite 数据库中。只要保留持久化卷，升级容器镜像或二进制不会丢失进度。
+
+- **优雅停机（`SIGTERM` / `SIGINT`）**：收到停机信号后，FeedCourier 会先排空 HTTP 连接，同时在两个投递任务之间立即停止领取新任务，等待当前在途任务发送完成后再干净关闭 SQLite。
+- **异常中断自动恢复**：若进程在投递中途被强制终止，下次启动时会立即回收遗留的 `delivering` 任务并完整保留断点进度，无需等待租约自然到期。
+- **Docker Compose 建议**：推荐配置 `stop_grace_period: 30s`（Docker 默认仅 10 秒），避免较慢的 SMTP、Telegram 媒体上传或 Notion 请求在完成前被强杀：
+
+```yaml
+services:
+  feedcourier:
+    image: elleryhe/feedcourier:latest
+    stop_grace_period: 30s
+    volumes:
+      - ./data:/data
+```
+
+---
+
+## 结构化日志与日志库（`logs.db` / ClickHouse） {#structured-logging-and-storage}
+
+FeedCourier 会将脱敏后的结构化日志同时输出到**标准输出**（`docker logs`，支持 `LOG_FORMAT=text` 或 `json`），并异步批量写入独立的日志存储，避免与主业务库争抢写锁：
+
+- **默认 SQLite 日志库（`LOG_STORE=sqlite`）**：写入 `<DATA_DIR>/logs.db`（与 `feedcourier.db` 物理分离）。默认保留 **`LOG_RETENTION_DAYS=7`** 天且最多 **`LOG_MAX_ROWS=100000`** 条，由每小时维护任务自动清理；如仅需 `docker logs` 且不希望在 `/data` 中生成额外文件，可设为 `LOG_STORE=off`。
+- **ClickHouse 后端（`LOG_STORE=clickhouse`）**：大规模部署可配置 `LOG_CLICKHOUSE_URL`（及可选的 `_DATABASE` / `_TABLE` / `_USER` / `_PASSWORD`）。启动时自动创建带 `TTL` 的 `MergeTree` 表并通过 HTTP `JSONEachRow` 批量写入；若 ClickHouse 暂时不可达，日志缓冲溢出后自动丢弃并限频告警，绝不阻塞启动或投递。
+
+---
+
 ## 自动与手动清理正文缓存（GC）
 
 - **后台定时清理**：每间隔 1 小时自动运行一次：

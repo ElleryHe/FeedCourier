@@ -18,7 +18,10 @@ use url::Url;
 
 use crate::config::{APP_NAME, AppConfig, REPO_URL, VERSION};
 use crate::error::{AppError, AppResult};
-use crate::net::ssrf::{CustomDnsLookup, SsrfDnsResolver, SsrfPolicy, find_ssrf_blocked_in_error};
+use crate::net::ssrf::{
+    CustomDnsLookup, PluginMetadataGuardDnsResolver, SsrfDnsResolver, SsrfPolicy,
+    check_hard_blocked_plugin_url, find_ssrf_blocked_in_error,
+};
 
 /// Default maximum response body size when fetching RSS/Atom/JSON Feeds (`10 MiB`).
 pub const DEFAULT_MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
@@ -142,6 +145,29 @@ pub struct FetchedResponse {
     pub bytes: Bytes,
 }
 
+/// Request parameters for a sandboxed JS plugin `fc.fetch(...)` HTTP call.
+#[derive(Debug, Clone)]
+pub struct PluginHttpRequest {
+    pub method: Method,
+    pub url: String,
+    pub headers: HeaderMap,
+    pub body: Option<Vec<u8>>,
+    pub timeout: Duration,
+    pub max_bytes: usize,
+    /// When `true`, target `(scheme, host, port)` matched an admin-configured `format: "uri"`
+    /// field: bypasses private/LAN IP blocks while still hard-blocking cloud metadata & redirects.
+    pub allow_private_origin: bool,
+    pub use_proxy: bool,
+}
+
+/// Response returned to a sandboxed JS plugin `fc.fetch(...)` HTTP call.
+#[derive(Debug, Clone)]
+pub struct PluginHttpResponse {
+    pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub body: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProxyDnsMode {
     /// Proxy resolves hostnames remotely (`socks5h`, `socks4a`, `http`, `https`).
@@ -160,11 +186,18 @@ struct ClientSet {
     trusted_direct_client: reqwest::Client,
     /// Optional proxied client for trusted downstream APIs.
     trusted_proxied_client: Option<reqwest::Client>,
+    /// Direct client for admin-configured `format: "uri"` plugin origins (no proxy, no redirect,
+    /// hard-blocks cloud metadata/unspecified IPs at connect time).
+    plugin_origin_direct_client: reqwest::Client,
+    /// Optional proxied client for admin-configured `format: "uri"` plugin origins (no redirect),
+    /// paired with proxy DNS resolution mode so local-DNS proxies still enforce metadata IP checks.
+    plugin_origin_proxied_client: Option<(reqwest::Client, ProxyDnsMode)>,
 }
 
 struct ProtectedHttpInner {
     policy: Arc<RwLock<SsrfPolicy>>,
     resolver: SsrfDnsResolver,
+    plugin_resolver: PluginMetadataGuardDnsResolver,
     state: RwLock<ClientSet>,
 }
 
@@ -198,12 +231,14 @@ impl ProtectedHttpClient {
             &settings.ssrf_allowlist,
         )?));
         let resolver = SsrfDnsResolver::new(Arc::clone(&policy));
-        let client_set = build_client_set(settings, &resolver)?;
+        let plugin_resolver = PluginMetadataGuardDnsResolver::new();
+        let client_set = build_client_set(settings, &resolver, &plugin_resolver)?;
 
         Ok(Self {
             inner: Arc::new(ProtectedHttpInner {
                 policy,
                 resolver,
+                plugin_resolver,
                 state: RwLock::new(client_set),
             }),
         })
@@ -220,13 +255,16 @@ impl ProtectedHttpClient {
         let policy = Arc::new(RwLock::new(SsrfPolicy::from_allowlist(
             &settings.ssrf_allowlist,
         )?));
-        let resolver = SsrfDnsResolver::with_custom_lookup(Arc::clone(&policy), lookup);
-        let client_set = build_client_set(settings, &resolver)?;
+        let resolver =
+            SsrfDnsResolver::with_custom_lookup(Arc::clone(&policy), Arc::clone(&lookup));
+        let plugin_resolver = PluginMetadataGuardDnsResolver::with_custom_lookup(lookup);
+        let client_set = build_client_set(settings, &resolver, &plugin_resolver)?;
 
         Ok(Self {
             inner: Arc::new(ProtectedHttpInner {
                 policy,
                 resolver,
+                plugin_resolver,
                 state: RwLock::new(client_set),
             }),
         })
@@ -255,7 +293,8 @@ impl ProtectedHttpClient {
     /// Hot-reload [`NetSettings`] (`outbound_proxy_url` and `ssrf_allowlist`) without process restart.
     pub fn update_settings(&self, settings: NetSettings) -> AppResult<()> {
         let new_policy = SsrfPolicy::from_allowlist(&settings.ssrf_allowlist)?;
-        let new_client_set = build_client_set(settings, &self.inner.resolver)?;
+        let new_client_set =
+            build_client_set(settings, &self.inner.resolver, &self.inner.plugin_resolver)?;
 
         {
             let mut policy_guard = self
@@ -622,13 +661,165 @@ impl ProtectedHttpClient {
             bytes: buf.freeze(),
         })
     }
+
+    /// Execute an outbound HTTP call on behalf of a sandboxed JS plugin (`fc.fetch`).
+    ///
+    /// Security guarantees:
+    /// - Enforces `http://`/`https://` without embedded credentials and unconditionally blocks
+    ///   cloud metadata / unspecified / broadcast targets.
+    /// - Disallows HTTP 3xx redirects (`redirect::Policy::none()` + explicit status check).
+    /// - When `req.allow_private_origin` is `false` (plugin `allowed_hosts` path), enforces full
+    ///   `SsrfPolicy` + connect-time `SsrfDnsResolver`.
+    /// - When `req.use_proxy` is `true`, requires a configured global `OUTBOUND_PROXY` (fail-closed).
+    /// - Streams and enforces `req.max_bytes` hard ceiling.
+    pub async fn send_plugin_http(&self, req: PluginHttpRequest) -> AppResult<PluginHttpResponse> {
+        let parsed_url = Url::parse(req.url.trim())?;
+        check_hard_blocked_plugin_url(&parsed_url)?;
+
+        let (client, proxy_dns_mode) = {
+            let guard = self
+                .inner
+                .state
+                .read()
+                .expect("ProtectedHttpClient state RwLock poisoned");
+            if req.allow_private_origin {
+                if req.use_proxy {
+                    let (proxied, mode) =
+                        guard.plugin_origin_proxied_client.clone().ok_or_else(|| {
+                            AppError::Validation(
+                                "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                                    .to_string(),
+                            )
+                        })?;
+                    (proxied, Some(mode))
+                } else {
+                    (guard.plugin_origin_direct_client.clone(), None)
+                }
+            } else if req.use_proxy {
+                if let Some((proxied, mode)) = &guard.ssrf_proxied_client {
+                    (proxied.clone(), Some(*mode))
+                } else {
+                    return Err(AppError::Validation(
+                        "use_proxy is enabled, but no global OUTBOUND_PROXY is configured in Settings"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                (guard.ssrf_direct_client.clone(), None)
+            }
+        };
+
+        if req.allow_private_origin {
+            // For local-DNS proxies (`socks5://`, `socks4://`), pre-resolve locally and reject any
+            // cloud metadata / unspecified / broadcast IP before opening the proxied tunnel.
+            // (Direct connections enforce the same check at connect time via `PluginMetadataGuardDnsResolver`;
+            // remote-DNS proxies such as `http://`/`socks5h://` enforce literal IP & metadata hostname
+            // blocking via `check_hard_blocked_plugin_url` above.)
+            if matches!(proxy_dns_mode, Some(ProxyDnsMode::Local))
+                && let Some(host_str) = parsed_url.host_str()
+            {
+                self.inner
+                    .plugin_resolver
+                    .resolve_and_check_metadata(host_str)
+                    .await?;
+            }
+        } else {
+            {
+                let policy = self
+                    .inner
+                    .policy
+                    .read()
+                    .expect("SSRF policy RwLock poisoned")
+                    .clone();
+                let remote_proxy_dns = matches!(proxy_dns_mode, Some(ProxyDnsMode::Remote));
+                policy.validate_url_hop(&parsed_url, remote_proxy_dns)?;
+            }
+            if matches!(proxy_dns_mode, Some(ProxyDnsMode::Local))
+                && let Some(host_str) = parsed_url.host_str()
+            {
+                self.inner.resolver.resolve_and_validate(host_str).await?;
+            }
+        }
+
+        let mut rb = client
+            .request(req.method, parsed_url.clone())
+            .timeout(req.timeout)
+            .headers(req.headers);
+        if let Some(body) = req.body {
+            rb = rb.body(body);
+        }
+
+        let resp = rb
+            .send()
+            .await
+            .map_err(|err| map_reqwest_error(&parsed_url, err))?;
+
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(AppError::SsrfBlocked(format!(
+                "redirect (HTTP {}) is disallowed on plugin fc.fetch requests to '{parsed_url}'",
+                status.as_u16()
+            )));
+        }
+
+        let mut resp_headers = std::collections::BTreeMap::new();
+        for (name, val) in resp.headers() {
+            if let Ok(v_str) = val.to_str() {
+                let key = name.as_str().to_ascii_lowercase();
+                resp_headers
+                    .entry(key)
+                    .and_modify(|existing: &mut String| {
+                        existing.push_str(", ");
+                        existing.push_str(v_str);
+                    })
+                    .or_insert_with(|| v_str.to_string());
+            }
+        }
+
+        let max_bytes = req.max_bytes;
+        if let Some(declared_len) = resp.content_length()
+            && declared_len > max_bytes as u64
+        {
+            return Err(AppError::Upstream(format!(
+                "plugin fetch response Content-Length ({declared_len} bytes) exceeds limit ({max_bytes} bytes)"
+            )));
+        }
+
+        let initial_cap = resp
+            .content_length()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(4 * 1024)
+            .min(max_bytes)
+            .min(64 * 1024);
+        let mut buf = BytesMut::with_capacity(initial_cap);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.map_err(|err| map_reqwest_error(&parsed_url, err))?;
+            if buf.len().saturating_add(chunk.len()) > max_bytes {
+                return Err(AppError::Upstream(format!(
+                    "plugin fetch response body exceeded limit ({max_bytes} bytes)"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        Ok(PluginHttpResponse {
+            status: status.as_u16(),
+            headers: resp_headers,
+            body: String::from_utf8_lossy(&buf).into_owned(),
+        })
+    }
 }
 
 fn default_user_agent() -> String {
     format!("{APP_NAME}/{VERSION} (+{REPO_URL})")
 }
 
-fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppResult<ClientSet> {
+fn build_client_set(
+    settings: NetSettings,
+    resolver: &SsrfDnsResolver,
+    plugin_resolver: &PluginMetadataGuardDnsResolver,
+) -> AppResult<ClientSet> {
     let ua = default_user_agent();
 
     let ssrf_direct_client = reqwest::Client::builder()
@@ -649,13 +840,29 @@ fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppRes
         .build()
         .map_err(|err| AppError::Config(format!("failed to build trusted HTTP client: {err}")))?;
 
+    let plugin_origin_direct_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(plugin_resolver.clone()))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .user_agent(&ua)
+        .build()
+        .map_err(|err| {
+            AppError::Config(format!("failed to build plugin direct HTTP client: {err}"))
+        })?;
+
     let proxy_raw = settings
         .outbound_proxy_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (ssrf_proxied_client, trusted_proxied_client) = if let Some(proxy_str) = proxy_raw {
+    let (ssrf_proxied_client, trusted_proxied_client, plugin_origin_proxied_client) = if let Some(
+        proxy_str,
+    ) =
+        proxy_raw
+    {
         let proxy_url = Url::parse(proxy_str).map_err(|err| {
             AppError::Validation(format!("invalid outbound_proxy_url '{proxy_str}': {err}"))
         })?;
@@ -673,6 +880,9 @@ fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppRes
             AppError::Validation(format!("invalid outbound_proxy_url '{proxy_str}': {err}"))
         })?;
         let proxy_trusted = Proxy::all(proxy_str).map_err(|err| {
+            AppError::Validation(format!("invalid outbound_proxy_url '{proxy_str}': {err}"))
+        })?;
+        let proxy_plugin = Proxy::all(proxy_str).map_err(|err| {
             AppError::Validation(format!("invalid outbound_proxy_url '{proxy_str}': {err}"))
         })?;
 
@@ -701,9 +911,25 @@ fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppRes
                 ))
             })?;
 
-        (Some((ssrf_proxied, dns_mode)), Some(trusted_proxied))
+        let plugin_proxied = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy_plugin)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .user_agent(&ua)
+            .build()
+            .map_err(|err| {
+                AppError::Config(format!("failed to build plugin proxied HTTP client: {err}"))
+            })?;
+
+        (
+            Some((ssrf_proxied, dns_mode)),
+            Some(trusted_proxied),
+            Some((plugin_proxied, dns_mode)),
+        )
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let normalized_proxy = proxy_raw.map(ToOwned::to_owned);
@@ -716,6 +942,8 @@ fn build_client_set(settings: NetSettings, resolver: &SsrfDnsResolver) -> AppRes
         ssrf_proxied_client,
         trusted_direct_client,
         trusted_proxied_client,
+        plugin_origin_direct_client,
+        plugin_origin_proxied_client,
     })
 }
 

@@ -164,6 +164,34 @@ At startup FeedCourier removes the TOTP secret and all recovery codes and logs a
 
 ---
 
+## Upgrading & Graceful Shutdown {#upgrading-and-graceful-shutdown}
+
+All outbox delivery tasks, checkpoints (including per-recipient SMTP progress, Telegram media batch offsets, and Notion page/async IDs), article fingerprints, and quota ledgers are persisted in SQLite under `DATA_DIR` (`/data`). Upgrading the container image or binary preserves queue progress as long as `/data` stays mounted on a persistent volume.
+
+- **Graceful shutdown (`SIGTERM` / `SIGINT`)**: FeedCourier stops accepting new HTTP requests, stops claiming new outbox tasks between deliveries, waits for any in-flight delivery to finish, and closes SQLite cleanly.
+- **Crash / force-kill recovery**: If a container is terminated mid-delivery, any orphaned `delivering` tasks are reclaimed immediately on next startup with their checkpoints intact—no manual intervention or waiting for lease expiry is required.
+- **Docker Compose recommendation**: Set `stop_grace_period: 30s` (Docker's default is 10s) so slow SMTP, Telegram media, or Notion requests finish before SIGKILL:
+
+```yaml
+services:
+  feedcourier:
+    image: elleryhe/feedcourier:latest
+    stop_grace_period: 30s
+    volumes:
+      - ./data:/data
+```
+
+---
+
+## Structured Logging & Storage (`logs.db` / ClickHouse) {#structured-logging-and-storage}
+
+FeedCourier emits redacted, structured logs to **stdout** (`docker logs`, switchable between `LOG_FORMAT=text` and `LOG_FORMAT=json`) and asynchronously persists them into a dedicated log store so log I/O never competes with the main SQLite write lock:
+
+- **Default SQLite store (`LOG_STORE=sqlite`)**: Writes batches asynchronously into `<DATA_DIR>/logs.db` (separate from `feedcourier.db`). Retention defaults to **`LOG_RETENTION_DAYS=7`** and **`LOG_MAX_ROWS=100000`**, pruned automatically every hour during maintenance. Set `LOG_STORE=off` if you only want `docker logs` and zero extra disk files under `/data`.
+- **ClickHouse backend (`LOG_STORE=clickhouse`)**: For high-volume deployments, set `LOG_CLICKHOUSE_URL` (plus optional `LOG_CLICKHOUSE_DATABASE`, `LOG_CLICKHOUSE_TABLE`, `LOG_CLICKHOUSE_USER`, and `LOG_CLICKHOUSE_PASSWORD`). FeedCourier creates the `MergeTree` table with automatic `TTL` on startup and writes batches via HTTP `JSONEachRow`. If ClickHouse is temporarily unreachable, buffered records drop cleanly without blocking startup or feed delivery.
+
+---
+
 ## Automatic Maintenance & Content Cleanup
 
 A background task runs every **1 hour** and performs four maintenance tasks:
